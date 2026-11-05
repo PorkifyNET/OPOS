@@ -1,3 +1,0 @@
-We want a full-fledged desktop environment that can run both Windows and Linux applications, that can be used on a daily basis for both work and free-time (gaming, browsing, document-editing such as text files, Word documents, spreadsheets, presentations, and more). Both GitHub Copilot and ChatGPT Codex have already worked on this project before you.
-
-Check agent-notes.md regularly for any found bugs/issues, comments and long-term ideas.

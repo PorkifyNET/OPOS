@@ -82,6 +82,8 @@ in a public issue. For help and questions, see [SUPPORT.md](SUPPORT.md).
 
 ## License
 
-OPOS does not have a license yet. A license will be chosen before the first
-public release. By contributing, you agree that your contribution may be
-released under the license the project adopts.
+OPOS is licensed under the GNU General Public License, version 3 or any later
+version (`GPL-3.0-or-later`). By submitting a contribution, you agree to
+license it under the same terms. Only submit code you wrote yourself or code
+whose license is compatible with GPLv3, and say where any third-party code
+came from.

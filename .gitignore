@@ -1,0 +1,7 @@
+/build/
+agent-notes.md
+
+# Disk images and other large test artifacts
+*.img
+*.iso
+*.ppm

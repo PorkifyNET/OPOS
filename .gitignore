@@ -1,5 +1,5 @@
 /build/
-agent-notes.md
+/agents/
 
 # Disk images and other large test artifacts
 *.img

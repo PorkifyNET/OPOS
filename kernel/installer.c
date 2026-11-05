@@ -941,6 +941,18 @@ void installer_boot_scan(size_t disk, const struct installer_layout *layout,
             scan_other_disk(scan, other, &info);
         }
     }
+    if (layout != NULL && layout->gpt) {
+        /* OPOS on a GPT disk only starts through UEFI, where Limine hides
+           BIOS entries: listing them would promise systems it cannot
+           start. */
+        size_t kept = 0;
+        for (size_t i = 0; i < scan->entry_count; i++) {
+            if (scan->entries[i].uefi) {
+                scan->entries[kept++] = scan->entries[i];
+            }
+        }
+        scan->entry_count = kept;
+    }
 }
 
 const char *installer_boot_mode_problem(const struct installer_layout *layout,

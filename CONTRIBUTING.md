@@ -77,7 +77,8 @@ Include:
 OPOS does not yet isolate users from each other, so do not rely on it to
 protect data. If you find a security problem in code that is meant to
 enforce a boundary (process isolation, syscall validation, the password
-store), report it privately to the maintainer rather than in a public issue.
+store), report it privately as described in [SECURITY.md](SECURITY.md), not
+in a public issue. For help and questions, see [SUPPORT.md](SUPPORT.md).
 
 ## License
 

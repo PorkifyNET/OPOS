@@ -136,7 +136,8 @@ The terminal command `shell` leaves the desktop for the kernel shell; type
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). For help, see [SUPPORT.md](SUPPORT.md);
+to report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## License
 

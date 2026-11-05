@@ -16,18 +16,20 @@ are goals, not current features.
 
 **Desktop**
 - Window manager with floating windows and Hyprland-style dwindle tiling,
-  switchable per user (Super+T).
+  switchable per user (Super+T). Windows resize by their edges (floating),
+  by dragging the gap between them (tiled), or with Super+Shift+arrows.
 - Taskbar with Start menu, window buttons and clock.
 - Built-in apps: Terminal, Files, Text Editor, System Info, Settings, Accounts,
   and a Welcome window shown on each user's first login.
 - Files: browse folders, open and run files, rename, delete, and create files
   and folders (right-click menu); sidebar with home folders and every mounted
-  volume.
+  volume; back/forward/up buttons and an address bar (Ctrl+L).
 - Text Editor: selection, clipboard, common Ctrl shortcuts, CRLF-preserving
   save.
 - User accounts with optional passwords (salted, iterated SHA-256), a login
-  screen, and per-user home folders and settings. Accounts do not yet enforce
-  file permissions.
+  screen, and per-user home folders and settings. Programs run as their
+  account: they cannot change system files, read password hashes, or open
+  other users' homes. See [docs/security-model.md](docs/security-model.md).
 
 **Installer**
 - Runs from the live ISO, or close it to try OPOS without installing.
@@ -50,13 +52,15 @@ are goals, not current features.
 
 **Kernel and programs**
 - Preemptive scheduler, isolated per-process address spaces, NX and
-  write-protected user code.
+  write-protected user code, SMEP and UMIP when the CPU has them.
+- Native application SDK in [sdk/](sdk/README.md): build an OPOS program
+  with any x86-64 GCC, copy it to the disk and run it.
 - ELF loader with a small dynamic interpreter, and a subset of Linux x86-64
   syscalls (files, pipes, fork/execve/wait, mmap, threads with futexes) that
   runs static musl programs. See [docs/linux-compat.md](docs/linux-compat.md).
 
-**Not yet:** networking, USB, sound, file permissions, window resizing,
-third-party native apps, general Linux or Windows application support.
+**Not yet:** networking, USB, sound, per-application sandboxes, graphical
+third-party apps, general Linux or Windows application support.
 
 ## Building
 
@@ -117,7 +121,8 @@ Add `-vga vmware` to test the SVGA driver, or the OVMF firmware
 | Ctrl while choosing Reboot | Boot into the kernel shell once |
 
 The terminal command `shell` leaves the desktop for the kernel shell; type
-`help` there for its commands (disk tools, installer, test programs).
+`help` there for its commands (disk tools, installer, test programs). On a
+computer with accounts the kernel shell first asks for an administrator.
 
 ## Project layout
 
@@ -130,7 +135,8 @@ The terminal command `shell` leaves the desktop for the kernel shell; type
 | `kernel/ata.c`, `ahci.c`, `nvme.c`, `scsi.c`, `pvscsi.c`, `mpt.c`, `buslogic.c` | Storage drivers |
 | `kernel/user.c`, `elf.c`, `scheduler.c`, `dynamic_*.c` | Processes, syscalls, ELF loading |
 | `kernel/svga.c`, `vmware.c` | VMware display and backdoor (mouse, autofit) |
-| `kernel/accounts.c`, `cmos.c` | Accounts and settings |
+| `kernel/accounts.c`, `permissions.c`, `cmos.c` | Accounts, file access rules, settings |
+| `sdk/` | Application SDK: header, start-up code, linker script, examples |
 | `tools/` | Host tools and QEMU test scripts |
 | `docs/` | Technical notes |
 

@@ -6,3 +6,4 @@
 *.iso
 *.ppm
 hyprland-example.webp
+/sdk/build/

@@ -14,6 +14,9 @@
 #define PAGING_NO_EXECUTE (1ULL << 63)
 
 bool paging_nx_supported(void);
+/* CPU protections turned on by paging_initialize when available. */
+bool paging_smep_enabled(void);
+bool paging_umip_enabled(void);
 bool paging_initialize(void);
 uint64_t paging_kernel_address_space(void);
 bool paging_address_space_create(uint64_t *physical_address);

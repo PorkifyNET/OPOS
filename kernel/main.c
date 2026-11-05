@@ -974,6 +974,10 @@ void kmain(void) {
         console_write_string("OPOS: page-table manager initialization failed\n");
         halt();
     }
+    serial_write_string(paging_smep_enabled() ? "OPOS: SMEP on\n"
+                                              : "OPOS: SMEP unavailable\n");
+    serial_write_string(paging_umip_enabled() ? "OPOS: UMIP on\n"
+                                              : "OPOS: UMIP unavailable\n");
 
     if (!interrupts_route_legacy_pic()) {
         console_write_string("OPOS: legacy PIC interrupt routing failed\n");

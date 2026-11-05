@@ -11,6 +11,7 @@
 #include "initramfs.h"
 #include "installer.h"
 #include "keyboard.h"
+#include "permissions.h"
 #include "memory.h"
 #include "mouse.h"
 #include "power.h"
@@ -348,6 +349,59 @@ static void terminal_reset(void) {
     terminal_print("OPOS TERMINAL - TYPE HELP");
 }
 
+/*
+ * While a program runs, its standard output and error land in the
+ * Terminal window, a line at a time, and the screen is redrawn so the
+ * output (and the echo of what the program reads) shows up at once.
+ */
+static char terminal_output[TERMINAL_COLUMNS];
+static size_t terminal_output_length;
+static void draw_scene(void);
+static void window_open(enum window_kind kind);
+static void window_raise(enum window_kind kind);
+
+static void terminal_output_flush(void) {
+    if (terminal_output_length != 0) {
+        terminal_output[terminal_output_length] = '\0';
+        terminal_print(terminal_output);
+        terminal_output_length = 0;
+    }
+}
+
+static void terminal_output_sink(const char *data, size_t length,
+                                 bool error) {
+    (void)error;
+    for (size_t i = 0; i < length; i++) {
+        char c = data[i];
+        if (c == '\n') {
+            terminal_output[terminal_output_length] = '\0';
+            terminal_print(terminal_output);
+            terminal_output_length = 0;
+        } else if (c == '\b') {
+            if (terminal_output_length != 0) {
+                terminal_output_length--;
+            }
+        } else if (c == '\t' || (c >= ' ' && c <= '~')) {
+            terminal_output[terminal_output_length++] = c == '\t' ? ' ' : c;
+            if (terminal_output_length + 1 == TERMINAL_COLUMNS) {
+                terminal_output_flush();
+            }
+        }
+    }
+    draw_scene();
+}
+
+static void terminal_capture_begin(void) {
+    window_open(WINDOW_TERMINAL);
+    terminal_output_length = 0;
+    user_set_console_sink(terminal_output_sink);
+}
+
+static void terminal_capture_end(void) {
+    user_set_console_sink(NULL);
+    terminal_output_flush();
+}
+
 static void terminal_report_exit(bool started, uint64_t exit_status) {
     terminal_print(!started ? "APPLICATION COULD NOT START"
                    : exit_status == 0 ? "APPLICATION EXITED WITH STATUS 0"
@@ -357,30 +411,74 @@ static void terminal_report_exit(bool started, uint64_t exit_status) {
 static void terminal_launch(enum user_program program) {
     uint64_t process_id;
     uint64_t exit_status = 1;
+    terminal_capture_begin();
     bool started = user_process_run(program, &process_id, &exit_status);
+    terminal_capture_end();
     terminal_report_exit(started, exit_status);
 }
 
 /* Runs an initramfs program; path may start with '/'. */
-static bool launch_path(const char *path, size_t path_length,
-                        uint64_t *exit_status) {
-    size_t path_start = path_length != 0 && path[0] == '/' ? 1 : 0;
-    size_t archive_length = path_length - path_start;
-    if (archive_length == 0 || archive_length > 127) {
-        return false;
+enum run_result {
+    RUN_STARTED,
+    RUN_NOT_FOUND,
+    RUN_DENIED,
+    RUN_TOO_LARGE,
+    RUN_NOT_PROGRAM,
+    RUN_FAILED,
+};
+
+/* Program images are loaded here first (the loader copies them). Same
+   64 KiB limit as the shell's "disk run". */
+static uint8_t program_image[64 * 1024];
+
+/*
+ * Runs an ELF program from the initramfs (/bin, /lib) or a disk (/disk...)
+ * as the logged-in account, after the same permission check Files uses.
+ */
+static enum run_result run_program_file(const char *typed,
+                                        size_t typed_length,
+                                        uint64_t *exit_status) {
+    char path[256];
+    size_t length = permission_canonicalize(typed, typed_length, path,
+                                            sizeof(path));
+    if (length < 2) {
+        return RUN_NOT_FOUND;
     }
-    char archive_path[128];
-    for (size_t i = 0; i < archive_length; i++) {
-        archive_path[i] = path[path_start + i];
+    if (!permission_ui_allows(path, length, PERMISSION_READ)) {
+        return RUN_DENIED;
     }
-    archive_path[archive_length] = '\0';
+    const uint8_t *image = program_image;
+    size_t size = 0;
     struct initramfs_file file;
-    if (!initramfs_find_file(archive_path, &file)) {
-        return false;
+    bool on_disk = length >= 5 && (path[1] | 32) == 'd'
+        && (path[2] | 32) == 'i' && (path[3] | 32) == 's'
+        && (path[4] | 32) == 'k';
+    if (!on_disk && initramfs_find_file(path + 1, &file)) {
+        image = file.data;
+        size = file.size;
+    } else if (!vfs_read_file(path, length, program_image,
+                              sizeof(program_image), &size)) {
+        return size > sizeof(program_image) ? RUN_TOO_LARGE : RUN_NOT_FOUND;
+    }
+    if (size < 4 || image[0] != 0x7f || image[1] != 'E' || image[2] != 'L'
+        || image[3] != 'F') {
+        return RUN_NOT_PROGRAM;
     }
     uint64_t process_id;
-    return user_process_run_elf_path(file.data, file.size, path, path_length,
-                                     &process_id, exit_status);
+    return user_process_run_elf_path(image, size, path, length, &process_id,
+                                     exit_status)
+        ? RUN_STARTED : RUN_FAILED;
+}
+
+static const char *run_result_text(enum run_result result) {
+    switch (result) {
+    case RUN_NOT_FOUND: return "FILE NOT FOUND";
+    case RUN_DENIED: return "ACCESS DENIED";
+    case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (64 KIB LIMIT)";
+    case RUN_NOT_PROGRAM: return "NOT A PROGRAM (NO ELF HEADER)";
+    case RUN_FAILED: return "PROGRAM COULD NOT START";
+    default: return "";
+    }
 }
 
 static void terminal_list_files(void) {
@@ -429,11 +527,22 @@ static bool terminal_execute(void) {
     } else if (text_equals(terminal_line, terminal_length, "demo")) {
         terminal_launch(USER_PROGRAM_DEMO);
     } else if (terminal_length > 4 && text_equals(terminal_line, 4, "run ")) {
+        /* A name without a leading '/' is looked up from the root, so
+           "run bin/elf-test" still works. */
+        char path[sizeof(terminal_line) + 1];
+        size_t length = 0;
+        if (terminal_line[4] != '/') {
+            path[length++] = '/';
+        }
+        for (size_t i = 4; i < terminal_length; i++) {
+            path[length++] = terminal_line[i];
+        }
         uint64_t exit_status = 1;
-        bool started = launch_path(terminal_line + 4, terminal_length - 4,
-                                   &exit_status);
-        if (!started) {
-            terminal_print("APPLICATION FILE NOT FOUND OR COULD NOT START");
+        terminal_capture_begin();
+        enum run_result result = run_program_file(path, length, &exit_status);
+        terminal_capture_end();
+        if (result != RUN_STARTED) {
+            terminal_print(run_result_text(result));
         } else {
             terminal_report_exit(true, exit_status);
         }
@@ -446,6 +555,8 @@ static bool terminal_execute(void) {
     } else if (text_equals(terminal_line, terminal_length, "exit")) {
         return false;
     } else if (text_equals(terminal_line, terminal_length, "shell")) {
+        /* The kernel shell asks for an administrator unless one is
+           logged in (see shell_lock_update in shell.c). */
         exit_to_shell = true;
     } else if (terminal_length != 0) {
         terminal_print("UNKNOWN COMMAND - TYPE HELP");
@@ -775,7 +886,8 @@ static size_t editor_line_offset(size_t line) {
 }
 
 static bool editor_is_writable_path(const char *path, size_t length) {
-    return length != 0 && !vfs_path_read_only(path, length);
+    return length != 0 && !vfs_path_read_only(path, length)
+        && permission_ui_allows(path, length, PERMISSION_WRITE);
 }
 
 /* Shows unsaved-changes warnings; true when the caller may go ahead. */
@@ -803,6 +915,10 @@ static void editor_set_path(const char *path, size_t length) {
 static bool editor_open(const char *path, size_t length) {
     if (windows[WINDOW_EDITOR].open && !editor_may_discard()) {
         window_open(WINDOW_EDITOR);
+        return false;
+    }
+    if (!permission_ui_allows(path, length, PERMISSION_READ)) {
+        set_status("ACCESS DENIED");
         return false;
     }
     size_t size = 0;
@@ -849,9 +965,17 @@ static void editor_new(void) {
     window_open(WINDOW_EDITOR);
 }
 
-static void editor_save_to(const char *path, size_t length) {
-    if (length < 2 || path[0] != '/') {
+static void editor_save_to(const char *typed, size_t typed_length) {
+    char path[EDITOR_PATH_CAPACITY];
+    size_t length = typed_length >= 2 && typed[0] == '/'
+        ? permission_canonicalize(typed, typed_length, path, sizeof(path))
+        : 0;
+    if (length < 2) {
         set_status("ENTER A FULL PATH, E.G. /DISK/NOTES.TXT");
+        return;
+    }
+    if (!permission_ui_allows(path, length, PERMISSION_WRITE)) {
+        set_status("ACCESS DENIED - SAVE IN YOUR HOME FOLDER");
         return;
     }
     if (!editor_is_writable_path(path, length)) {
@@ -1534,8 +1658,6 @@ static size_t files_selection;
 static size_t files_scroll;
 static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
-/* Same 64 KiB load limit as the shell's "disk run". */
-static uint8_t files_program[64 * 1024];
 
 struct files_place {
     const char *label;
@@ -1745,10 +1867,11 @@ static bool files_navigate(const char *path, size_t length) {
     files_prompt_kind = FILES_PROMPT_NONE;
     files_menu_open = false;
     files_address_editing = false;
-    if (files_load()) {
+    bool allowed = permission_ui_allows(path, length, PERMISSION_READ);
+    if (allowed && files_load()) {
         return true;
     }
-    set_status("FOLDER COULD NOT BE OPENED");
+    set_status(allowed ? "FOLDER COULD NOT BE OPENED" : "ACCESS DENIED");
     files_set_path(previous, previous_length);
     if (!files_load()) {
         files_set_path("/", 1);
@@ -2013,34 +2136,27 @@ static size_t files_entry_path(size_t index, char *path, size_t capacity) {
 }
 
 static void files_run_program(const char *path, size_t length) {
-    const uint8_t *image = files_program;
-    size_t size = 0;
-    struct initramfs_file file;
-    bool on_disk = length >= 5 && path[1] == 'd' && path[2] == 'i'
-        && path[3] == 's' && path[4] == 'k'
-        && (length == 5 || path[5] == '/');
-    if (!on_disk && initramfs_find_file(path + 1, &file)) {
-        image = file.data;
-        size = file.size;
-    } else if (!vfs_read_file(path, length, files_program,
-                              sizeof(files_program), &size)) {
-        set_status(size > sizeof(files_program)
-                   ? "FILE TOO LARGE TO OPEN (64 KIB LIMIT)"
-                   : "FILE COULD NOT BE READ");
-        return;
-    }
-    if (size < 4 || image[0] != 0x7f || image[1] != 'E' || image[2] != 'L'
-        || image[3] != 'F') {
-        (void)editor_open(path, length); /* everything else is text */
-        return;
-    }
-    uint64_t process_id;
     uint64_t exit_status = 1;
-    bool started = user_process_run_elf_path(image, size, path, length,
-                                             &process_id, &exit_status);
-    set_status(!started ? "FILE COULD NOT START"
-               : exit_status == 0 ? "PROGRAM EXITED WITH STATUS 0"
-                                  : "PROGRAM EXITED WITH ERROR");
+    /* Output goes to the Terminal, which comes up if it was closed. */
+    enum window_kind previous = z_count != 0 ? z_order[z_count - 1]
+                                             : WINDOW_COUNT;
+    terminal_capture_begin();
+    enum run_result result = run_program_file(path, length, &exit_status);
+    terminal_capture_end();
+    if (result == RUN_STARTED) {
+        terminal_report_exit(true, exit_status);
+    }
+    if (previous != WINDOW_COUNT) {
+        window_raise(previous);
+    }
+    if (result == RUN_NOT_PROGRAM) {
+        (void)editor_open(path, length); /* everything else is text */
+    } else if (result != RUN_STARTED) {
+        set_status(run_result_text(result));
+    } else {
+        set_status(exit_status == 0 ? "PROGRAM EXITED WITH STATUS 0"
+                                    : "PROGRAM EXITED WITH ERROR");
+    }
 }
 
 /* Opens a row: ".." goes up, folders are entered, programs run. */
@@ -5021,7 +5137,9 @@ static const char *const files_action_labels[] = {
 #define FILES_DELETE_DEPTH 8
 
 static bool files_location_read_only(void) {
-    return vfs_path_read_only(files_path, files_path_length);
+    return vfs_path_read_only(files_path, files_path_length)
+        || !permission_ui_allows(files_path, files_path_length,
+                                 PERMISSION_WRITE);
 }
 
 /* Entry index of the selected row, or false for ".." / nothing. */
@@ -5196,6 +5314,10 @@ static void files_prompt_commit(void) {
                               &length)) {
             return;
         }
+        if (!permission_ui_allows(path, length, PERMISSION_REMOVE)) {
+            set_status("ACCESS DENIED");
+            return;
+        }
         bool removed = files_delete_tree(path, length, 0);
         size_t selection = files_selection;
         files_refresh();
@@ -5215,6 +5337,11 @@ static void files_prompt_commit(void) {
     struct vfs_metadata metadata;
     bool exists = vfs_stat(path, length, &metadata);
     const char *failure = NULL;
+    if (!permission_ui_allows(path, length, kind == FILES_PROMPT_RENAME
+                              ? PERMISSION_REMOVE : PERMISSION_WRITE)) {
+        set_status("ACCESS DENIED");
+        return;
+    }
     if (kind == FILES_PROMPT_RENAME) {
         if (files_prompt_target >= files_count) {
             return;
@@ -5224,6 +5351,10 @@ static void files_prompt_commit(void) {
         size_t old_length;
         if (!files_child_path(entry->name, text_length(entry->name),
                               old_path, &old_length)) {
+            return;
+        }
+        if (!permission_ui_allows(old_path, old_length, PERMISSION_REMOVE)) {
+            set_status("ACCESS DENIED");
             return;
         }
         enum vfs_rename_result result =

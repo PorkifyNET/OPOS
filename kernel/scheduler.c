@@ -404,8 +404,26 @@ void scheduler_save_current_fpu(uint8_t state[SCHEDULER_FPU_STATE_SIZE]) {
 
 void scheduler_restore_current_fpu(
     const uint8_t state[SCHEDULER_FPU_STATE_SIZE]) {
-    scheduler_copy_fpu(tasks[current_task].fpu_state, state);
-    scheduler_restore_fpu(tasks[current_task].fpu_state);
+    uint8_t *saved = tasks[current_task].fpu_state;
+    scheduler_copy_fpu(saved, state);
+    /* The state comes from user memory (rt_sigreturn). FXRSTOR raises #GP
+       in ring 0 when MXCSR sets a bit outside MXCSR_MASK (FXSAVE bytes
+       28-31; zero means the default 0xffbf). */
+    uint32_t mask = (uint32_t)initial_fpu_state[28]
+                  | (uint32_t)initial_fpu_state[29] << 8
+                  | (uint32_t)initial_fpu_state[30] << 16
+                  | (uint32_t)initial_fpu_state[31] << 24;
+    if (mask == 0) {
+        mask = 0xffbf;
+    }
+    uint32_t mxcsr = (uint32_t)saved[24] | (uint32_t)saved[25] << 8
+                   | (uint32_t)saved[26] << 16 | (uint32_t)saved[27] << 24;
+    mxcsr &= mask;
+    saved[24] = (uint8_t)mxcsr;
+    saved[25] = (uint8_t)(mxcsr >> 8);
+    saved[26] = (uint8_t)(mxcsr >> 16);
+    saved[27] = (uint8_t)(mxcsr >> 24);
+    scheduler_restore_fpu(saved);
 }
 
 bool scheduler_sleep_until(uint64_t wake_tick) {

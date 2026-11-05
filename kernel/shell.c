@@ -48,9 +48,69 @@ static bool command_matches(const char *command, size_t length, const char *expe
     return i == length && expected[i] == '\0';
 }
 
+/*
+ * The kernel shell can read and write any sector, so it is for
+ * administrators only. With accounts on the disk it asks for an
+ * administrator's name and password first, unless one is logged in.
+ */
+enum shell_lock {
+    SHELL_OPEN,
+    SHELL_ASK_NAME,
+    SHELL_ASK_PASSWORD,
+};
+
+static enum shell_lock shell_lock;
+static size_t shell_login_account;
+
 static void print_prompt(void) {
+    if (shell_lock == SHELL_ASK_NAME) {
+        console_write_string("Administrator account: ");
+        console_write_bytes(input_line, input_length);
+        return;
+    }
+    if (shell_lock == SHELL_ASK_PASSWORD) {
+        console_write_string("Password: ");
+        for (size_t i = 0; i < input_length; i++) {
+            console_write_string("*");
+        }
+        return;
+    }
     console_write_string("opos> ");
     console_write_bytes(input_line, input_length);
+}
+
+static void shell_lock_update(void) {
+    if (accounts_current() == ACCOUNT_NONE) {
+        accounts_load();
+    }
+    size_t current = accounts_current();
+    bool admin_present = current != ACCOUNT_NONE && accounts_is_admin(current);
+    shell_lock = accounts_count() == 0 || admin_present
+        ? SHELL_OPEN : SHELL_ASK_NAME;
+    if (shell_lock != SHELL_OPEN) {
+        console_write_string(
+            "This computer has accounts. Log in as an administrator.\n");
+    }
+}
+
+static void shell_login_line(void) {
+    if (shell_lock == SHELL_ASK_NAME) {
+        shell_login_account = accounts_find(input_line);
+        shell_lock = SHELL_ASK_PASSWORD;
+        return;
+    }
+    size_t account = shell_login_account;
+    bool ok = account != ACCOUNT_NONE && accounts_is_admin(account)
+        && accounts_login(account, input_line);
+    if (ok) {
+        shell_lock = SHELL_OPEN;
+        console_write_string("OPOS shell ready. Type help for commands.\n");
+        return;
+    }
+    /* Same reply for a wrong name, a standard account or a wrong
+       password. */
+    console_write_error("Login failed.\n");
+    shell_lock = SHELL_ASK_NAME;
 }
 
 static void write_decimal(uint64_t value) {
@@ -800,7 +860,10 @@ void shell_initialize(void) {
     input_length = 0;
     input_overflow = false;
     input_line[0] = '\0';
-    console_write_string("OPOS shell ready. Type help for commands.\n");
+    shell_lock_update();
+    if (shell_lock == SHELL_OPEN) {
+        console_write_string("OPOS shell ready. Type help for commands.\n");
+    }
     print_prompt();
 }
 
@@ -809,8 +872,20 @@ void shell_handle_character(char character) {
         console_write_string("\n");
         if (input_overflow) {
             console_write_error("Input too long; command not run.\n");
+        } else if (shell_lock != SHELL_OPEN) {
+            shell_login_line();
         } else {
+            bool desktop = command_matches(input_line, input_length,
+                                           "desktop");
             execute_command();
+            /* The desktop may have logged the administrator out. */
+            if (desktop) {
+                shell_lock_update();
+            }
+        }
+        /* Do not keep a typed password in memory. */
+        for (size_t i = 0; i < input_length; i++) {
+            input_line[i] = '\0';
         }
         input_length = 0;
         input_overflow = false;
@@ -837,7 +912,11 @@ void shell_handle_character(char character) {
 
     input_line[input_length++] = character;
     input_line[input_length] = '\0';
-    console_write_bytes(&character, 1);
+    if (shell_lock == SHELL_ASK_PASSWORD) {
+        console_write_string("*");
+    } else {
+        console_write_bytes(&character, 1);
+    }
 }
 
 void shell_report_dropped_input(uint64_t count) {

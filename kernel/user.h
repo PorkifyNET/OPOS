@@ -33,5 +33,13 @@ bool user_exception_dispatch(uint64_t vector, void *exception_frame);
 void user_syscall_dispatch(void *saved_registers);
 bool user_linux_syscall_dispatch(void *saved_registers);
 bool user_linux_signal_deliver(void *saved_registers);
+/* Sanitizes the frame before SYSRET; true ends the process instead. */
+bool user_linux_return_check(void *saved_registers, bool exiting);
+
+/* Where programs' standard output and error go while set (e.g. the
+   desktop Terminal window); NULL means the kernel console. */
+typedef void (*user_console_sink)(const char *data, size_t length,
+                                  bool error);
+void user_set_console_sink(user_console_sink sink);
 
 #endif

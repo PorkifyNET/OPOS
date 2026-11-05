@@ -128,6 +128,11 @@ syscall_entry:
     call user_linux_signal_deliver
     movq %rax, %rbx
 1:
+    /* Never sysret with registers user memory chose unchecked. */
+    movq %r12, %rdi
+    movq %rbx, %rsi
+    call user_linux_return_check
+    movq %rax, %rbx
     movq 120(%r12), %rdi
     call scheduler_linux_syscall_leave
     movq %rbx, %rax

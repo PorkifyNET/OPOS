@@ -7,6 +7,8 @@
 #include "keyboard.h"
 #include "memory.h"
 #include "paging.h"
+#include "permissions.h"
+#include "accounts.h"
 #include "scheduler.h"
 #include "timer.h"
 #include "user.h"
@@ -301,6 +303,8 @@ struct user_process {
     struct user_descriptor descriptors[USER_DESCRIPTOR_CAPACITY];
     struct linux_signal_action signal_actions[LINUX_SIGNAL_COUNT];
     size_t active_threads;
+    /* Who the program runs as; checked on every path it touches. */
+    struct permission_identity identity;
 };
 
 struct user_thread {
@@ -352,6 +356,7 @@ struct user_child_job {
     uint64_t fork_signal_mask;
     size_t cwd_length;
     char cwd[USER_FILE_PATH_CAPACITY];
+    struct permission_identity identity;
     volatile enum user_child_state state;
     bool started;
     uint64_t process_id;
@@ -382,12 +387,15 @@ static int64_t user_wait_linux_child(struct user_process *parent,
                                      int64_t requested_process_id,
                                      uint32_t *wait_status);
 static void user_orphan_children(uint64_t parent_process_id);
+static void user_console_write(uint64_t file_descriptor, const char *data,
+                               size_t length);
 static void user_child_worker(void *argument);
 static void user_thread_worker(void *argument);
 static struct user_file_descriptor *user_file_descriptor(
     struct user_process *process, uint64_t descriptor);
 static int64_t user_pipe_write(struct user_file_descriptor *file,
-                               const uint8_t *buffer, size_t length);
+                               const uint8_t *buffer, size_t length,
+                               bool user_buffer);
 
 static uint64_t user_random_fallback(void) {
     uint32_t low;
@@ -819,7 +827,7 @@ void user_syscall_dispatch(void *saved_registers) {
             if (character == '\b') {
                 if (length != 0) {
                     length--;
-                    console_write_bytes(&character, 1);
+                    user_console_write(1, &character, 1);
                 }
                 continue;
             }
@@ -827,8 +835,14 @@ void user_syscall_dispatch(void *saved_registers) {
                 continue;
             }
 
+            /* Another thread may have unmapped it while we waited. */
+            if (!paging_user_range_valid((uintptr_t)(buffer + length), 1,
+                                         true, false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return;
+            }
             buffer[length++] = character;
-            console_write_bytes(&character, 1);
+            user_console_write(1, &character, 1);
             if (character == '\n') {
                 break;
             }
@@ -865,7 +879,9 @@ void user_syscall_dispatch(void *saved_registers) {
         uint64_t child_process_id = 0;
         int64_t status = user_wait_child(process, frame->rdi,
                                          &child_process_id);
-        if (status >= 0 && frame->rsi != 0) {
+        if (status >= 0 && frame->rsi != 0
+            && paging_user_range_valid((uintptr_t)frame->rsi,
+                                       sizeof(uint64_t), true, false)) {
             *(uint64_t *)(uintptr_t)frame->rsi = child_process_id;
         }
         frame->rax = (uint64_t)status;
@@ -964,8 +980,18 @@ static void copy_utsname_field(char destination[LINUX_UTS_FIELD_SIZE],
 }
 
 /* Console output for fd 1/2; stderr is drawn in the error colour. */
+static user_console_sink console_sink;
+
+void user_set_console_sink(user_console_sink sink) {
+    console_sink = sink;
+}
+
 static void user_console_write(uint64_t file_descriptor, const char *data,
                                size_t length) {
+    if (console_sink != NULL) {
+        console_sink(data, length, file_descriptor == 2);
+        return;
+    }
     if (file_descriptor == 2) {
         console_set_text_style(CONSOLE_TEXT_ERROR);
     }
@@ -1033,7 +1059,8 @@ static bool user_linux_writev(struct user_process *process,
         user_console_write(frame->rdi, (const char *)buffer, total_length);
         frame->rax = total_length;
     } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
-        frame->rax = (uint64_t)user_pipe_write(file, buffer, total_length);
+        frame->rax = (uint64_t)user_pipe_write(file, buffer, total_length,
+                                               false);
     } else {
         if (file->append) {
             struct vfs_metadata metadata;
@@ -1117,6 +1144,14 @@ static int64_t user_pipe_read(struct user_file_descriptor *file,
         __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
         if (pipe->size != 0) {
             size_t copied = length < pipe->size ? length : pipe->size;
+            /* Checked again here: blocking let other threads run. */
+            if (!paging_user_range_valid((uintptr_t)buffer, copied, true,
+                                         false)) {
+                if ((flags & (1u << 9)) != 0) {
+                    __asm__ volatile ("sti" : : : "memory");
+                }
+                return -14;
+            }
             for (size_t i = 0; i < copied; i++) {
                 buffer[i] = pipe->data[pipe->read_offset];
                 pipe->read_offset =
@@ -1147,8 +1182,10 @@ static int64_t user_pipe_read(struct user_file_descriptor *file,
     }
 }
 
+/* user_buffer: buffer is user memory (checked again after blocking). */
 static int64_t user_pipe_write(struct user_file_descriptor *file,
-                               const uint8_t *buffer, size_t length) {
+                               const uint8_t *buffer, size_t length,
+                               bool user_buffer) {
     struct user_pipe *pipe = user_file_pipe(file);
     if (pipe == NULL || file->kind != USER_OPEN_FILE_PIPE_WRITE) {
         return -9;
@@ -1166,6 +1203,15 @@ static int64_t user_pipe_write(struct user_file_descriptor *file,
             return -32;
         }
         if (length <= USER_PIPE_BUFFER_CAPACITY - pipe->size) {
+            /* Checked again here: blocking let other threads run. */
+            if (user_buffer
+                && !paging_user_range_valid((uintptr_t)buffer, length, false,
+                                            false)) {
+                if ((flags & (1u << 9)) != 0) {
+                    __asm__ volatile ("sti" : : : "memory");
+                }
+                return -14;
+            }
             for (size_t i = 0; i < length; i++) {
                 pipe->data[pipe->write_offset] = buffer[i];
                 pipe->write_offset =
@@ -1342,6 +1388,14 @@ static int64_t user_resolve_file_path(struct user_process *process,
     return 0;
 }
 
+/* True when the process's identity may access the resolved path. */
+static bool user_path_allowed(const struct user_process *process,
+                              const char *path, size_t path_length,
+                              enum permission_access access) {
+    return permission_program_allows(&process->identity, path, path_length,
+                                     access);
+}
+
 static int64_t user_linux_open_file(struct user_process *process,
                                     int64_t directory_descriptor,
                                     uintptr_t path_address, uint64_t flags) {
@@ -1361,6 +1415,12 @@ static int64_t user_linux_open_file(struct user_process *process,
                                             path_address, path, &path_length);
     if (copied != 0) {
         return copied;
+    }
+    bool modifies = access != LINUX_O_RDONLY
+        || (flags & (LINUX_O_CREAT | LINUX_O_TRUNC)) != 0;
+    if (!user_path_allowed(process, path, path_length,
+                           modifies ? PERMISSION_WRITE : PERMISSION_READ)) {
+        return -13;
     }
 
     size_t descriptor_slot = USER_DESCRIPTOR_CAPACITY;
@@ -1640,6 +1700,9 @@ static int64_t user_linux_stat_path(struct user_process *process,
     if (copied != 0) {
         return copied;
     }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)) {
+        return -13;
+    }
     struct vfs_metadata metadata;
     if (!vfs_stat(path, path_length, &metadata)) {
         return -2;
@@ -1657,6 +1720,9 @@ static int64_t user_linux_change_directory(struct user_process *process,
                                               path_address, path, &path_length);
     if (resolved != 0) {
         return resolved;
+    }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)) {
+        return -13;
     }
     struct vfs_metadata metadata;
     if (!vfs_stat(path, path_length, &metadata)) {
@@ -1700,6 +1766,9 @@ static int64_t user_linux_make_directory(struct user_process *process,
     if (resolved != 0) {
         return resolved;
     }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_WRITE)) {
+        return -13;
+    }
     struct vfs_metadata metadata;
     if (vfs_stat(path, path_length, &metadata)) {
         return -17;
@@ -1719,6 +1788,9 @@ static int64_t user_linux_remove(struct user_process *process,
                                               path_address, path, &path_length);
     if (resolved != 0) {
         return resolved;
+    }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_REMOVE)) {
+        return -13;
     }
     struct vfs_metadata metadata;
     if (!vfs_stat(path, path_length, &metadata)) {
@@ -1834,6 +1906,12 @@ static int64_t user_linux_rename(struct user_process *process,
     if (resolved != 0) {
         return resolved;
     }
+    if (!user_path_allowed(process, old_path, old_path_length,
+                           PERMISSION_REMOVE)
+        || !user_path_allowed(process, new_path, new_path_length,
+                              PERMISSION_REMOVE)) {
+        return -13;
+    }
     if (!user_renamed_cwds_fit(old_path, old_path_length,
                                new_path_length)) {
         return -36;
@@ -1867,6 +1945,9 @@ static int64_t user_linux_truncate_path(struct user_process *process,
                                               path_address, path, &path_length);
     if (resolved != 0) {
         return resolved;
+    }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_WRITE)) {
+        return -13;
     }
     struct vfs_metadata metadata;
     if (!vfs_stat(path, path_length, &metadata)) {
@@ -2497,6 +2578,7 @@ static int64_t user_linux_fork(struct user_process *parent,
     for (size_t i = 0; i < parent->image_segment_count; i++) {
         child.image_segments[i] = parent->image_segments[i];
     }
+    child.identity = parent->identity;
     child.cwd_length = parent->cwd_length;
     for (size_t i = 0; i < parent->cwd_length; i++) {
         child.cwd[i] = parent->cwd[i];
@@ -2595,6 +2677,9 @@ static int64_t user_linux_execve(struct user_process *process,
     if (resolved != 0) {
         return resolved;
     }
+    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)) {
+        return -13;
+    }
     struct user_exec_vectors vectors = {0};
     int64_t copied = user_copy_exec_vector((uintptr_t)frame->rsi, false,
                                            &vectors);
@@ -2624,6 +2709,13 @@ static int64_t user_linux_execve(struct user_process *process,
     struct elf_load_plan interpreter_plan = {0};
     size_t interpreter_size = 0;
     if (plan.has_interpreter) {
+        if (plan.interpreter_path_length == 0
+            || plan.interpreter_path[0] != '/'
+            || !user_path_allowed(process, plan.interpreter_path,
+                                  plan.interpreter_path_length,
+                                  PERMISSION_READ)) {
+            return -13;
+        }
         if (!vfs_read_file(plan.interpreter_path,
                            plan.interpreter_path_length,
                            user_interpreter_images[task_slot],
@@ -2807,6 +2899,67 @@ static int64_t user_linux_execve(struct user_process *process,
     return 0;
 }
 
+/*
+ * OPOS native calls. They use the SYSCALL instruction like the Linux ABI,
+ * with numbers 0x4f500000 and up ("OP"), which Linux never uses. The SDK
+ * (sdk/include/opos.h) documents them; numbers and structures are only
+ * ever added to, never changed, so old programs keep working.
+ */
+#define OPOS_SYSCALL_BASE 0x4f500000ULL
+#define OPOS_SYSCALL_ABI_VERSION (OPOS_SYSCALL_BASE + 0)
+#define OPOS_SYSCALL_USER_INFO (OPOS_SYSCALL_BASE + 1)
+#define OPOS_ABI_VERSION 1
+#define OPOS_USER_ADMIN 1u
+#define OPOS_USER_ACCOUNT 2u
+
+struct opos_user_info {
+    uint32_t size;
+    uint32_t flags;
+    char name[32];
+    char home[128];
+};
+
+static int64_t user_opos_user_info(const struct user_process *process,
+                                   uintptr_t address) {
+    if (!paging_user_range_valid(address, sizeof(uint32_t), false, false)) {
+        return -14;
+    }
+    /* The caller states how much room it has, so a newer kernel can grow
+       the structure without writing past an older program's copy. */
+    uint32_t size = *(const uint32_t *)address;
+    if (size < sizeof(struct opos_user_info)) {
+        return -22;
+    }
+    if (!paging_user_range_valid(address, sizeof(struct opos_user_info),
+                                 true, false)) {
+        return -14;
+    }
+    struct opos_user_info info = {.size = sizeof(info)};
+    if (process->identity.admin) {
+        info.flags |= OPOS_USER_ADMIN;
+    }
+    size_t account = process->identity.account;
+    if (account != PERMISSION_NO_ACCOUNT && account < accounts_count()) {
+        info.flags |= OPOS_USER_ACCOUNT;
+        const char *name = accounts_name(account);
+        size_t length = 0;
+        while (name[length] != '\0' && length + 1 < sizeof(info.name)) {
+            info.name[length] = name[length];
+            length++;
+        }
+        static const char root[] = ACCOUNT_HOME_ROOT "/";
+        size_t used = 0;
+        for (size_t i = 0; root[i] != '\0'; i++) {
+            info.home[used++] = root[i];
+        }
+        for (size_t i = 0; i < length && used + 1 < sizeof(info.home); i++) {
+            info.home[used++] = name[i];
+        }
+    }
+    *(struct opos_user_info *)address = info;
+    return 0;
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -2815,6 +2968,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     }
 
     uint64_t number = frame->rax;
+    if (number == OPOS_SYSCALL_ABI_VERSION) {
+        frame->rax = OPOS_ABI_VERSION;
+        return false;
+    }
+    if (number == OPOS_SYSCALL_USER_INFO) {
+        frame->rax = (uint64_t)user_opos_user_info(process,
+                                                   (uintptr_t)frame->rdi);
+        return false;
+    }
     uint64_t file_descriptor = frame->rdi;
     uintptr_t buffer_address = (uintptr_t)frame->rsi;
     size_t length = (size_t)frame->rdx;
@@ -2851,7 +3013,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             frame->rax = (uint64_t)(int64_t)-14;
         } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
             frame->rax = (uint64_t)user_pipe_write(
-                file, (const uint8_t *)buffer_address, length);
+                file, (const uint8_t *)buffer_address, length, true);
         } else {
             if (file->append) {
                 struct vfs_metadata metadata;
@@ -2901,15 +3063,21 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 if (character == '\b') {
                     if (bytes_read != 0) {
                         bytes_read--;
-                        console_write_bytes(&character, 1);
+                        user_console_write(1, &character, 1);
                     }
                     continue;
                 }
                 if (character != '\n' && (character < ' ' || character > '~')) {
                     continue;
                 }
+                /* Another thread may have unmapped it while we waited. */
+                if (!paging_user_range_valid(
+                        (uintptr_t)(buffer + bytes_read), 1, true, false)) {
+                    frame->rax = (uint64_t)(int64_t)-14;
+                    return false;
+                }
                 buffer[bytes_read++] = character;
-                console_write_bytes(&character, 1);
+                user_console_write(1, &character, 1);
                 if (character == '\n') {
                     break;
                 }
@@ -3883,6 +4051,35 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     return false;
 }
 
+/*
+ * Last check before SYSRET. rt_sigreturn, signal delivery, execve and
+ * arch_prctl can all put values from user memory into the saved frame:
+ * - RFLAGS: SYSRET keeps IOPL, so IOPL 3 would give ring 3 port I/O
+ *   (direct disk access). Only arithmetic flags, DF, AC and ID may pass.
+ * - RIP: a non-canonical RIP makes Intel CPUs fault in ring 0 after the
+ *   user stack is loaded. Linux stops one page below the user top too.
+ * - FS base: WRMSR with a non-canonical value faults in ring 0.
+ * A bad value ends the process (SIGSEGV) instead of crashing the kernel.
+ */
+#define USER_ADDRESS_LIMIT 0x00007ffffffff000ULL
+#define USER_RFLAGS_ALLOWED 0x00240cd5ULL
+#define USER_RFLAGS_FORCED 0x00000202ULL
+
+bool user_linux_return_check(void *saved_registers, bool exiting) {
+    struct linux_syscall_frame *frame = saved_registers;
+    if (exiting || frame == NULL) {
+        return exiting;
+    }
+    frame->flags = (frame->flags & USER_RFLAGS_ALLOWED) | USER_RFLAGS_FORCED;
+    if (frame->instruction_pointer >= USER_ADDRESS_LIMIT
+        || frame->fs_base >= USER_ADDRESS_LIMIT
+        || scheduler_linux_syscall_user_stack() >= USER_ADDRESS_LIMIT) {
+        frame->rax = 128 + 11;
+        return true;
+    }
+    return false;
+}
+
 static bool user_signal_default_ignored(uint64_t signal_number) {
     return signal_number == LINUX_SIGCHLD || signal_number == LINUX_SIGCONT
         || signal_number == LINUX_SIGURG || signal_number == LINUX_SIGWINCH;
@@ -4034,6 +4231,7 @@ static bool user_process_run_image(enum user_program program,
                                    size_t initial_cwd_length,
                                    const char *initial_execfn,
                                    size_t initial_execfn_length,
+                                   const struct permission_identity *identity,
                                    uint64_t *process_id,
                                    uint64_t *exit_status) {
     size_t task_slot = scheduler_current_slot();
@@ -4059,6 +4257,10 @@ static bool user_process_run_image(enum user_program program,
 
     process_slots[task_slot] = (struct user_process) {0};
     struct user_process *process = &process_slots[task_slot];
+    /* Started by the person at the keyboard, or inherited from the
+       parent program. */
+    process->identity = identity != NULL ? *identity
+                                         : permission_session_identity();
     static const char default_cwd[] = "/";
     const char *cwd = initial_cwd != NULL ? initial_cwd : default_cwd;
     size_t cwd_length = initial_cwd != NULL
@@ -4368,7 +4570,7 @@ bool user_process_run(enum user_program program, uint64_t *process_id,
         program, NULL, 0, NULL, 0,
         program == USER_PROGRAM_MODULE_ELF ? default_execfn : NULL,
         program == USER_PROGRAM_MODULE_ELF ? sizeof(default_execfn) - 1 : 0,
-                                  process_id, exit_status);
+                                  NULL, process_id, exit_status);
 }
 
 bool user_process_run_elf(const uint8_t *image, size_t image_size,
@@ -4387,7 +4589,7 @@ bool user_process_run_elf_path(const uint8_t *image, size_t image_size,
     }
     return user_process_run_image(USER_PROGRAM_MODULE_ELF, image, image_size,
                                   NULL, 0, exec_path, exec_path_length,
-                                  process_id, exit_status);
+                                  NULL, process_id, exit_status);
 }
 
 static void user_child_worker(void *argument) {
@@ -4431,7 +4633,7 @@ static void user_child_worker(void *argument) {
             job->cwd, job->cwd_length,
             job->elf_image ? "/bin/elf-test" : NULL,
             job->elf_image ? sizeof("/bin/elf-test") - 1 : 0,
-            &job->process_id, &job->exit_status);
+            &job->identity, &job->process_id, &job->exit_status);
     }
 
     uint64_t flags;
@@ -4541,6 +4743,7 @@ static int64_t user_spawn_child(struct user_process *parent,
         .image_size = file.size,
         .elf_image = elf_image,
         .cwd_length = parent->cwd_length,
+        .identity = parent->identity,
         .state = USER_CHILD_RUNNING,
     };
     for (size_t i = 0; i < parent->cwd_length; i++) {
@@ -4630,7 +4833,10 @@ static int64_t user_wait_linux_child(struct user_process *parent,
             uint64_t process_id = finished->process_id;
             uint64_t status = finished->exit_status;
             finished->state = USER_CHILD_UNUSED;
-            if (wait_status != NULL) {
+            if (wait_status != NULL
+                && paging_user_range_valid((uintptr_t)wait_status,
+                                           sizeof(*wait_status), true,
+                                           false)) {
                 *wait_status = (uint32_t)((status & 0xffu) << 8);
             }
             if ((flags & (1u << 9)) != 0) {

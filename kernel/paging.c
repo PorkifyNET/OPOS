@@ -24,6 +24,22 @@
 #define CPUID_EXTENDED_FEATURES 0x80000001u
 #define CPUID_NX (1u << 20)
 
+#define CR4_UMIP (1ULL << 11)
+#define CR4_SMEP (1ULL << 20)
+#define CPUID7_EBX_SMEP (1u << 7)
+#define CPUID7_ECX_UMIP (1u << 2)
+
+static bool smep_enabled;
+static bool umip_enabled;
+
+bool paging_smep_enabled(void) {
+    return smep_enabled;
+}
+
+bool paging_umip_enabled(void) {
+    return umip_enabled;
+}
+
 static volatile uint64_t *root_table;
 static uint64_t kernel_root_physical;
 static uint64_t active_root_physical;
@@ -97,6 +113,36 @@ bool paging_initialize(void) {
     __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0) : "memory");
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
     __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+
+    /*
+     * SMEP: ring 0 never runs code from user pages, so a kernel bug cannot
+     * jump into code a program wrote. UMIP: ring 3 cannot read the GDT/IDT
+     * addresses (SGDT/SIDT/SLDT/SMSW/STR), which would leak kernel layout.
+     */
+    uint32_t leaf_max;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+    __asm__ volatile ("cpuid" : "=a"(leaf_max), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                      : "a"(0));
+    if (leaf_max >= 7) {
+        uint32_t eax;
+        __asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                          : "a"(7), "c"(0));
+        uint64_t enable = 0;
+        if ((ebx & CPUID7_EBX_SMEP) != 0) {
+            enable |= CR4_SMEP;
+        }
+        if ((ecx & CPUID7_ECX_UMIP) != 0) {
+            enable |= CR4_UMIP;
+        }
+        if (enable != 0) {
+            cr4 |= enable;
+            __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+        }
+        smep_enabled = (enable & CR4_SMEP) != 0;
+        umip_enabled = (enable & CR4_UMIP) != 0;
+    }
 
     paging_levels = (cr4 & CR4_LA57) != 0 ? 5 : 4;
     kernel_root_physical = cr3 & PAGE_TABLE_ADDRESS_MASK;

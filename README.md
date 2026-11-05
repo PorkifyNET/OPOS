@@ -101,8 +101,8 @@ qemu-system-x86_64 -accel kvm -cpu host -m 1G -cdrom build/opos.iso \
 Add `-vga vmware` to test the SVGA driver, or the OVMF firmware
 (`-drive if=pflash,...`) to test UEFI boot.
 
-> **Warning:** the installer erases or repartitions disks. Only install OPOS
-> on virtual disks or on hardware with nothing you want to keep.
+> [!WARNING]
+> The installer erases or repartitions disks. Only install OPOS on virtual disks or on hardware with nothing you want to keep.
 
 ### Desktop keys
 

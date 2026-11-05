@@ -28,6 +28,9 @@ void console_draw_rectangle(uint64_t x, uint64_t y, uint64_t width, uint64_t hei
                             uint8_t red, uint8_t green, uint8_t blue);
 void console_draw_text(uint64_t x, uint64_t y, const char *text,
                        uint8_t red, uint8_t green, uint8_t blue);
+/* Limit desktop drawing (rectangles and text) to one rectangle. */
+void console_set_clip(uint64_t x, uint64_t y, uint64_t width, uint64_t height);
+void console_clear_clip(void);
 uint64_t console_screen_width(void);
 uint64_t console_screen_height(void);
 void console_cursor_refresh(void);

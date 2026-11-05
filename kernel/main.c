@@ -273,12 +273,40 @@ void console_cursor_refresh(void) {
     display_dirty = true;
 }
 
+/* Desktop clip rectangle, [left, right) x [top, bottom); open by default. */
+static uint64_t clip_left;
+static uint64_t clip_top;
+static uint64_t clip_right = UINT64_MAX;
+static uint64_t clip_bottom = UINT64_MAX;
+
+void console_set_clip(uint64_t x, uint64_t y, uint64_t width, uint64_t height) {
+    clip_left = x;
+    clip_top = y;
+    clip_right = width > UINT64_MAX - x ? UINT64_MAX : x + width;
+    clip_bottom = height > UINT64_MAX - y ? UINT64_MAX : y + height;
+}
+
+void console_clear_clip(void) {
+    clip_left = 0;
+    clip_top = 0;
+    clip_right = UINT64_MAX;
+    clip_bottom = UINT64_MAX;
+}
+
 static void framebuffer_draw_character_at(char character, uint64_t x, uint64_t y,
                                           uint32_t color) {
     const uint8_t *glyph = font_glyph(character);
     if (glyph == NULL) {
         return;
     }
+    uint64_t glyph_width = FONT_WIDTH * GLYPH_SCALE;
+    uint64_t glyph_height = FONT_HEIGHT * GLYPH_SCALE;
+    if (x >= clip_right || y >= clip_bottom
+        || x + glyph_width <= clip_left || y + glyph_height <= clip_top) {
+        return;
+    }
+    bool partial = x < clip_left || y < clip_top
+                || x + glyph_width > clip_right || y + glyph_height > clip_bottom;
 
     for (uint64_t row = 0; row < FONT_HEIGHT; row++) {
         for (uint64_t column = 0; column < FONT_WIDTH; column++) {
@@ -287,10 +315,19 @@ static void framebuffer_draw_character_at(char character, uint64_t x, uint64_t y
             }
 
             for (uint64_t dy = 0; dy < GLYPH_SCALE; dy++) {
+                uint64_t pixel_y = y + row * GLYPH_SCALE + dy;
+                if (partial && (pixel_y < clip_top || pixel_y >= clip_bottom)) {
+                    continue;
+                }
                 volatile uint32_t *pixels = (volatile uint32_t *)
-                    (draw_base + (y + row * GLYPH_SCALE + dy) * draw_pitch);
+                    (draw_base + pixel_y * draw_pitch);
                 for (uint64_t dx = 0; dx < GLYPH_SCALE; dx++) {
-                    pixels[x + column * GLYPH_SCALE + dx] = color;
+                    uint64_t pixel_x = x + column * GLYPH_SCALE + dx;
+                    if (partial
+                        && (pixel_x < clip_left || pixel_x >= clip_right)) {
+                        continue;
+                    }
+                    pixels[pixel_x] = color;
                 }
             }
         }
@@ -330,8 +367,29 @@ static void framebuffer_draw_character(char character) {
 
 void console_draw_rectangle(uint64_t x, uint64_t y, uint64_t width, uint64_t height,
                             uint8_t red, uint8_t green, uint8_t blue) {
-    if (active_framebuffer == NULL || x >= active_framebuffer->width
-        || y >= active_framebuffer->height) {
+    if (active_framebuffer == NULL) {
+        return;
+    }
+    if (x < clip_left) {
+        uint64_t cut = clip_left - x;
+        width = width > cut ? width - cut : 0;
+        x = clip_left;
+    }
+    if (y < clip_top) {
+        uint64_t cut = clip_top - y;
+        height = height > cut ? height - cut : 0;
+        y = clip_top;
+    }
+    if (x >= clip_right || y >= clip_bottom || width == 0 || height == 0) {
+        return;
+    }
+    if (width > clip_right - x) {
+        width = clip_right - x;
+    }
+    if (height > clip_bottom - y) {
+        height = clip_bottom - y;
+    }
+    if (x >= active_framebuffer->width || y >= active_framebuffer->height) {
         return;
     }
 

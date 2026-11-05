@@ -80,6 +80,11 @@ static size_t z_count;
 static enum window_kind tile_order[WINDOW_COUNT];
 static size_t tile_count;
 static bool tiled_layout = true;
+/* Dwindle split i gives tile_order[i] this share of its area, in permille. */
+#define SPLIT_DEFAULT 500
+#define SPLIT_MIN 150
+#define SPLIT_MAX 850
+static uint16_t split_ratio[WINDOW_COUNT];
 static void layout_load(void);
 static void welcome_open_first_time(void);
 static bool start_menu_open;
@@ -468,12 +473,13 @@ static struct rect tiled_rect(enum window_kind kind) {
             return area;
         }
         struct rect first = area;
+        int64_t ratio = split_ratio[i];
         if (area.width >= area.height) {
-            first.width = (area.width - GAP) / 2;
+            first.width = (area.width - GAP) * ratio / 1000;
             area.x += first.width + GAP;
             area.width -= first.width + GAP;
         } else {
-            first.height = (area.height - GAP) / 2;
+            first.height = (area.height - GAP) * ratio / 1000;
             area.y += first.height + GAP;
             area.height -= first.height + GAP;
         }
@@ -573,6 +579,10 @@ static void window_open(enum window_kind kind) {
     }
     windows[kind].open = true;
     z_order[z_count++] = kind;
+    /* The window that was last now gets a split of its own. */
+    if (tile_count != 0) {
+        split_ratio[tile_count - 1] = SPLIT_DEFAULT;
+    }
     tile_order[tile_count++] = kind;
     if (kind == WINDOW_TERMINAL) {
         terminal_reset();
@@ -599,6 +609,15 @@ static void window_close(enum window_kind kind) {
         editor_reset();
     }
     windows[kind].open = false;
+    /* Its split goes with it; the other windows keep their sizes. */
+    for (size_t i = 0; i < tile_count; i++) {
+        if (tile_order[i] == kind) {
+            for (size_t j = i; j + 1 < WINDOW_COUNT; j++) {
+                split_ratio[j] = split_ratio[j + 1];
+            }
+            break;
+        }
+    }
     remove_from(z_order, &z_count, kind);
     remove_from(tile_order, &tile_count, kind);
 }
@@ -1676,10 +1695,43 @@ static void files_set_path(const char *path, size_t length) {
     files_path_length = length;
 }
 
-/* Switches to path (absolute, no trailing '/'); stays put on failure. */
-static void files_navigate(const char *path, size_t length) {
+/* Address bar: typed path, edited after a click or Ctrl+L. */
+static bool files_address_editing;
+static char files_address[FILES_PATH_CAPACITY];
+static size_t files_address_length;
+
+/* Back/forward history; the oldest entry drops off when full. */
+#define FILES_HISTORY 16
+struct files_history {
+    char paths[FILES_HISTORY][FILES_PATH_CAPACITY];
+    size_t count;
+};
+static struct files_history files_back;
+static struct files_history files_forward;
+
+static void files_history_push(struct files_history *history,
+                               const char *path, size_t length) {
+    if (history->count == FILES_HISTORY) {
+        for (size_t i = 0; i + 1 < FILES_HISTORY; i++) {
+            text_copy(history->paths[i], FILES_PATH_CAPACITY,
+                      history->paths[i + 1]);
+        }
+        history->count--;
+    }
+    char *slot = history->paths[history->count++];
+    for (size_t i = 0; i < length; i++) {
+        slot[i] = path[i];
+    }
+    slot[length] = '\0';
+}
+
+/*
+ * Switches to path (absolute, no trailing '/'); stays put on failure and
+ * returns false. Does not touch the back/forward history.
+ */
+static bool files_navigate(const char *path, size_t length) {
     if (length == 0 || length >= FILES_PATH_CAPACITY || path[0] != '/') {
-        return;
+        return false;
     }
     char previous[FILES_PATH_CAPACITY];
     size_t previous_length = files_path_length;
@@ -1692,14 +1744,201 @@ static void files_navigate(const char *path, size_t length) {
     files_last_click_row = (size_t)-1;
     files_prompt_kind = FILES_PROMPT_NONE;
     files_menu_open = false;
+    files_address_editing = false;
     if (files_load()) {
-        return;
+        return true;
     }
     set_status("FOLDER COULD NOT BE OPENED");
     files_set_path(previous, previous_length);
     if (!files_load()) {
         files_set_path("/", 1);
         (void)files_load();
+    }
+    return false;
+}
+
+static bool files_path_is(const char *path, size_t length) {
+    if (length != files_path_length) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        if (path[i] != files_path[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* User navigation: like files_navigate, but recorded for BACK. */
+static bool files_visit(const char *path, size_t length) {
+    if (files_path_is(path, length)) {
+        return files_navigate(path, length);
+    }
+    char previous[FILES_PATH_CAPACITY];
+    size_t previous_length = files_path_length;
+    for (size_t i = 0; i <= previous_length; i++) {
+        previous[i] = files_path[i];
+    }
+    if (!files_navigate(path, length)) {
+        return false;
+    }
+    files_history_push(&files_back, previous, previous_length);
+    files_forward.count = 0;
+    return true;
+}
+
+/* BACK (forward false) or FORWARD (forward true). */
+static void files_history_step(bool forward) {
+    struct files_history *from = forward ? &files_forward : &files_back;
+    struct files_history *to = forward ? &files_back : &files_forward;
+    while (from->count != 0) {
+        const char *path = from->paths[--from->count];
+        char previous[FILES_PATH_CAPACITY];
+        size_t previous_length = files_path_length;
+        for (size_t i = 0; i <= previous_length; i++) {
+            previous[i] = files_path[i];
+        }
+        /* A folder that is gone (deleted, disk removed) is skipped. */
+        if (files_navigate(path, text_length(path))) {
+            status_text[0] = '\0';
+            files_history_push(to, previous, previous_length);
+            return;
+        }
+    }
+}
+
+/*
+ * Turns typed text into an absolute path without a trailing '/'. Relative
+ * text starts at the current folder; "." and ".." are resolved.
+ */
+static size_t files_resolve_typed(const char *text, size_t text_length_in,
+                                  char *path, size_t capacity) {
+    char joined[FILES_PATH_CAPACITY * 2];
+    size_t joined_length = 0;
+    if (text_length_in == 0 || text[0] != '/') {
+        for (size_t i = 0; i < files_path_length; i++) {
+            joined[joined_length++] = files_path[i];
+        }
+        joined[joined_length++] = '/';
+    }
+    for (size_t i = 0; i < text_length_in
+         && joined_length + 1 < sizeof(joined); i++) {
+        joined[joined_length++] = text[i] == '\\' ? '/' : text[i];
+    }
+    size_t length = 0;
+    size_t i = 0;
+    while (i < joined_length) {
+        while (i < joined_length && joined[i] == '/') {
+            i++;
+        }
+        size_t start = i;
+        while (i < joined_length && joined[i] != '/') {
+            i++;
+        }
+        size_t part = i - start;
+        if (part == 0 || (part == 1 && joined[start] == '.')) {
+            continue;
+        }
+        if (part == 2 && joined[start] == '.' && joined[start + 1] == '.') {
+            while (length > 0 && path[length - 1] != '/') {
+                length--;
+            }
+            if (length > 0) {
+                length--;
+            }
+            continue;
+        }
+        if (length + 1 + part >= capacity) {
+            return 0;
+        }
+        path[length++] = '/';
+        for (size_t j = 0; j < part; j++) {
+            path[length++] = joined[start + j];
+        }
+    }
+    if (length == 0) {
+        path[length++] = '/';
+    }
+    path[length] = '\0';
+    return length;
+}
+
+static void files_address_start(void) {
+    files_address_editing = true;
+    files_menu_open = false;
+    files_prompt_kind = FILES_PROMPT_NONE;
+    files_address_length = files_path_length;
+    for (size_t i = 0; i <= files_path_length; i++) {
+        files_address[i] = files_path[i];
+    }
+}
+
+static void files_run_program(const char *path, size_t length);
+
+/* Enter in the address bar: folders open in Files, files are opened. */
+static void files_address_commit(void) {
+    char path[FILES_PATH_CAPACITY];
+    size_t length = files_resolve_typed(files_address, files_address_length,
+                                        path, sizeof(path));
+    struct vfs_metadata metadata;
+    if (length == 0 || !vfs_stat(path, length, &metadata)) {
+        set_status("PATH NOT FOUND");
+        return;
+    }
+    files_address_editing = false;
+    if (metadata.type == VFS_NODE_DIRECTORY) {
+        (void)files_visit(path, length);
+        return;
+    }
+    /* Show the file's folder, select it, then open it. */
+    size_t parent = length;
+    while (parent > 1 && path[parent - 1] != '/') {
+        parent--;
+    }
+    size_t name_start = parent;
+    if (parent > 1) {
+        parent--;
+    }
+    if (files_visit(path, parent)) {
+        for (size_t i = 0; i < files_count; i++) {
+            const char *name = files_entries[i].name;
+            size_t name_length = text_length(name);
+            if (name_length != length - name_start) {
+                continue;
+            }
+            bool same = true;
+            for (size_t j = 0; j < name_length; j++) {
+                char a = name[j];
+                char b = path[name_start + j];
+                a = (a >= 'a' && a <= 'z') ? (char)(a - 32) : a;
+                b = (b >= 'a' && b <= 'z') ? (char)(b - 32) : b;
+                same = same && a == b;
+            }
+            if (same) {
+                files_selection = i + (files_at_root() ? 0 : 1);
+                break;
+            }
+        }
+    }
+    files_run_program(path, length);
+}
+
+static void files_address_key(char character) {
+    if (character == KEY_ESCAPE) {
+        files_address_editing = false;
+    } else if (character == '\n') {
+        files_address_commit();
+    } else if (line_ctrl_key(files_address, &files_address_length,
+                             sizeof(files_address) - 1, false, character)) {
+        return;
+    } else if (character == '\b') {
+        if (files_address_length > 0) {
+            files_address[--files_address_length] = '\0';
+        }
+    } else if (character >= ' ' && character <= '~'
+               && files_address_length + 1 < sizeof(files_address)) {
+        files_address[files_address_length++] = character;
+        files_address[files_address_length] = '\0';
     }
 }
 
@@ -1711,7 +1950,7 @@ static void files_refresh(void) {
     for (size_t i = 0; i <= length; i++) {
         path[i] = files_path[i];
     }
-    files_navigate(path, length);
+    (void)files_navigate(path, length);
     files_selection = selection;
 }
 
@@ -1739,7 +1978,7 @@ static void files_go_up(void) {
     for (size_t i = 0; i < length; i++) {
         path[i] = files_path[i];
     }
-    files_navigate(path, length);
+    (void)files_visit(path, length);
     for (size_t i = 0; i < files_count; i++) {
         const char *name = files_entries[i].name;
         if (text_length(name) != child_length) {
@@ -1819,7 +2058,7 @@ static void files_open_row(size_t row) {
     char path[FILES_PATH_CAPACITY];
     size_t length = files_entry_path(row, path, sizeof(path));
     if (files_entries[row].directory) {
-        files_navigate(path, length);
+        (void)files_visit(path, length);
     } else {
         files_run_program(path, length);
     }
@@ -1834,6 +2073,26 @@ static struct rect files_list_area(struct rect area) {
 static struct rect files_place_rect(struct rect area, size_t slot) {
     return (struct rect){area.x + 6, area.y + 34 + (int64_t)slot * LINE_HEIGHT,
                          FILES_SIDEBAR_WIDTH - 12, LINE_HEIGHT};
+}
+
+/* Toolbar: BACK, FORWARD and UP buttons, then the address bar. */
+#define FILES_NAV_BUTTONS 3
+#define FILES_NAV_WIDTH 30
+
+static struct rect files_nav_rect(struct rect list, size_t index) {
+    return (struct rect){list.x + 6 + (int64_t)index * (FILES_NAV_WIDTH + 4),
+                         list.y + 6, FILES_NAV_WIDTH, 26};
+}
+
+static struct rect files_address_rect(struct rect list) {
+    int64_t x = list.x + 6 + FILES_NAV_BUTTONS * (FILES_NAV_WIDTH + 4);
+    return (struct rect){x, list.y + 6, list.x + list.width - 6 - x, 26};
+}
+
+static bool files_nav_enabled(size_t index) {
+    return index == 0 ? files_back.count != 0
+         : index == 1 ? files_forward.count != 0
+         : !files_at_root();
 }
 
 static struct rect files_line_rect(struct rect list, size_t index) {
@@ -1920,19 +2179,56 @@ static void draw_files(struct rect area, bool focused) {
         }
     }
 
-    /* Path bar with the item count on the right. */
-    char count_text[32];
-    size_t count_length = append_decimal(count_text, sizeof(count_text), 0,
-                                         files_count);
-    append_text(count_text, sizeof(count_text), count_length,
-                files_count == 1 ? " ITEM" : " ITEMS");
-    int64_t count_width = (int64_t)text_length(count_text) * CHAR_WIDTH;
-    struct rect bar = {list.x + 6, list.y + 6, list.width - 12, 26};
-    fill(bar, 32, 40, 62);
-    draw_text_clipped(bar.x + 6, bar.y + 4, bar.width - count_width - 24,
-                      files_path, 230, 238, 255);
-    draw_text_clipped(bar.x + bar.width - count_width - 6, bar.y + 4,
-                      count_width, count_text, 151, 190, 235);
+    /* Toolbar: navigation buttons, then the address bar. */
+    static const char *const nav_labels[FILES_NAV_BUTTONS] = {"<", ">", "^"};
+    for (size_t i = 0; i < FILES_NAV_BUTTONS; i++) {
+        struct rect button = files_nav_rect(list, i);
+        bool enabled = files_nav_enabled(i);
+        fill(button, enabled ? 46 : 32, enabled ? 62 : 38, enabled ? 96 : 52);
+        draw_text_clipped(button.x + (FILES_NAV_WIDTH - CHAR_WIDTH) / 2 + 1,
+                          button.y + 4, CHAR_WIDTH, nav_labels[i],
+                          enabled ? 230 : 90, enabled ? 238 : 100,
+                          enabled ? 255 : 120);
+    }
+    struct rect bar = files_address_rect(list);
+    if (files_address_editing) {
+        fill(bar, 110, 160, 255);
+        struct rect inner = {bar.x + 2, bar.y + 2, bar.width - 4,
+                             bar.height - 4};
+        fill(inner, 32, 40, 62);
+        /* Show the end of long text, where the caret is. */
+        int64_t columns = (inner.width - 12) / CHAR_WIDTH;
+        size_t shown_columns = columns > 1 ? (size_t)columns - 1 : 0;
+        size_t start = files_address_length > shown_columns
+                     ? files_address_length - shown_columns : 0;
+        char shown[FILES_PATH_CAPACITY + 2];
+        size_t length = 0;
+        for (size_t i = start; i < files_address_length; i++) {
+            shown[length++] = files_address[i];
+        }
+        if (focused && (timer_ticks() / 50) % 2 == 0) {
+            shown[length++] = '_';
+        }
+        shown[length] = '\0';
+        draw_text_clipped(inner.x + 4, bar.y + 4, inner.width - 8, shown,
+                          240, 245, 255);
+    } else {
+        char count_text[32];
+        size_t count_length = append_decimal(count_text, sizeof(count_text), 0,
+                                             files_count);
+        append_text(count_text, sizeof(count_text), count_length,
+                    files_count == 1 ? " ITEM" : " ITEMS");
+        int64_t count_width = (int64_t)text_length(count_text) * CHAR_WIDTH;
+        fill(bar, 32, 40, 62);
+        /* A long path shows its end; that is the folder you are in. */
+        int64_t columns = (bar.width - count_width - 24) / CHAR_WIDTH;
+        size_t start = columns > 0 && files_path_length > (size_t)columns
+                     ? files_path_length - (size_t)columns : 0;
+        draw_text_clipped(bar.x + 6, bar.y + 4, bar.width - count_width - 24,
+                          files_path + start, 230, 238, 255);
+        draw_text_clipped(bar.x + bar.width - count_width - 6, bar.y + 4,
+                          count_width, count_text, 151, 190, 235);
+    }
 
     files_clamp(list);
     size_t rows = files_row_count();
@@ -1996,9 +2292,11 @@ static void draw_files(struct rect area, bool focused) {
         files_draw_prompt(list);
         return;
     }
-    const char *hint = files_skipped != 0
+    const char *hint = files_address_editing
+        ? "ENTER: GO  ESC: CANCEL  RELATIVE PATHS AND .. WORK"
+        : files_skipped != 0
         ? "SOME ITEMS ARE NOT SHOWN (NAME OR COUNT LIMIT)"
-        : "ENTER: OPEN  BACKSPACE: UP  RIGHT-CLICK: MORE";
+        : "ENTER: OPEN  BACKSPACE: UP  CTRL+L: PATH  RIGHT-CLICK: MORE";
     draw_text_clipped(list.x + 12, list.y + list.height - LINE_HEIGHT + 2,
                       list.width - 24, hint, 120, 140, 175);
 }
@@ -4317,6 +4615,17 @@ static void draw_installer(struct rect area, bool focused) {
 static void draw_window(enum window_kind kind) {
     struct rect frame = window_rect(kind);
     bool focused = window_focused(kind);
+    /* Content never spills out of a window, however small it is resized. */
+    int64_t clip_x = frame.x < 0 ? 0 : frame.x;
+    int64_t clip_y = frame.y < 0 ? 0 : frame.y;
+    int64_t clip_right = frame.x + frame.width;
+    int64_t clip_bottom = frame.y + frame.height;
+    if (clip_right <= clip_x || clip_bottom <= clip_y) {
+        return;
+    }
+    console_set_clip((uint64_t)clip_x, (uint64_t)clip_y,
+                     (uint64_t)(clip_right - clip_x),
+                     (uint64_t)(clip_bottom - clip_y));
     if (focused) {
         fill(frame, 110, 160, 255);
     } else {
@@ -4359,6 +4668,7 @@ static void draw_window(enum window_kind kind) {
         draw_welcome(content);
         break;
     }
+    console_clear_clip();
 }
 
 /* -------------------------------------------------------------- taskbar */
@@ -4633,12 +4943,30 @@ static void files_click(struct rect area, int32_t x, int32_t y) {
             }
             if (rect_contains(files_place_rect(area, slot++), x, y)) {
                 const char *path = files_places[i].path;
-                files_navigate(path, text_length(path));
+                (void)files_visit(path, text_length(path));
                 return;
             }
         }
         return;
     }
+    for (size_t i = 0; i < FILES_NAV_BUTTONS; i++) {
+        if (rect_contains(files_nav_rect(list, i), x, y)) {
+            files_address_editing = false;
+            if (i == 2) {
+                files_go_up();
+            } else {
+                files_history_step(i == 1);
+            }
+            return;
+        }
+    }
+    if (rect_contains(files_address_rect(list), x, y)) {
+        if (!files_address_editing) {
+            files_address_start();
+        }
+        return;
+    }
+    files_address_editing = false;
     files_clamp(list);
     size_t rows = files_row_count();
     size_t visible = files_visible_rows(list);
@@ -5133,12 +5461,18 @@ static void files_key(char character) {
             return;
         }
     }
+    if (files_address_editing) {
+        files_address_key(character);
+        return;
+    }
     if (files_prompt_kind != FILES_PROMPT_NONE) {
         files_prompt_key(character);
         return;
     }
     if (keyboard_last_ctrl()) {
-        if (character == 'r' || character == 'R') {
+        if (character == 'l' || character == 'L') {
+            files_address_start();
+        } else if (character == 'r' || character == 'R') {
             files_start_prompt(FILES_PROMPT_RENAME);
         } else if (character == 'N') {
             /* Ctrl+Shift+N, as in Windows Explorer. */
@@ -5155,12 +5489,218 @@ static void files_key(char character) {
     files_key_navigate(character);
 }
 
+enum drag_mode {
+    DRAG_MOVE,
+    DRAG_RESIZE,
+    DRAG_SPLIT
+};
+
+#define EDGE_LEFT 1
+#define EDGE_RIGHT 2
+#define EDGE_TOP 4
+#define EDGE_BOTTOM 8
+/* Grab band around a floating window: outside the frame plus the border. */
+#define RESIZE_OUTSIDE 6
+#define RESIZE_INSIDE (BORDER + 2)
+/* Near a corner both edges are grabbed, over this length. */
+#define RESIZE_CORNER 18
+
 struct drag_state {
     bool active;
+    enum drag_mode mode;
     enum window_kind kind;
     int32_t offset_x;
     int32_t offset_y;
+    unsigned edges;
+    struct rect start;
+    int32_t start_x;
+    int32_t start_y;
+    /* DRAG_SPLIT: split index and the area it divides. */
+    size_t split;
+    struct rect split_area;
+    bool split_vertical;
 };
+
+/* Edges of a floating window's frame under the pointer, or 0. */
+static unsigned resize_edges(struct rect frame, int32_t x, int32_t y) {
+    int64_t left = frame.x;
+    int64_t top = frame.y;
+    int64_t right = frame.x + frame.width;
+    int64_t bottom = frame.y + frame.height;
+    if (x < left - RESIZE_OUTSIDE || x >= right + RESIZE_OUTSIDE
+        || y < top - RESIZE_OUTSIDE || y >= bottom + RESIZE_OUTSIDE) {
+        return 0;
+    }
+    bool near_left = x < left + RESIZE_INSIDE;
+    bool near_right = x >= right - RESIZE_INSIDE;
+    /* The top edge stays thin so the title bar and close button work. */
+    bool near_top = y < top + BORDER;
+    bool near_bottom = y >= bottom - RESIZE_INSIDE;
+    unsigned edges = 0;
+    if (near_left || near_right) {
+        edges |= near_left ? EDGE_LEFT : EDGE_RIGHT;
+        if (y < top + RESIZE_CORNER) {
+            edges |= EDGE_TOP;
+        } else if (y >= bottom - RESIZE_CORNER) {
+            edges |= EDGE_BOTTOM;
+        }
+    }
+    if (near_top || near_bottom) {
+        edges |= near_top ? EDGE_TOP : EDGE_BOTTOM;
+        if (x < left + RESIZE_CORNER) {
+            edges |= EDGE_LEFT;
+        } else if (x >= right - RESIZE_CORNER) {
+            edges |= EDGE_RIGHT;
+        }
+    }
+    return edges;
+}
+
+/*
+ * Starts resizing the topmost floating window whose edge is under the
+ * pointer. A window covering the point with its inner area wins instead.
+ */
+static bool resize_start(int32_t x, int32_t y, struct drag_state *drag) {
+    if (tiled_layout) {
+        return false;
+    }
+    for (size_t i = z_count; i != 0; i--) {
+        enum window_kind kind = z_order[i - 1];
+        struct rect frame = windows[kind].floating;
+        unsigned edges = resize_edges(frame, x, y);
+        if (edges != 0) {
+            window_raise(kind);
+            drag->active = true;
+            drag->mode = DRAG_RESIZE;
+            drag->kind = kind;
+            drag->edges = edges;
+            drag->start = frame;
+            drag->start_x = x;
+            drag->start_y = y;
+            return true;
+        }
+        if (rect_contains(frame, x, y)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool handle_resize(const struct drag_state *drag, int32_t x, int32_t y) {
+    struct rect frame = drag->start;
+    int64_t dx = x - drag->start_x;
+    int64_t dy = y - drag->start_y;
+    int64_t right = frame.x + frame.width;
+    int64_t bottom = frame.y + frame.height;
+    int64_t max_bottom = screen_height() - TASKBAR_HEIGHT;
+    if (drag->edges & EDGE_LEFT) {
+        int64_t left = frame.x + dx;
+        if (left > right - MIN_WINDOW_WIDTH) {
+            left = right - MIN_WINDOW_WIDTH;
+        }
+        if (left < 0) {
+            left = 0;
+        }
+        frame.x = left;
+        frame.width = right - left;
+    }
+    if (drag->edges & EDGE_RIGHT) {
+        int64_t new_right = right + dx;
+        if (new_right < frame.x + MIN_WINDOW_WIDTH) {
+            new_right = frame.x + MIN_WINDOW_WIDTH;
+        }
+        if (new_right > screen_width()) {
+            new_right = screen_width();
+        }
+        frame.width = new_right - frame.x;
+    }
+    if (drag->edges & EDGE_TOP) {
+        int64_t top = frame.y + dy;
+        if (top > bottom - MIN_WINDOW_HEIGHT) {
+            top = bottom - MIN_WINDOW_HEIGHT;
+        }
+        if (top < 0) {
+            top = 0;
+        }
+        frame.y = top;
+        frame.height = bottom - top;
+    }
+    if (drag->edges & EDGE_BOTTOM) {
+        int64_t new_bottom = bottom + dy;
+        if (new_bottom < frame.y + MIN_WINDOW_HEIGHT) {
+            new_bottom = frame.y + MIN_WINDOW_HEIGHT;
+        }
+        if (new_bottom > max_bottom) {
+            new_bottom = max_bottom;
+        }
+        frame.height = new_bottom - frame.y;
+    }
+    struct rect *current = &windows[drag->kind].floating;
+    if (current->x == frame.x && current->y == frame.y
+        && current->width == frame.width && current->height == frame.height) {
+        return false;
+    }
+    *current = frame;
+    return true;
+}
+
+/*
+ * Tiled layout: pressing in the gap between two windows grabs the dwindle
+ * split there, so dragging moves the boundary.
+ */
+static bool split_start(int32_t x, int32_t y, struct drag_state *drag) {
+    if (!tiled_layout || tile_count < 2) {
+        return false;
+    }
+    struct rect area = workspace_area();
+    for (size_t i = 0; i + 1 < tile_count; i++) {
+        bool vertical = area.width >= area.height;
+        struct rect gap;
+        struct rect next = area;
+        if (vertical) {
+            int64_t first = (area.width - GAP) * split_ratio[i] / 1000;
+            gap = (struct rect){area.x + first, area.y, GAP, area.height};
+            next.x += first + GAP;
+            next.width -= first + GAP;
+        } else {
+            int64_t first = (area.height - GAP) * split_ratio[i] / 1000;
+            gap = (struct rect){area.x, area.y + first, area.width, GAP};
+            next.y += first + GAP;
+            next.height -= first + GAP;
+        }
+        if (rect_contains(gap, x, y)) {
+            drag->active = true;
+            drag->mode = DRAG_SPLIT;
+            drag->split = i;
+            drag->split_area = area;
+            drag->split_vertical = vertical;
+            return true;
+        }
+        area = next;
+    }
+    return false;
+}
+
+static bool handle_split(const struct drag_state *drag, int32_t x, int32_t y) {
+    struct rect area = drag->split_area;
+    int64_t span = drag->split_vertical ? area.width : area.height;
+    int64_t offset = drag->split_vertical ? x - area.x : y - area.y;
+    if (span <= GAP) {
+        return false;
+    }
+    int64_t ratio = (offset - GAP / 2) * 1000 / (span - GAP);
+    if (ratio < SPLIT_MIN) {
+        ratio = SPLIT_MIN;
+    }
+    if (ratio > SPLIT_MAX) {
+        ratio = SPLIT_MAX;
+    }
+    if (split_ratio[drag->split] == ratio) {
+        return false;
+    }
+    split_ratio[drag->split] = (uint16_t)ratio;
+    return true;
+}
 
 static enum desktop_result handle_press(int32_t x, int32_t y,
                                         struct drag_state *drag) {
@@ -5201,6 +5741,9 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         return DESKTOP_CONTINUE;
     }
 
+    if (resize_start(x, y, drag) || split_start(x, y, drag)) {
+        return DESKTOP_CONTINUE;
+    }
     enum window_kind kind = window_at(x, y);
     if (kind == WINDOW_COUNT) {
         return DESKTOP_CONTINUE;
@@ -5212,6 +5755,7 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     } else if (rect_contains(title_rect(frame), x, y)) {
         if (!tiled_layout) {
             drag->active = true;
+            drag->mode = DRAG_MOVE;
             drag->kind = kind;
             drag->offset_x = x - (int32_t)frame.x;
             drag->offset_y = y - (int32_t)frame.y;
@@ -5328,6 +5872,53 @@ static void focus_direction(char direction) {
     }
 }
 
+#define RESIZE_KEY_STEP 40
+#define SPLIT_KEY_STEP 50
+
+/*
+ * Super+Shift+arrow: Right/Down grow the focused window, Left/Up shrink it.
+ * Floating windows change size; tiled ones move their split.
+ */
+static void resize_focused(char direction) {
+    if (z_count == 0) {
+        return;
+    }
+    enum window_kind kind = z_order[z_count - 1];
+    bool grow = direction == KEY_RIGHT || direction == KEY_DOWN;
+    if (!tiled_layout) {
+        struct drag_state drag = {0};
+        drag.kind = kind;
+        drag.start = windows[kind].floating;
+        int32_t step = grow ? RESIZE_KEY_STEP : -RESIZE_KEY_STEP;
+        if (direction == KEY_LEFT || direction == KEY_RIGHT) {
+            drag.edges = EDGE_RIGHT;
+            (void)handle_resize(&drag, step, 0);
+        } else {
+            drag.edges = EDGE_BOTTOM;
+            (void)handle_resize(&drag, 0, step);
+        }
+        return;
+    }
+    size_t index = 0;
+    while (index < tile_count && tile_order[index] != kind) {
+        index++;
+    }
+    if (index == tile_count || tile_count < 2) {
+        return;
+    }
+    /* The last window has no split; it grows when the one before shrinks. */
+    size_t split = index + 1 < tile_count ? index : index - 1;
+    bool larger = index + 1 < tile_count ? grow : !grow;
+    int ratio = split_ratio[split] + (larger ? SPLIT_KEY_STEP : -SPLIT_KEY_STEP);
+    if (ratio < SPLIT_MIN) {
+        ratio = SPLIT_MIN;
+    }
+    if (ratio > SPLIT_MAX) {
+        ratio = SPLIT_MAX;
+    }
+    split_ratio[split] = (uint16_t)ratio;
+}
+
 /* Super+key shortcuts, Hyprland style. */
 static enum desktop_result handle_super_key(char character) {
     start_menu_open = false;
@@ -5336,7 +5927,11 @@ static enum desktop_result handle_super_key(char character) {
     case KEY_RIGHT:
     case KEY_UP:
     case KEY_DOWN:
-        focus_direction(character);
+        if (keyboard_last_shift()) {
+            resize_focused(character);
+        } else {
+            focus_direction(character);
+        }
         break;
     case 'q':
     case 'Q':
@@ -5450,6 +6045,7 @@ void desktop_run(void) {
     for (size_t i = 0; i < WINDOW_COUNT; i++) {
         windows[i].open = false;
         windows[i].floating.width = 0;
+        split_ratio[i] = SPLIT_DEFAULT;
     }
     z_count = 0;
     tile_count = 0;
@@ -5526,7 +6122,13 @@ void desktop_run(void) {
                 }
                 redraw = true;
             } else if (pressed && drag.active) {
-                redraw |= handle_drag(&drag, mouse.x, mouse.y);
+                if (drag.mode == DRAG_RESIZE) {
+                    redraw |= handle_resize(&drag, mouse.x, mouse.y);
+                } else if (drag.mode == DRAG_SPLIT) {
+                    redraw |= handle_split(&drag, mouse.x, mouse.y);
+                } else {
+                    redraw |= handle_drag(&drag, mouse.x, mouse.y);
+                }
             } else if (!pressed) {
                 drag.active = false;
             }

@@ -21,6 +21,7 @@
 #include "cmos.h"
 #include "desktop.h"
 #include "timer.h"
+#include "update.h"
 #include "user.h"
 #include "ata.h"
 #include "console.h"
@@ -1288,6 +1289,9 @@ void kmain(void) {
     } else {
         console_write_string("OPOS: no usable IDE, SATA, NVMe or SCSI disk found\n");
     }
+
+    /* An update cut short by a power loss is finished first. */
+    update_resume();
 
     /* CD/DVD drives, and the disc in each (mounted at /cdrom...). */
     optical_initialize();

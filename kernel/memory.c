@@ -196,3 +196,20 @@ void *memcpy(void *destination, const void *source, size_t length) {
     }
     return destination;
 }
+
+/* For BearSSL (update signature checks). */
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *memmove(void *destination, const void *source, size_t length) {
+    uint8_t *to = destination;
+    const uint8_t *from = source;
+    if (to < from) {
+        for (size_t i = 0; i < length; i++) {
+            to[i] = from[i];
+        }
+    } else {
+        for (size_t i = length; i > 0; i--) {
+            to[i - 1] = from[i - 1];
+        }
+    }
+    return destination;
+}

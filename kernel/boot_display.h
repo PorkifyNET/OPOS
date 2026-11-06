@@ -43,4 +43,13 @@ void boot_display_reload(void);
 enum boot_display_result boot_display_configure(uint32_t width,
                                                 uint32_t height);
 
+/*
+ * Used by updates (update.c): adds an "OPOS (previous version)" entry to
+ * the installed limine.conf files, a copy of the OPOS entry that boots
+ * .../boot/kernel.elf with that path changed to .../boot/old/kernel.elf
+ * (its initramfs module is found next to the kernel). True when every
+ * file with such an entry has the copy afterwards. No permission check.
+ */
+bool boot_display_add_previous_entry(void);
+
 #endif

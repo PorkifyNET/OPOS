@@ -134,6 +134,79 @@ static inline long opos_user_info(struct opos_user_info *info) {
     return opos_syscall1(OPOS_SYS_USER_INFO, (long)info);
 }
 
+/* ------------------------------------------------------- system update */
+
+/*
+ * Installing OPOS updates (used by /bin/update; administrators only).
+ * The kernel checks the manifest's signature and every file's SHA-256
+ * itself, so a program cannot install anything that was not signed with
+ * the OPOS release key. Kernels before these calls answer -OPOS_ENOSYS.
+ *
+ *   count = opos_update_begin(manifest, length, signature, sig_length);
+ *   for each i < count: opos_update_file(i, &info); if info.needed, send
+ *       the file's bytes in order with opos_update_write(i, offset, ...);
+ *   opos_update_commit();   then restart.
+ *
+ * Errors are -OPOS_UPDATE_E* (not errno values), or -OPOS_EFAULT.
+ */
+#define OPOS_SYS_UPDATE_BEGIN 0x4f500020L
+#define OPOS_SYS_UPDATE_FILE 0x4f500021L
+#define OPOS_SYS_UPDATE_WRITE 0x4f500022L
+#define OPOS_SYS_UPDATE_COMMIT 0x4f500023L
+#define OPOS_SYS_UPDATE_CANCEL 0x4f500024L
+
+#define OPOS_UPDATE_ENOT_INSTALLED 1  /* live media */
+#define OPOS_UPDATE_ENOT_ADMIN 2
+#define OPOS_UPDATE_EBAD_SIGNATURE 3
+#define OPOS_UPDATE_EBAD_MANIFEST 4
+#define OPOS_UPDATE_EUNSUPPORTED 5    /* needs a newer updater */
+#define OPOS_UPDATE_ENOT_NEWER 6
+#define OPOS_UPDATE_ENO_SESSION 7
+#define OPOS_UPDATE_EBAD_FILE 8       /* wrong size or SHA-256 */
+#define OPOS_UPDATE_EINCOMPLETE 9
+#define OPOS_UPDATE_EDISK 10
+#define OPOS_UPDATE_EINVAL 11
+#define OPOS_UPDATE_EBUSY 12          /* another program is updating */
+#define OPOS_UPDATE_WRITE_MAX (1024 * 1024)
+
+struct opos_update_file {
+    uint64_t size;
+    uint32_t needed;   /* 1: differs from the installed file */
+    uint32_t reserved;
+    char asset[64];    /* release file name */
+    char path[96];     /* where it goes, e.g. "boot/kernel.elf" */
+};
+
+/* Returns the number of files in the manifest, or an error. */
+static inline long opos_update_begin(const void *manifest, size_t length,
+                                     const void *signature,
+                                     size_t signature_length) {
+    return opos_syscall4(OPOS_SYS_UPDATE_BEGIN, (long)manifest, (long)length,
+                         (long)signature, (long)signature_length);
+}
+
+static inline long opos_update_file(size_t index,
+                                    struct opos_update_file *info) {
+    return opos_syscall2(OPOS_SYS_UPDATE_FILE, (long)index, (long)info);
+}
+
+/* Bytes must arrive in order; offset 0 starts the file again. At most
+   OPOS_UPDATE_WRITE_MAX bytes per call. */
+static inline long opos_update_write(size_t index, uint64_t offset,
+                                     const void *data, size_t length) {
+    return opos_syscall4(OPOS_SYS_UPDATE_WRITE, (long)index, (long)offset,
+                         (long)data, (long)length);
+}
+
+/* Installs the received files; the new version runs after a restart. */
+static inline long opos_update_commit(void) {
+    return opos_syscall0(OPOS_SYS_UPDATE_COMMIT);
+}
+
+static inline long opos_update_cancel(void) {
+    return opos_syscall0(OPOS_SYS_UPDATE_CANCEL);
+}
+
 /* ------------------------------------------------------------ windows */
 
 /*

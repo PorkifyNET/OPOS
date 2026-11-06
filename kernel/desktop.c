@@ -27,6 +27,7 @@
 #include "vmware.h"
 #include "net.h"
 #include "timer.h"
+#include "update.h"
 #include "user.h"
 #include "vfs.h"
 
@@ -461,6 +462,8 @@ enum app_origin {
     APP_FROM_TERMINAL,
     APP_FROM_FILES,
     APP_FROM_NOTEPAD,
+    /* /bin/update for Settings > UPDATES: its output goes to that page. */
+    APP_FROM_UPDATES,
 };
 
 static enum run_result app_launch(enum app_origin origin, const char *typed,
@@ -535,6 +538,7 @@ static bool terminal_execute(void) {
         terminal_print("PS KILL PID  SHELL REBOOT SHUTDOWN EXIT");
         terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
         terminal_print("NET  DHCP  PING HOST  LOOKUP NAME  HTTP HOST[/PATH]");
+        terminal_print("UPDATE [INSTALL]  FETCH URL  (ANY PROGRAM IN /BIN)");
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
     } else if (text_equals(terminal_line, terminal_length, "clear")) {
@@ -630,7 +634,38 @@ static bool terminal_execute(void) {
            logged in (see shell_lock_update in shell.c). */
         exit_to_shell = true;
     } else if (terminal_length != 0) {
-        terminal_print("UNKNOWN COMMAND - TYPE HELP");
+        /* "update install" runs /bin/update with "install". */
+        char path[48] = "/bin/";
+        size_t length = 5;
+        size_t i = 0;
+        while (i < terminal_length && terminal_line[i] != ' '
+               && length + 1 < sizeof(path)) {
+            char c = terminal_line[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                  || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+                break;
+            }
+            path[length++] = c;
+            i++;
+        }
+        path[length] = '\0';
+        struct initramfs_file file;
+        bool program = length > 5
+            && (i == terminal_length || terminal_line[i] == ' ')
+            && initramfs_find_file(path + 1, &file);
+        if (!program) {
+            terminal_print("UNKNOWN COMMAND - TYPE HELP");
+        } else {
+            while (i < terminal_length && terminal_line[i] == ' ') {
+                i++;
+            }
+            enum run_result result = app_launch(
+                APP_FROM_TERMINAL, path, length, terminal_line + i,
+                terminal_length - i, NULL, 0);
+            if (result != RUN_STARTED) {
+                terminal_print(run_result_text(result));
+            }
+        }
     }
     return true;
 }
@@ -3325,8 +3360,12 @@ static void draw_about(struct rect area) {
                 installer_available() ? "LIVE SESSION"
                 : me != ACCOUNT_NONE ? accounts_name(me) : "NO ACCOUNT");
 
+    char version[48] = "OPOS ";
+    length = append_text(version, sizeof(version), 5,
+                         update_current_version());
+    append_text(version, sizeof(version), length, " X86-64");
     const char *lines[] = {
-        "OPOS X86-64", user, memory, uptime, screen,
+        version, user, memory, uptime, screen,
         svga_available() ? "DISPLAY: VMWARE SVGA II"
                          : "DISPLAY: FIRMWARE FRAMEBUFFER",
         disks, "PIT TIMER: 100 HZ",
@@ -3394,13 +3433,14 @@ enum settings_category {
     CATEGORY_DESKTOP,
     CATEGORY_DATE_TIME,
     CATEGORY_TOUCHPAD,
+    CATEGORY_UPDATES,
     CATEGORY_ABOUT,
     CATEGORY_COUNT
 };
 
 static const char *const category_names[CATEGORY_COUNT] = {
     "SYSTEM", "ACCOUNTS", "DISPLAY", "APPEARANCE", "DESKTOP", "DATE & TIME", "TOUCHPAD",
-    "ABOUT",
+    "UPDATES", "ABOUT",
 };
 
 struct setting_row {
@@ -3414,8 +3454,7 @@ static const struct setting_row setting_rows[] = {
     {"OPEN DESKTOP ON BOOT", ROW_TOGGLE, SETTING_AUTOSTART_DESKTOP,
      CATEGORY_SYSTEM},
     {"COLORED TERMINAL MESSAGES", ROW_TOGGLE, SETTING_TERMINAL_COLORS,
-     CATEGORY_SYSTEM},
-    {"RESOLUTION", ROW_RESOLUTION, 0, CATEGORY_DISPLAY},
+     CATEGORY_SYSTEM},    {"RESOLUTION", ROW_RESOLUTION, 0, CATEGORY_DISPLAY},
     {"COLOR THEME", ROW_THEME, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND", ROW_WALLPAPER, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0, CATEGORY_APPEARANCE},
@@ -3456,6 +3495,13 @@ static void draw_accounts(struct rect area, bool focused);
 static void accounts_key(char character);
 static void accounts_click(struct rect area, int32_t x, int32_t y);
 static bool accounts_prompt_active(void);
+/* The UPDATES page (see "updates page"). */
+static void draw_updates(struct rect area, bool focused);
+static void updates_key(char character);
+static void updates_click(struct rect area, int32_t x, int32_t y);
+static void updates_start(bool install);
+static bool updates_checked;
+static bool updates_running;
 static bool settings_in_sidebar = true;
 /* First row shown; rows scroll so the selected one stays visible. */
 static size_t settings_scroll;
@@ -3478,15 +3524,20 @@ static size_t settings_row_index(size_t index) {
     return 0;
 }
 
-/* Pages the keyboard can enter: those with rows, and ACCOUNTS. */
+/* Pages the keyboard can enter: those with rows, ACCOUNTS and UPDATES. */
 static bool settings_page_has_focus(void) {
-    return settings_row_count() != 0 || settings_category == CATEGORY_ACCOUNTS;
+    return settings_row_count() != 0 || settings_category == CATEGORY_ACCOUNTS
+        || settings_category == CATEGORY_UPDATES;
 }
 
 static void settings_show_category(enum settings_category category) {
     settings_category = category;
     settings_selection = 0;
     settings_scroll = 0;
+    /* The first visit to UPDATES checks for a new version. */
+    if (category == CATEGORY_UPDATES && !updates_checked && !updates_running) {
+        updates_start(false);
+    }
 }
 
 static struct rect settings_sidebar_rect(struct rect area) {
@@ -3688,7 +3739,7 @@ static void setting_value_text(const struct setting_row *row,
                 length = append_decimal(text, capacity, length, height);
             }
         } else if (vmware_autofit_enabled()) {
-            length = append_text(text, capacity, length, "AUTOFIT");
+            length = append_text(text, capacity, length, "VM AUTOFIT");
         } else if (mode == 0) {
             length = append_text(text, capacity, length, "DEFAULT");
         } else if (svga_mode_size(mode, &width, &height)) {
@@ -3729,6 +3780,8 @@ static void draw_settings(struct rect area, bool focused) {
         ? "UP/DOWN: PAGE  TAB: OPEN"
         : settings_category == CATEGORY_ACCOUNTS
         ? "N R P A I DEL: ACTIONS  TAB: PAGES"
+        : settings_category == CATEGORY_UPDATES
+        ? "LEFT/RIGHT: BUTTON  ENTER: PRESS  TAB: PAGES"
         : "LEFT/RIGHT: CHANGE  TAB: PAGES";
     draw_text_clipped(page.x + 16, page.y + 14, page.width - 32, hint,
                       151, 190, 235);
@@ -3736,6 +3789,12 @@ static void draw_settings(struct rect area, bool focused) {
         draw_accounts((struct rect){page.x, page.y + 32, page.width,
                                     page.height - 32},
                       focused && !settings_in_sidebar);
+        return;
+    }
+    if (settings_category == CATEGORY_UPDATES) {
+        draw_updates((struct rect){page.x, page.y + 32, page.width,
+                                   page.height - 32},
+                     focused && !settings_in_sidebar);
         return;
     }
     if (settings_category == CATEGORY_ABOUT) {
@@ -4024,6 +4083,8 @@ static void settings_key(char character) {
         settings_in_sidebar = true;
     } else if (accounts_page) {
         accounts_key(character);
+    } else if (settings_category == CATEGORY_UPDATES) {
+        updates_key(character);
     } else if (character == KEY_UP) {
         settings_selection = (settings_selection + count - 1) % count;
     } else if (character == KEY_DOWN) {
@@ -4052,6 +4113,14 @@ static void settings_click(struct rect area, int32_t x, int32_t y) {
             settings_in_sidebar = false;
             accounts_click((struct rect){page.x, page.y + 32, page.width,
                                          page.height - 32}, x, y);
+        }
+        return;
+    }
+    if (settings_category == CATEGORY_UPDATES) {
+        if (x >= page.x) {
+            settings_in_sidebar = false;
+            updates_click((struct rect){page.x, page.y + 32, page.width,
+                                        page.height - 32}, x, y);
         }
         return;
     }
@@ -4676,6 +4745,437 @@ static void accounts_click(struct rect area, int32_t x, int32_t y) {
     for (size_t i = 0; i < ACCOUNTS_ACTION_COUNT; i++) {
         if (rect_contains(accounts_action_rect(area, i), x, y)) {
             accounts_start((enum accounts_action)i);
+            return;
+        }
+    }
+}
+
+/* --------------------------------------------------------- updates page */
+
+/*
+ * Settings > UPDATES runs /bin/update --gui (check or install) without a
+ * Terminal. Its output comes here (updates_feed): lines starting with '@'
+ * carry the state (see sdk/examples/update.c), the rest is the log shown
+ * under SHOW DETAILS.
+ */
+#define UPDATES_TEXT 100
+/* Release note lines are word-wrapped when drawn, so they can be longer. */
+#define UPDATES_NOTE_TEXT 256
+#define UPDATES_NOTE_LINES 32
+#define UPDATES_LOG_LINES 48
+
+enum updates_status {
+    UPDATES_UNKNOWN,
+    UPDATES_NONE,
+    UPDATES_UP_TO_DATE,
+    UPDATES_AVAILABLE,
+    UPDATES_INSTALLED,
+    UPDATES_ERROR,
+};
+
+enum updates_button {
+    UPDATES_BUTTON_REFRESH,
+    UPDATES_BUTTON_UPDATE, /* RESTART once installed */
+    UPDATES_BUTTON_DETAILS,
+    UPDATES_BUTTON_COUNT,
+};
+
+static enum updates_status updates_status;
+static char updates_latest[32];
+static char updates_phase[48];
+static char updates_error[UPDATES_TEXT];
+static int updates_progress = -1;
+static char updates_notes[UPDATES_NOTE_LINES][UPDATES_NOTE_TEXT];
+static size_t updates_note_count;
+static char updates_log[UPDATES_LOG_LINES][UPDATES_TEXT];
+static size_t updates_log_first;
+static size_t updates_log_count;
+static char updates_line[UPDATES_NOTE_TEXT + 16];
+static size_t updates_line_length;
+static bool updates_details;
+static size_t updates_button;
+
+static bool updates_admin(void) {
+    return permission_session_identity().admin;
+}
+
+static bool updates_button_enabled(size_t button) {
+    switch (button) {
+    case UPDATES_BUTTON_REFRESH:
+        return !updates_running && !installer_available();
+    case UPDATES_BUTTON_UPDATE:
+        return !updates_running
+            && (updates_status == UPDATES_INSTALLED
+                || (updates_status == UPDATES_AVAILABLE && updates_admin()));
+    default:
+        return true;
+    }
+}
+
+static const char *updates_button_label(size_t button) {
+    switch (button) {
+    case UPDATES_BUTTON_REFRESH:
+        return "REFRESH";
+    case UPDATES_BUTTON_UPDATE:
+        return updates_status == UPDATES_INSTALLED ? "RESTART NOW" : "UPDATE";
+    default:
+        return updates_details ? "HIDE DETAILS" : "SHOW DETAILS";
+    }
+}
+
+static void updates_log_add(const char *text, size_t length) {
+    size_t slot = (updates_log_first + updates_log_count) % UPDATES_LOG_LINES;
+    if (updates_log_count == UPDATES_LOG_LINES) {
+        updates_log_first = (updates_log_first + 1) % UPDATES_LOG_LINES;
+    } else {
+        updates_log_count++;
+    }
+    if (length >= UPDATES_TEXT) {
+        length = UPDATES_TEXT - 1;
+    }
+    for (size_t i = 0; i < length; i++) {
+        updates_log[slot][i] = text[i];
+    }
+    updates_log[slot][length] = '\0';
+}
+
+static void updates_copy(char *out, size_t capacity, const char *text,
+                         size_t length) {
+    if (length >= capacity) {
+        length = capacity - 1;
+    }
+    for (size_t i = 0; i < length; i++) {
+        out[i] = text[i];
+    }
+    out[length] = '\0';
+}
+
+/* One complete output line from the updater. */
+static void updates_line_done(void) {
+    const char *line = updates_line;
+    size_t length = updates_line_length;
+    updates_line_length = 0;
+    if (length == 0 || line[0] != '@') {
+        updates_log_add(line, length);
+        return;
+    }
+    size_t key_end = 1;
+    while (key_end < length && line[key_end] != ' ') {
+        key_end++;
+    }
+    const char *value = line + (key_end < length ? key_end + 1 : length);
+    size_t value_length = length - (size_t)(value - line);
+    const char *key = line + 1;
+    size_t key_length = key_end - 1;
+    if (text_equals(key, key_length, "latest")) {
+        updates_copy(updates_latest, sizeof(updates_latest), value,
+                     value_length);
+    } else if (text_equals(key, key_length, "notes")) {
+        if (updates_note_count < UPDATES_NOTE_LINES) {
+            updates_copy(updates_notes[updates_note_count++], UPDATES_NOTE_TEXT,
+                         value, value_length);
+        }
+    } else if (text_equals(key, key_length, "phase")) {
+        updates_copy(updates_phase, sizeof(updates_phase), value,
+                     value_length);
+    } else if (text_equals(key, key_length, "progress")) {
+        int percent = 0;
+        for (size_t i = 0; i < value_length && value[i] >= '0'
+                           && value[i] <= '9' && percent < 1000; i++) {
+            percent = percent * 10 + (value[i] - '0');
+        }
+        updates_progress = percent > 100 ? 100 : percent;
+    } else if (text_equals(key, key_length, "error")) {
+        updates_copy(updates_error, sizeof(updates_error), value,
+                     value_length);
+    } else if (text_equals(key, key_length, "status")) {
+        if (text_equals(value, value_length, "none")) {
+            updates_status = UPDATES_NONE;
+        } else if (text_equals(value, value_length, "uptodate")) {
+            updates_status = UPDATES_UP_TO_DATE;
+        } else if (text_equals(value, value_length, "available")) {
+            updates_status = UPDATES_AVAILABLE;
+        } else if (text_equals(value, value_length, "installed")) {
+            updates_status = UPDATES_INSTALLED;
+        } else if (text_equals(value, value_length, "error")) {
+            updates_status = UPDATES_ERROR;
+        }
+    }
+}
+
+static void updates_feed(char character) {
+    if (character == '\n') {
+        updates_line_done();
+    } else if (character != '\r'
+               && updates_line_length + 1 < sizeof(updates_line)) {
+        updates_line[updates_line_length++] = character;
+    }
+}
+
+/* Runs /bin/update --gui check (install: --gui install). */
+static void updates_start(bool install) {
+    if (updates_running || installer_available()) {
+        return;
+    }
+    updates_error[0] = '\0';
+    updates_phase[0] = '\0';
+    updates_progress = -1;
+    updates_line_length = 0;
+    /* An install sends the notes again. */
+    updates_note_count = 0;
+    if (!install) {
+        updates_status = UPDATES_UNKNOWN;
+        updates_latest[0] = '\0';
+    }
+    updates_log_add("", 0);
+    static const char program[] = "/bin/update";
+    const char *arguments = install ? "--gui install" : "--gui check";
+    enum run_result result = app_launch(
+        APP_FROM_UPDATES, program, sizeof(program) - 1, arguments,
+        text_length(arguments), NULL, 0);
+    updates_checked = true;
+    if (result != RUN_STARTED) {
+        updates_status = UPDATES_ERROR;
+        text_copy(updates_error, sizeof(updates_error),
+                  run_result_text(result));
+        return;
+    }
+    updates_running = true;
+}
+
+/* The updater ended (from app_job_report). */
+static void updates_finished(bool started, uint64_t exit_status) {
+    if (updates_line_length != 0) {
+        updates_line_done();
+    }
+    updates_running = false;
+    updates_phase[0] = '\0';
+    if (!started) {
+        updates_status = UPDATES_ERROR;
+        text_copy(updates_error, sizeof(updates_error),
+                  "/BIN/UPDATE COULD NOT START");
+    } else if (exit_status != 0 && updates_status != UPDATES_ERROR) {
+        updates_status = UPDATES_ERROR;
+        if (updates_error[0] == '\0') {
+            text_copy(updates_error, sizeof(updates_error),
+                      exit_status == 128 + 9 ? "THE UPDATER WAS ENDED"
+                                             : "THE UPDATER FAILED");
+        }
+    }
+    if (updates_status != UPDATES_INSTALLED) {
+        updates_progress = -1;
+    }
+}
+
+/* Draws text word-wrapped in [x, x + width); returns the next line's y,
+   stopping before bottom. */
+static int64_t draw_wrapped(int64_t x, int64_t y, int64_t width,
+                            int64_t bottom, const char *text, uint8_t red,
+                            uint8_t green, uint8_t blue) {
+    size_t columns = width > CHAR_WIDTH ? (size_t)(width / CHAR_WIDTH) : 1;
+    if (columns > UPDATES_TEXT) {
+        columns = UPDATES_TEXT; /* the piece buffer below */
+    }
+    size_t length = text_length(text);
+    size_t start = 0;
+    do {
+        if (y + CHAR_HEIGHT > bottom) {
+            return y;
+        }
+        size_t end = length - start > columns ? start + columns : length;
+        if (end < length) {
+            size_t space = end;
+            while (space > start && text[space] != ' ') {
+                space--;
+            }
+            if (space > start) {
+                end = space;
+            }
+        }
+        char piece[UPDATES_TEXT + 1];
+        size_t count = end - start < UPDATES_TEXT ? end - start : UPDATES_TEXT;
+        for (size_t i = 0; i < count; i++) {
+            piece[i] = text[start + i];
+        }
+        piece[count] = '\0';
+        draw_text_clipped(x, y, width, piece, red, green, blue);
+        y += CHAR_HEIGHT + 6;
+        start = end;
+        while (start < length && text[start] == ' ') {
+            start++;
+        }
+    } while (start < length);
+    return y;
+}
+
+static struct rect updates_button_rect(struct rect area, size_t index) {
+    int64_t width = (area.width - 32 - 2 * 8) / UPDATES_BUTTON_COUNT;
+    return (struct rect){area.x + 16 + (int64_t)index * (width + 8),
+                         area.y + area.height - 48, width, 34};
+}
+
+static void draw_updates(struct rect area, bool focused) {
+    fill(area, 24, 30, 46);
+    int64_t x = area.x + 16;
+    int64_t width = area.width - 32;
+    int64_t y = area.y + 16;
+
+    char versions[96] = "OPOS ";
+    size_t length = append_text(versions, sizeof(versions), 5,
+                                update_current_version());
+    if (updates_latest[0] != '\0'
+        && (updates_status == UPDATES_AVAILABLE
+            || updates_status == UPDATES_INSTALLED
+            || (updates_running && updates_status != UPDATES_UP_TO_DATE))) {
+        length = append_text(versions, sizeof(versions), length, "  ->  ");
+        append_text(versions, sizeof(versions), length, updates_latest);
+    }
+    draw_text_clipped(x, y, width, versions, 151, 190, 255);
+    y += 30;
+
+    const char *status;
+    uint8_t red = 200;
+    uint8_t green = 214;
+    uint8_t blue = 255;
+    if (installer_available()) {
+        status = "UPDATES NEED AN INSTALLED OPOS (THIS IS THE LIVE SYSTEM).";
+    } else if (updates_running) {
+        status = updates_phase[0] != '\0' ? updates_phase : "STARTING...";
+    } else {
+        switch (updates_status) {
+        case UPDATES_NONE:
+            status = "NO OPOS RELEASE HAS BEEN PUBLISHED YET.";
+            break;
+        case UPDATES_UP_TO_DATE:
+            status = "OPOS IS UP TO DATE.";
+            red = 150, green = 220, blue = 150;
+            break;
+        case UPDATES_AVAILABLE:
+            status = updates_admin()
+                ? "A NEW VERSION IS AVAILABLE."
+                : "A NEW VERSION IS AVAILABLE. ONLY AN ADMINISTRATOR CAN "
+                  "INSTALL IT.";
+            red = 240, green = 210, blue = 120;
+            break;
+        case UPDATES_INSTALLED:
+            status = "INSTALLED. RESTART TO USE THE NEW VERSION. THE BOOT "
+                     "MENU KEEPS \"OPOS (PREVIOUS VERSION)\".";
+            red = 150, green = 220, blue = 150;
+            break;
+        case UPDATES_ERROR:
+            status = updates_error[0] != '\0' ? updates_error
+                                              : "THE UPDATE FAILED.";
+            red = 255, green = 120, blue = 120;
+            break;
+        default:
+            status = "NOT CHECKED YET.";
+            break;
+        }
+    }
+    int64_t buttons_top = updates_button_rect(area, 0).y;
+    y = draw_wrapped(x, y, width, buttons_top, status, red, green, blue);
+    y += 6;
+
+    if (updates_progress >= 0) {
+        struct rect bar = {x, y, width - 70, 18};
+        fill(bar, 40, 48, 70);
+        fill((struct rect){bar.x, bar.y, bar.width * updates_progress / 100,
+                           bar.height},
+             90, 160, 240);
+        char percent[8];
+        size_t used = append_decimal(percent, sizeof(percent), 0,
+                                     (uint64_t)updates_progress);
+        append_text(percent, sizeof(percent), used, "%");
+        draw_text_clipped(bar.x + bar.width + 12, bar.y, 60, percent,
+                          230, 238, 255);
+        y += 32;
+    }
+
+    /* Release notes, and the log below them under SHOW DETAILS. */
+    int64_t bottom = buttons_top - 10;
+    int64_t log_top = bottom;
+    if (updates_details) {
+        log_top = y + (bottom - y) / 2;
+        if (updates_note_count == 0) {
+            log_top = y;
+        }
+    }
+    if (updates_note_count != 0 && y + 2 * LINE_HEIGHT < log_top) {
+        struct rect box = {x, y, width, log_top - y - 8};
+        fill(box, 32, 40, 62);
+        draw_text_clipped(box.x + 10, box.y + 8, box.width - 20,
+                          "RELEASE NOTES", 151, 190, 235);
+        int64_t line_y = box.y + 8 + LINE_HEIGHT;
+        for (size_t i = 0; i < updates_note_count; i++) {
+            line_y = draw_wrapped(box.x + 10, line_y, box.width - 20,
+                                  box.y + box.height - 4, updates_notes[i],
+                                  225, 232, 245);
+        }
+    }
+    if (updates_details && log_top + LINE_HEIGHT < bottom) {
+        struct rect box = {x, log_top, width, bottom - log_top};
+        fill(box, 14, 18, 28);
+        /* The newest lines that fit. */
+        size_t fit = (size_t)((box.height - 12) / (CHAR_HEIGHT + 6));
+        size_t first = updates_log_count > fit ? updates_log_count - fit : 0;
+        int64_t line_y = box.y + 6;
+        for (size_t i = first; i < updates_log_count; i++) {
+            const char *text =
+                updates_log[(updates_log_first + i) % UPDATES_LOG_LINES];
+            draw_text_clipped(box.x + 8, line_y, box.width - 16, text,
+                              190, 200, 220);
+            line_y += CHAR_HEIGHT + 6;
+        }
+    }
+
+    for (size_t i = 0; i < UPDATES_BUTTON_COUNT; i++) {
+        struct rect button = updates_button_rect(area, i);
+        if (!updates_button_enabled(i)) {
+            draw_text_button(button, updates_button_label(i), false);
+        } else {
+            draw_button(button, updates_button_label(i),
+                        focused && i == updates_button);
+        }
+    }
+}
+
+static void updates_press(size_t button) {
+    if (!updates_button_enabled(button)) {
+        return;
+    }
+    switch (button) {
+    case UPDATES_BUTTON_REFRESH:
+        updates_start(false);
+        break;
+    case UPDATES_BUTTON_UPDATE:
+        if (updates_status == UPDATES_INSTALLED) {
+            power_reboot();
+        } else {
+            updates_start(true);
+        }
+        break;
+    default:
+        updates_details = !updates_details;
+        break;
+    }
+}
+
+static void updates_key(char character) {
+    if (character == KEY_LEFT) {
+        updates_button = (updates_button + UPDATES_BUTTON_COUNT - 1)
+                       % UPDATES_BUTTON_COUNT;
+    } else if (character == KEY_RIGHT) {
+        updates_button = (updates_button + 1) % UPDATES_BUTTON_COUNT;
+    } else if (character == '\n' || character == ' ') {
+        updates_press(updates_button);
+    }
+}
+
+static void updates_click(struct rect area, int32_t x, int32_t y) {
+    for (size_t i = 0; i < UPDATES_BUTTON_COUNT; i++) {
+        if (rect_contains(updates_button_rect(area, i), x, y)) {
+            updates_button = i;
+            updates_press(i);
             return;
         }
     }
@@ -9395,9 +9895,43 @@ static size_t app_output_head;
 static size_t app_output_count;
 /* Output from a program without a window brings up the Terminal. */
 static bool app_output_windowless;
+/* The updater run by Settings > UPDATES writes to that page instead. */
+#define UPDATES_OUTPUT_CAPACITY 2048
+static char updates_output[UPDATES_OUTPUT_CAPACITY];
+static size_t updates_output_head;
+static size_t updates_output_count;
+static bool app_current_is_updater(void);
+static void updates_feed(char character);
+
+static void updates_output_sink(const char *data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        while (updates_output_count == UPDATES_OUTPUT_CAPACITY) {
+            if (user_current_killed() || !desktop_active) {
+                return;
+            }
+            (void)scheduler_sleep_until(timer_ticks() + 1);
+        }
+        updates_output[(updates_output_head + updates_output_count)
+                       % UPDATES_OUTPUT_CAPACITY] = data[i];
+        updates_output_count++;
+    }
+}
+
+static void updates_output_drain(void) {
+    while (updates_output_count != 0) {
+        updates_feed(updates_output[updates_output_head]);
+        updates_output_head = (updates_output_head + 1)
+                            % UPDATES_OUTPUT_CAPACITY;
+        updates_output_count--;
+    }
+}
 
 static void app_output_sink(const char *data, size_t length, bool error) {
     (void)error;
+    if (app_current_is_updater()) {
+        updates_output_sink(data, length);
+        return;
+    }
     if (app_window_of(user_current_process_id()) == NULL) {
         app_output_windowless = true;
     }
@@ -9588,6 +10122,18 @@ static uint64_t app_job_process(const struct app_job *job) {
                                        : 0;
 }
 
+static bool app_current_is_updater(void) {
+    uint64_t process_id = user_current_process_id();
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        const struct app_job *job = &app_jobs[i];
+        if (job->used && job->origin == APP_FROM_UPDATES
+            && process_id != 0 && app_job_process(job) == process_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Ctrl+C in the Terminal: ends the newest program started there. */
 static bool app_kill_terminal_job(void) {
     const struct app_job *newest = NULL;
@@ -9662,6 +10208,10 @@ static void app_job_report(struct app_job *job) {
                        : job->exit_status == 128 + 9 ? "PROGRAM WAS ENDED"
                                                      : "PROGRAM EXITED WITH ERROR");
         }
+        break;
+    case APP_FROM_UPDATES:
+        updates_output_drain();
+        updates_finished(started, job->exit_status);
         break;
     case APP_FROM_NOTEPAD:
         if (!started && !apps_stopping) {
@@ -9929,6 +10479,10 @@ static bool apps_poll(void) {
             window->dirty = false;
             redraw = true;
         }
+    }
+    if (updates_output_count != 0) {
+        updates_output_drain();
+        redraw = true;
     }
     if (app_output_count != 0) {
         if (app_output_windowless && !windows[WINDOW_TERMINAL].open

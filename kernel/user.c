@@ -14,6 +14,7 @@
 #include "cmos.h"
 #include "net.h"
 #include "timer.h"
+#include "update.h"
 #include "user.h"
 #include "vfs.h"
 
@@ -3063,6 +3064,80 @@ static int64_t user_opos_user_info(const struct user_process *process,
 
 
 /*
+ * System updates (ABI 1, added later; older kernels answer -ENOSYS). The
+ * kernel checks the signed manifest and every file itself (update.c), so
+ * these only need an administrator, not trust in the calling program.
+ * Results are >= 0, or -UPDATE_* (update.h; opos.h OPOS_UPDATE_E*).
+ */
+#define OPOS_SYSCALL_UPDATE_BEGIN (OPOS_SYSCALL_BASE + 0x20)
+#define OPOS_SYSCALL_UPDATE_FILE (OPOS_SYSCALL_BASE + 0x21)
+#define OPOS_SYSCALL_UPDATE_WRITE (OPOS_SYSCALL_BASE + 0x22)
+#define OPOS_SYSCALL_UPDATE_COMMIT (OPOS_SYSCALL_BASE + 0x23)
+#define OPOS_SYSCALL_UPDATE_CANCEL (OPOS_SYSCALL_BASE + 0x24)
+#define UPDATE_WRITE_MAX (1024 * 1024)
+
+static int64_t user_opos_update(const struct user_process *process,
+                                const struct linux_syscall_frame *frame,
+                                uint64_t number) {
+    bool admin = process->identity.admin;
+    enum update_result result = UPDATE_INVALID;
+    if (number == OPOS_SYSCALL_UPDATE_BEGIN) {
+        size_t manifest_length = (size_t)frame->rsi;
+        size_t signature_length = (size_t)frame->r10;
+        if (manifest_length == 0 || manifest_length > UPDATE_MANIFEST_MAX
+            || signature_length == 0
+            || signature_length > UPDATE_SIGNATURE_MAX) {
+            return -UPDATE_INVALID;
+        }
+        if (!paging_user_range_valid((uintptr_t)frame->rdi, manifest_length,
+                                     false, false)
+            || !paging_user_range_valid((uintptr_t)frame->rdx,
+                                        signature_length, false, false)) {
+            return -14;
+        }
+        size_t count = 0;
+        result = update_begin(admin, (const uint8_t *)(uintptr_t)frame->rdi,
+                              manifest_length,
+                              (const uint8_t *)(uintptr_t)frame->rdx,
+                              signature_length, &count);
+        return result == UPDATE_OK ? (int64_t)count : -(int64_t)result;
+    }
+    if (number == OPOS_SYSCALL_UPDATE_FILE) {
+        if (!paging_user_range_valid((uintptr_t)frame->rsi,
+                                     sizeof(struct update_file_info), true,
+                                     false)) {
+            return -14;
+        }
+        struct update_file_info info;
+        result = update_file((size_t)frame->rdi, &info);
+        if (result == UPDATE_OK) {
+            *(struct update_file_info *)(uintptr_t)frame->rsi = info;
+        }
+    } else if (number == OPOS_SYSCALL_UPDATE_WRITE) {
+        size_t length = (size_t)frame->r10;
+        if (length > UPDATE_WRITE_MAX) {
+            return -UPDATE_INVALID;
+        }
+        if (length != 0
+            && !paging_user_range_valid((uintptr_t)frame->rdx, length, false,
+                                        false)) {
+            return -14;
+        }
+        result = update_write(admin, (size_t)frame->rdi, frame->rsi,
+                              (const uint8_t *)(uintptr_t)frame->rdx, length);
+    } else if (number == OPOS_SYSCALL_UPDATE_COMMIT) {
+        result = update_commit(admin);
+    } else if (number == OPOS_SYSCALL_UPDATE_CANCEL) {
+        if (!admin) {
+            return -UPDATE_NOT_ADMIN;
+        }
+        update_cancel();
+        result = UPDATE_OK;
+    }
+    return result == UPDATE_OK ? 0 : -(int64_t)result;
+}
+
+/*
  * Windows (ABI 1): one window per program, shown by the desktop. See
  * desktop_app_window_* in desktop.c and sdk/include/opos.h.
  */
@@ -4478,6 +4553,16 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         && number <= OPOS_SYSCALL_WINDOW_SIZE) {
         return user_opos_window(process, frame);
     }
+    if (number >= OPOS_SYSCALL_UPDATE_BEGIN
+        && number <= OPOS_SYSCALL_UPDATE_CANCEL) {
+        if (!update_call_enter()) {
+            frame->rax = (uint64_t)-(int64_t)UPDATE_BUSY;
+        } else {
+            frame->rax = (uint64_t)user_opos_update(process, frame, number);
+            update_call_leave();
+        }
+        return false;
+    }
     if (user_linux_socket_syscall(process, frame, number)) {
         return false;
     }
@@ -4606,12 +4691,14 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             && length > USER_SOCKET_IO_MAX) {
             length = USER_SOCKET_IO_MAX;
         }
+        /* A larger read returns fewer bytes, which read() may always do. */
+        if (file != NULL && file->kind != USER_OPEN_FILE_SOCKET
+            && length > USER_FILE_IO_MAX) {
+            length = USER_FILE_IO_MAX;
+        }
         if (file == NULL || !file->readable || file->directory) {
             frame->rax = (uint64_t)(int64_t)(file != NULL && file->directory
                                              ? -21 : -9);
-        } else if (length > USER_FILE_IO_MAX
-                   && file->kind != USER_OPEN_FILE_SOCKET) {
-            frame->rax = (uint64_t)(int64_t)-22;
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, true, false)) {
             frame->rax = (uint64_t)(int64_t)-14;
@@ -5106,7 +5193,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 (struct linux_utsname *)(uintptr_t)frame->rdi;
             copy_utsname_field(name->sysname, "Linux");
             copy_utsname_field(name->nodename, "opos");
-            copy_utsname_field(name->release, "0.1.0-opos");
+            copy_utsname_field(name->release, update_current_version());
             copy_utsname_field(name->version, "#1 OPOS");
             copy_utsname_field(name->machine, "x86_64");
             copy_utsname_field(name->domainname, "localdomain");

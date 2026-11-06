@@ -6,3 +6,6 @@
 *.iso
 *.ppm
 /sdk/build/
+
+# Signing keys never go into the repository.
+*.pem

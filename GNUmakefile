@@ -27,7 +27,8 @@ INITRAMFS := $(BUILD)/initramfs.tar
 # the initramfs as /bin/notepad.
 SDK_NOTEPAD := sdk/build/notepad
 SDK_FETCH := sdk/build/fetch
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/lib/image.c sdk/include/opos_tls.h sdk/include/opos_image.h
+SDK_UPDATE := sdk/build/update
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/lib/image.c sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -35,6 +36,19 @@ CA_BUNDLE := data/ssl/ca-certificates.crt
 INSTALL_TAR := $(BUILD)/install.tar
 BIOS_BOOT := $(BUILD)/bios-boot.bin
 TEST_DISK := $(BUILD)/fat16-test.img
+# The OPOS version (VERSION file); updates must have a higher one.
+OPOS_VERSION := $(shell cat VERSION)
+RELEASE := $(BUILD)/release
+UPDATE_KEY ?= $(HOME)/.opos-signing/update-key.pem
+# BearSSL files the kernel uses to check update signatures (ECDSA P-256).
+KERNEL_BEARSSL_SOURCES := $(addprefix sdk/bearssl/src/,codec/ccopy.c \
+	ec/ec_p256_m31.c ec/ec_secp256r1.c ec/ec_secp384r1.c ec/ec_secp521r1.c \
+	ec/ecdsa_atr.c ec/ecdsa_i31_bits.c ec/ecdsa_i31_vrfy_asn1.c \
+	ec/ecdsa_i31_vrfy_raw.c int/i31_add.c int/i31_bitlen.c int/i31_decmod.c \
+	int/i31_decode.c int/i31_encode.c int/i31_fmont.c int/i31_iszero.c \
+	int/i31_modpow.c int/i31_montmul.c int/i31_muladd.c int/i31_ninv31.c \
+	int/i31_rshift.c int/i31_sub.c int/i31_tmont.c int/i32_div32.c)
+KERNEL_BEARSSL_OBJECTS := $(patsubst sdk/bearssl/src/%.c,$(BUILD)/kbearssl/%.o,$(KERNEL_BEARSSL_SOURCES))
 
 CFLAGS := -std=gnu11 -O2 -Wall -Wextra \
 	-ffreestanding -fno-builtin -fno-stack-protector \
@@ -45,7 +59,7 @@ LDFLAGS := -nostdlib -static \
 	-Wl,--build-id=none \
 	-Wl,-T,kernel/linker.ld
 
-.PHONY: all run test-disk persistence-test clean
+.PHONY: all run test-disk persistence-test release clean
 
 all: $(ISO)
 
@@ -163,6 +177,9 @@ $(SDK_NOTEPAD): $(SDK_SOURCES)
 $(SDK_FETCH): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/fetch
 
+$(SDK_UPDATE): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/update
+
 # The SDK is self-contained, so it carries copies of the kernel's image
 # decoder; these rules keep them identical.
 sdk/include/opos_image.h: kernel/image.h
@@ -171,7 +188,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
+$(INITRAMFS): $(WALLPAPERS) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -187,14 +204,22 @@ $(INITRAMFS): $(WALLPAPERS) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(USER_ELF)
 	cp $(MUSL_SIGNAL_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-signal-test
 	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
 	cp $(SDK_FETCH) $(BUILD)/initramfs_root/bin/fetch
+	cp $(SDK_UPDATE) $(BUILD)/initramfs_root/bin/update
 	mkdir -p $(BUILD)/initramfs_root/share/wallpapers
 	cp $(WALLPAPERS) $(BUILD)/initramfs_root/share/wallpapers/
 	mkdir -p $(BUILD)/initramfs_root/etc/ssl/certs
 	cp $(CA_BUNDLE) $(BUILD)/initramfs_root/etc/ssl/certs/
 	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin etc lib share tests
 
-$(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/storage.c kernel/storage.h kernel/optical.c kernel/optical.h kernel/iso9660.c kernel/iso9660.h kernel/xhci.c kernel/xhci.h kernel/usb_storage.c kernel/usb_storage.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/image.c kernel/image.h kernel/appearance.c kernel/appearance.h kernel/boot_display.c kernel/boot_display.h kernel/sdhci.c kernel/sdhci.h kernel/acpi_dump.c kernel/acpi_dump.h kernel/i2c_hid.c kernel/i2c_hid.h kernel/touchpad_gesture.c kernel/touchpad_gesture.h kernel/e1000.c kernel/e1000.h kernel/vmxnet3.c kernel/vmxnet3.h kernel/pcnet.c kernel/pcnet.h kernel/nic.c kernel/nic.h kernel/net.c kernel/net.h kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
-	$(CC) $(CFLAGS) -Ikernel -I$(dir $(LIMINE_HEADER)) $(LDFLAGS) -o $@ kernel/main.c kernel/interrupts.c kernel/interrupts.S kernel/pci.c kernel/ahci.c kernel/ata.c kernel/nvme.c kernel/pvscsi.c kernel/mpt.c kernel/buslogic.c kernel/scsi.c kernel/partition.c kernel/block.c kernel/fat16.c kernel/storage.c kernel/optical.c kernel/iso9660.c kernel/xhci.c kernel/usb_storage.c kernel/vfs.c kernel/keyboard.c kernel/mouse.c kernel/desktop.c kernel/cmos.c kernel/memory.c kernel/paging.c kernel/power.c kernel/scheduler.c kernel/shell.c kernel/timer.c kernel/user.c kernel/elf.c kernel/initramfs.c kernel/font.c kernel/svga.c kernel/vmware.c kernel/installer.c kernel/accounts.c kernel/sha256.c kernel/permissions.c kernel/image.c kernel/appearance.c kernel/boot_display.c kernel/sdhci.c kernel/acpi_dump.c kernel/i2c_hid.c kernel/touchpad_gesture.c kernel/e1000.c kernel/vmxnet3.c kernel/pcnet.c kernel/nic.c kernel/net.c kernel/user.S kernel/vbrstub.S
+$(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/storage.c kernel/storage.h kernel/optical.c kernel/optical.h kernel/iso9660.c kernel/iso9660.h kernel/xhci.c kernel/xhci.h kernel/usb_storage.c kernel/usb_storage.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/image.c kernel/image.h kernel/appearance.c kernel/appearance.h kernel/boot_display.c kernel/boot_display.h kernel/sdhci.c kernel/sdhci.h kernel/acpi_dump.c kernel/acpi_dump.h kernel/i2c_hid.c kernel/i2c_hid.h kernel/touchpad_gesture.c kernel/touchpad_gesture.h kernel/e1000.c kernel/e1000.h kernel/vmxnet3.c kernel/vmxnet3.h kernel/pcnet.c kernel/pcnet.h kernel/nic.c kernel/nic.h kernel/net.c kernel/net.h kernel/update.c kernel/update.h kernel/update_key.h VERSION $(KERNEL_BEARSSL_OBJECTS) kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
+	$(CC) $(CFLAGS) -DOPOS_VERSION='"$(OPOS_VERSION)"' -Ikernel -Isdk/bearssl/inc -I$(dir $(LIMINE_HEADER)) $(LDFLAGS) -o $@ kernel/main.c kernel/interrupts.c kernel/interrupts.S kernel/pci.c kernel/ahci.c kernel/ata.c kernel/nvme.c kernel/pvscsi.c kernel/mpt.c kernel/buslogic.c kernel/scsi.c kernel/partition.c kernel/block.c kernel/fat16.c kernel/storage.c kernel/optical.c kernel/iso9660.c kernel/xhci.c kernel/usb_storage.c kernel/vfs.c kernel/keyboard.c kernel/mouse.c kernel/desktop.c kernel/cmos.c kernel/memory.c kernel/paging.c kernel/power.c kernel/scheduler.c kernel/shell.c kernel/timer.c kernel/user.c kernel/elf.c kernel/initramfs.c kernel/font.c kernel/svga.c kernel/vmware.c kernel/installer.c kernel/accounts.c kernel/sha256.c kernel/permissions.c kernel/image.c kernel/appearance.c kernel/boot_display.c kernel/sdhci.c kernel/acpi_dump.c kernel/i2c_hid.c kernel/touchpad_gesture.c kernel/e1000.c kernel/vmxnet3.c kernel/pcnet.c kernel/nic.c kernel/net.c kernel/update.c kernel/user.S kernel/vbrstub.S $(KERNEL_BEARSSL_OBJECTS)
+
+$(BUILD)/kbearssl/%.o: sdk/bearssl/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(filter-out -Wall -Wextra,$(CFLAGS)) -U_FORTIFY_SOURCE -Isdk/bearssl/inc -Isdk/bearssl/src \
+		-DBR_USE_UNIX_TIME=0 -DBR_USE_URANDOM=0 -DBR_USE_GETENTROPY=0 \
+		-DBR_USE_WIN32_RAND=0 -DBR_USE_WIN32_TIME=0 -DBR_RDRAND=0 \
+		-DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_POWER8=0 -c $< -o $@
 
 # BIOS boot sector + stage 2 for installed disks, as `limine bios-install`
 # would lay them out on an MBR disk (see tools/mkbiosboot.c).
@@ -213,12 +238,15 @@ $(INSTALL_TAR): $(BIOS_BOOT) $(LIMINE_DIR)/limine limine.conf
 	tar --format=ustar -C $(BUILD)/install_root -cf $@ bios-boot.bin limine-bios.sys BOOTX64.EFI limine.conf
 	rm -rf $(BUILD)/install_root
 
-$(ISO): $(LIMINE_DIR)/limine $(KERNEL) $(USER_ELF) $(INITRAMFS) $(INSTALL_TAR) limine.conf
+# make_iso OUTPUT,EXTRA: builds a boot ISO; files in the folder EXTRA (if
+# given) go into its /boot as well.
+define make_iso
 	rm -rf $(BUILD)/iso_root
 	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/kernel.elf
 	cp $(INITRAMFS) $(BUILD)/iso_root/boot/initramfs.tar
 	cp $(INSTALL_TAR) $(BUILD)/iso_root/boot/install.tar
+	$(if $(2),cp $(2)/* $(BUILD)/iso_root/boot/)
 	cp limine.conf $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE_DIR)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(BUILD)/iso_root/boot/limine/
@@ -228,9 +256,29 @@ $(ISO): $(LIMINE_DIR)/limine $(KERNEL) $(USER_ELF) $(INITRAMFS) $(INSTALL_TAR) l
 		-hfsplus -apm-block-size 2048 \
 		--efi-boot boot/limine/limine-uefi-cd.bin \
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
-		$(BUILD)/iso_root -o $@
-	$(LIMINE_DIR)/limine bios-install $@
+		$(BUILD)/iso_root -o $(1)
+	$(LIMINE_DIR)/limine bios-install $(1)
 	rm -rf $(BUILD)/iso_root
+endef
+
+$(ISO): $(LIMINE_DIR)/limine $(KERNEL) $(USER_ELF) $(INITRAMFS) $(INSTALL_TAR) limine.conf
+	$(call make_iso,$@,)
+
+# Update files for a GitHub Release (see docs/updates.md), signed with
+# UPDATE_KEY. Upload everything in build/release/ to the release.
+# release-notes.txt is shown in Settings > UPDATES: edit it per release.
+# The release ISO also carries the signed manifest in /boot, so attaching
+# it to a VM (or burning it) works as update media too.
+release: $(ISO)
+	python3 tools/mkrelease.py --version $(OPOS_VERSION) --key $(UPDATE_KEY) \
+		--output $(RELEASE) --notes release-notes.txt \
+		$(INITRAMFS)=boot/initramfs.tar $(KERNEL)=boot/kernel.elf
+	rm -rf $(BUILD)/iso_extra
+	mkdir -p $(BUILD)/iso_extra
+	cp $(RELEASE)/opos-update.manifest $(RELEASE)/opos-update.sig \
+		$(RELEASE)/opos-release-notes.txt $(BUILD)/iso_extra/
+	$(call make_iso,$(RELEASE)/opos-$(OPOS_VERSION).iso,$(BUILD)/iso_extra)
+	rm -rf $(BUILD)/iso_extra
 
 clean:
 	rm -rf $(BUILD)

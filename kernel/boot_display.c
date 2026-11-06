@@ -359,6 +359,140 @@ static size_t rewrite_config(const char *text, size_t length,
     return any_opos ? used : 0;
 }
 
+#define PREVIOUS_HEADER "/OPOS (previous version)"
+#define KERNEL_TAIL "/boot/kernel.elf"
+#define OLD_KERNEL_TAIL "/boot/old/kernel.elf"
+
+/* Whether [start, end) contains `word` (case-insensitive); sets *at. */
+static bool find_folded(const char *text, size_t start, size_t end,
+                        const char *word, size_t *at) {
+    size_t length = text_length(word);
+    for (size_t i = start; i + length <= end; i++) {
+        size_t j = 0;
+        while (j < length && lower(text[i + j]) == lower(word[j])) {
+            j++;
+        }
+        if (j == length) {
+            *at = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Copies text into config_output with a copy of the first OPOS entry that
+ * boots .../boot/kernel.elf inserted after it, renamed PREVIOUS_HEADER
+ * and booting .../boot/old/kernel.elf. Returns the output length, or 0
+ * when there is no such entry or the copy is already there.
+ */
+static size_t add_previous_entry(const char *text, size_t length) {
+    for (size_t start = 0; start < length;) {
+        struct line line = line_at(text, length, start);
+        size_t at;
+        if (line_is_header(text, line)
+            && find_folded(text, line.start, line.content_end,
+                           PREVIOUS_HEADER, &at)) {
+            return 0;
+        }
+        start = line.next;
+    }
+    /* The entry: [entry_start, entry_end). */
+    size_t entry_start = length;
+    size_t entry_end = length;
+    for (size_t start = 0; start < length;) {
+        struct line line = line_at(text, length, start);
+        if (line_is_header(text, line)) {
+            if (entry_start != length) {
+                entry_end = start;
+                break;
+            }
+            if (entry_is_opos(text, length, start)) {
+                /* Only an entry whose path is the system kernel. */
+                for (size_t s = line.next; s < length;) {
+                    struct line option = line_at(text, length, s);
+                    size_t value_start;
+                    size_t value_end;
+                    size_t found;
+                    if (line_is_header(text, option)) {
+                        break;
+                    }
+                    if ((line_option(text, option, "path", &value_start,
+                                     &value_end)
+                         || line_option(text, option, "kernel_path",
+                                        &value_start, &value_end))
+                        && find_folded(text, value_start, value_end,
+                                       KERNEL_TAIL, &found)
+                        && found + text_length(KERNEL_TAIL) == value_end) {
+                        entry_start = start;
+                        break;
+                    }
+                    s = option.next;
+                }
+            }
+        }
+        start = line.next;
+    }
+    if (entry_start == length) {
+        return 0;
+    }
+    size_t used = 0;
+    if (!output_append(&used, text, entry_end)) {
+        return 0;
+    }
+    struct line header = line_at(text, length, entry_start);
+    const char *ending = "\n";
+    size_t ending_length = 1;
+    if (header.next != header.content_end) {
+        ending = text + header.content_end;
+        ending_length = header.next - header.content_end;
+    }
+    if (used != 0 && config_output[used - 1] != '\n'
+        && !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    size_t indent_end = skip_blanks(text, header.start, header.content_end);
+    if (!output_append(&used, text + header.start, indent_end - header.start)
+        || !output_append(&used, PREVIOUS_HEADER, text_length(PREVIOUS_HEADER))
+        || !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    for (size_t s = header.next; s < entry_end;) {
+        struct line option = line_at(text, length, s);
+        size_t value_start;
+        size_t value_end;
+        size_t found;
+        bool is_path = (line_option(text, option, "path", &value_start,
+                                    &value_end)
+                        || line_option(text, option, "kernel_path",
+                                       &value_start, &value_end))
+            && find_folded(text, value_start, value_end, KERNEL_TAIL, &found)
+            && found + text_length(KERNEL_TAIL) == value_end;
+        if (is_path) {
+            if (!output_append(&used, text + option.start,
+                               found - option.start)
+                || !output_append(&used, OLD_KERNEL_TAIL,
+                                  text_length(OLD_KERNEL_TAIL))
+                || !output_append(&used, text + value_end,
+                                  option.next - value_end)) {
+                return 0;
+            }
+        } else if (!output_append(&used, text + option.start,
+                                  option.next - option.start)) {
+            return 0;
+        }
+        s = option.next;
+    }
+    if (used != 0 && config_output[used - 1] != '\n'
+        && !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    if (!output_append(&used, text + entry_end, length - entry_end)) {
+        return 0;
+    }
+    return used;
+}
+
 /* --------------------------------------------------------------- files */
 
 static size_t config_path(size_t index, char *path) {
@@ -459,4 +593,48 @@ enum boot_display_result boot_display_configure(uint32_t width,
     }
     boot_display_reload();
     return wrote ? BOOT_DISPLAY_OK : BOOT_DISPLAY_NOT_INSTALLED;
+}
+
+bool boot_display_add_previous_entry(void) {
+    if (!installed()) {
+        return false;
+    }
+    bool any = false;
+    bool failed = false;
+    for (size_t index = 0; index < VOLUME_NAME_COUNT * 2; index++) {
+        size_t length;
+        if (!read_config(index, &length)) {
+            continue;
+        }
+        size_t at;
+        bool present = false;
+        for (size_t start = 0; start < length;) {
+            struct line line = line_at(config_text, length, start);
+            if (line_is_header(config_text, line)
+                && find_folded(config_text, line.start, line.content_end,
+                               PREVIOUS_HEADER, &at)) {
+                present = true;
+                break;
+            }
+            start = line.next;
+        }
+        if (present) {
+            any = true;
+            continue;
+        }
+        size_t output_length = add_previous_entry(config_text, length);
+        if (output_length == 0) {
+            continue;
+        }
+        char path[CONFIG_PATH_CAPACITY];
+        size_t path_length = config_path(index, path);
+        if (vfs_write_file(path, path_length, (const uint8_t *)config_output,
+                           output_length)) {
+            any = true;
+        } else {
+            failed = true;
+        }
+    }
+    boot_display_reload();
+    return any && !failed;
 }

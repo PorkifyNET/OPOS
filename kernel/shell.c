@@ -505,6 +505,25 @@ static void shell_net_wait(bool started) {
     }
 }
 
+/* Whether /bin/NAME exists, for a NAME of letters, digits, '-' and '_'. */
+static bool bin_program_exists(const char *name, size_t length) {
+    char path[48] = "bin/";
+    if (length == 0 || length + 5 > sizeof(path)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+              || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+            return false;
+        }
+        path[4 + i] = c;
+    }
+    path[4 + length] = '\0';
+    struct initramfs_file file;
+    return initramfs_find_file(path, &file);
+}
+
 static void execute_command(void) {
     /* USB sticks may have come or gone since the last command. */
     (void)storage_poll();
@@ -534,7 +553,8 @@ static void execute_command(void) {
                              "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
                              "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest, "
-                             "net, dhcp, ping HOST, lookup NAME, http HOST[/PATH]\n");
+                             "net, dhcp, ping HOST, lookup NAME, http HOST[/PATH], "
+                             "update [install], fetch URL (any program in /bin runs by name)\n");
     } else if (command_matches(command, command_length, "echo")) {
         console_write_string(arguments);
         console_write_string("\n");
@@ -1058,6 +1078,28 @@ static void execute_command(void) {
             console_set_text_style(CONSOLE_TEXT_NORMAL);
             console_write_string("\n");
         }
+    } else if (bin_program_exists(command, command_length)
+               && 9 + command_length + 1 + arguments_length
+                  < SHELL_LINE_CAPACITY) {
+        /* "fetch URL" runs /bin/fetch: rewritten to "run /bin/fetch URL". */
+        char line[SHELL_LINE_CAPACITY];
+        size_t length = 0;
+        static const char prefix[] = "run /bin/";
+        for (size_t i = 0; prefix[i] != '\0'; i++) {
+            line[length++] = prefix[i];
+        }
+        for (size_t i = 0; i < command_length; i++) {
+            line[length++] = command[i];
+        }
+        line[length++] = ' ';
+        for (size_t i = 0; i < arguments_length; i++) {
+            line[length++] = arguments[i];
+        }
+        line[length] = '\0';
+        for (size_t i = 0; i <= length; i++) {
+            input_line[i] = line[i];
+        }
+        execute_command();
     } else {
         console_set_text_style(CONSOLE_TEXT_ERROR);
         console_write_string("Unknown command: ");

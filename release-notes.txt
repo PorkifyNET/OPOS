@@ -1,0 +1,5 @@
+OPOS 0.1.1: the first release with the OPOS Updater.
+
+- OPOS can update itself from GitHub Releases (Settings > UPDATES, or the update command).
+- Updates can also come from a CD/DVD or USB stick, or from a VM host (tools/serve-release.ps1).
+- Fix: file reads larger than 4 KB now return fewer bytes instead of failing.

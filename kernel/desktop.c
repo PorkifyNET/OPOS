@@ -364,31 +364,188 @@ static bool line_ctrl_key(char *text, size_t *length, size_t limit,
 
 /* ------------------------------------------------------------ terminal */
 
-#define TERMINAL_HISTORY 32
+#define TERMINAL_HISTORY 1000
 #define TERMINAL_COLUMNS 96
 
 static char terminal_line[64];
 static size_t terminal_length;
+/* Scrollback is a ring: terminal_line_at(0) is the oldest kept line. Every
+   line has an absolute number (terminal_dropped + index) so a selection
+   survives older lines falling off the front. */
 static char terminal_history[TERMINAL_HISTORY][TERMINAL_COLUMNS];
 static size_t terminal_history_count;
+static size_t terminal_history_start;
+static uint64_t terminal_dropped;
+/* Lines the view is scrolled up from the bottom. */
+static size_t terminal_scroll;
+/* Rows the Terminal showed last draw (PgUp/PgDn step). */
+static size_t terminal_page_rows = 10;
+/* Mouse selection: anchor and cursor as (absolute line, column). */
+static bool terminal_selecting;
+static uint64_t terminal_anchor_line, terminal_cursor_line;
+static size_t terminal_anchor_column, terminal_cursor_column;
+
+static char *terminal_line_at(size_t index) {
+    return terminal_history[(terminal_history_start + index)
+                            % TERMINAL_HISTORY];
+}
 
 static void terminal_print(const char *text) {
     if (terminal_history_count == TERMINAL_HISTORY) {
-        for (size_t i = 1; i < TERMINAL_HISTORY; i++) {
-            text_copy(terminal_history[i - 1], TERMINAL_COLUMNS,
-                      terminal_history[i]);
-        }
+        terminal_history_start = (terminal_history_start + 1)
+                               % TERMINAL_HISTORY;
+        terminal_dropped++;
         terminal_history_count--;
     }
-    text_copy(terminal_history[terminal_history_count++], TERMINAL_COLUMNS,
+    text_copy(terminal_line_at(terminal_history_count++), TERMINAL_COLUMNS,
               text);
+    /* A scrolled view stays on the same text while output arrives. */
+    if (terminal_scroll != 0 && terminal_scroll + 1 < terminal_history_count) {
+        terminal_scroll++;
+    }
 }
 
 static void terminal_reset(void) {
     terminal_length = 0;
     terminal_line[0] = '\0';
+    terminal_dropped += terminal_history_count;
     terminal_history_count = 0;
+    terminal_history_start = 0;
+    terminal_scroll = 0;
+    terminal_selecting = false;
     terminal_print("OPOS TERMINAL - TYPE HELP");
+}
+
+/* Text area of the Terminal window and how many history rows fit. */
+static size_t terminal_visible_rows(struct rect area) {
+    int64_t rows = (area.height - LINE_HEIGHT - 4 - 8) / LINE_HEIGHT;
+    return rows > 0 ? (size_t)rows : 0;
+}
+
+static size_t terminal_max_scroll(struct rect area) {
+    size_t visible = terminal_visible_rows(area);
+    return terminal_history_count > visible
+         ? terminal_history_count - visible : 0;
+}
+
+/* Index of the history line drawn in the top row. */
+static size_t terminal_first_row(struct rect area) {
+    size_t max = terminal_max_scroll(area);
+    if (terminal_scroll > max) {
+        terminal_scroll = max;
+    }
+    return max - terminal_scroll;
+}
+
+static void terminal_scroll_by(struct rect area, int64_t lines) {
+    int64_t next = (int64_t)terminal_scroll + lines;
+    int64_t max = (int64_t)terminal_max_scroll(area);
+    terminal_scroll = (size_t)(next < 0 ? 0 : next > max ? max : next);
+}
+
+/* Maps a pointer position to (absolute line, column), clamped to the text. */
+static void terminal_hit(struct rect area, int32_t x, int32_t y,
+                         uint64_t *line, size_t *column) {
+    size_t visible = terminal_visible_rows(area);
+    if (terminal_history_count == 0 || visible == 0) {
+        *line = terminal_dropped;
+        *column = 0;
+        return;
+    }
+    int64_t row = (y - (area.y + 8)) / LINE_HEIGHT;
+    if (y < area.y + 8) {
+        row = 0;
+    }
+    if (row >= (int64_t)visible) {
+        row = (int64_t)visible - 1;
+    }
+    size_t index = terminal_first_row(area) + (size_t)row;
+    if (index >= terminal_history_count) {
+        index = terminal_history_count - 1;
+    }
+    int64_t col = (x - (area.x + 10) + CHAR_WIDTH / 2) / CHAR_WIDTH;
+    size_t length = text_length(terminal_line_at(index));
+    if (x < area.x + 10 || col < 0) {
+        col = 0;
+    }
+    *line = terminal_dropped + index;
+    *column = (size_t)col > length ? length : (size_t)col;
+}
+
+/* Selection ends in reading order; false when nothing is selected. */
+static bool terminal_selection_range(uint64_t *first_line, size_t *first_col,
+                                     uint64_t *last_line, size_t *last_col) {
+    if (!terminal_selecting
+        || (terminal_anchor_line == terminal_cursor_line
+            && terminal_anchor_column == terminal_cursor_column)) {
+        return false;
+    }
+    bool anchor_first = terminal_anchor_line < terminal_cursor_line
+        || (terminal_anchor_line == terminal_cursor_line
+            && terminal_anchor_column < terminal_cursor_column);
+    *first_line = anchor_first ? terminal_anchor_line : terminal_cursor_line;
+    *first_col = anchor_first ? terminal_anchor_column : terminal_cursor_column;
+    *last_line = anchor_first ? terminal_cursor_line : terminal_anchor_line;
+    *last_col = anchor_first ? terminal_cursor_column : terminal_anchor_column;
+    return true;
+}
+
+/* Copies the selected text (lines joined with \n) to the clipboard. */
+static bool terminal_copy_selection(void) {
+    uint64_t first_line, last_line;
+    size_t first_col, last_col;
+    if (!terminal_selection_range(&first_line, &first_col, &last_line,
+                                  &last_col)) {
+        return false;
+    }
+    static char text[TERMINAL_HISTORY * (TERMINAL_COLUMNS + 1)];
+    size_t length = 0;
+    for (uint64_t line = first_line; line <= last_line; line++) {
+        if (line < terminal_dropped
+            || line - terminal_dropped >= terminal_history_count) {
+            continue;
+        }
+        const char *source = terminal_line_at((size_t)(line - terminal_dropped));
+        size_t from = line == first_line ? first_col : 0;
+        size_t to = line == last_line ? last_col : text_length(source);
+        size_t end = text_length(source);
+        if (to > end) {
+            to = end;
+        }
+        for (size_t i = from; i < to; i++) {
+            text[length++] = source[i];
+        }
+        if (line != last_line) {
+            text[length++] = '\n';
+        }
+    }
+    clipboard_set(text, length);
+    return true;
+}
+
+static void terminal_click(struct rect area, int32_t x, int32_t y) {
+    terminal_hit(area, x, y, &terminal_anchor_line, &terminal_anchor_column);
+    terminal_cursor_line = terminal_anchor_line;
+    terminal_cursor_column = terminal_anchor_column;
+    terminal_selecting = true;
+}
+
+static bool terminal_drag_motion(struct rect area, int32_t x, int32_t y) {
+    /* Past the top or bottom edge the view scrolls along. */
+    if (y < area.y + 8) {
+        terminal_scroll_by(area, 1);
+    } else if (y >= area.y + area.height - LINE_HEIGHT - 4) {
+        terminal_scroll_by(area, -1);
+    }
+    uint64_t line;
+    size_t column;
+    terminal_hit(area, x, y, &line, &column);
+    if (line == terminal_cursor_line && column == terminal_cursor_column) {
+        return y < area.y + 8 || y >= area.y + area.height - LINE_HEIGHT - 4;
+    }
+    terminal_cursor_line = line;
+    terminal_cursor_column = column;
+    return true;
 }
 
 /*
@@ -913,16 +1070,42 @@ static void draw_terminal(struct rect area, bool focused) {
     int64_t text_x = area.x + 10;
     int64_t text_width = area.width - 20;
     int64_t prompt_y = area.y + area.height - LINE_HEIGHT - 4;
-    int64_t visible = (prompt_y - area.y - 8) / LINE_HEIGHT;
-    if (visible < 0) {
-        visible = 0;
-    }
-    size_t first = terminal_history_count > (size_t)visible
-                 ? terminal_history_count - (size_t)visible : 0;
+    size_t visible = terminal_visible_rows(area);
+    terminal_page_rows = visible > 1 ? visible - 1 : 1;
+    size_t first = terminal_first_row(area);
     int64_t y = area.y + 8;
     bool colors = settings_get(SETTING_TERMINAL_COLORS);
-    for (size_t i = first; i < terminal_history_count; i++) {
-        const char *line = terminal_history[i];
+    uint64_t sel_first_line = 0, sel_last_line = 0;
+    size_t sel_first_col = 0, sel_last_col = 0;
+    bool has_selection = terminal_selection_range(
+        &sel_first_line, &sel_first_col, &sel_last_line, &sel_last_col);
+    for (size_t i = first; i < terminal_history_count && i < first + visible;
+         i++) {
+        const char *line = terminal_line_at(i);
+        uint64_t number = terminal_dropped + i;
+        if (has_selection && number >= sel_first_line
+            && number <= sel_last_line) {
+            size_t length = text_length(line);
+            size_t from = number == sel_first_line ? sel_first_col : 0;
+            size_t to = number == sel_last_line ? sel_last_col : length + 1;
+            if (from > length) {
+                from = length;
+            }
+            if (to > length + 1) {
+                to = length + 1;
+            }
+            if (to > from) {
+                int64_t left = text_x + (int64_t)from * CHAR_WIDTH;
+                int64_t right = text_x + (int64_t)to * CHAR_WIDTH;
+                if (right > text_x + text_width) {
+                    right = text_x + text_width;
+                }
+                if (right > left) {
+                    fill((struct rect){left, y, right - left, LINE_HEIGHT},
+                         50, 90, 150);
+                }
+            }
+        }
         bool echo = line[0] == 'O' && line[4] == '>';
         uint8_t red = echo ? 120 : 220;
         uint8_t green = echo ? 210 : 228;
@@ -8690,7 +8873,8 @@ enum drag_mode {
     DRAG_RESIZE,
     DRAG_SPLIT,
     DRAG_FILES, /* the Files selection (files_drag_*) */
-    DRAG_TASKBAR /* a taskbar button (taskbar_drag_motion) */
+    DRAG_TASKBAR, /* a taskbar button (taskbar_drag_motion) */
+    DRAG_TERMINAL /* a text selection in the Terminal */
 };
 
 #define EDGE_LEFT 1
@@ -9056,6 +9240,10 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         }
     } else if (kind == WINDOW_EDITOR) {
         editor_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_TERMINAL) {
+        terminal_click(content_rect(frame), x, y);
+        drag->active = true;
+        drag->mode = DRAG_TERMINAL;
     } else if (kind == WINDOW_INSTALLER) {
         installer_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_TASKS) {
@@ -9099,6 +9287,32 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
 
 /* Returns true when the focused terminal consumed the character. */
 static bool terminal_key(char character) {
+    struct rect terminal_area = content_rect(window_rect(WINDOW_TERMINAL));
+    if (character == KEY_PAGE_UP || character == KEY_PAGE_DOWN) {
+        terminal_scroll_by(terminal_area, character == KEY_PAGE_UP
+                           ? (int64_t)terminal_page_rows
+                           : -(int64_t)terminal_page_rows);
+        return true;
+    }
+    if (keyboard_last_ctrl() && character == KEY_HOME) {
+        terminal_scroll_by(terminal_area, (int64_t)TERMINAL_HISTORY);
+        return true;
+    }
+    if (keyboard_last_ctrl() && character == KEY_END) {
+        terminal_scroll = 0;
+        return true;
+    }
+    /* Ctrl+C copies a selection; without one it interrupts as before. */
+    if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
+        && terminal_copy_selection()) {
+        terminal_selecting = false;
+        return true;
+    }
+    if (!keyboard_last_ctrl() && (character == '\n' || character == '\b'
+                                  || (character >= ' ' && character <= '~'))) {
+        terminal_scroll = 0;
+        terminal_selecting = false;
+    }
     if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
         && terminal_net_session && net_session_active()) {
         net_session_stop();
@@ -10645,6 +10859,11 @@ static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
         }
         return true;
     }
+    if (kind == WINDOW_TERMINAL) {
+        size_t before = terminal_scroll;
+        terminal_scroll_by(area, (int64_t)notches * WHEEL_ROWS);
+        return terminal_scroll != before;
+    }
     if (kind == WINDOW_EDITOR && !editor_prompt_active) {
         struct rect text = editor_text_rect(area);
         size_t visible = text.height > 0 ? (size_t)(text.height / LINE_HEIGHT)
@@ -10733,6 +10952,10 @@ static bool desktop_step(void) {
                 redraw |= files_drag_motion(mouse.x, mouse.y);
             } else if (loop_drag.mode == DRAG_TASKBAR) {
                 redraw |= taskbar_drag_motion(&loop_drag, mouse.x, mouse.y);
+            } else if (loop_drag.mode == DRAG_TERMINAL) {
+                redraw |= terminal_drag_motion(
+                    content_rect(window_rect(WINDOW_TERMINAL)),
+                    mouse.x, mouse.y);
             } else {
                 redraw |= handle_drag(&loop_drag, mouse.x, mouse.y);
             }

@@ -22,6 +22,7 @@
 #include "scheduler.h"
 #include "storage.h"
 #include "svga.h"
+#include "boot_display.h"
 #include "vmware.h"
 #include "timer.h"
 #include "user.h"
@@ -3279,7 +3280,20 @@ static void setting_value_text(const struct setting_row *row,
     case ROW_RESOLUTION: {
         uint32_t width = 0, height = 0;
         size_t mode = svga_current_mode();
-        if (vmware_autofit_enabled()) {
+        if (!svga_available()) {
+            /* Boot resolution: the installed limine.conf's choice, or the
+               running size when OPOS is not installed. */
+            if (!boot_display_configured(&width, &height)) {
+                boot_display_running(&width, &height);
+            }
+            if (width == 0) {
+                length = append_text(text, capacity, length, "DEFAULT");
+            } else {
+                length = append_decimal(text, capacity, length, width);
+                length = append_text(text, capacity, length, "x");
+                length = append_decimal(text, capacity, length, height);
+            }
+        } else if (vmware_autofit_enabled()) {
             length = append_text(text, capacity, length, "AUTOFIT");
         } else if (mode == 0) {
             length = append_text(text, capacity, length, "DEFAULT");
@@ -3364,9 +3378,48 @@ static int wrap_step(int value, int delta, int low, int high) {
  * sizes the adapter cannot show. Applies and saves the choice. Choice
  * index svga_mode_count() stands for AUTOFIT.
  */
+/*
+ * Without the SVGA adapter: steps through DEFAULT and the firmware's modes
+ * and writes the choice into the installed limine.conf for the next boot.
+ */
+static void settings_change_boot_resolution(int delta) {
+    uint32_t width;
+    uint32_t height;
+    if (!boot_display_configured(&width, &height)) {
+        set_status("INSTALL OPOS TO CHANGE THE RESOLUTION");
+        return;
+    }
+    int count = (int)boot_display_mode_count();
+    int current = 0; /* DEFAULT, or a size the firmware does not list */
+    for (int i = 0; i < count && width != 0; i++) {
+        uint32_t mode_width;
+        uint32_t mode_height;
+        if (boot_display_mode_size((size_t)i, &mode_width, &mode_height)
+            && mode_width == width && mode_height == height) {
+            current = i + 1;
+        }
+    }
+    int choice = wrap_step(current, delta < 0 ? -1 : 1, 0, count);
+    width = 0;
+    height = 0;
+    if (choice != 0) {
+        boot_display_mode_size((size_t)choice - 1, &width, &height);
+    }
+    enum boot_display_result result = boot_display_configure(width, height);
+    if (result == BOOT_DISPLAY_NOT_ADMIN) {
+        set_status("ONLY AN ADMINISTRATOR CAN CHANGE THE RESOLUTION");
+    } else if (result != BOOT_DISPLAY_OK) {
+        set_status(result == BOOT_DISPLAY_NOT_INSTALLED
+                   ? "INSTALL OPOS TO CHANGE THE RESOLUTION"
+                   : "SAVING THE BOOT MENU FAILED");
+    } else {
+        set_status("THE NEW RESOLUTION APPLIES AFTER A RESTART");
+    }
+}
+
 static void settings_change_resolution(int delta) {
     if (!svga_available()) {
-        set_status("THIS DISPLAY CANNOT CHANGE RESOLUTION");
+        settings_change_boot_resolution(delta);
         return;
     }
     int count = (int)svga_mode_count();

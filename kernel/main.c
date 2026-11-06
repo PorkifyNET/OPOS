@@ -36,6 +36,7 @@
 #include "storage.h"
 #include "xhci.h"
 #include "optical.h"
+#include "boot_display.h"
 
 #define COM1 0x3f8
 #define GLYPH_SCALE 2
@@ -50,7 +51,7 @@ static volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_framebuffer_request framebuffer_request = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
-    .revision = 0
+    .revision = 1
 };
 
 __attribute__((used, section(".limine_requests")))
@@ -1008,6 +1009,20 @@ static bool framebuffer_initialize(void) {
         || framebuffer->blue_mask_shift + framebuffer->blue_mask_size > 32) {
         return false;
     }
+
+    /* Firmware modes (revision 1 responses), for the Settings RESOLUTION row. */
+    if (framebuffer_request.response->revision >= 1) {
+        for (uint64_t i = 0; i < framebuffer->mode_count; i++) {
+            const struct limine_video_mode *mode = framebuffer->modes[i];
+            if (mode != NULL && mode->bpp == 32
+                && mode->memory_model == LIMINE_FRAMEBUFFER_RGB) {
+                boot_display_add_mode((uint32_t)mode->width,
+                                      (uint32_t)mode->height);
+            }
+        }
+    }
+    boot_display_set_running((uint32_t)framebuffer->width,
+                             (uint32_t)framebuffer->height);
 
     framebuffer_state = *framebuffer;
     boot_framebuffer = *framebuffer;

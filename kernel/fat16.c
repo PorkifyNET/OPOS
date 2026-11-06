@@ -263,6 +263,8 @@ static bool disk_start_is_blank(uint64_t disk_sectors) {
     return true;
 }
 
+static void remember_label(void);
+
 static bool mount_volume(uint32_t first_sector, uint32_t sectors) {
     if (!parse_volume(first_sector, sectors, &volume)) {
         volume = (struct fat16_volume){0};
@@ -270,6 +272,7 @@ static bool mount_volume(uint32_t first_sector, uint32_t sectors) {
     }
     volume_ready = true;
     disk_state = FAT_DISK_MOUNTED;
+    remember_label();
     return true;
 }
 
@@ -2788,9 +2791,15 @@ struct fat_volume_slot {
     enum fat_disk_state disk_state;
     bool fsinfo_invalidated;
     char label[12];
+    /* New for every extra mount, so open files can tell that their
+       volume was unmounted (USB unplug) and the slot reused. */
+    uint32_t generation;
+    /* block_disk_generation of the disk when mounted. */
+    uint32_t disk_generation;
 };
 
 static struct fat_volume_slot slots[FAT16_MAX_VOLUMES];
+static uint32_t next_generation = 1;
 static size_t current_slot;
 
 static void slot_save(void) {
@@ -2819,7 +2828,13 @@ static void slot_load(size_t index) {
 }
 
 bool fat16_use(size_t index) {
-    if (index >= FAT16_MAX_VOLUMES || (index != 0 && !slots[index].used)) {
+    if (index >= FAT16_MAX_VOLUMES || (index != 0 && !slots[index].used)
+        /* The disk went away (USB unplug) before storage_poll noticed:
+           selecting the slot would leave another disk active, or apply
+           this volume's layout to a different stick. */
+        || (index != 0
+            && block_disk_generation(slots[index].disk)
+                   != slots[index].disk_generation)) {
         return false;
     }
     if (index != current_slot) {
@@ -2833,14 +2848,38 @@ size_t fat16_current_volume(void) {
     return current_slot;
 }
 
-/* Volume label from the boot sector, trimmed; "" for NO NAME. */
+/* Volume label, trimmed; "" for NO NAME. Windows and mtools keep the
+   label the user set in a root directory entry with the volume ID
+   attribute, and often leave the boot sector copy at NO NAME, so the root
+   entry wins. */
 static void read_label(char label[12]) {
     uint8_t sector[SECTOR_SIZE];
     label[0] = '\0';
-    if (!volume_ready || !block_read_sectors(volume.first_sector, 1, sector)) {
+    if (!volume_ready) {
         return;
     }
-    const uint8_t *text = sector + (volume.fat32 ? 71 : 43);
+    const uint8_t *text = NULL;
+    for (size_t index = 0; index < 64; index++) {
+        struct fat16_node node;
+        if (!fat16_directory_node_at(0, index, &node) || node.name[0] == 0) {
+            break;
+        }
+        if (node.name[0] != 0xe5
+            && node.attributes != FAT16_ATTRIBUTE_LONG_NAME
+            && (node.attributes & FAT16_ATTRIBUTE_VOLUME_ID) != 0) {
+            for (size_t i = 0; i < 11; i++) {
+                sector[i] = node.name[i];
+            }
+            text = sector;
+            break;
+        }
+    }
+    if (text == NULL) {
+        if (!block_read_sectors(volume.first_sector, 1, sector)) {
+            return;
+        }
+        text = sector + (volume.fat32 ? 71 : 43);
+    }
     size_t length = 0;
     for (size_t i = 0; i < 11; i++) {
         uint8_t character = text[i];
@@ -2859,6 +2898,11 @@ static void read_label(char label[12]) {
     if (unnamed) {
         label[0] = '\0';
     }
+}
+
+/* Called by mount_volume for the slot being mounted. */
+static void remember_label(void) {
+    read_label(slots[current_slot].label);
 }
 
 /* Mounts the FAT volume at first..first+sectors of `disk` into a free
@@ -2881,7 +2925,8 @@ static void mount_extra(size_t disk, uint32_t first, uint32_t sectors) {
     forget_volume();
     fsinfo_invalidated = false;
     if (mount_volume(first, sectors)) {
-        read_label(slots[free_slot].label);
+        slots[free_slot].generation = next_generation++;
+        slots[free_slot].disk_generation = block_disk_generation(disk);
         slot_save();
     } else {
         slots[free_slot].used = false;
@@ -2898,44 +2943,67 @@ void fat16_unmount_others(size_t disk) {
     }
 }
 
+/* Mounts every FAT volume on one disk into free slots, skipping the
+   system volume. */
+static void mount_disk_volumes(size_t disk, size_t system_disk,
+                               uint32_t system_first) {
+    uint8_t sector[SECTOR_SIZE];
+    struct block_disk_info info;
+    if (!block_disk_info(disk, &info)
+        || !block_disk_read(disk, 0, 1, sector)) {
+        return;
+    }
+    /* A FAT boot sector at LBA 0 (no partition table) also ends in
+       0x55AA; its boot code must not be read as partition entries. */
+    bool whole_disk_fat = (sector[0] == 0xeb || sector[0] == 0xe9)
+        && read_le16(sector + 11) == SECTOR_SIZE && sector[13] != 0;
+    static struct partition_table table;
+    if (!whole_disk_fat && partition_read(disk, &table)) {
+        for (size_t i = 0; i < table.count; i++) {
+            const struct partition_entry *partition = &table.entries[i];
+            uint64_t first = partition->first;
+            uint64_t count = partition->sectors;
+            /* EFI system partitions are FAT too; they are shown but
+               never chosen as the system volume. */
+            if ((!supported_partition_type(partition->type)
+                 && partition->type != EFI_SYSTEM_PARTITION_TYPE)
+                || first == 0 || count == 0 || first + count > info.sectors
+                || first + count > UINT32_MAX
+                || (disk == system_disk && first == system_first)) {
+                continue;
+            }
+            mount_extra(disk, (uint32_t)first, (uint32_t)count);
+        }
+    }
+    if (whole_disk_fat && info.sectors <= UINT32_MAX
+        && !(disk == system_disk && system_first == 0)) {
+        mount_extra(disk, 0, (uint32_t)info.sectors);
+    }
+}
+
 void fat16_mount_others(void) {
     fat16_unmount_others(BLOCK_NO_DISK);
     size_t system_disk = block_active_disk();
     uint32_t system_first = volume_ready ? volume.first_sector : UINT32_MAX;
-    uint8_t sector[SECTOR_SIZE];
     for (size_t disk = 0; disk < block_disk_count(); disk++) {
-        struct block_disk_info info;
-        if (!block_disk_info(disk, &info)
-            || !block_disk_read(disk, 0, 1, sector)) {
-            continue;
-        }
-        /* A FAT boot sector at LBA 0 (no partition table) also ends in
-           0x55AA; its boot code must not be read as partition entries. */
-        bool whole_disk_fat = (sector[0] == 0xeb || sector[0] == 0xe9)
-            && read_le16(sector + 11) == SECTOR_SIZE && sector[13] != 0;
-        static struct partition_table table;
-        if (!whole_disk_fat && partition_read(disk, &table)) {
-            for (size_t i = 0; i < table.count; i++) {
-                const struct partition_entry *partition = &table.entries[i];
-                uint64_t first = partition->first;
-                uint64_t count = partition->sectors;
-                /* EFI system partitions are FAT too; they are shown but
-                   never chosen as the system volume. */
-                if ((!supported_partition_type(partition->type)
-                     && partition->type != EFI_SYSTEM_PARTITION_TYPE)
-                    || first == 0 || count == 0 || first + count > info.sectors
-                    || first + count > UINT32_MAX
-                    || (disk == system_disk && first == system_first)) {
-                    continue;
-                }
-                mount_extra(disk, (uint32_t)first, (uint32_t)count);
-            }
-        }
-        if (whole_disk_fat && info.sectors <= UINT32_MAX
-            && !(disk == system_disk && system_first == 0)) {
-            mount_extra(disk, 0, (uint32_t)info.sectors);
+        mount_disk_volumes(disk, system_disk, system_first);
+    }
+}
+
+void fat16_mount_disk(size_t disk) {
+    (void)fat16_use(0);
+    for (size_t i = 1; i < FAT16_MAX_VOLUMES; i++) {
+        if (slots[i].used && slots[i].disk == disk) {
+            return; /* already mounted */
         }
     }
+    mount_disk_volumes(disk, block_active_disk(),
+                       volume_ready ? volume.first_sector : UINT32_MAX);
+}
+
+uint32_t fat16_volume_generation(size_t index) {
+    return index < FAT16_MAX_VOLUMES && slots[index].used
+        ? slots[index].generation : 0;
 }
 
 bool fat16_volume_info(size_t index, struct fat16_volume_info *info) {
@@ -2946,7 +3014,9 @@ bool fat16_volume_info(size_t index, struct fat16_volume_info *info) {
         slot_save();
     }
     const struct fat_volume_slot *slot = &slots[index];
-    if (!slot->used || !slot->volume_ready) {
+    if (!slot->used || !slot->volume_ready
+        || (index != 0
+            && block_disk_generation(slot->disk) != slot->disk_generation)) {
         return false;
     }
     info->disk = slot->disk;

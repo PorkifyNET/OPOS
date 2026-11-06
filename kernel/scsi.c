@@ -21,11 +21,21 @@ struct scsi_disk {
     uint8_t target;
     uint64_t sectors;
     char model[26];
+    /* False once the device is gone (USB unplug); the slot then reads
+       as empty and can be reused by the next device. */
+    bool present;
+    /* INQUIRY RMB: removable medium (USB sticks, card readers). */
+    bool removable;
+    /* New for every device put in this slot. */
+    uint32_t generation;
 };
 
 static struct scsi_disk disks[SCSI_MAX_DISKS];
 static size_t disk_count;
 static bool flush_deferred;
+/* CD/DVD targets; `sectors` is unused (optical.c asks the drive). */
+static struct scsi_disk cdroms[SCSI_MAX_CDROMS];
+static size_t cdrom_count;
 
 /* Retries after CHECK CONDITION, e.g. the unit attention every target
    reports once after a reset. */
@@ -76,24 +86,40 @@ static void set_model(struct scsi_disk *disk, const uint8_t *inquiry) {
     disk->model[length] = '\0';
 }
 
-static void probe_target(const struct scsi_host *host, uint8_t target) {
+static uint32_t next_generation = 1;
+
+static bool probe_target(const struct scsi_host *host, uint8_t target) {
     uint8_t *data = host->buffer;
     uint8_t inquiry[6] = {SCSI_INQUIRY, 0, 0, 0, 36, 0};
     if (!command(host, target, inquiry, 6, SCSI_DATA_IN, 36)) {
-        return;
+        return false;
+    }
+    /* Peripheral qualifier 0 (connected), device type 5 (CD/DVD). */
+    if (data[0] == 0x05) {
+        if (cdrom_count < SCSI_MAX_CDROMS) {
+            struct scsi_disk *cdrom = &cdroms[cdrom_count++];
+            *cdrom = (struct scsi_disk){.host = host, .target = target};
+            set_model(cdrom, data);
+        }
+        return false;
     }
     /* Peripheral qualifier 0 (connected), device type 0 (disk). */
     if (data[0] != 0x00) {
-        return;
+        return false;
     }
-    struct scsi_disk disk = {.host = host, .target = target};
+    struct scsi_disk disk = {
+        .host = host,
+        .target = target,
+        .present = true,
+        .removable = (data[1] & 0x80) != 0 || host->hotplug,
+    };
     set_model(&disk, data);
     uint8_t ready[6] = {SCSI_TEST_UNIT_READY};
     (void)command(host, target, ready, 6, SCSI_DATA_NONE, 0);
 
     uint8_t capacity10[10] = {SCSI_READ_CAPACITY_10};
     if (!command(host, target, capacity10, 10, SCSI_DATA_IN, 8)) {
-        return;
+        return false;
     }
     uint64_t last = be32(data);
     uint32_t block_size = be32(data + 4);
@@ -102,45 +128,91 @@ static void probe_target(const struct scsi_host *host, uint8_t target) {
                                   SCSI_READ_CAPACITY_16};
         capacity16[13] = 32;
         if (!command(host, target, capacity16, 16, SCSI_DATA_IN, 32)) {
-            return;
+            return false;
         }
         last = ((uint64_t)be32(data) << 32) | be32(data + 4);
         block_size = be32(data + 8);
     }
-    if (block_size != SECTOR_SIZE || disk_count >= SCSI_MAX_DISKS) {
-        return;
+    /* Reuse the slot of a device that was unplugged, else append. */
+    size_t slot = disk_count;
+    for (size_t i = 0; i < disk_count; i++) {
+        if (!disks[i].present) {
+            slot = i;
+            break;
+        }
+    }
+    if (block_size != SECTOR_SIZE || slot >= SCSI_MAX_DISKS) {
+        return false;
     }
     disk.sectors = last + 1;
-    disks[disk_count++] = disk;
+    disk.generation = next_generation++;
+    disks[slot] = disk;
+    if (slot == disk_count) {
+        disk_count++;
+    }
+    return true;
 }
 
 size_t scsi_scan_host(const struct scsi_host *host, unsigned target_count) {
-    size_t before = disk_count;
+    size_t added = 0;
     if (host == NULL || host->buffer == NULL || host->buffer_size < 4096) {
         return 0;
     }
     for (unsigned target = 0;
          target < target_count && target < SCSI_MAX_TARGETS; target++) {
-        probe_target(host, (uint8_t)target);
+        if (probe_target(host, (uint8_t)target)) {
+            added++;
+        }
     }
-    return disk_count - before;
+    return added;
+}
+
+bool scsi_probe_target(const struct scsi_host *host, uint8_t target) {
+    return host != NULL && host->buffer != NULL && host->buffer_size >= 4096
+        && probe_target(host, target);
+}
+
+void scsi_remove_target(const struct scsi_host *host, uint8_t target) {
+    for (size_t i = 0; i < disk_count; i++) {
+        if (disks[i].present && disks[i].host == host
+            && disks[i].target == target) {
+            disks[i].present = false;
+            disks[i].sectors = 0;
+        }
+    }
 }
 
 size_t scsi_disk_count(void) {
     return disk_count;
 }
 
+bool scsi_disk_present(size_t disk) {
+    return disk < disk_count && disks[disk].present;
+}
+
+uint32_t scsi_disk_generation(size_t disk) {
+    return scsi_disk_present(disk) ? disks[disk].generation : 0;
+}
+
+bool scsi_removable(size_t disk) {
+    return scsi_disk_present(disk) && disks[disk].removable;
+}
+
 uint64_t scsi_sector_count(size_t disk) {
-    return disk < disk_count ? disks[disk].sectors : 0;
+    return scsi_disk_present(disk) ? disks[disk].sectors : 0;
 }
 
 const char *scsi_model(size_t disk) {
-    return disk < disk_count ? disks[disk].model : "";
+    return scsi_disk_present(disk) ? disks[disk].model : "";
 }
 
 void scsi_location(size_t disk, char *buffer, size_t capacity) {
     size_t length = 0;
     if (capacity == 0) {
+        return;
+    }
+    if (disk < disk_count && disks[disk].host->location != NULL) {
+        disks[disk].host->location(disks[disk].target, buffer, capacity);
         return;
     }
     if (disk < disk_count) {
@@ -212,7 +284,7 @@ bool scsi_read_sectors(size_t disk, uint32_t first_sector,
 }
 
 bool scsi_flush(size_t disk) {
-    if (disk >= disk_count) {
+    if (!scsi_disk_present(disk)) {
         return false;
     }
     uint8_t cdb[10] = {SCSI_SYNCHRONIZE_CACHE_10};
@@ -251,4 +323,67 @@ bool scsi_write_sectors(size_t disk, uint32_t first_sector,
         done += chunk;
     }
     return flush_deferred || scsi_flush(disk);
+}
+
+/* ------------------------------------------------------------ CD/DVD */
+
+size_t scsi_cdrom_count(void) {
+    return cdrom_count;
+}
+
+const char *scsi_cdrom_model(size_t drive) {
+    return drive < cdrom_count ? cdroms[drive].model : "";
+}
+
+void scsi_cdrom_location(size_t drive, char *buffer, size_t capacity) {
+    size_t length = 0;
+    if (capacity == 0) {
+        return;
+    }
+    if (drive < cdrom_count) {
+        const char *parts[2] = {cdroms[drive].host->name, " TARGET "};
+        for (size_t p = 0; p < 2; p++) {
+            for (const char *c = parts[p]; *c != '\0' && length + 1 < capacity;
+                 c++) {
+                buffer[length++] = *c;
+            }
+        }
+        unsigned target = cdroms[drive].target;
+        if (target >= 10 && length + 1 < capacity) {
+            buffer[length++] = (char)('0' + target / 10);
+        }
+        if (length + 1 < capacity) {
+            buffer[length++] = (char)('0' + target % 10);
+        }
+    }
+    buffer[length] = '\0';
+}
+
+uint32_t scsi_cdrom_limit(size_t drive) {
+    return drive < cdrom_count ? cdroms[drive].host->buffer_size : 0;
+}
+
+enum scsi_result scsi_cdrom_packet(size_t drive, const uint8_t cdb[12],
+                                   void *buffer, uint32_t length) {
+    if (drive >= cdrom_count || cdb == NULL
+        || (length != 0 && buffer == NULL)) {
+        return SCSI_FAILED;
+    }
+    const struct scsi_host *host = cdroms[drive].host;
+    if (length > host->buffer_size) {
+        return SCSI_FAILED;
+    }
+    /* The CDB length follows from the opcode's group. */
+    uint8_t group = cdb[0] >> 5;
+    uint8_t cdb_length = group == 0 ? 6 : group == 5 ? 12 : 10;
+    enum scsi_result result =
+        host->execute(cdroms[drive].target, cdb, cdb_length,
+                      length != 0 ? SCSI_DATA_IN : SCSI_DATA_NONE, length);
+    if (result == SCSI_OK && length != 0) {
+        uint8_t *destination = buffer;
+        for (uint32_t i = 0; i < length; i++) {
+            destination[i] = host->buffer[i];
+        }
+    }
+    return result;
 }

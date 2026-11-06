@@ -96,6 +96,12 @@ size_t fat16_current_volume(void);
 void fat16_mount_others(void);
 /* Drops extra volumes on `disk` (BLOCK_NO_DISK: all of them). */
 void fat16_unmount_others(size_t disk);
+/* Mounts the FAT volumes of one disk (a USB stick that was plugged in)
+   into free slots; the other mounts keep their slots. */
+void fat16_mount_disk(size_t disk);
+/* Changes whenever a slot is mounted again; 0 for slot 0 and unused
+   slots. */
+uint32_t fat16_volume_generation(size_t volume);
 bool fat16_volume_info(size_t volume, struct fat16_volume_info *info);
 /* Makes the system volume (/disk) current and reports whether it is
    mounted. Code outside the VFS calls this before other fat16_* calls. */

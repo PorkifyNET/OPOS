@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "scsi.h"
+
 #define AHCI_MODEL_LENGTH 40
 
 struct ahci_status {
@@ -26,5 +28,17 @@ bool ahci_read_sectors(size_t disk, uint32_t first_sector,
                        uint8_t sector_count, void *buffer);
 bool ahci_write_sectors(size_t disk, uint32_t first_sector,
                         uint8_t sector_count, const void *buffer);
+
+/* ATAPI CD/DVD drives on the same controller (at most 4), numbered in
+   port order. Driven with packet commands by optical.c. */
+size_t ahci_atapi_count(void);
+const char *ahci_atapi_model(size_t drive);
+uint32_t ahci_atapi_port(size_t drive);
+/* Most bytes one ahci_packet call moves. */
+uint32_t ahci_packet_limit(void);
+/* Runs a 12-byte SCSI command, reading `length` bytes into buffer (NULL
+   and 0 for commands without data). */
+enum scsi_result ahci_packet(size_t drive, const uint8_t cdb[12],
+                             void *buffer, uint32_t length);
 
 #endif

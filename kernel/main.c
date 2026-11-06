@@ -32,6 +32,10 @@
 #include "vmware.h"
 #include "font.h"
 #include "installer.h"
+#include "iso9660.h"
+#include "storage.h"
+#include "xhci.h"
+#include "optical.h"
 
 #define COM1 0x3f8
 #define GLYPH_SCALE 2
@@ -1235,6 +1239,25 @@ void kmain(void) {
         console_write_string("OPOS: no usable IDE, SATA, NVMe or SCSI disk found\n");
     }
 
+    /* CD/DVD drives, and the disc in each (mounted at /cdrom...). */
+    optical_initialize();
+    iso_refresh();
+    for (size_t i = 0; i < optical_drive_count(); i++) {
+        struct optical_drive_info info;
+        if (optical_drive_info(i, &info)) {
+            serial_write_string("OPOS: CD/DVD drive ");
+            serial_write_string(info.location);
+            serial_write_string(" \"");
+            serial_write_string(info.model);
+            serial_write_string(iso_mounted(i) ? "\" (disc \"" : "\"");
+            if (iso_mounted(i)) {
+                serial_write_string(iso_label(i));
+                serial_write_string("\")");
+            }
+            serial_write_string("\n");
+        }
+    }
+
     /* After the disk, so the saved resolution can come from OPOS.CFG. */
     if (svga_initialize()) {
         console_write_string("OPOS: VMware SVGA II display found\n");
@@ -1266,6 +1289,22 @@ void kmain(void) {
     }
     interrupts_enable();
     keyboard_start_leds();
+
+    /* USB (xHCI, only under a hypervisor) and the sticks plugged in.
+       After interrupts are on: the driver times itself with the timer. */
+    storage_initialize();
+    serial_write_string(xhci_ready() ? "OPOS: USB controller ready\n"
+                                     : "OPOS: no USB controller used\n");
+    for (size_t i = 0; i < block_disk_count(); i++) {
+        struct block_disk_info info;
+        if (block_disk_info(i, &info) && info.removable) {
+            serial_write_string("OPOS: USB disk ");
+            serial_write_string(info.location);
+            serial_write_string(" \"");
+            serial_write_string(info.model);
+            serial_write_string("\"\n");
+        }
+    }
 
     uint64_t reported_dropped_characters = 0;
     bool boot_shell = settings_take_boot_shell_once();

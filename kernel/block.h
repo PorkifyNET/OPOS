@@ -25,6 +25,8 @@ struct block_disk_info {
     char location[32];
     /* OPOS was booted from this disk (the boot loader's disk ID matches). */
     bool boot_disk;
+    /* Removable medium, e.g. a USB stick. */
+    bool removable;
 };
 
 /* The boot loader's identity of the disk it loaded OPOS from: the MBR disk
@@ -37,7 +39,16 @@ void block_set_boot_identity(uint32_t mbr_disk_id, const uint8_t gpt_guid[16]);
    when the boot disk is not among them (for example a live CD). Initialize
    AHCI, NVMe and the SCSI host drivers first. */
 enum block_device block_initialize(void);
+/* Disk slots; a slot whose device was unplugged stays (indexes are
+   stable) but is not present: block_disk_info then fails and transfers
+   fail. */
 size_t block_disk_count(void);
+bool block_disk_present(size_t index);
+/* Adds SCSI disks that appeared since (USB hot-plug); true if any. */
+bool block_rescan(void);
+/* Changes when a different device takes the slot (USB); 0 when absent,
+   1 for fixed disks. */
+uint32_t block_disk_generation(size_t index);
 bool block_disk_info(size_t index, struct block_disk_info *info);
 /* Reads from any listed disk without changing the active one. */
 bool block_disk_read(size_t index, uint32_t first_sector,

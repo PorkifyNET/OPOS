@@ -32,9 +32,18 @@
    IDENTIFY wait gives up quickly instead of spinning the full limit. */
 #define ATA_PROBE_POLL_LIMIT 100000
 
+#define ATA_FEATURES 1
+#define ATA_COMMAND_PACKET 0xa0
+#define ATA_COMMAND_IDENTIFY_PACKET 0xa1
+/* Packet commands wait for the drive itself (spin-up, seeks), so they get
+   a much longer poll limit than register commands. */
+#define ATA_PACKET_POLL_LIMIT 50000000
+
 struct ata_unit {
     bool ready;
     bool lba48;
+    /* ATAPI CD/DVD drive (ready stays false: it is not a disk). */
+    bool atapi;
     uint64_t sector_count;
     char model[ATA_MODEL_LENGTH + 1];
 };
@@ -241,6 +250,136 @@ static void copy_model(const uint16_t *identify, char *model) {
     }
 }
 
+/* ------------------------------------------------------ ATAPI (CD/DVD) */
+
+/* After IDENTIFY was aborted with the ATAPI signature. */
+static bool probe_atapi(size_t unit) {
+    struct ata_unit *state = &units[unit];
+    uint16_t base = base_of(unit);
+    io_out8(base + ATA_COMMAND, ATA_COMMAND_IDENTIFY_PACKET);
+    ata_delay_400ns(unit);
+    if (!ata_wait_status_limit(unit, true, ATA_PROBE_POLL_LIMIT)) {
+        return false;
+    }
+    uint16_t identify[256];
+    for (size_t i = 0; i < 256; i++) {
+        identify[i] = io_in16(base + ATA_DATA);
+    }
+    /* Word 0: bits 15-14 = 10b (ATAPI), bits 12-8 = 5 (CD/DVD). */
+    if ((identify[0] >> 14) != 2 || ((identify[0] >> 8) & 0x1f) != 5) {
+        return false;
+    }
+    copy_model(identify, state->model);
+    state->atapi = true;
+    return true;
+}
+
+bool ata_is_atapi(size_t unit) {
+    return unit < ATA_UNIT_COUNT && units[unit].atapi;
+}
+
+const char *ata_atapi_model(size_t unit) {
+    return ata_is_atapi(unit) ? units[unit].model : "";
+}
+
+/* Waits until BSY clears; *status gets the final status. */
+static bool packet_wait(size_t unit, uint8_t *status) {
+    uint16_t base = base_of(unit);
+    for (unsigned i = 0; i < ATA_PACKET_POLL_LIMIT; i++) {
+        uint8_t value = io_in8(base + ATA_STATUS);
+        if (value == 0xff) {
+            return false;
+        }
+        if ((value & ATA_STATUS_BUSY) == 0) {
+            *status = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+enum scsi_result ata_packet(size_t unit, const uint8_t cdb[12], void *buffer,
+                            uint32_t length) {
+    if (!ata_is_atapi(unit) || cdb == NULL || length > ATA_PACKET_LIMIT
+        || (length != 0 && buffer == NULL)) {
+        return SCSI_FAILED;
+    }
+    uint16_t base = base_of(unit);
+    uint8_t status;
+    io_out8(base + ATA_DRIVE_HEAD, (uint8_t)(0xa0 | drive_bits(unit)));
+    ata_delay_400ns(unit);
+    if (!packet_wait(unit, &status)) {
+        return SCSI_FAILED;
+    }
+    /* Byte count limit: how much the drive may send per DRQ block. */
+    uint32_t limit = length > 0xf800 ? 0xf800 : length;
+    io_out8(base + ATA_FEATURES, 0); /* PIO, no overlap */
+    io_out8(base + ATA_SECTOR_COUNT, 0);
+    io_out8(base + ATA_LBA_LOW, 0);
+    io_out8(base + ATA_LBA_MID, (uint8_t)limit);
+    io_out8(base + ATA_LBA_HIGH, (uint8_t)(limit >> 8));
+    io_out8(base + ATA_COMMAND, ATA_COMMAND_PACKET);
+    ata_delay_400ns(unit);
+    if (!packet_wait(unit, &status)) {
+        return SCSI_FAILED;
+    }
+    if ((status & ATA_STATUS_ERROR) != 0) {
+        return SCSI_CHECK_CONDITION;
+    }
+    if ((status & ATA_STATUS_DRQ) == 0) {
+        return SCSI_FAILED;
+    }
+    for (size_t i = 0; i < 12; i += 2) {
+        io_out16(base + ATA_DATA, (uint16_t)(cdb[i] | (cdb[i + 1] << 8)));
+    }
+
+    uint8_t *destination = buffer;
+    uint32_t done = 0;
+    for (;;) {
+        ata_delay_400ns(unit);
+        if (!packet_wait(unit, &status)) {
+            return SCSI_FAILED;
+        }
+        if ((status & ATA_STATUS_ERROR) != 0) {
+            return SCSI_CHECK_CONDITION;
+        }
+        if ((status & ATA_STATUS_DEVICE_FAULT) != 0) {
+            return SCSI_FAILED;
+        }
+        if ((status & ATA_STATUS_DRQ) == 0) {
+            break;
+        }
+        uint32_t bytes = (uint32_t)io_in8(base + ATA_LBA_MID)
+            | ((uint32_t)io_in8(base + ATA_LBA_HIGH) << 8);
+        if (bytes == 0) {
+            return SCSI_FAILED;
+        }
+        uint32_t words = (bytes + 1) / 2;
+        if ((bytes & 1) == 0 && done + bytes <= length) {
+            /* The usual case: a whole block fits, move it in one go. */
+            void *target = destination + done;
+            size_t count = words;
+            __asm__ volatile ("cld; rep insw"
+                              : "+D"(target), "+c"(count)
+                              : "d"((uint16_t)(base + ATA_DATA))
+                              : "memory");
+        } else {
+            for (uint32_t i = 0; i < words; i++) {
+                uint16_t word = io_in16(base + ATA_DATA);
+                uint32_t at = done + i * 2;
+                if (at < length) {
+                    destination[at] = (uint8_t)word;
+                }
+                if (at + 1 < length) {
+                    destination[at + 1] = (uint8_t)(word >> 8);
+                }
+            }
+        }
+        done += bytes;
+    }
+    return done >= length ? SCSI_OK : SCSI_FAILED;
+}
+
 static bool probe_unit(size_t unit) {
     struct ata_unit *state = &units[unit];
     *state = (struct ata_unit){0};
@@ -259,8 +398,14 @@ static bool probe_unit(size_t unit) {
     io_out8(base + ATA_COMMAND, ATA_COMMAND_IDENTIFY);
 
     /* ATAPI devices abort IDENTIFY and set the 0x14/0xEB signature. */
-    if (!ata_wait_status_limit(unit, false, ATA_PROBE_POLL_LIMIT)
-        || io_in8(base + ATA_LBA_MID) != 0 || io_in8(base + ATA_LBA_HIGH) != 0
+    bool answered = ata_wait_status_limit(unit, false, ATA_PROBE_POLL_LIMIT);
+    uint8_t signature_mid = io_in8(base + ATA_LBA_MID);
+    uint8_t signature_high = io_in8(base + ATA_LBA_HIGH);
+    if (signature_mid == 0x14 && signature_high == 0xeb) {
+        (void)probe_atapi(unit);
+        return false;
+    }
+    if (!answered || signature_mid != 0 || signature_high != 0
         || !ata_wait_status_limit(unit, true, ATA_PROBE_POLL_LIMIT)) {
         return false;
     }

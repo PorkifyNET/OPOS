@@ -148,6 +148,40 @@ enum block_device block_initialize(void) {
     return block_active_device();
 }
 
+bool block_disk_present(size_t index) {
+    if (index >= disk_count) {
+        return false;
+    }
+    /* Only SCSI disks (USB sticks among them) can go away. */
+    return disks[index].device != BLOCK_DEVICE_SCSI
+        || scsi_disk_present(disks[index].unit);
+}
+
+uint32_t block_disk_generation(size_t index) {
+    if (!block_disk_present(index)) {
+        return 0;
+    }
+    return disks[index].device == BLOCK_DEVICE_SCSI
+        ? scsi_disk_generation(disks[index].unit) : 1;
+}
+
+bool block_rescan(void) {
+    bool added = false;
+    for (size_t unit = 0; unit < scsi_disk_count(); unit++) {
+        bool known = false;
+        for (size_t i = 0; i < disk_count && !known; i++) {
+            known = disks[i].device == BLOCK_DEVICE_SCSI
+                && disks[i].unit == unit;
+        }
+        if (!known && scsi_disk_present(unit)
+            && disk_count < BLOCK_MAX_DISKS) {
+            add_disk(BLOCK_DEVICE_SCSI, unit);
+            added = true;
+        }
+    }
+    return added;
+}
+
 size_t block_disk_count(void) {
     return disk_count;
 }
@@ -177,13 +211,15 @@ static size_t append_number(char *buffer, size_t capacity, size_t offset,
 }
 
 bool block_disk_info(size_t index, struct block_disk_info *info) {
-    if (index >= disk_count || info == NULL) {
+    if (index >= disk_count || info == NULL || !block_disk_present(index)) {
         return false;
     }
     const struct block_disk *disk = &disks[index];
     info->device = disk->device;
     info->sectors = disk_sectors(disk);
     info->boot_disk = disk->boot_disk;
+    info->removable = disk->device == BLOCK_DEVICE_SCSI
+        && scsi_removable(disk->unit);
     char *location = info->location;
     size_t capacity = sizeof(info->location);
     location[0] = '\0';
@@ -227,7 +263,7 @@ bool block_disk_read(size_t index, uint32_t first_sector,
 }
 
 bool block_select_disk(size_t index) {
-    if (index >= disk_count) {
+    if (index >= disk_count || !block_disk_present(index)) {
         return false;
     }
     active_index = index;

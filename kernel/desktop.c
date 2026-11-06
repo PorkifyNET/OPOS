@@ -11,12 +11,15 @@
 #include "font.h"
 #include "initramfs.h"
 #include "installer.h"
+#include "iso9660.h"
 #include "keyboard.h"
 #include "permissions.h"
 #include "memory.h"
 #include "mouse.h"
+#include "optical.h"
 #include "power.h"
 #include "scheduler.h"
+#include "storage.h"
 #include "svga.h"
 #include "vmware.h"
 #include "timer.h"
@@ -1700,21 +1703,45 @@ static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
 
 struct files_place {
-    const char *label;
+    char label[16];
     char path[96];
 };
 
 /* Sidebar places: the logged-in account's home folders, then the system
-   places. Rebuilt on login, logout and account rename. */
-static struct files_place files_places[20];
+   places. Rebuilt on login, logout, account rename and whenever the Files
+   folder reloads (volume labels change after a format or install). */
+static struct files_place files_places[32];
 static size_t files_place_count;
+
+/* The THIS PC view: every disk and partition, readable or not. It is a
+   pseudo-folder with this path (no leading '/', so it never names a VFS
+   path); files_load lists storage_list() there. */
+#define FILES_DRIVES_PATH "THIS PC"
+static struct storage_volume files_drives[STORAGE_MAX_VOLUMES];
+
+static bool files_is_drives_path(const char *path, size_t length) {
+    static const char drives[] = FILES_DRIVES_PATH;
+    if (length != sizeof(drives) - 1) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        char character = path[i];
+        if (character >= 'a' && character <= 'z') {
+            character = (char)(character - 32);
+        }
+        if (character != drives[i]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void files_place_add(const char *label, const char *path) {
     if (files_place_count >= sizeof(files_places) / sizeof(files_places[0])) {
         return;
     }
     struct files_place *place = &files_places[files_place_count++];
-    place->label = label;
+    text_copy(place->label, sizeof(place->label), label);
     text_copy(place->path, sizeof(place->path), path);
 }
 
@@ -1736,20 +1763,39 @@ static void files_places_rebuild(void) {
             }
         }
     }
+    files_place_add("THIS PC", FILES_DRIVES_PATH);
     files_place_add("ROOT", "/");
     files_place_add("PROGRAMS", "/bin");
     files_place_add("LIBRARIES", "/lib");
     files_place_add("DISK", "/disk");
-    /* Other FAT volumes (files_place_visible hides unmounted ones). */
-    static const char *const extra_labels[] = {
-        "DISK 2", "DISK 3", "DISK 4", "DISK 5", "DISK 6", "DISK 7", "DISK 8",
-    };
-    static const char *const extra_paths[] = {
-        "/disk2", "/disk3", "/disk4", "/disk5", "/disk6", "/disk7", "/disk8",
-    };
-    for (size_t i = 0; i < sizeof(extra_labels) / sizeof(extra_labels[0]);
-         i++) {
-        files_place_add(extra_labels[i], extra_paths[i]);
+    /* Other FAT volumes by label, else "DISK n" (files_place_visible
+       hides unmounted ones). */
+    for (size_t i = 1; i < FAT16_MAX_VOLUMES; i++) {
+        char label[16];
+        struct fat16_volume_info info;
+        if (fat16_volume_info(i, &info) && info.label[0] != '\0') {
+            text_copy(label, sizeof(label), info.label);
+        } else {
+            append_decimal(label, sizeof(label),
+                           append_text(label, sizeof(label), 0, "DISK "),
+                           i + 1);
+        }
+        char mount[16];
+        if (storage_mount_path(i, mount, sizeof(mount)) != 0) {
+            files_place_add(label, mount);
+        }
+    }
+    /* Discs by label, else "CD/DVD" (hidden while the drive is empty). */
+    for (size_t i = 0; i < ISO_MAX_VOLUMES; i++) {
+        char label[16];
+        const char *disc = iso_label(i);
+        text_copy(label, sizeof(label), disc[0] != '\0' ? disc : "CD/DVD");
+        char mount[16];
+        size_t used = append_text(mount, sizeof(mount), 0, "/cdrom");
+        if (i != 0) {
+            append_decimal(mount, sizeof(mount), used, i + 1);
+        }
+        files_place_add(label, mount);
     }
 }
 
@@ -1776,8 +1822,13 @@ static int64_t files_menu_y;
 static void files_draw_prompt(struct rect list);
 static void draw_files_menu(void);
 
+static bool files_in_drives(void) {
+    return files_is_drives_path(files_path, files_path_length);
+}
+
+/* The root and THIS PC have no ".." row. */
 static bool files_at_root(void) {
-    return files_path_length == 1;
+    return files_path_length == 1 || files_in_drives();
 }
 
 static size_t files_row_count(void) {
@@ -1786,6 +1837,9 @@ static size_t files_row_count(void) {
 
 static bool files_place_visible(size_t index) {
     const char *path = files_places[index].path;
+    if (files_is_drives_path(path, text_length(path))) {
+        return true;
+    }
     struct vfs_metadata metadata;
     return vfs_stat(path, text_length(path), &metadata)
         && metadata.type == VFS_NODE_DIRECTORY;
@@ -1811,10 +1865,70 @@ static bool files_name_less(const struct files_entry *a,
     }
 }
 
+/* Row name of a drive: its label, else what it is and where. */
+static void files_drive_name(const struct storage_volume *drive, char *name,
+                             size_t capacity) {
+    if (drive->label[0] != '\0') {
+        text_copy(name, capacity, drive->label);
+        return;
+    }
+    if (drive->optical) {
+        text_copy(name, capacity, "CD/DVD DRIVE");
+        return;
+    }
+    if (drive->mount == 0) {
+        text_copy(name, capacity, "SYSTEM DISK");
+        return;
+    }
+    if (drive->partition_type == 0xef) {
+        text_copy(name, capacity, "EFI SYSTEM");
+        return;
+    }
+    size_t used;
+    if (drive->removable) {
+        used = append_text(name, capacity, 0, "USB DRIVE");
+    } else {
+        used = append_text(name, capacity, 0, "DISK ");
+        used = append_decimal(name, capacity, used, drive->disk + 1);
+    }
+    if (drive->partition != 0) {
+        used = append_text(name, capacity, used, " PART ");
+        append_decimal(name, capacity, used, drive->partition);
+    }
+}
+
+/* THIS PC: one row per volume, in disk order. Rows that OPOS can open
+   (mounted FAT volumes) are folders. */
+static bool files_load_drives(void) {
+    files_places_rebuild();
+    size_t count = storage_list(files_drives, STORAGE_MAX_VOLUMES);
+    for (size_t i = 0; i < count && i < FILES_ENTRY_CAPACITY; i++) {
+        struct files_entry *entry = &files_entries[files_count++];
+        files_drive_name(&files_drives[i], entry->name, sizeof(entry->name));
+        entry->directory = files_drives[i].path[0] != 0;
+        entry->size = 0;
+    }
+    return true;
+}
+
 /* Reads the current folder into files_entries (folders first, by name). */
 static bool files_load(void) {
     files_count = 0;
     files_skipped = 0;
+    if (files_in_drives()) {
+        return files_load_drives();
+    }
+    /* The root lists the discs, so look for a new or changed one there
+       and on the disc itself. */
+    static const char cdrom[] = "/cdrom";
+    bool on_disc = files_path_length >= sizeof(cdrom) - 1;
+    for (size_t i = 0; on_disc && i < sizeof(cdrom) - 1; i++) {
+        on_disc = files_path[i] == cdrom[i];
+    }
+    if (files_path_length == 1 || on_disc) {
+        iso_refresh();
+        files_places_rebuild();
+    }
     size_t count;
     if (!vfs_directory_count(files_path, files_path_length, &count)) {
         return false;
@@ -1892,7 +2006,11 @@ static void files_history_push(struct files_history *history,
  * returns false. Does not touch the back/forward history.
  */
 static bool files_navigate(const char *path, size_t length) {
-    if (length == 0 || length >= FILES_PATH_CAPACITY || path[0] != '/') {
+    bool drives = files_is_drives_path(path, length);
+    if (drives) {
+        path = FILES_DRIVES_PATH;
+    } else if (length == 0 || length >= FILES_PATH_CAPACITY
+               || path[0] != '/') {
         return false;
     }
     char previous[FILES_PATH_CAPACITY];
@@ -1907,7 +2025,8 @@ static bool files_navigate(const char *path, size_t length) {
     files_prompt_kind = FILES_PROMPT_NONE;
     files_menu_open = false;
     files_address_editing = false;
-    bool allowed = permission_ui_allows(path, length, PERMISSION_READ);
+    bool allowed = drives
+        || permission_ui_allows(path, length, PERMISSION_READ);
     if (allowed && files_load()) {
         return true;
     }
@@ -1978,7 +2097,8 @@ static size_t files_resolve_typed(const char *text, size_t text_length_in,
                                   char *path, size_t capacity) {
     char joined[FILES_PATH_CAPACITY * 2];
     size_t joined_length = 0;
-    if (text_length_in == 0 || text[0] != '/') {
+    /* Relative text in THIS PC starts at the root. */
+    if ((text_length_in == 0 || text[0] != '/') && !files_in_drives()) {
         for (size_t i = 0; i < files_path_length; i++) {
             joined[joined_length++] = files_path[i];
         }
@@ -2045,6 +2165,18 @@ static void files_address_commit(void) {
                                         path, sizeof(path));
     struct vfs_metadata metadata;
     if (length == 0 || !vfs_stat(path, length, &metadata)) {
+        /* "THIS PC", also typed after the "/" the bar starts with. */
+        size_t skip = 0;
+        while (skip < files_address_length && files_address[skip] == '/') {
+            skip++;
+        }
+        if (files_is_drives_path(files_address + skip,
+                                 files_address_length - skip)) {
+            files_address_editing = false;
+            (void)files_visit(FILES_DRIVES_PATH,
+                              sizeof(FILES_DRIVES_PATH) - 1);
+            return;
+        }
         set_status("PATH NOT FOUND");
         return;
     }
@@ -2107,6 +2239,7 @@ static void files_address_key(char character) {
 
 /* Reloads the current folder, e.g. when the window opens. */
 static void files_refresh(void) {
+    files_places_rebuild();
     size_t selection = files_selection;
     char path[FILES_PATH_CAPACITY];
     size_t length = files_path_length;
@@ -2225,8 +2358,59 @@ static void files_run_program(const char *path, size_t length) {
     }
 }
 
+/* THIS PC: opens a mounted drive, or says why the drive cannot open. */
+static void files_open_drive(size_t row) {
+    if (row >= files_count) {
+        return;
+    }
+    const struct storage_volume *drive = &files_drives[row];
+    size_t length = text_length(drive->path);
+    if (length != 0) {
+        (void)files_visit(drive->path, length);
+        return;
+    }
+    char message[64];
+    switch (drive->filesystem) {
+    case STORAGE_FS_EMPTY:
+        text_copy(message, sizeof(message), "THIS DRIVE IS EMPTY");
+        break;
+    case STORAGE_FS_NO_DISC:
+        text_copy(message, sizeof(message), "NO DISC IN THE DRIVE");
+        break;
+    case STORAGE_FS_NO_PARTITIONS:
+        text_copy(message, sizeof(message), "THIS DISK HAS NO PARTITIONS");
+        break;
+    case STORAGE_FS_READ_ERROR:
+        text_copy(message, sizeof(message), "THIS DRIVE CANNOT BE READ");
+        break;
+    case STORAGE_FS_UNKNOWN:
+        text_copy(message, sizeof(message), "UNKNOWN FILESYSTEM");
+        break;
+    case STORAGE_FS_FAT12:
+    case STORAGE_FS_FAT16:
+    case STORAGE_FS_FAT32:
+        /* FAT that did not mount: FAT12, an odd partition type, or no
+           free volume slot. */
+        text_copy(message, sizeof(message), "OPOS CANNOT OPEN THIS FAT DRIVE");
+        break;
+    default: {
+        size_t used = append_text(message, sizeof(message), 0,
+                                  "OPOS CANNOT READ ");
+        used = append_text(message, sizeof(message), used,
+                           storage_filesystem_name(drive->filesystem));
+        append_text(message, sizeof(message), used, " DRIVES YET");
+        break;
+    }
+    }
+    set_status(message);
+}
+
 /* Opens a row: ".." goes up, folders are entered, programs run. */
 static void files_open_row(size_t row) {
+    if (files_in_drives()) {
+        files_open_drive(row);
+        return;
+    }
     if (!files_at_root()) {
         if (row == 0) {
             files_go_up();
@@ -2415,15 +2599,41 @@ static void draw_files(struct rect area, bool focused) {
     files_clamp(list);
     size_t rows = files_row_count();
     size_t visible = files_visible_rows(list);
-    int64_t detail_width = 10 * CHAR_WIDTH;
+    bool drives = files_in_drives();
+    /* THIS PC shows filesystem, size and path; folders show size only. */
+    int64_t detail_width = (drives ? 30 : 10) * CHAR_WIDTH;
+    if (drives && detail_width > list.width / 2) {
+        detail_width = list.width / 2;
+    }
     for (size_t row = files_scroll; row < rows
          && row < files_scroll + visible; row++) {
         struct rect line = files_line_rect(list, row - files_scroll);
         char text[TERMINAL_COLUMNS];
-        char detail[24];
+        char detail[48];
         detail[0] = '\0';
         bool directory = true;
-        if (!files_at_root() && row == 0) {
+        if (drives) {
+            const struct storage_volume *drive = &files_drives[row];
+            append_text(text, sizeof(text), 0, files_entries[row].name);
+            directory = drive->path[0] != 0;
+            size_t used = append_text(detail, sizeof(detail), 0,
+                                      storage_filesystem_name(
+                                          drive->filesystem));
+            while (used < 14) {
+                detail[used++] = ' ';
+            }
+            detail[used] = '\0';
+            char size[16];
+            storage_format_size(drive->sectors, size, sizeof(size));
+            used = append_text(detail, sizeof(detail), used, size);
+            while (used < 23) {
+                detail[used++] = ' ';
+            }
+            detail[used] = '\0';
+            if (directory) {
+                append_text(detail, sizeof(detail), used, drive->path);
+            }
+        } else if (!files_at_root() && row == 0) {
             append_text(text, sizeof(text), 0, "..");
         } else {
             const struct files_entry *entry =
@@ -2457,6 +2667,11 @@ static void draw_files(struct rect area, bool focused) {
             draw_text_clipped(line.x + 6, line.y + 3,
                               line.width - detail_width - 18, text,
                               250, 220, 140);
+        } else if (drives) {
+            /* A drive OPOS cannot open. */
+            draw_text_clipped(line.x + 6, line.y + 3,
+                              line.width - detail_width - 18, text,
+                              140, 150, 175);
         } else {
             draw_text_clipped(line.x + 6, line.y + 3,
                               line.width - detail_width - 18, text,
@@ -2467,14 +2682,68 @@ static void draw_files(struct rect area, bool focused) {
     }
     if (rows == 0) {
         draw_text_clipped(list.x + 12, list.y + FILES_LIST_TOP + 4,
-                          list.width - 24, "THIS FOLDER IS EMPTY",
+                          list.width - 24,
+                          drives ? "NO DISKS FOUND" : "THIS FOLDER IS EMPTY",
                           151, 190, 235);
     }
     if (files_prompt_kind != FILES_PROMPT_NONE) {
         files_draw_prompt(list);
         return;
     }
-    const char *hint = files_address_editing
+    /* THIS PC: the selected drive's disk, e.g. "DISK 2 PARTITION 1:
+       VMWARE VIRTUAL S (SCSI TARGET 1)". */
+    char drive_hint[TERMINAL_COLUMNS];
+    drive_hint[0] = '\0';
+    const char *hint_model = NULL;
+    char hint_location[32];
+    hint_location[0] = 0;
+    bool hint_known = false;
+    const struct storage_volume *hint_drive = NULL;
+    if (drives && !files_address_editing && files_selection < files_count) {
+        hint_drive = &files_drives[files_selection];
+        struct block_disk_info disk_info;
+        struct optical_drive_info optical_info;
+        if (hint_drive->optical
+            && optical_drive_info(hint_drive->disk, &optical_info)) {
+            hint_model = optical_info.model;
+            text_copy(hint_location, sizeof(hint_location),
+                      optical_info.location);
+            hint_known = true;
+        } else if (!hint_drive->optical
+                   && block_disk_info(hint_drive->disk, &disk_info)) {
+            hint_model = disk_info.model;
+            text_copy(hint_location, sizeof(hint_location),
+                      disk_info.location);
+            hint_known = true;
+        }
+    }
+    if (hint_known) {
+        const struct storage_volume *drive = hint_drive;
+        size_t used = append_text(drive_hint, sizeof(drive_hint), 0,
+                                  drive->optical ? "CD/DVD " : "DISK ");
+        used = append_decimal(drive_hint, sizeof(drive_hint), used,
+                              drive->disk + 1);
+        if (drive->partition != 0) {
+            used = append_text(drive_hint, sizeof(drive_hint), used,
+                               " PARTITION ");
+            used = append_decimal(drive_hint, sizeof(drive_hint), used,
+                                  drive->partition);
+        }
+        used = append_text(drive_hint, sizeof(drive_hint), used, ": ");
+        if (hint_model != NULL && hint_model[0] != 0) {
+            used = append_text(drive_hint, sizeof(drive_hint), used,
+                               hint_model);
+            used = append_text(drive_hint, sizeof(drive_hint), used, " (");
+            used = append_text(drive_hint, sizeof(drive_hint), used,
+                               hint_location);
+            append_text(drive_hint, sizeof(drive_hint), used, ")");
+        } else {
+            append_text(drive_hint, sizeof(drive_hint), used,
+                        hint_location);
+        }
+    }
+    const char *hint = drive_hint[0] != '\0' ? drive_hint
+        : files_address_editing
         ? "ENTER: GO  ESC: CANCEL  RELATIVE PATHS AND .. WORK"
         : files_skipped != 0
         ? "SOME ITEMS ARE NOT SHOWN (NAME OR COUNT LIMIT)"
@@ -5217,7 +5486,8 @@ static const char *const files_action_labels[] = {
 #define FILES_DELETE_DEPTH 8
 
 static bool files_location_read_only(void) {
-    return vfs_path_read_only(files_path, files_path_length)
+    return files_in_drives()
+        || vfs_path_read_only(files_path, files_path_length)
         || !permission_ui_allows(files_path, files_path_length,
                                  PERMISSION_WRITE);
 }
@@ -7392,6 +7662,44 @@ static uint8_t loop_previous_buttons;
 static struct drag_state loop_drag;
 static uint64_t loop_drawn_tick;
 
+static size_t removable_disk_count(void) {
+    size_t count = 0;
+    for (size_t i = 0; i < block_disk_count(); i++) {
+        struct block_disk_info info;
+        if (block_disk_info(i, &info) && info.removable) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* USB sticks: notices one plugged in or pulled out (twice a second). The
+   Files window shows the change; if its folder was on a stick that is
+   gone, it moves to THIS PC. */
+static void desktop_storage_poll(void) {
+    size_t before = removable_disk_count();
+    if (!storage_poll()) {
+        return;
+    }
+    size_t after = removable_disk_count();
+    files_places_rebuild();
+    char path[FILES_PATH_CAPACITY];
+    size_t length = files_path_length;
+    for (size_t i = 0; i <= length; i++) {
+        path[i] = files_path[i];
+    }
+    size_t selection = files_selection;
+    if (files_navigate(path, length)) {
+        files_selection = selection;
+    } else {
+        (void)files_navigate(FILES_DRIVES_PATH,
+                             sizeof(FILES_DRIVES_PATH) - 1);
+    }
+    set_status(after > before ? "USB DRIVE CONNECTED"
+               : after < before ? "USB DRIVE REMOVED"
+                                : "USB DRIVES CHANGED");
+}
+
 static bool desktop_step(void) {
     bool redraw = apps_poll();
     char character;
@@ -7453,6 +7761,7 @@ static bool desktop_step(void) {
     /* Half-second tick drives the clock and the terminal caret blink. */
     uint64_t tick = timer_ticks() / 50;
     if (tick != loop_drawn_tick) {
+        desktop_storage_poll();
         redraw = true;
     }
     if (redraw) {

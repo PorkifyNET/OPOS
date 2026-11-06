@@ -283,8 +283,28 @@ static bool issue_ahci_command(struct ahci_disk *disk, uint8_t command, uint64_t
     return true;
 }
 
-static bool configure_sata_port(struct ahci_disk *disk, uint32_t port_offset,
-                                uint32_t capability) {
+/* Model: words 27-46, big-endian character pairs padded with spaces. */
+static void copy_model(const uint16_t *identify, char *model) {
+    size_t length = 0;
+    for (size_t word = 27; word <= 46; word++) {
+        model[length++] = (char)(identify[word] >> 8);
+        model[length++] = (char)identify[word];
+    }
+    model[length] = '\0';
+    while (length > 0
+           && (model[length - 1] == ' ' || model[length - 1] == '\0')) {
+        model[--length] = '\0';
+    }
+    for (size_t i = 0; i < length; i++) {
+        if (model[i] < ' ' || model[i] > '~') {
+            model[i] = '?';
+        }
+    }
+}
+
+/* Stops the port, gives it a command list and FIS area, and restarts it. */
+static bool start_port(struct ahci_disk *disk, uint32_t port_offset,
+                       uint32_t capability) {
     uint32_t port_command = mmio_read32(port_offset + AHCI_PORT_COMMAND);
     port_command &= ~(AHCI_PORT_COMMAND_START
                       | AHCI_PORT_COMMAND_FIS_RECEIVE_ENABLE);
@@ -316,6 +336,14 @@ static bool configure_sata_port(struct ahci_disk *disk, uint32_t port_offset,
 
     disk->port_offset = port_offset;
     disk->ready = true;
+    return true;
+}
+
+static bool configure_sata_port(struct ahci_disk *disk, uint32_t port_offset,
+                                uint32_t capability) {
+    if (!start_port(disk, port_offset, capability)) {
+        return false;
+    }
     uint8_t identify_data[512];
     if (!issue_ahci_command(disk, AHCI_COMMAND_IDENTIFY, 0, identify_data, false)) {
         disk->ready = false;
@@ -345,24 +373,152 @@ static bool configure_sata_port(struct ahci_disk *disk, uint32_t port_offset,
         release_disk_pages(disk);
         return false;
     }
-    /* Model: words 27-46, big-endian character pairs padded with spaces. */
-    size_t length = 0;
-    for (size_t word = 27; word <= 46; word++) {
-        disk->model[length++] = (char)(identify[word] >> 8);
-        disk->model[length++] = (char)identify[word];
+    copy_model(identify, disk->model);
+    return true;
+}
+
+/* ---------------------------------------------------- ATAPI (CD/DVD) */
+
+#define AHCI_COMMAND_PACKET 0xa0
+#define AHCI_COMMAND_IDENTIFY_PACKET 0xa1
+#define AHCI_COMMAND_HEADER_ATAPI (1u << 5)
+#define AHCI_PORT_INTERRUPT_TASK_FILE_ERROR (1u << 30)
+#define AHCI_MAX_ATAPI 4
+/* One contiguous buffer shared by every ATAPI port: 32 CD sectors. */
+#define AHCI_PACKET_PAGES 16
+/* Packet commands wait for the drive (spin-up, seeks). */
+#define AHCI_PACKET_POLL_LIMIT 50000000
+
+static struct ahci_disk atapi_drives[AHCI_MAX_ATAPI];
+static size_t atapi_count;
+static uint8_t *packet_buffer;
+static uint64_t packet_physical;
+
+/* After a failed command the port stops; restart it so the next command
+   runs (AHCI 1.3, 6.2.2.1). */
+static void port_recover(uint32_t port_offset) {
+    uint32_t command = mmio_read32(port_offset + AHCI_PORT_COMMAND);
+    mmio_write32(port_offset + AHCI_PORT_COMMAND,
+                 command & ~AHCI_PORT_COMMAND_START);
+    (void)wait_port_clear(port_offset, AHCI_PORT_COMMAND_LIST_RUNNING);
+    mmio_write32(port_offset + AHCI_PORT_SERIAL_ERROR, 0xffffffff);
+    mmio_write32(port_offset + AHCI_PORT_INTERRUPT_STATUS, 0xffffffff);
+    command = mmio_read32(port_offset + AHCI_PORT_COMMAND);
+    mmio_write32(port_offset + AHCI_PORT_COMMAND,
+                 command | AHCI_PORT_COMMAND_START);
+}
+
+static bool configure_atapi_port(struct ahci_disk *drive,
+                                 uint32_t port_offset, uint32_t capability) {
+    if (packet_buffer == NULL) {
+        uint64_t physical =
+            physical_pages_alloc_contiguous(AHCI_PACKET_PAGES);
+        if (physical == 0
+            || ((capability & AHCI_CAP_64BIT_ADDRESSING) == 0
+                && physical + AHCI_PACKET_PAGES * PAGE_SIZE > UINT32_MAX)) {
+            return false;
+        }
+        packet_physical = physical;
+        packet_buffer = physical_page_to_hhdm(physical);
     }
-    disk->model[length] = '\0';
-    while (length > 0
-           && (disk->model[length - 1] == ' '
-               || disk->model[length - 1] == '\0')) {
-        disk->model[--length] = '\0';
+    if (!start_port(drive, port_offset, capability)) {
+        return false;
     }
-    for (size_t i = 0; i < length; i++) {
-        if (disk->model[i] < ' ' || disk->model[i] > '~') {
-            disk->model[i] = '?';
+    uint8_t identify_data[512];
+    if (!issue_ahci_command(drive, AHCI_COMMAND_IDENTIFY_PACKET, 0,
+                            identify_data, false)) {
+        drive->ready = false;
+        release_disk_pages(drive);
+        return false;
+    }
+    copy_model((const uint16_t *)identify_data, drive->model);
+    return true;
+}
+
+size_t ahci_atapi_count(void) {
+    return atapi_count;
+}
+
+const char *ahci_atapi_model(size_t index) {
+    return index < atapi_count ? atapi_drives[index].model : "";
+}
+
+uint32_t ahci_atapi_port(size_t index) {
+    return index < atapi_count ? atapi_drives[index].port : 0;
+}
+
+uint32_t ahci_packet_limit(void) {
+    return AHCI_PACKET_PAGES * PAGE_SIZE;
+}
+
+enum scsi_result ahci_packet(size_t index, const uint8_t cdb[12],
+                             void *buffer, uint32_t length) {
+    if (index >= atapi_count || !atapi_drives[index].ready || cdb == NULL
+        || length > ahci_packet_limit() || (length & 1) != 0
+        || (length != 0 && buffer == NULL)) {
+        return SCSI_FAILED;
+    }
+    struct ahci_disk *drive = &atapi_drives[index];
+    uint32_t port_offset = drive->port_offset;
+    if (!wait_task_file_ready(port_offset)) {
+        port_recover(port_offset);
+        return SCSI_FAILED;
+    }
+    struct ahci_command_header *header = &drive->command_list[0];
+    for (size_t i = 0; i < sizeof(*header); i++) {
+        ((uint8_t *)header)[i] = 0;
+    }
+    for (size_t i = 0; i < sizeof(*drive->command_table); i++) {
+        ((uint8_t *)drive->command_table)[i] = 0;
+    }
+    header->flags = AHCI_COMMAND_FIS_LENGTH_DWORDS | AHCI_COMMAND_HEADER_ATAPI;
+    header->prdt_length = length != 0 ? 1 : 0;
+    header->command_table_base = (uint32_t)drive->command_table_physical;
+    header->command_table_base_upper =
+        (uint32_t)(drive->command_table_physical >> 32);
+
+    struct ahci_register_fis *fis =
+        (struct ahci_register_fis *)drive->command_table->command_fis;
+    fis->type = AHCI_FIS_TYPE_REGISTER_H2D;
+    fis->flags = AHCI_FIS_COMMAND_FLAG;
+    fis->command = AHCI_COMMAND_PACKET;
+    fis->feature_low = length != 0 ? 1 : 0; /* DMA */
+    for (size_t i = 0; i < 12; i++) {
+        drive->command_table->atapi_command[i] = cdb[i];
+    }
+    if (length != 0) {
+        drive->command_table->prdt[0].data_base = (uint32_t)packet_physical;
+        drive->command_table->prdt[0].data_base_upper =
+            (uint32_t)(packet_physical >> 32);
+        drive->command_table->prdt[0].byte_count_and_interrupt = length - 1;
+    }
+
+    mmio_write32(port_offset + AHCI_PORT_INTERRUPT_STATUS, 0xffffffff);
+    mmio_write32(port_offset + AHCI_PORT_SERIAL_ERROR, 0xffffffff);
+    __asm__ volatile ("" : : : "memory");
+    mmio_write32(port_offset + AHCI_PORT_COMMAND_ISSUE, 1);
+    for (unsigned i = 0; i < AHCI_PACKET_POLL_LIMIT; i++) {
+        uint32_t status = mmio_read32(port_offset
+                                      + AHCI_PORT_INTERRUPT_STATUS);
+        if ((status & AHCI_PORT_INTERRUPT_ERRORS) != 0) {
+            port_recover(port_offset);
+            /* Task file error: the drive answered CHECK CONDITION. */
+            return (status & AHCI_PORT_INTERRUPT_TASK_FILE_ERROR) != 0
+                ? SCSI_CHECK_CONDITION : SCSI_FAILED;
+        }
+        if ((mmio_read32(port_offset + AHCI_PORT_COMMAND_ISSUE) & 1) == 0) {
+            if (length != 0) {
+                __asm__ volatile ("" : : : "memory");
+                uint8_t *destination = buffer;
+                for (uint32_t j = 0; j < length; j++) {
+                    destination[j] = packet_buffer[j];
+                }
+            }
+            return SCSI_OK;
         }
     }
-    return true;
+    port_recover(port_offset);
+    return SCSI_FAILED;
 }
 
 static bool map_ahci_registers(uint64_t physical_address) {
@@ -399,6 +555,10 @@ bool ahci_initialize(void) {
         release_disk_pages(&disks[i]);
     }
     disk_count = 0;
+    for (size_t i = 0; i < AHCI_MAX_ATAPI; i++) {
+        release_disk_pages(&atapi_drives[i]);
+    }
+    atapi_count = 0;
     ahci_registers = NULL;
 
     struct pci_storage_controllers controllers;
@@ -449,6 +609,12 @@ bool ahci_initialize(void) {
             }
         } else if (signature == AHCI_ATAPI_SIGNATURE) {
             controller_status.atapi_devices++;
+            if (atapi_count < AHCI_MAX_ATAPI
+                && configure_atapi_port(&atapi_drives[atapi_count],
+                                        (uint32_t)port_offset, capability)) {
+                atapi_drives[atapi_count].port = port;
+                atapi_count++;
+            }
         }
     }
     return true;

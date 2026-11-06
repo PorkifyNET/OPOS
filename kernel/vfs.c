@@ -4,6 +4,7 @@
 
 #include "fat16.h"
 #include "initramfs.h"
+#include "iso9660.h"
 #include "vfs.h"
 
 struct vfs_resolved_node {
@@ -18,6 +19,7 @@ struct vfs_resolved_node {
 enum vfs_backend {
     VFS_BACKEND_FAT16,
     VFS_BACKEND_INITRAMFS,
+    VFS_BACKEND_ISO9660,
 };
 
 struct vfs_open_object {
@@ -27,9 +29,16 @@ struct vfs_open_object {
     uint32_t references;
     uint64_t inode;
     enum vfs_backend backend;
-    /* FAT volume the node lives on (0 = /disk, 1 = /disk2, ...). */
+    /* FAT volume the node lives on (0 = /disk, 1 = /disk2, ...), or the
+       disc for ISO 9660 objects (0 = /cdrom, 1 = /cdrom2, ...). */
     size_t volume;
     struct fat16_node node;
+    /* ISO 9660: the node, and the mount it belongs to (a changed or
+       ejected disc makes the object unusable). */
+    /* FAT: the mount the object belongs to (fat16_volume_generation). */
+    uint32_t fat_generation;
+    struct iso_node iso_node;
+    uint32_t iso_generation;
     size_t initramfs_path_length;
     char initramfs_path[256];
     enum vfs_node_type initramfs_type;
@@ -53,7 +62,10 @@ static struct vfs_open_object *open_object(vfs_object_handle handle) {
     }
     struct vfs_open_object *object = &open_objects[handle - 1];
     /* Make the object's volume current before any fat16_* call on it. */
-    if (object->backend == VFS_BACKEND_FAT16 && !fat16_use(object->volume)) {
+    if (object->backend == VFS_BACKEND_FAT16
+        && (fat16_volume_generation(object->volume)
+                != object->fat_generation
+            || !fat16_use(object->volume))) {
         return NULL;
     }
     return object;
@@ -68,6 +80,8 @@ static struct vfs_open_object *open_object_for_node(
         if (open_objects[i].used && open_objects[i].linked
             && open_objects[i].backend == VFS_BACKEND_FAT16
             && open_objects[i].volume == fat16_current_volume()
+            && open_objects[i].fat_generation
+                == fat16_volume_generation(fat16_current_volume())
             && !open_objects[i].root
             && open_objects[i].node.entry_sector == node->entry_sector
             && open_objects[i].node.entry_offset == node->entry_offset) {
@@ -191,12 +205,88 @@ static bool disk_prefix(const char *path, size_t path_length) {
     return disk_prefix_length(path, path_length, NULL) != 0;
 }
 
+/* ------------------------------------------------- CD/DVD (ISO 9660) */
+
+#define VFS_ISO_DEVICE_BASE 16
+#define VFS_ISO_INODE_BASE 0x200000000ULL
+
+/* Length of the prefix of a disc path: 6 for "/cdrom" (volume 0), 7 for
+   "/cdrom2".."/cdrom8" (volumes 1-7), 0 for any other path. */
+static size_t cdrom_prefix_length(const char *path, size_t path_length,
+                                  size_t *volume) {
+    static const char prefix[] = "/cdrom";
+    size_t length = sizeof(prefix) - 1;
+    if (path == NULL || path_length < length) {
+        return 0;
+    }
+    for (size_t i = 0; i < length; i++) {
+        if (!path_character_equal(path[i], prefix[i])) {
+            return 0;
+        }
+    }
+    size_t index = 0;
+    if (path_length > length && path[length] >= '2'
+        && path[length] < (char)('1' + ISO_MAX_VOLUMES)) {
+        index = (size_t)(path[length] - '1');
+        length++;
+    }
+    if (path_length != length && path[length] != '/') {
+        return 0;
+    }
+    if (volume != NULL) {
+        *volume = index;
+    }
+    return length;
+}
+
+/* Resolves a disc path; false for other paths and missing discs. */
+static bool iso_path_node(const char *path, size_t path_length,
+                          size_t *volume, struct iso_node *node) {
+    size_t prefix = cdrom_prefix_length(path, path_length, volume);
+    return prefix != 0
+        && iso_resolve(*volume, path + prefix, path_length - prefix, node);
+}
+
+static uint64_t iso_inode(const struct iso_node *node) {
+    return VFS_ISO_INODE_BASE + ((uint64_t)node->extent << 1)
+        + (node->directory ? 1 : 0);
+}
+
+static void iso_metadata(size_t volume, const struct iso_node *node,
+                         struct vfs_metadata *metadata) {
+    *metadata = (struct vfs_metadata) {
+        .device = VFS_ISO_DEVICE_BASE + volume,
+        .type = node->directory ? VFS_NODE_DIRECTORY : VFS_NODE_FILE,
+        .size = node->directory ? 0 : node->size,
+        .inode = iso_inode(node),
+        .read_only = true,
+    };
+}
+
+static bool iso_entry(size_t volume, const struct iso_node *directory,
+                      size_t index, struct vfs_directory_entry *entry) {
+    struct iso_node child;
+    size_t name_length;
+    if (entry == NULL
+        || !iso_directory_entry_at(volume, directory, index, entry->name,
+                                   sizeof(entry->name), &name_length,
+                                   &child)) {
+        return false;
+    }
+    entry->name_length = name_length;
+    entry->type = child.directory ? VFS_NODE_DIRECTORY : VFS_NODE_FILE;
+    entry->size = child.directory ? 0 : child.size;
+    entry->inode = iso_inode(&child);
+    return true;
+}
+
 static bool initramfs_mount_path(const char *path, size_t path_length,
                                  const char **relative,
                                  size_t *relative_length) {
     if (path == NULL || relative == NULL || relative_length == NULL
         || path_length == 0 || path[0] != '/'
-        || disk_prefix(path, path_length)) {
+        || disk_prefix(path, path_length)
+        || cdrom_prefix_length(path, path_length, NULL) != 0) {
         return false;
     }
     *relative = path + 1;
@@ -205,12 +295,18 @@ static bool initramfs_mount_path(const char *path, size_t path_length,
 }
 
 /* The root folder lists "disk" (system volume) and "disk2".."disk8" (other
-   mounted FAT volumes) before the initramfs entries. */
+   mounted FAT volumes), then "cdrom".."cdrom8" (discs), before the
+   initramfs entries. */
 static size_t root_disk_count(void) {
     size_t count = 0;
     struct fat16_volume_info info;
     for (size_t i = 0; i < FAT16_MAX_VOLUMES; i++) {
         if (fat16_volume_info(i, &info)) {
+            count++;
+        }
+    }
+    for (size_t i = 0; i < ISO_MAX_VOLUMES; i++) {
+        if (iso_mounted(i)) {
             count++;
         }
     }
@@ -236,6 +332,23 @@ static bool root_disk_entry(size_t index, struct vfs_directory_entry *entry) {
         }
         return true;
     }
+    for (size_t i = 0; i < ISO_MAX_VOLUMES; i++) {
+        if (!iso_mounted(i) || index-- != 0) {
+            continue;
+        }
+        *entry = (struct vfs_directory_entry) {
+            .name = "cdrom",
+            .name_length = 5,
+            .type = VFS_NODE_DIRECTORY,
+            .inode = VFS_ISO_INODE_BASE - 1 - i,
+        };
+        if (i != 0) {
+            entry->name[5] = (char)('1' + i);
+            entry->name[6] = '\0';
+            entry->name_length = 6;
+        }
+        return true;
+    }
     return false;
 }
 
@@ -253,7 +366,8 @@ bool vfs_path_read_only(const char *path, size_t path_length) {
     const char *relative;
     size_t relative_length;
     return initramfs_mount_path(path, path_length, &relative,
-                                &relative_length);
+                                &relative_length)
+        || cdrom_prefix_length(path, path_length, NULL) != 0;
 }
 
 /* Resolves a disk path on its volume, which becomes the current one. */
@@ -359,8 +473,19 @@ static bool resolved_file(const char *path, size_t path_length,
     return true;
 }
 
+/* An ISO object stays usable only while its disc is in the drive. */
+static bool iso_object_live(const struct vfs_open_object *object) {
+    return object != NULL && object->backend == VFS_BACKEND_ISO9660
+        && iso_mounted(object->volume)
+        && iso_generation(object->volume) == object->iso_generation;
+}
+
 static void open_object_metadata(const struct vfs_open_object *object,
                                  struct vfs_metadata *metadata) {
+    if (object->backend == VFS_BACKEND_ISO9660) {
+        iso_metadata(object->volume, &object->iso_node, metadata);
+        return;
+    }
     if (object->backend == VFS_BACKEND_INITRAMFS) {
         *metadata = (struct vfs_metadata) {
             .device = 1,
@@ -388,6 +513,49 @@ bool vfs_open_object(const char *path, size_t path_length,
     if (handle == NULL || metadata == NULL || path == NULL
         || path_length >= sizeof(open_objects[0].namespace_path)) {
         return false;
+    }
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        if (!iso_path_node(path, path_length, &iso_volume, &iso_node)) {
+            return false;
+        }
+        uint32_t generation = iso_generation(iso_volume);
+        struct vfs_open_object *object = NULL;
+        for (size_t i = 0; i < VFS_OPEN_OBJECT_CAPACITY && object == NULL;
+             i++) {
+            if (open_objects[i].used
+                && open_objects[i].backend == VFS_BACKEND_ISO9660
+                && open_objects[i].volume == iso_volume
+                && open_objects[i].iso_generation == generation
+                && open_objects[i].iso_node.extent == iso_node.extent
+                && open_objects[i].iso_node.directory == iso_node.directory) {
+                object = &open_objects[i];
+            }
+        }
+        for (size_t i = 0; i < VFS_OPEN_OBJECT_CAPACITY && object == NULL;
+             i++) {
+            if (!open_objects[i].used) {
+                object = &open_objects[i];
+                *object = (struct vfs_open_object) {
+                    .used = true,
+                    .linked = true,
+                    .backend = VFS_BACKEND_ISO9660,
+                    .volume = iso_volume,
+                    .inode = iso_inode(&iso_node),
+                    .iso_node = iso_node,
+                    .iso_generation = generation,
+                };
+                (void)set_namespace_path(object, path, path_length);
+            }
+        }
+        if (object == NULL || object->references == UINT32_MAX) {
+            return false;
+        }
+        object->references++;
+        *handle = (vfs_object_handle)(object - open_objects + 1);
+        open_object_metadata(object, metadata);
+        return true;
     }
     const char *init_path;
     size_t init_path_length;
@@ -459,6 +627,8 @@ bool vfs_open_object(const char *path, size_t path_length,
         bool same = open_objects[i].used && open_objects[i].linked
             && open_objects[i].backend == VFS_BACKEND_FAT16
             && open_objects[i].volume == fat16_current_volume()
+            && open_objects[i].fat_generation
+                == fat16_volume_generation(fat16_current_volume())
             && ((resolved.root && open_objects[i].root)
                 || (!resolved.root && !open_objects[i].root
                     && open_objects[i].node.entry_sector
@@ -482,6 +652,8 @@ bool vfs_open_object(const char *path, size_t path_length,
                     .inode = resolved.root ? 1 : node_inode(&resolved.node),
                     .backend = VFS_BACKEND_FAT16,
                     .volume = fat16_current_volume(),
+                    .fat_generation =
+                        fat16_volume_generation(fat16_current_volume()),
                     .node = resolved.node,
                 };
                 (void)set_namespace_path(object, path, path_length);
@@ -499,6 +671,22 @@ bool vfs_open_object(const char *path, size_t path_length,
 }
 
 bool vfs_close_object(vfs_object_handle handle) {
+    /* An object whose USB stick was pulled out cannot reach its
+       volume any more; closing it only frees the slot. */
+    if (handle != VFS_INVALID_OBJECT_HANDLE
+        && handle <= VFS_OPEN_OBJECT_CAPACITY) {
+        struct vfs_open_object *stale = &open_objects[handle - 1];
+        if (stale->used && stale->backend == VFS_BACKEND_FAT16
+            && fat16_volume_generation(stale->volume)
+                != stale->fat_generation) {
+            if (stale->references > 1) {
+                stale->references--;
+            } else {
+                *stale = (struct vfs_open_object){0};
+            }
+            return true;
+        }
+    }
     struct vfs_open_object *object = open_object(handle);
     if (object == NULL || object->references == 0) {
         return false;
@@ -558,6 +746,11 @@ bool vfs_object_read_at(vfs_object_handle handle, size_t offset,
     if (object == NULL) {
         return false;
     }
+    if (object->backend == VFS_BACKEND_ISO9660) {
+        return iso_object_live(object)
+            && iso_read(object->volume, &object->iso_node, offset, buffer,
+                        length, bytes_read);
+    }
     if (object->backend == VFS_BACKEND_INITRAMFS) {
         return object->initramfs_type == VFS_NODE_FILE
             && initramfs_read_at(object->initramfs_path,
@@ -587,6 +780,20 @@ bool vfs_read_file(const char *path, size_t path_length, uint8_t *buffer,
         return false;
     }
     *file_size = 0;
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        size_t bytes_read;
+        if (!iso_path_node(path, path_length, &iso_volume, &iso_node)
+            || iso_node.directory) {
+            return false;
+        }
+        *file_size = iso_node.size;
+        return iso_node.size <= buffer_capacity
+            && iso_read(iso_volume, &iso_node, 0, buffer, iso_node.size,
+                        &bytes_read)
+            && bytes_read == iso_node.size;
+    }
     const char *init_path;
     size_t init_path_length;
     if (initramfs_mount_path(path, path_length, &init_path,
@@ -636,6 +843,17 @@ bool vfs_write_file(const char *path, size_t path_length,
 }
 
 bool vfs_file_size(const char *path, size_t path_length, size_t *file_size) {
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        if (file_size == NULL
+            || !iso_path_node(path, path_length, &iso_volume, &iso_node)
+            || iso_node.directory) {
+            return false;
+        }
+        *file_size = iso_node.size;
+        return true;
+    }
     const char *init_path;
     size_t init_path_length;
     if (file_size != NULL
@@ -875,6 +1093,13 @@ enum vfs_rename_result vfs_rename(const char *old_path,
 
 bool vfs_read_at(const char *path, size_t path_length, size_t offset,
                  uint8_t *buffer, size_t length, size_t *bytes_read) {
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        return iso_path_node(path, path_length, &iso_volume, &iso_node)
+            && iso_read(iso_volume, &iso_node, offset, buffer, length,
+                        bytes_read);
+    }
     const char *init_path;
     size_t init_path_length;
     if (initramfs_mount_path(path, path_length, &init_path,
@@ -905,6 +1130,16 @@ bool vfs_write_at(const char *path, size_t path_length, size_t offset,
 
 bool vfs_stat(const char *path, size_t path_length,
               struct vfs_metadata *metadata) {
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        if (metadata == NULL
+            || !iso_path_node(path, path_length, &iso_volume, &iso_node)) {
+            return false;
+        }
+        iso_metadata(iso_volume, &iso_node, metadata);
+        return true;
+    }
     const char *init_path;
     size_t init_path_length;
     if (metadata != NULL
@@ -1000,6 +1235,12 @@ static bool directory_count(uint32_t directory_cluster, size_t *count) {
 }
 
 bool vfs_directory_count(const char *path, size_t path_length, size_t *count) {
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        return iso_path_node(path, path_length, &iso_volume, &iso_node)
+            && iso_directory_count(iso_volume, &iso_node, count);
+    }
     const char *init_path;
     size_t init_path_length;
     if (count != NULL
@@ -1018,6 +1259,10 @@ bool vfs_directory_count(const char *path, size_t path_length, size_t *count) {
 
 bool vfs_object_directory_count(vfs_object_handle handle, size_t *count) {
     struct vfs_open_object *object = open_object(handle);
+    if (object != NULL && object->backend == VFS_BACKEND_ISO9660) {
+        return iso_object_live(object)
+            && iso_directory_count(object->volume, &object->iso_node, count);
+    }
     if (object != NULL && object->backend == VFS_BACKEND_INITRAMFS) {
         if (object->initramfs_type != VFS_NODE_DIRECTORY
             || !initramfs_directory_count(object->initramfs_path,
@@ -1071,6 +1316,12 @@ static bool directory_entry_at(uint32_t directory_cluster, size_t index,
 
 bool vfs_directory_entry_at(const char *path, size_t path_length, size_t index,
                             struct vfs_directory_entry *entry) {
+    size_t iso_volume;
+    struct iso_node iso_node;
+    if (cdrom_prefix_length(path, path_length, NULL) != 0) {
+        return iso_path_node(path, path_length, &iso_volume, &iso_node)
+            && iso_entry(iso_volume, &iso_node, index, entry);
+    }
     const char *init_path;
     size_t init_path_length;
     if (entry != NULL
@@ -1106,6 +1357,10 @@ bool vfs_directory_entry_at(const char *path, size_t path_length, size_t index,
 bool vfs_object_directory_entry_at(vfs_object_handle handle, size_t index,
                                    struct vfs_directory_entry *entry) {
     struct vfs_open_object *object = open_object(handle);
+    if (object != NULL && object->backend == VFS_BACKEND_ISO9660) {
+        return iso_object_live(object)
+            && iso_entry(object->volume, &object->iso_node, index, entry);
+    }
     if (object != NULL && object->backend == VFS_BACKEND_INITRAMFS) {
         if (object->initramfs_type != VFS_NODE_DIRECTORY) {
             return false;

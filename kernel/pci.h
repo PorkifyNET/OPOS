@@ -33,6 +33,10 @@ struct pci_device {
 /* Finds the first function with this vendor/device ID. */
 bool pci_find_device(uint16_t vendor_id, uint16_t device_id,
                      struct pci_device *found);
+/* Finds the index-th function (0 = first) with this class, subclass and
+   programming interface, e.g. 0x0c/0x03/0x30 for an xHCI controller. */
+bool pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
+                    size_t index, struct pci_device *found);
 /* BAR index 0-5. I/O BARs return the port base, memory BARs the address
  * (64-bit BARs combined). Returns 0 when the BAR is unset. */
 uint64_t pci_bar_address(const struct pci_device *device, uint8_t bar,

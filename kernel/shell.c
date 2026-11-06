@@ -14,6 +14,7 @@
 #include "mouse.h"
 #include "power.h"
 #include "scheduler.h"
+#include "storage.h"
 #include "pci.h"
 #include "shell.h"
 #include "timer.h"
@@ -154,6 +155,14 @@ static bool disk_path(const char *name, size_t name_length,
         || name_length == 0
         || sizeof(prefix) - 1 + name_length > path_capacity) {
         return false;
+    }
+    /* An absolute path ("/disk2/A.TXT") is used as it is. */
+    if (name[0] == '/') {
+        for (size_t i = 0; i < name_length; i++) {
+            path[i] = name[i];
+        }
+        *path_length = name_length;
+        return true;
     }
     for (size_t i = 0; i < sizeof(prefix) - 1; i++) {
         path[i] = prefix[i];
@@ -463,6 +472,8 @@ static void shell_install(const char *arguments, size_t length) {
 }
 
 static void execute_command(void) {
+    /* USB sticks may have come or gone since the last command. */
+    (void)storage_poll();
     char *command = input_line;
     size_t command_length = 0;
     while (command[command_length] == ' ') {
@@ -485,8 +496,8 @@ static void execute_command(void) {
     }
     if (command_matches(command, command_length, "help")) {
         console_write_string("Commands: help, echo, uptime, clear, mouse, desktop, disk, "
-                             "storage, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
-                             "ls, install, reboot, shutdown, run demo, run fault, "
+                             "storage, drives, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
+                             "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
                              "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest\n");
     } else if (command_matches(command, command_length, "echo")) {
@@ -537,6 +548,39 @@ static void execute_command(void) {
         }
     } else if (command_matches(command, command_length, "desktop")) {
         desktop_run();
+    } else if (command_matches(command, command_length, "drives")) {
+        static struct storage_volume drives[STORAGE_MAX_VOLUMES];
+        size_t count = storage_list(drives, STORAGE_MAX_VOLUMES);
+        if (count == 0) {
+            console_write_warning("No disks found.\n");
+        }
+        for (size_t i = 0; i < count; i++) {
+            char size[16];
+            storage_format_size(drives[i].sectors, size, sizeof(size));
+            console_write_string(drives[i].optical ? "cd/dvd " : "disk ");
+            write_decimal(drives[i].disk + 1);
+            if (!drives[i].optical) {
+                console_write_string(" part ");
+                write_decimal(drives[i].partition);
+            }
+            if (drives[i].removable) {
+                console_write_string(" (usb)");
+            }
+            console_write_string(": ");
+            console_write_string(storage_filesystem_name(drives[i].filesystem));
+            console_write_string(", ");
+            console_write_string(size);
+            if (drives[i].label[0] != '\0') {
+                console_write_string(", label '");
+                console_write_string(drives[i].label);
+                console_write_string("'");
+            }
+            if (drives[i].path[0] != 0) {
+                console_write_string(", at ");
+                console_write_string(drives[i].path);
+            }
+            console_write_string("\n");
+        }
     } else if (command_matches(command, command_length, "storage")) {
         struct pci_storage_controllers controllers;
         struct ahci_status ahci;
@@ -736,9 +780,57 @@ static void execute_command(void) {
             console_write_warning("Usage: disk | disk format | disk read LBA | disk ls [PATH] | disk mkdir PATH | "
                                  "disk cat PATH | disk write PATH TEXT | disk run PATH\n");
         }
+    } else if (command_matches(command, command_length, "sum")) {
+        /* sum PATH: size and FNV-1a 64 of any VFS file (test reads). */
+        uint64_t hash = 0xcbf29ce484222325ULL;
+        size_t offset = 0;
+        static uint8_t chunk[4096];
+        size_t got = 0;
+        while (vfs_read_at(arguments, arguments_length, offset, chunk,
+                           sizeof(chunk), &got) && got != 0) {
+            for (size_t i = 0; i < got; i++) {
+                hash = (hash ^ chunk[i]) * 0x100000001b3ULL;
+            }
+            offset += got;
+        }
+        size_t size = 0;
+        if (!vfs_file_size(arguments, arguments_length, &size)) {
+            console_write_error("File not found.\n");
+        } else {
+            console_write_string("size ");
+            write_decimal(size);
+            console_write_string(" read ");
+            write_decimal(offset);
+            console_write_string(" fnv 0x");
+            console_write_hex(hash);
+            console_write_string("\n");
+        }
+    } else if (command_matches(command, command_length, "ls")
+               && arguments_length != 0) {
+        /* ls PATH: any VFS folder (/disk2, /cdrom, ...). */
+        size_t count = 0;
+        if (!vfs_directory_count(arguments, arguments_length, &count)) {
+            console_write_error("Folder not found.\n");
+            return;
+        }
+        for (size_t i = 0; i < count; i++) {
+            struct vfs_directory_entry entry;
+            if (!vfs_directory_entry_at(arguments, arguments_length, i,
+                                        &entry)) {
+                break;
+            }
+            console_write_string(entry.name);
+            if (entry.type == VFS_NODE_DIRECTORY) {
+                console_write_string("/\n");
+            } else {
+                console_write_string(" (");
+                write_decimal(entry.size);
+                console_write_string(" bytes)\n");
+            }
+        }
     } else if (command_matches(command, command_length, "ls")) {
         if (arguments_length != 0) {
-            console_write_warning("Usage: ls\n");
+            console_write_warning("Usage: ls [PATH]\n");
         } else {
             char path[256];
             size_t file_size;

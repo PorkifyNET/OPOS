@@ -223,3 +223,41 @@ bool pci_enable_nvme_memory_and_bus_master(void) {
                                      storage_controllers.nvme_function);
     return true;
 }
+
+bool pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
+                    size_t index, struct pci_device *found) {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            if (!pci_function_exists((uint8_t)bus, device, 0)) {
+                continue;
+            }
+            uint8_t header_type = (uint8_t)(pci_read_config32(
+                (uint8_t)bus, device, 0, 0x0c) >> 16);
+            uint8_t function_count =
+                (header_type & PCI_HEADER_TYPE_MULTI_FUNCTION) != 0 ? 8 : 1;
+            for (uint8_t function = 0; function < function_count; function++) {
+                uint32_t identifier =
+                    pci_read_config32((uint8_t)bus, device, function, 0);
+                if ((uint16_t)identifier == PCI_VENDOR_ID_INVALID) {
+                    continue;
+                }
+                uint32_t class_register =
+                    pci_read_config32((uint8_t)bus, device, function, 0x08);
+                if ((uint8_t)(class_register >> 24) != class_code
+                    || (uint8_t)(class_register >> 16) != subclass
+                    || (uint8_t)(class_register >> 8) != prog_if
+                    || index-- != 0) {
+                    continue;
+                }
+                if (found != NULL) {
+                    *found = (struct pci_device){
+                        (uint8_t)bus, device, function,
+                        (uint16_t)identifier, (uint16_t)(identifier >> 16),
+                    };
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}

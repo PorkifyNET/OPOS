@@ -119,6 +119,12 @@ struct ctx {
     int float_extent;
 };
 
+/* How see-through a background rectangle is (0 opaque). */
+static uint8_t fill_transparency(const struct style *style) {
+    uint8_t alpha = style->background_alpha;
+    return alpha == 0 ? 0 : (uint8_t)(255 - alpha);
+}
+
 static int clamp_min(int value, int minimum) {
     return value < minimum ? minimum : value;
 }
@@ -803,6 +809,13 @@ static void emit_line(struct ctx *c, size_t count, int used,
         const struct style *style = item->style;
         int x = c->bx + offset + p->x;
         note_right(c, x + p->width);
+#ifdef BROWSER_HOST_DEBUG
+        if (x + p->width > 50000 && getenv("FLEXDEBUG") != NULL) {
+            extern int printf(const char *, ...);
+            printf("WIDE item kind %d x %d width %d bx %d\n", item->kind, x,
+                   p->width, c->bx);
+        }
+#endif
         if (c->measuring) {
             continue;
         }
@@ -817,6 +830,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
                     ascent + descent);
                 if (back != NULL) {
                     back->colour = style->background;
+                    back->transparency = fill_transparency(style);
                 }
             }
             if (item->kind == IT_SPACE && !style->underline
@@ -1105,7 +1119,7 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     }
     cw = clamp_min(cw, 1);
     int leftover = avail - ml - mr - frame - cw;
-    if (leftover > 0) {
+    if (leftover > 0 && !c->measuring) {
         if (style->margin_auto_left && style->margin_auto_right) {
             ml += leftover / 2;
             mr += leftover - leftover / 2;
@@ -1115,6 +1129,14 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     }
     int box_x = c->bx + ml;
     int box_width = clamp_min(cw + frame, 1);
+#ifdef BROWSER_HOST_DEBUG
+    if (box_x > 50000 && getenv("FLEXDEBUG") != NULL) {
+        extern int printf(const char *, ...);
+        const char *k = opos_html_attribute(node, "class");
+        printf("WIDE block <%s %.60s> bx %d ml %d\n", node->name, k ? k : "",
+               c->bx, ml);
+    }
+#endif
     c->bx += ml + style->border + style->padding[LEFT];
     c->bwidth = cw;
 
@@ -1134,6 +1156,8 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
             if (add_item(c, ITEM_RECT, box_x, box_top, box_width, 0) != NULL) {
                 fill_index = c->page->item_count - 1;
                 c->page->items[fill_index].colour = style->background;
+                c->page->items[fill_index].transparency =
+                    fill_transparency(style);
             }
         }
         if (style->border > 0) {
@@ -1157,15 +1181,37 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
         c->marker_style = style;
         c->marker_pending = true;
     }
-    if (style->flex) {
+    /* Measuring: the content's right edge plus this box's right padding,
+       border and margin (or its fixed width) is what it needs. */
+    int outer_right = c->max_right;
+    c->max_right = 0;
+    if (style->flex && !style->flex_column) {
         layout_flex_children(c, node, style);
-    } else if (style->grid_count > 0) {
+    } else if (style->grid && style->grid_count > 0) {
         layout_grid_children(c, node, style);
     } else {
         process_children(c, node, style);
     }
     flush_inline(c);
     c->marker_pending = false;
+    int inner_right = c->max_right;
+    if (inner_right > 0) {
+        inner_right += style->padding[RIGHT] + style->border + mr;
+    }
+    /* (Widths near WIDE come from boxes sized to the "unlimited"
+       measuring width, not from the page.) */
+    if (style->width >= 0 && style->width < WIDE / 2 && c->measuring) {
+        inner_right = max_int(inner_right, box_x + box_width + mr);
+    }
+    c->max_right = max_int(outer_right, inner_right);
+#ifdef BROWSER_HOST_DEBUG
+    if (inner_right > 50000 && getenv("FLEXDEBUG") != NULL) {
+        extern int printf(const char *, ...);
+        const char *k = opos_html_attribute(node, "class");
+        printf("WIDE inner <%s %.60s> w %d pct %d flex %d\n", node->name,
+               k ? k : "", style->width, style->width_pct, style->flex);
+    }
+#endif
 
     bool collapse_bottom = !boxed && style->padding[BOTTOM] == 0;
     if (collapse_bottom) {
@@ -1276,15 +1322,23 @@ static int measure_content(struct ctx *c, const struct opos_html_node *node,
     c->marker_pending = false;
     if (style->display == DISPLAY_TABLE) {
         layout_table(c, node, style);
-    } else if (style->flex) {
+    } else if (style->flex && !style->flex_column) {
         layout_flex_children(c, node, style);
-    } else if (style->grid_count > 0) {
+    } else if (style->grid && style->grid_count > 0) {
         layout_grid_children(c, node, style);
     } else {
         process_children(c, node, style);
     }
     flush_inline(c);
     int result = c->max_right;
+#ifdef BROWSER_HOST_DEBUG
+    if (result > 50000 && getenv("FLEXDEBUG") != NULL) {
+        extern int printf(const char *, ...);
+        const char *k = opos_html_attribute(node, "class");
+        printf("WIDE measure <%s %.60s> display %d\n", node->name,
+               k ? k : "", style->display);
+    }
+#endif
 
     c->page->item_count = saved_items;
     c->bx = saved_x;
@@ -1682,6 +1736,7 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
             && add_item(c, ITEM_RECT, x0, table_top, total, 0) != NULL) {
             table_fill = c->page->item_count - 1;
             c->page->items[table_fill].colour = st->background;
+            c->page->items[table_fill].transparency = fill_transparency(st);
         }
         if (border > 0 && add_item(c, ITEM_OUTLINE, x0, table_top, total, 0)
                               != NULL) {
@@ -1722,9 +1777,11 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
                 if (has_bg && add_item(c, ITEM_RECT, cell_x, y, cell_width, 0)
                                   != NULL) {
                     cell->fill_index = c->page->item_count - 1;
-                    c->page->items[cell->fill_index].colour =
-                        style->has_background ? style->background
-                                              : row->style.background;
+                    const struct style *from = style->has_background
+                                             ? style : &row->style;
+                    c->page->items[cell->fill_index].colour = from->background;
+                    c->page->items[cell->fill_index].transparency =
+                        fill_transparency(from);
                 }
                 if (cell_border > 0
                     && add_item(c, ITEM_OUTLINE, cell_x, y, cell_width, 0)
@@ -1900,7 +1957,7 @@ static void layout_float(struct ctx *c, const struct opos_html_node *node,
             line_bounds(c, c->y, &left, &right);
             top = c->y;
         }
-        int x = st->float_side == 1 ? left : right - w;
+        int x = st->float_side == 1 || c->measuring ? left : right - w;
         if (x < left) {
             x = left;
         }
@@ -1946,7 +2003,7 @@ static void layout_float(struct ctx *c, const struct opos_html_node *node,
     }
     cw = clamp_min(cw, 1);
     int total = cw + frame + margins;
-    int x = st->float_side == 1 ? left : right - total;
+    int x = st->float_side == 1 || c->measuring ? left : right - total;
     if (x < left) {
         x = left;
     }
@@ -1964,18 +2021,16 @@ struct flex_item {
     int min, base, width, frame, grow, margin_auto;
 };
 
-static void layout_flex_children(struct ctx *c,
-                                 const struct opos_html_node *node,
-                                 struct style *st) {
-    struct flex_item *items = malloc(MAX_FLEX_ITEMS * sizeof(*items));
-    if (items == NULL) {
-        c->failed = true;
-        return;
-    }
-    int count = 0;
-    bool plain = true;
+/* Adds the flex items among node's children (looking through
+   display: contents). Clears *plain if any child cannot be a flex item. */
+static void collect_flex_items(struct ctx *c,
+                               const struct opos_html_node *node,
+                               struct style *st, struct flex_item *items,
+                               int *count_out, bool *plain_out, int depth) {
+    int count = *count_out;
+    bool plain = *plain_out;
     for (const struct opos_html_node *child = node->first_child;
-         child != NULL; child = child->next_sibling) {
+         child != NULL && plain; child = child->next_sibling) {
         if (child->type == HTML_NODE_TEXT) {
             for (size_t i = 0; i < child->text_length; i++) {
                 if (!is_ws(child->text[i])) {
@@ -1991,6 +2046,13 @@ static void layout_flex_children(struct ctx *c,
         }
         style_compute(child, st, s);
         if (s->display == DISPLAY_NONE) {
+            continue;
+        }
+        if (s->display == DISPLAY_CONTENTS && depth < 8) {
+            *count_out = count;
+            collect_flex_items(c, child, s, items, count_out, &plain,
+                               depth + 1);
+            count = *count_out;
             continue;
         }
         if (count == MAX_FLEX_ITEMS) {
@@ -2011,6 +2073,21 @@ static void layout_flex_children(struct ctx *c,
         items[count].style = s;
         count++;
     }
+    *count_out = count;
+    *plain_out = plain;
+}
+
+static void layout_flex_children(struct ctx *c,
+                                 const struct opos_html_node *node,
+                                 struct style *st) {
+    struct flex_item *items = malloc(MAX_FLEX_ITEMS * sizeof(*items));
+    if (items == NULL) {
+        c->failed = true;
+        return;
+    }
+    int count = 0;
+    bool plain = true;
+    collect_flex_items(c, node, st, items, &count, &plain, 0);
     if (!plain || count == 0 || c->failed) {
         free(items);
         process_children(c, node, st);
@@ -2029,14 +2106,27 @@ static void layout_flex_children(struct ctx *c,
                   + ml + mr;
         it->grow = s->flex_grow;
         int max, min;
-        if (s->width >= 0) {
-            max = min = s->width;
-        } else if (s->width_pct >= 0) {
-            max = min = avail * s->width_pct / 100 - it->frame;
+        /* Percentages mean nothing while measuring (the width is
+           "unlimited"): the item is then sized by its content. */
+        bool sized = s->width >= 0 || (s->width_pct >= 0 && !c->measuring);
+        if (sized) {
+            /* An explicit width is the flex basis. */
+            max = s->width >= 0 ? s->width
+                : avail * s->width_pct / 100 - it->frame;
+            min = max;
+            if (!s->no_shrink && !c->measuring) {
+                struct style probe = *s;
+                probe.width = probe.width_pct = -1;
+                int content = measure_content(c, it->node, &probe, true);
+                if (content < min) {
+                    min = content;
+                }
+            }
         } else {
             struct style probe = *s;
             max = measure_content(c, it->node, &probe, false);
-            min = measure_content(c, it->node, &probe, true);
+            min = s->no_shrink ? max
+                : measure_content(c, it->node, &probe, true);
             if (min > max) {
                 min = max;
             }
@@ -2066,6 +2156,11 @@ static void layout_flex_children(struct ctx *c,
         int n = line_end - line_start;
         struct flex_item *line = &items[line_start];
         int free_space = avail - sum;
+        if (c->measuring && !c->measure_min) {
+            /* Max-content: items take their own widths; no free space to
+               grow into or to spread with justify-content. */
+            free_space = 0;
+        }
         int shift = 0, extra_gap = 0;
         if (free_space > 0) {
             int grow_total = 0, auto_total = 0;
@@ -2078,9 +2173,12 @@ static void layout_flex_children(struct ctx *c,
             }
             if (grow_total > 0) {
                 int given = 0;
+                /* Weights below 1 in total take only that share. */
+                long share = grow_total < 100 ? grow_total : 100;
                 for (int i = 0; i < n; i++) {
                     if (line[i].grow) {
-                        int part = free_space / grow_total;
+                        int part = (int)((long)free_space * line[i].grow
+                                         * share / 100 / grow_total);
                         line[i].width += part;
                         given += part;
                     }
@@ -2109,6 +2207,21 @@ static void layout_flex_children(struct ctx *c,
                 line[i].width = line[i].base - cut;
             }
         }
+#ifdef BROWSER_HOST_DEBUG
+        if ((!c->measuring || sum > 50000) && getenv("FLEXDEBUG") != NULL) {
+            extern int printf(const char *, ...);
+            const char *cls = opos_html_attribute(node, "class");
+            printf("flex <%s %.40s> avail %d gap %d sum %d\n", node->name,
+                   cls ? cls : "", avail, gap, sum);
+            for (int i = 0; i < n; i++) {
+                const char *k = opos_html_attribute(line[i].node, "class");
+                printf("   <%s %.40s> min %d base %d width %d frame %d grow %d\n",
+                       line[i].node->name, k ? k : "", line[i].min,
+                       line[i].base, line[i].width, line[i].frame,
+                       line[i].grow);
+            }
+        }
+#endif
         int x = c->bx + shift;
         int top = c->y;
         int bottom = top;
@@ -2259,30 +2372,62 @@ static void layout_grid_children(struct ctx *c,
         }
     }
     int saved_floats = c->float_count;
-    for (int row = 0; row * columns < count && !c->failed; row++) {
-        int x = c->bx;
-        int top = c->y;
-        int bottom = top;
-        for (int col = 0; col < columns; col++) {
-            int index = row * columns + col;
-            if (index < count) {
-                struct style item_style = *items[index].style;
-                int frame = 2 * item_style.border + item_style.padding[LEFT]
-                          + item_style.padding[RIGHT]
-                          + item_style.margin[LEFT] + item_style.margin[RIGHT];
-                int cw = clamp_min(widths[col] - frame, 1);
-                c->float_count = 0;
-                int item_bottom = layout_boxed(c, items[index].node,
-                                               &item_style, x, cw, top);
-                if (item_bottom > bottom) {
-                    bottom = item_bottom;
-                }
-            }
-            x += widths[col] + gap;
+    /* Place items in order: each takes grid_span tracks from its start
+       line (or the next free column), wrapping to a new row. */
+    int col = 0;
+    int top = c->y;
+    int bottom = top;
+    bool row_used = false;
+    for (int index = 0; index < count && !c->failed; index++) {
+        struct style item_style = *items[index].style;
+        int span = item_style.grid_span;
+        int start = item_style.grid_start > 0 ? item_style.grid_start - 1 : -1;
+        if (start >= columns) {
+            start = -1;
         }
-        c->y = bottom + (row * columns + columns < count ? gap : 0);
-        c->pending_margin = 0;
+        if (span < 0) {
+            span = columns - (start >= 0 ? start : 0);
+        }
+        if (span < 1) {
+            span = 1;
+        }
+        if (span > columns) {
+            span = columns;
+        }
+        int want = start >= 0 ? start : col;
+        if (row_used && (want < col || want + span > columns)) {
+            top = bottom + gap;
+            bottom = top;
+            col = 0;
+            row_used = false;
+            want = start >= 0 ? start : 0;
+        }
+        if (want + span > columns) {
+            span = columns - want;
+        }
+        int x = c->bx;
+        for (int k = 0; k < want; k++) {
+            x += widths[k] + gap;
+        }
+        int width = gap * (span - 1);
+        for (int k = want; k < want + span; k++) {
+            width += widths[k];
+        }
+        int frame = 2 * item_style.border + item_style.padding[LEFT]
+                  + item_style.padding[RIGHT] + item_style.margin[LEFT]
+                  + item_style.margin[RIGHT];
+        int cw = clamp_min(width - frame, 1);
+        c->float_count = 0;
+        int item_bottom = layout_boxed(c, items[index].node, &item_style, x,
+                                       cw, top);
+        if (item_bottom > bottom) {
+            bottom = item_bottom;
+        }
+        col = want + span;
+        row_used = true;
     }
+    c->y = bottom;
+    c->pending_margin = 0;
     c->float_count = saved_floats;
     free(items);
 }
@@ -2347,6 +2492,9 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
         return;
     case DISPLAY_INLINE_BLOCK:
         add_control(c, node, style);
+        return;
+    case DISPLAY_CONTENTS:
+        process_children(c, node, style);
         return;
     case DISPLAY_INLINE:
         if (node->tag == HTML_TAG_BR) {

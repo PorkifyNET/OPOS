@@ -60,8 +60,107 @@ static const char *skip_space(const char *text) {
     return text;
 }
 
-bool parse_colour(const char *text, uint32_t *out) {
+/* Reads a number ("12", "-.5", "1e2" is not used by CSS colours). Sets
+   *percent when a % follows. Returns the position after it, or NULL. */
+static const char *read_number(const char *p, double *value, bool *percent) {
+    p = skip_space(p);
+    bool negative = false;
+    if (*p == '-' || *p == '+') {
+        negative = *p == '-';
+        p++;
+    }
+    if (!isdigit((unsigned char)*p) && !(*p == '.'
+                                         && isdigit((unsigned char)p[1]))) {
+        return NULL;
+    }
+    double v = 0;
+    while (isdigit((unsigned char)*p)) {
+        v = v * 10 + (*p++ - '0');
+    }
+    if (*p == '.') {
+        p++;
+        double scale = 0.1;
+        while (isdigit((unsigned char)*p)) {
+            v += (*p++ - '0') * scale;
+            scale /= 10;
+        }
+    }
+    *percent = *p == '%';
+    if (*percent) {
+        p++;
+    }
+    while (isalpha((unsigned char)*p)) {
+        p++; /* units such as deg */
+    }
+    *value = negative ? -v : v;
+    return p;
+}
+
+static int clamp_byte(double v) {
+    return v < 0 ? 0 : v > 255 ? 255 : (int)(v + 0.5);
+}
+
+/* Reads the arguments of rgb()/hsl(): three numbers and an optional alpha,
+   separated by commas, spaces or "/". */
+static bool read_channels(const char *p, double v[4], bool pct[4],
+                          int *count) {
+    *count = 0;
+    p = skip_space(p);
+    while (*p != ')' && *p != '\0' && *count < 4) {
+        p = read_number(p, &v[*count], &pct[*count]);
+        if (p == NULL) {
+            return false;
+        }
+        (*count)++;
+        p = skip_space(p);
+        if (*p == ',' || *p == '/') {
+            p = skip_space(p + 1);
+        }
+    }
+    return *count >= 3;
+}
+
+static double hue_to_rgb(double m1, double m2, double h) {
+    if (h < 0) {
+        h += 1;
+    }
+    if (h > 1) {
+        h -= 1;
+    }
+    if (h * 6 < 1) {
+        return m1 + (m2 - m1) * h * 6;
+    }
+    if (h * 2 < 1) {
+        return m2;
+    }
+    if (h * 3 < 2) {
+        return m1 + (m2 - m1) * (2.0 / 3 - h) * 6;
+    }
+    return m1;
+}
+
+/* The end of a colour argument: the next top-level comma or ")". */
+static const char *argument_end(const char *p) {
+    int depth = 0;
+    while (*p != '\0') {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            if (depth == 0) {
+                return p;
+            }
+            depth--;
+        } else if (*p == ',' && depth == 0) {
+            return p;
+        }
+        p++;
+    }
+    return p;
+}
+
+bool parse_colour_alpha(const char *text, uint32_t *out, int *alpha) {
     text = skip_space(text);
+    *alpha = 255;
     if (*text == '#') {
         text++;
         size_t digits = 0;
@@ -73,6 +172,9 @@ bool parse_colour(const char *text, uint32_t *out) {
             int g = hex_value((unsigned char)text[1]);
             int b = hex_value((unsigned char)text[2]);
             *out = OPOS_RGB(r * 17, g * 17, b * 17);
+            if (digits == 4) {
+                *alpha = hex_value((unsigned char)text[3]) * 17;
+            }
             return true;
         }
         if (digits == 6 || digits == 8) {
@@ -81,37 +183,99 @@ bool parse_colour(const char *text, uint32_t *out) {
                 value = value << 4 | (uint32_t)hex_value((unsigned char)text[i]);
             }
             *out = value;
+            if (digits == 8) {
+                *alpha = hex_value((unsigned char)text[6]) * 16
+                       + hex_value((unsigned char)text[7]);
+            }
             return true;
         }
         return false;
     }
-    if (strncmp(text, "rgb", 3) == 0 && (text[3] == '(' || text[3] == 'a')) {
-        const char *p = strchr(text, '(');
-        if (p == NULL) {
+    bool is_rgb = strncmp(text, "rgb(", 4) == 0 || strncmp(text, "rgba(", 5) == 0;
+    bool is_hsl = strncmp(text, "hsl(", 4) == 0 || strncmp(text, "hsla(", 5) == 0;
+    if (is_rgb || is_hsl) {
+        double v[4];
+        bool pct[4];
+        int count;
+        if (!read_channels(strchr(text, '(') + 1, v, pct, &count)) {
             return false;
         }
-        p++;
-        int channel[3];
-        for (int i = 0; i < 3; i++) {
-            p = skip_space(p);
-            if (!isdigit((unsigned char)*p)) {
+        if (count == 4) {
+            *alpha = clamp_byte(pct[3] ? v[3] * 2.55 : v[3] * 255);
+        }
+        if (is_rgb) {
+            int c[3];
+            for (int i = 0; i < 3; i++) {
+                c[i] = clamp_byte(pct[i] ? v[i] * 2.55 : v[i]);
+            }
+            *out = OPOS_RGB(c[0], c[1], c[2]);
+        } else {
+            double h = v[0] / 360.0;
+            h -= (long)h;
+            if (h < 0) {
+                h += 1;
+            }
+            double sat = v[1] / 100, light = v[2] / 100;
+            double m2 = light <= 0.5 ? light * (sat + 1)
+                                     : light + sat - light * sat;
+            double m1 = light * 2 - m2;
+            *out = OPOS_RGB(clamp_byte(hue_to_rgb(m1, m2, h + 1.0 / 3) * 255),
+                            clamp_byte(hue_to_rgb(m1, m2, h) * 255),
+                            clamp_byte(hue_to_rgb(m1, m2, h - 1.0 / 3) * 255));
+        }
+        return true;
+    }
+    if (strncmp(text, "color-mix(", 10) == 0) {
+        /* color-mix(in <space>, A [p%], B [q%]): mixed in sRGB. */
+        const char *p = argument_end(text + 10);
+        if (*p != ',') {
+            return false;
+        }
+        uint32_t colour[2];
+        int alphas[2];
+        double share[2] = {-1, -1};
+        for (int i = 0; i < 2; i++) {
+            const char *start = skip_space(p + 1);
+            p = argument_end(start);
+            char piece[160];
+            size_t n = (size_t)(p - start);
+            if (n >= sizeof(piece)) {
                 return false;
             }
-            int value = 0;
-            while (isdigit((unsigned char)*p)) {
-                value = value * 10 + (*p++ - '0');
+            memcpy(piece, start, n);
+            piece[n] = '\0';
+            /* An optional percentage after the colour. */
+            char *last = strrchr(piece, ' ');
+            if (last != NULL && strchr(last, '%') != NULL) {
+                share[i] = atoi(last + 1) / 100.0;
+                *last = '\0';
             }
-            if (*p == '%') {
-                value = value * 255 / 100;
-                p++;
+            if (!parse_colour_alpha(piece, &colour[i], &alphas[i])) {
+                return false;
             }
-            channel[i] = value > 255 ? 255 : value;
-            p = skip_space(p);
-            if (*p == ',' || *p == '/') {
-                p++;
+            if (i == 0 && *p != ',') {
+                return false;
             }
         }
-        *out = OPOS_RGB(channel[0], channel[1], channel[2]);
+        if (share[0] < 0 && share[1] < 0) {
+            share[0] = share[1] = 0.5;
+        } else if (share[0] < 0) {
+            share[0] = 1 - share[1];
+        } else if (share[1] < 0) {
+            share[1] = 1 - share[0];
+        }
+        double total = share[0] + share[1];
+        if (total <= 0) {
+            return false;
+        }
+        double a = share[0] / total;
+        int r = clamp_byte(((colour[0] >> 16) & 255) * a
+                           + ((colour[1] >> 16) & 255) * (1 - a));
+        int g = clamp_byte(((colour[0] >> 8) & 255) * a
+                           + ((colour[1] >> 8) & 255) * (1 - a));
+        int b = clamp_byte((colour[0] & 255) * a + (colour[1] & 255) * (1 - a));
+        *out = OPOS_RGB(r, g, b);
+        *alpha = clamp_byte(alphas[0] * a + alphas[1] * (1 - a));
         return true;
     }
     size_t length = 0;
@@ -146,7 +310,9 @@ bool parse_colour(const char *text, uint32_t *out) {
         }
         if (k == length) {
             if (named_colours[i].value == 0xffffffffu) {
-                return false; /* transparent: no colour */
+                *out = 0;
+                *alpha = 0; /* transparent */
+                return true;
             }
             *out = named_colours[i].value;
             return true;
@@ -155,11 +321,285 @@ bool parse_colour(const char *text, uint32_t *out) {
     return false;
 }
 
+bool parse_colour(const char *text, uint32_t *out) {
+    int alpha;
+    uint32_t colour;
+    if (!parse_colour_alpha(text, &colour, &alpha) || alpha == 0) {
+        return false; /* transparent: no colour */
+    }
+    *out = colour;
+    return true;
+}
+
 int viewport_width_px = 800;
 int viewport_height_px = 600;
 
+/* ---- calc(), min(), max(), clamp(): values are px + % of the container. */
+
+struct calc_value {
+    double px, pct;
+    bool number; /* unitless */
+    double cap;  /* min() of px and %: the px limit, else -1 */
+};
+
+static bool calc_sum(const char **p, struct calc_value *out, int depth);
+
+static bool calc_unit(const char **p, double number, struct calc_value *out) {
+    const char *t = *p;
+    out->px = out->pct = 0;
+    out->number = false;
+    out->cap = -1;
+    double w = viewport_width_px, h = viewport_height_px;
+    if (*t == '%') {
+        out->pct = number;
+        t++;
+    } else if (strncmp(t, "px", 2) == 0) {
+        out->px = number;
+        t += 2;
+    } else if (strncmp(t, "rem", 3) == 0) {
+        out->px = number * 16;
+        t += 3;
+    } else if (strncmp(t, "em", 2) == 0) {
+        out->px = number * 16;
+        t += 2;
+    } else if (strncmp(t, "pt", 2) == 0) {
+        out->px = number * 4 / 3;
+        t += 2;
+    } else if (strncmp(t, "ch", 2) == 0 || strncmp(t, "ex", 2) == 0) {
+        out->px = number * 8;
+        t += 2;
+    } else if (strncmp(t, "vmin", 4) == 0) {
+        out->px = number * (w < h ? w : h) / 100;
+        t += 4;
+    } else if (strncmp(t, "vmax", 4) == 0) {
+        out->px = number * (w > h ? w : h) / 100;
+        t += 4;
+    } else if (strncmp(t, "vw", 2) == 0 || strncmp(t, "dvw", 3) == 0
+               || strncmp(t, "svw", 3) == 0 || strncmp(t, "lvw", 3) == 0) {
+        out->px = number * w / 100;
+        t += t[1] == 'w' ? 2 : 3;
+    } else if (strncmp(t, "vh", 2) == 0 || strncmp(t, "dvh", 3) == 0
+               || strncmp(t, "svh", 3) == 0 || strncmp(t, "lvh", 3) == 0) {
+        out->px = number * h / 100;
+        t += t[1] == 'h' ? 2 : 3;
+    } else if (isalpha((unsigned char)*t)) {
+        return false;
+    } else {
+        out->px = number;
+        out->number = true;
+    }
+    *p = t;
+    return true;
+}
+
+static bool calc_factor(const char **p, struct calc_value *out, int depth) {
+    const char *t = skip_space(*p);
+    if (depth > 8) {
+        return false;
+    }
+    bool negative = false;
+    if (*t == '-' && !isdigit((unsigned char)t[1]) && t[1] != '.') {
+        negative = true; /* -(...) or -min(...) */
+        t++;
+    }
+    if (isdigit((unsigned char)*t) || *t == '.'
+        || ((*t == '-' || *t == '+')
+            && (isdigit((unsigned char)t[1]) || t[1] == '.'))) {
+        double sign = 1, number = 0;
+        if (*t == '-' || *t == '+') {
+            sign = *t == '-' ? -1 : 1;
+            t++;
+        }
+        while (isdigit((unsigned char)*t)) {
+            number = number * 10 + (*t++ - '0');
+        }
+        if (*t == '.') {
+            t++;
+            double scale = 0.1;
+            while (isdigit((unsigned char)*t)) {
+                number += (*t++ - '0') * scale;
+                scale /= 10;
+            }
+        }
+        if (!calc_unit(&t, number * sign, out)) {
+            return false;
+        }
+    } else if (*t == '(' || strncmp(t, "calc(", 5) == 0) {
+        t = strchr(t, '(') + 1;
+        if (!calc_sum(&t, out, depth + 1)) {
+            return false;
+        }
+        t = skip_space(t);
+        if (*t != ')') {
+            return false;
+        }
+        t++;
+    } else if (strncmp(t, "min(", 4) == 0 || strncmp(t, "max(", 4) == 0
+               || strncmp(t, "clamp(", 6) == 0) {
+        char kind = t[1] == 'i' ? 'n' : t[1] == 'a' ? 'x' : 'c';
+        t = strchr(t, '(') + 1;
+        struct calc_value args[8];
+        int count = 0;
+        for (;;) {
+            if (count == 8 || !calc_sum(&t, &args[count], depth + 1)) {
+                return false;
+            }
+            count++;
+            t = skip_space(t);
+            if (*t == ',') {
+                t++;
+                continue;
+            }
+            if (*t != ')') {
+                return false;
+            }
+            t++;
+            break;
+        }
+        if (kind == 'c') {
+            if (count != 3) {
+                return false;
+            }
+            /* clamp(lo, x, hi) = max(lo, min(x, hi)): with mixed units
+               use the preferred value, capped by hi when hi is in px. */
+            *out = args[1];
+            if (args[1].pct == 0 && args[0].pct == 0 && args[2].pct == 0) {
+                double v = args[1].px;
+                v = v > args[2].px ? args[2].px : v;
+                v = v < args[0].px ? args[0].px : v;
+                out->px = v;
+            } else if (args[2].pct == 0 && args[1].pct != 0) {
+                out->cap = args[2].px;
+            }
+        } else {
+            *out = args[0];
+            for (int i = 1; i < count; i++) {
+                bool pure_px = out->pct == 0 && args[i].pct == 0;
+                bool pure_pct = out->px == 0 && args[i].px == 0;
+                if (pure_px) {
+                    bool smaller = args[i].px < out->px;
+                    if (smaller == (kind == 'n')) {
+                        out->px = args[i].px;
+                    }
+                } else if (pure_pct) {
+                    bool smaller = args[i].pct < out->pct;
+                    if (smaller == (kind == 'n')) {
+                        out->pct = args[i].pct;
+                    }
+                } else if (kind == 'n') {
+                    /* min(100%, 80rem): the percentage, at most the px. */
+                    const struct calc_value *px = out->pct == 0 ? out : &args[i];
+                    const struct calc_value *pc = out->pct == 0 ? &args[i] : out;
+                    double cap = px->px;
+                    *out = *pc;
+                    out->cap = cap;
+                } else if (out->pct == 0) {
+                    *out = args[i]; /* max(px, %): the percentage */
+                }
+            }
+        }
+    } else {
+        return false; /* var() left over, env(), keywords */
+    }
+    if (negative) {
+        out->px = -out->px;
+        out->pct = -out->pct;
+    }
+    *p = t;
+    return true;
+}
+
+static bool calc_product(const char **p, struct calc_value *out, int depth) {
+    if (!calc_factor(p, out, depth)) {
+        return false;
+    }
+    for (;;) {
+        const char *t = skip_space(*p);
+        if (*t != '*' && *t != '/') {
+            return true;
+        }
+        char op = *t++;
+        struct calc_value right;
+        if (!calc_factor(&t, &right, depth)) {
+            return false;
+        }
+        if (op == '*') {
+            if (right.number) {
+                out->px *= right.px;
+                out->pct *= right.px;
+            } else if (out->number) {
+                double k = out->px;
+                *out = right;
+                out->px *= k;
+                out->pct *= k;
+            } else {
+                return false;
+            }
+        } else {
+            if (!right.number || right.px == 0) {
+                return false;
+            }
+            out->px /= right.px;
+            out->pct /= right.px;
+        }
+        out->cap = -1;
+        *p = t;
+    }
+}
+
+static bool calc_sum(const char **p, struct calc_value *out, int depth) {
+    if (!calc_product(p, out, depth)) {
+        return false;
+    }
+    for (;;) {
+        const char *t = skip_space(*p);
+        /* CSS wants spaces round + and -; "-" glued to a number is a sign. */
+        if ((*t != '+' && *t != '-') || !(t[1] == ' ' || t[1] == '\t')) {
+            return true;
+        }
+        char op = *t++;
+        struct calc_value right;
+        if (!calc_product(&t, &right, depth)) {
+            return false;
+        }
+        double k = op == '+' ? 1 : -1;
+        out->px += k * right.px;
+        out->pct += k * right.pct;
+        out->number = out->number && right.number;
+        out->cap = -1;
+        *p = t;
+    }
+}
+
+int last_length_cap = -1;
+
+/* calc()/min()/max()/clamp(). The result is pixels, or a percentage when a
+   percentage is involved (a px part next to it is dropped, so calc(100% -
+   2rem) is 100%). last_length_cap gets the px limit of min(%, px). */
+static bool parse_math(const char *text, int *value, bool *percent) {
+    const char *p = text;
+    struct calc_value v;
+    if (!calc_factor(&p, &v, 0)) {
+        return false;
+    }
+    if (v.pct != 0) {
+        *percent = true;
+        *value = (int)(v.pct + (v.pct < 0 ? -0.5 : 0.5));
+        last_length_cap = v.cap >= 0 ? (int)(v.cap + 0.5) : -1;
+    } else {
+        *percent = false;
+        *value = (int)(v.px + (v.px < 0 ? -0.5 : 0.5));
+    }
+    return true;
+}
+
 bool parse_length(const char *text, int *value, bool *percent) {
     text = skip_space(text);
+    last_length_cap = -1;
+    if (strncmp(text, "calc(", 5) == 0 || strncmp(text, "min(", 4) == 0
+        || strncmp(text, "max(", 4) == 0 || strncmp(text, "clamp(", 6) == 0) {
+        return parse_math(text, value, percent);
+    }
     bool negative = false;
     if (*text == '-' || *text == '+') {
         negative = *text == '-';
@@ -275,6 +715,27 @@ static bool parse_font_size(const char *value, int parent_size, int *size) {
 }
 
 /* Reads up to four lengths into sides (CSS margin/padding shorthand). */
+/* flex-grow as a weight in hundredths ("1" -> 100, "0.5" -> 50). */
+static int flex_weight(const char *text) {
+    int whole = 0, hundredths = 0;
+    while (isdigit((unsigned char)*text)) {
+        whole = whole * 10 + (*text++ - '0');
+        if (whole > 1000) {
+            whole = 1000;
+        }
+    }
+    if (*text == '.') {
+        text++;
+        if (isdigit((unsigned char)*text)) {
+            hundredths = (*text++ - '0') * 10;
+            if (isdigit((unsigned char)*text)) {
+                hundredths += *text - '0';
+            }
+        }
+    }
+    return whole * 100 + hundredths;
+}
+
 static void parse_box(const char *value, int font_size, int sides[4]) {
     int values[4];
     int count = 0;
@@ -465,7 +926,69 @@ void apply_declaration(struct style *style, const char *name,
     memcpy(text, value, value_length);
     text[value_length] = '\0';
 
+    /* margin-inline, padding-block-start, ...: map to physical sides. */
+    for (int box = 0; box < 2; box++) {
+        const char *prefix = box == 0 ? "margin-" : "padding-";
+        size_t plen = strlen(prefix);
+        if (name_length <= plen || strncmp(name, prefix, plen) != 0) {
+            continue;
+        }
+        const char *rest = name + plen;
+        size_t rlen = name_length - plen;
+        bool inline_axis = rlen >= 6 && strncmp(rest, "inline", 6) == 0;
+        bool block_axis = rlen >= 5 && strncmp(rest, "block", 5) == 0;
+        if (!inline_axis && !block_axis) {
+            break;
+        }
+        const char *edge = rest + (inline_axis ? 6 : 5);
+        size_t elen = rlen - (inline_axis ? 6 : 5);
+        const char *first = inline_axis ? "left" : "top";
+        const char *second = inline_axis ? "right" : "bottom";
+        char physical[24];
+        if (elen == 0) {
+            /* One or two values: start [end]. */
+            char a[96], b[96];
+            const char *space = strchr(text, ' ');
+            if (space == NULL) {
+                snprintf(a, sizeof(a), "%s", text);
+                snprintf(b, sizeof(b), "%s", text);
+            } else {
+                snprintf(a, sizeof(a), "%.*s", (int)(space - text), text);
+                snprintf(b, sizeof(b), "%s", skip_space(space));
+            }
+            snprintf(physical, sizeof(physical), "%s%s", prefix, first);
+            apply_declaration(style, physical, strlen(physical), a, parent);
+            snprintf(physical, sizeof(physical), "%s%s", prefix, second);
+            apply_declaration(style, physical, strlen(physical), b, parent);
+            return;
+        }
+        if (word_is(edge, elen, "-start") || word_is(edge, elen, "-end")) {
+            snprintf(physical, sizeof(physical), "%s%s", prefix,
+                     edge[1] == 's' ? first : second);
+            apply_declaration(style, physical, strlen(physical), text, parent);
+            return;
+        }
+        break;
+    }
+
     if (word_is(name, name_length, "display")) {
+        /* A later display value replaces an earlier flex or grid. */
+        bool known = word_is(text, strlen(text), "none")
+                  || word_is(text, strlen(text), "block")
+                  || word_is(text, strlen(text), "inline")
+                  || word_is(text, strlen(text), "inline-block")
+                  || word_is(text, strlen(text), "list-item")
+                  || word_is(text, strlen(text), "flow-root")
+                  || word_is(text, strlen(text), "flex")
+                  || word_is(text, strlen(text), "inline-flex")
+                  || word_is(text, strlen(text), "grid")
+                  || word_is(text, strlen(text), "inline-grid")
+                  || word_is(text, strlen(text), "contents");
+        if (known) {
+            style->flex = false;
+            style->grid = word_is(text, strlen(text), "grid")
+                       || word_is(text, strlen(text), "inline-grid");
+        }
         if (word_is(text, strlen(text), "none")) {
             style->display = DISPLAY_NONE;
         } else if (word_is(text, strlen(text), "flex")
@@ -475,6 +998,7 @@ void apply_declaration(struct style *style, const char *name,
         } else if (word_is(text, strlen(text), "block")
                    || word_is(text, strlen(text), "flex")
                    || word_is(text, strlen(text), "grid")
+                   || word_is(text, strlen(text), "inline-grid")
                    || word_is(text, strlen(text), "flow-root")) {
             style->display = DISPLAY_BLOCK;
         } else if (word_is(text, strlen(text), "inline")) {
@@ -484,6 +1008,8 @@ void apply_declaration(struct style *style, const char *name,
                            ? DISPLAY_INLINE_BLOCK : DISPLAY_INLINE;
         } else if (word_is(text, strlen(text), "list-item")) {
             style->display = DISPLAY_LIST_ITEM;
+        } else if (word_is(text, strlen(text), "contents")) {
+            style->display = DISPLAY_CONTENTS;
         }
     } else if (word_is(name, name_length, "color")) {
         uint32_t colour;
@@ -502,10 +1028,18 @@ void apply_declaration(struct style *style, const char *name,
             }
             char saved = *end;
             *end = '\0';
-            if (strncmp(token, "url(", 4) != 0 && parse_colour(token, &colour)) {
-                style->has_background = true;
+            int alpha;
+            if (strncmp(token, "url(", 4) != 0
+                && parse_colour_alpha(token, &colour, &alpha)) {
+                /* "transparent" (or any fully transparent colour) removes
+                   a background set by an earlier rule. */
+                style->has_background = alpha > 0;
                 style->background = colour;
+                style->background_alpha = (uint8_t)alpha;
                 break;
+            }
+            if (word_is(token, strlen(token), "none")) {
+                style->has_background = false;
             }
             *end = saved;
             token = end;
@@ -557,6 +1091,9 @@ void apply_declaration(struct style *style, const char *name,
             } else {
                 style->width = percent ? -1 : number;
                 style->width_pct = percent ? number : -1;
+                if (percent && last_length_cap >= 0) {
+                    style->max_width = last_length_cap; /* min(100%, 80rem) */
+                }
             }
         } else if (word_is(text, strlen(text), "auto")
                    || word_is(text, strlen(text), "none")) {
@@ -572,21 +1109,77 @@ void apply_declaration(struct style *style, const char *name,
     } else if (word_is(name, name_length, "clear")) {
         style->clear_both = !word_is(text, strlen(text), "none");
     } else if (word_is(name, name_length, "flex-direction")) {
-        style->flex = style->flex && strncmp(text, "column", 6) != 0;
+        style->flex_column = strncmp(text, "column", 6) == 0;
     } else if (word_is(name, name_length, "flex-wrap")) {
         style->flex_wrap = strncmp(text, "wrap", 4) == 0;
     } else if (word_is(name, name_length, "flex-grow")) {
-        style->flex_grow = atoi(text) > 0 ? 1 : 0;
+        style->flex_grow = flex_weight(text);
+    } else if (word_is(name, name_length, "flex-shrink")) {
+        style->no_shrink = text[0] == '0' && text[1] != '.';
+    } else if (word_is(name, name_length, "flex-basis")) {
+        style->flex_zero = text[0] == '0' && !isdigit((unsigned char)text[1])
+                        && text[1] != '.';
     } else if (word_is(name, name_length, "flex")) {
-        style->flex_grow = atoi(text) > 0 ? 1 : 0;
-        style->flex_zero = style->flex_grow && strchr(text, ' ') == NULL;
+        /* none | auto | <grow> [<shrink>] [<basis>]; "flex: 1" means a
+           zero basis, "auto" a content basis. */
+        if (word_is(text, strlen(text), "none")
+            || word_is(text, strlen(text), "initial")) {
+            style->flex_grow = 0;
+            style->flex_zero = false;
+            style->no_shrink = word_is(text, strlen(text), "none");
+        } else if (word_is(text, strlen(text), "auto")) {
+            style->flex_grow = 100;
+            style->flex_zero = false;
+        } else if (isdigit((unsigned char)text[0]) || text[0] == '.') {
+            style->flex_grow = flex_weight(text);
+            const char *shrink = strchr(text, ' ');
+            style->no_shrink = shrink != NULL && shrink[1] == '0'
+                            && shrink[2] != '.' && shrink[2] != '%'
+                            && !isalpha((unsigned char)shrink[2]);
+            const char *basis = strrchr(text, ' ');
+            style->flex_zero = basis == NULL
+                            || (basis[1] == '0' && !isdigit((unsigned char)basis[2])
+                                && basis[2] != '.');
+        }
     } else if (word_is(name, name_length, "gap")
-               || word_is(name, name_length, "column-gap")) {
+               || word_is(name, name_length, "column-gap")
+               || word_is(name, name_length, "grid-column-gap")
+               || word_is(name, name_length, "grid-gap")) {
         int side[4] = {0};
         parse_box(text, style->font_size, side);
-        style->gap = side[word_is(name, name_length, "gap") ? 1 : 0];
+        style->gap = side[word_is(name, name_length, "gap")
+                          || word_is(name, name_length, "grid-gap") ? 1 : 0];
         if (style->gap == 0) {
             style->gap = side[0];
+        }
+    } else if (word_is(name, name_length, "grid-column")) {
+        /* "span N", "A", "A / B", "A / span N", "1 / -1". */
+        style->grid_start = 0;
+        style->grid_span = 1;
+        char *slash = strchr(text, '/');
+        char *second = slash != NULL ? slash + 1 : NULL;
+        if (slash != NULL) {
+            *slash = '\0';
+        }
+        const char *first = skip_space(text);
+        if (strncmp(first, "span", 4) == 0) {
+            style->grid_span = atoi(first + 4);
+        } else if (isdigit((unsigned char)*first)) {
+            style->grid_start = atoi(first);
+        }
+        if (second != NULL) {
+            second = (char *)skip_space(second);
+            if (strncmp(second, "span", 4) == 0) {
+                style->grid_span = atoi(second + 4);
+            } else if (*second == '-' && second[1] == '1') {
+                style->grid_span = -1;
+            } else if (isdigit((unsigned char)*second)
+                       && style->grid_start > 0) {
+                style->grid_span = atoi(second) - style->grid_start;
+            }
+        }
+        if (style->grid_span == 0) {
+            style->grid_span = 1;
         }
     } else if (word_is(name, name_length, "grid-template-columns")) {
         parse_grid_columns(style, text);

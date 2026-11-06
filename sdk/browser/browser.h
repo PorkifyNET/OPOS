@@ -30,7 +30,8 @@ enum display {
     DISPLAY_TABLE,
     DISPLAY_TABLE_PART, /* row, row group, caption, column: handled by table */
     DISPLAY_TABLE_CELL,
-    DISPLAY_INLINE_BLOCK /* form controls */
+    DISPLAY_INLINE_BLOCK, /* form controls */
+    DISPLAY_CONTENTS      /* no box: children belong to the parent */
 };
 
 enum align { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
@@ -46,6 +47,7 @@ struct style {
     bool pre;                /* keep white space and line breaks */
     uint32_t colour;         /* 0x00RRGGBB */
     bool has_background;
+    uint8_t background_alpha;  /* 255 opaque; less is blended */
     uint32_t background;
     int margin[4];           /* top, right, bottom, left */
     int padding[4];
@@ -63,8 +65,11 @@ struct style {
     int float_side;          /* 0 none, 1 left, 2 right */
     bool clear_both;
     bool flex, flex_wrap, flex_zero; /* flex_zero: flex: N (basis 0) */
+    bool flex_column, grid;          /* flex-direction: column; display: grid */
+    bool no_shrink;                  /* flex-shrink: 0 */
     int flex_grow, justify, gap;     /* justify: 0 start 1 center 2 end 3 between */
     int grid_count;                  /* tracks from grid-template-columns */
+    int grid_start, grid_span;       /* grid-column: 1-based line (0 auto), tracks; span -1 = to the end */
     int grid_size[12];               /* px, percent or fr*100 */
     char grid_kind[12];              /* p px, c percent, f fr, a auto */
     int grid_fill_min;               /* repeat(auto-fill, minmax(N, 1fr)) */
@@ -81,6 +86,9 @@ struct style {
 
 /* Parses "#rgb", "#rrggbb", "rgb(r,g,b)" and the usual colour names. */
 bool parse_colour(const char *text, uint32_t *out);
+/* Like parse_colour, and also gives the alpha (0 transparent, 255 opaque);
+   understands #rgba, rgb()/rgba(), hsl()/hsla() and color-mix(). */
+bool parse_colour_alpha(const char *text, uint32_t *out, int *alpha);
 
 /* Parses an integer length ("12", "12px", "50%"). percent is set for "%".
    Returns false when there is no number. */
@@ -109,6 +117,7 @@ struct display_item {
     enum item_kind kind;
     int x, y, width, height;   /* the item's box; text: y is the line top */
     uint32_t colour;
+    uint8_t transparency;      /* rectangles: 0 opaque, 255 invisible */
     /* text */
     const char *text;
     size_t length;

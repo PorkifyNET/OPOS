@@ -385,65 +385,357 @@ static void split_block(char *block, char **normal, char **important) {
     *important = im;
 }
 
-static bool media_matches(const char *query) {
-    /* Comma-separated list: any alternative may match. */
-    char copy[256];
-    {
-        size_t n = strlen(query);
-        if (n >= sizeof(copy)) {
-            n = sizeof(copy) - 1;
-        }
-        memcpy(copy, query, n);
-        copy[n] = '\0';
+/* ---- Media queries: screen, light colour scheme, a mouse, the window's
+   size. Supports min-/max- features, range syntax (width >= 40em,
+   400px < width < 800px), and / or / not, and comma lists. */
+
+static const char *media_space(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
     }
-    for (char *c = copy; *c != '\0'; c++) {
-        *c = (char)tolower((unsigned char)*c);
+    return p;
+}
+
+static bool media_word(const char **p, const char *word) {
+    size_t n = strlen(word);
+    if (strncmp(*p, word, n) == 0 && !isalnum((unsigned char)(*p)[n])
+        && (*p)[n] != '-') {
+        *p = media_space(*p + n);
+        return true;
     }
-    char *alternative = copy;
-    for (;;) {
-        char *comma = strchr(alternative, ',');
-        if (comma != NULL) {
-            *comma = '\0';
+    return false;
+}
+
+/* A length in px (em and rem are 16 px). Returns false if none. */
+static bool media_length(const char **p, double *out) {
+    const char *t = media_space(*p);
+    if (!isdigit((unsigned char)*t) && *t != '.') {
+        return false;
+    }
+    double v = 0;
+    while (isdigit((unsigned char)*t)) {
+        v = v * 10 + (*t++ - '0');
+    }
+    if (*t == '.') {
+        t++;
+        double scale = 0.1;
+        while (isdigit((unsigned char)*t)) {
+            v += (*t++ - '0') * scale;
+            scale /= 10;
         }
-        bool ok = strstr(alternative, "print") == NULL
-               && strstr(alternative, "speech") == NULL
-               && strstr(alternative, "dark") == NULL
-               && strstr(alternative, "portrait") == NULL
-               && strstr(alternative, "reduce") == NULL
-               && strstr(alternative, "hover: none") == NULL
-               && strstr(alternative, "hover:none") == NULL
-               && strstr(alternative, "pointer: coarse") == NULL
-               && strstr(alternative, "pointer:coarse") == NULL;
-        const char *f;
-        if (ok && (f = strstr(alternative, "min-width")) != NULL) {
-            const char *colon = strchr(f, ':');
-            if (colon != NULL) {
-                int v = atoi(colon + 1);
-                if (strstr(colon, "em") != NULL
-                    && strstr(colon, "em") < strchr(colon, ')')) {
-                    v *= 16;
-                }
-                ok = v <= viewport_width_px;
-            }
+    }
+    if (strncmp(t, "em", 2) == 0) {
+        v *= 16;
+        t += 2;
+    } else if (strncmp(t, "rem", 3) == 0) {
+        v *= 16;
+        t += 3;
+    } else if (strncmp(t, "px", 2) == 0) {
+        t += 2;
+    } else if (*t == '/') {
+        /* aspect ratio a/b: compare as a number */
+        t++;
+        double b = 0;
+        while (isdigit((unsigned char)*t)) {
+            b = b * 10 + (*t++ - '0');
         }
-        if (ok && (f = strstr(alternative, "max-width")) != NULL) {
-            const char *colon = strchr(f, ':');
-            if (colon != NULL) {
-                int v = atoi(colon + 1);
-                if (strstr(colon, "em") != NULL
-                    && strstr(colon, "em") < strchr(colon, ')')) {
-                    v *= 16;
-                }
-                ok = v >= viewport_width_px;
-            }
+        if (b > 0) {
+            v /= b;
         }
-        if (ok) {
-            return true;
+    }
+    *out = v;
+    *p = media_space(t);
+    return true;
+}
+
+/* The value of a size feature (width, height, aspect-ratio), or -1. */
+static double media_size(const char *name, size_t length) {
+    double w = viewport_width_px, h = viewport_height_px;
+    if (length == 5 && strncmp(name, "width", 5) == 0) {
+        return w;
+    }
+    if (length == 6 && strncmp(name, "height", 6) == 0) {
+        return h;
+    }
+    if (length == 12 && strncmp(name, "aspect-ratio", 12) == 0) {
+        return h > 0 ? w / h : 1;
+    }
+    if (length == 12 && strncmp(name, "device-width", 12) == 0) {
+        return w;
+    }
+    if (length == 13 && strncmp(name, "device-height", 13) == 0) {
+        return h;
+    }
+    return -1;
+}
+
+static bool media_compare(double a, const char *op, double b) {
+    if (op[0] == '<') {
+        return op[1] == '=' ? a <= b + 0.01 : a < b;
+    }
+    if (op[0] == '>') {
+        return op[1] == '=' ? a >= b - 0.01 : a > b;
+    }
+    return a > b - 0.5 && a < b + 0.5;
+}
+
+static const char *media_operator(const char **p) {
+    const char *t = media_space(*p);
+    static const char *ops[] = {"<=", ">=", "<", ">", "="};
+    for (size_t i = 0; i < 5; i++) {
+        size_t n = strlen(ops[i]);
+        if (strncmp(t, ops[i], n) == 0) {
+            *p = media_space(t + n);
+            return ops[i];
         }
-        if (comma == NULL) {
+    }
+    return NULL;
+}
+
+/* Inside one "( ... )" that holds a feature; *p is after "(". */
+static bool media_feature(const char **p) {
+    const char *t = media_space(*p);
+    const char *end = strchr(t, ')');
+    if (end == NULL) {
+        *p = t + strlen(t);
+        return false;
+    }
+    *p = end + 1;
+    char text[96];
+    size_t n = (size_t)(end - t);
+    if (n >= sizeof(text)) {
+        return false;
+    }
+    memcpy(text, t, n);
+    text[n] = '\0';
+    while (n > 0 && text[n - 1] == ' ') {
+        text[--n] = '\0';
+    }
+    const char *q = text;
+    /* Range: "400px < width <= 800px" or "width >= 40em". */
+    double first;
+    if (media_length(&q, &first)) {
+        const char *op1 = media_operator(&q);
+        const char *name = q;
+        while (isalpha((unsigned char)*q) || *q == '-') {
+            q++;
+        }
+        double value = media_size(name, (size_t)(q - name));
+        q = media_space(q);
+        if (op1 == NULL || value < 0) {
             return false;
         }
-        alternative = comma + 1;
+        /* "a < width" means width > a: flip the operator. */
+        char flipped[3] = {op1[0] == '<' ? '>' : op1[0] == '>' ? '<' : '=',
+                           op1[1], '\0'};
+        bool ok = media_compare(value, flipped, first);
+        const char *op2 = media_operator(&q);
+        double second;
+        if (op2 != NULL && media_length(&q, &second)) {
+            ok = ok && media_compare(value, op2, second);
+        }
+        return ok;
+    }
+    const char *name = q;
+    while (isalpha((unsigned char)*q) || *q == '-') {
+        q++;
+    }
+    size_t name_length = (size_t)(q - name);
+    q = media_space(q);
+    const char *op = media_operator(&q);
+    if (op != NULL) {
+        double value = media_size(name, name_length), limit;
+        return value >= 0 && media_length(&q, &limit)
+            && media_compare(value, op, limit);
+    }
+    const char *value = "";
+    if (*q == ':') {
+        value = media_space(q + 1);
+    }
+    bool has_value = *value != '\0';
+    if (name_length > 4 && (strncmp(name, "min-", 4) == 0
+                            || strncmp(name, "max-", 4) == 0)) {
+        double v = media_size(name + 4, name_length - 4), limit;
+        const char *vp = value;
+        if (v < 0 || !media_length(&vp, &limit)) {
+            return false;
+        }
+        return name[1] == 'i' ? v >= limit - 0.01 : v <= limit + 0.01;
+    }
+#define FEATURE(word) (name_length == strlen(word) \
+                       && strncmp(name, word, name_length) == 0)
+    if (FEATURE("width") || FEATURE("height")) {
+        double v = media_size(name, name_length), limit;
+        const char *vp = value;
+        return !has_value
+            || (media_length(&vp, &limit) && media_compare(v, "=", limit));
+    }
+    if (FEATURE("prefers-color-scheme")) {
+        return strncmp(value, "light", 5) == 0;
+    }
+    if (FEATURE("prefers-reduced-motion")
+        || FEATURE("prefers-reduced-transparency")
+        || FEATURE("prefers-reduced-data")) {
+        return strncmp(value, "no-preference", 13) == 0;
+    }
+    if (FEATURE("prefers-contrast")) {
+        return strncmp(value, "no-preference", 13) == 0;
+    }
+    if (FEATURE("forced-colors")) {
+        return strncmp(value, "none", 4) == 0;
+    }
+    if (FEATURE("hover") || FEATURE("any-hover")) {
+        return !has_value || strncmp(value, "hover", 5) == 0;
+    }
+    if (FEATURE("pointer") || FEATURE("any-pointer")) {
+        return !has_value || strncmp(value, "fine", 4) == 0;
+    }
+    if (FEATURE("orientation")) {
+        bool landscape = viewport_width_px >= viewport_height_px;
+        return strncmp(value, landscape ? "landscape" : "portrait", 8) == 0;
+    }
+    if (FEATURE("color") || FEATURE("min-color")) {
+        return true;
+    }
+    if (FEATURE("monochrome") || FEATURE("grid")) {
+        return has_value && value[0] == '0';
+    }
+    if (FEATURE("display-mode")) {
+        return strncmp(value, "browser", 7) == 0;
+    }
+    if (FEATURE("scripting")) {
+        return strncmp(value, "none", 4) == 0;
+    }
+    if (FEATURE("update")) {
+        return strncmp(value, "fast", 4) == 0;
+    }
+    if (FEATURE("resolution") || FEATURE("min-resolution")
+        || FEATURE("-webkit-min-device-pixel-ratio")) {
+        return true;
+    }
+#undef FEATURE
+    return false;
+}
+
+static bool media_condition(const char **p, int depth);
+
+/* "( condition )" or "( feature )" or "not ( ... )". */
+static bool media_term(const char **p, int depth) {
+    const char *t = media_space(*p);
+    if (media_word(&t, "not")) {
+        bool ok = !media_term(&t, depth);
+        *p = t;
+        return ok;
+    }
+    if (*t != '(') {
+        /* A bare media type inside a condition: unknown. */
+        while (*t != '\0' && *t != ')' && *t != ' ') {
+            t++;
+        }
+        *p = t;
+        return false;
+    }
+    const char *inner = media_space(t + 1);
+    if (*inner == '(' || strncmp(inner, "not ", 4) == 0) {
+        t = inner;
+        bool ok = media_condition(&t, depth + 1);
+        t = media_space(t);
+        if (*t == ')') {
+            t++;
+        }
+        *p = media_space(t);
+        return ok;
+    }
+    t = inner;
+    bool ok = media_feature(&t);
+    *p = media_space(t);
+    return ok;
+}
+
+static bool media_condition(const char **p, int depth) {
+    if (depth > 8) {
+        return false;
+    }
+    bool ok = media_term(p, depth);
+    for (;;) {
+        const char *t = media_space(*p);
+        if (media_word(&t, "and")) {
+            bool next = media_term(&t, depth);
+            ok = ok && next;
+        } else if (media_word(&t, "or")) {
+            bool next = media_term(&t, depth);
+            ok = ok || next;
+        } else {
+            *p = t;
+            return ok;
+        }
+        *p = t;
+    }
+}
+
+/* One query of a comma list. */
+static bool media_query(const char *query) {
+    const char *p = media_space(query);
+    if (*p == '\0') {
+        return true;
+    }
+    bool negate = false;
+    if (media_word(&p, "not")) {
+        negate = true;
+    } else {
+        media_word(&p, "only");
+    }
+    bool ok = true;
+    if (*p != '(') {
+        /* Media type. */
+        if (media_word(&p, "screen") || media_word(&p, "all")) {
+            ok = true;
+        } else {
+            while (*p != '\0' && *p != ' ') {
+                p++;
+            }
+            p = media_space(p);
+            ok = false;
+        }
+        if (media_word(&p, "and")) {
+            bool rest = media_condition(&p, 0);
+            ok = ok && rest;
+        }
+    } else {
+        ok = media_condition(&p, 0);
+    }
+    return negate ? !ok : ok;
+}
+
+static bool media_matches(const char *query) {
+    char copy[512];
+    size_t n = strlen(query);
+    if (n >= sizeof(copy)) {
+        n = sizeof(copy) - 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        copy[i] = (char)tolower((unsigned char)query[i]);
+    }
+    copy[n] = '\0';
+    /* Comma-separated list (commas at the top level): any may match. */
+    char *start = copy;
+    int depth = 0;
+    for (char *c = copy;; c++) {
+        if (*c == '(') {
+            depth++;
+        } else if (*c == ')') {
+            depth--;
+        } else if ((*c == ',' && depth == 0) || *c == '\0') {
+            bool last = *c == '\0';
+            *c = '\0';
+            if (media_query(start)) {
+                return true;
+            }
+            if (last) {
+                return false;
+            }
+            start = c + 1;
+        }
     }
 }
 
@@ -1164,6 +1456,10 @@ static void substitute(const struct var_scope *scope, const char *value,
     out[used] = '\0';
 }
 
+#ifdef BROWSER_HOST_DEBUG
+static bool debug_element;
+#endif
+
 void css_apply_block(struct style *style, const char *text,
                      const struct style *parent) {
     while (*text != '\0') {
@@ -1216,6 +1512,13 @@ void css_apply_block(struct style *style, const char *text,
                                                     != NULL) {
                 char value[400];
                 substitute(style->vars, raw, value, sizeof(value), 0);
+#ifdef BROWSER_HOST_DEBUG
+                if (debug_element) {
+                    extern int printf(const char *, ...);
+                    printf("    %.*s: %s => %s\n", (int)name_length, text,
+                           raw, value);
+                }
+#endif
                 apply_declaration(style, text, name_length, value, parent);
             } else {
                 apply_declaration(style, text, name_length, raw, parent);
@@ -1535,6 +1838,27 @@ void css_apply(const struct css_sheet *chain,
         return;
     }
     style->vars = element_scope(index, matched, element, parent->vars);
+#ifdef BROWSER_HOST_DEBUG
+    /* Host builds: CSSDEBUG=class prints the rules of matching elements. */
+    debug_element = false;
+    {
+        extern char *getenv(const char *);
+        extern int printf(const char *, ...);
+        const char *wanted = getenv("CSSDEBUG");
+        if (wanted != NULL && has_class(element, wanted, strlen(wanted))) {
+            debug_element = true;
+            printf("<%s class=%s> %zu rules\n", element->name,
+                   opos_html_attribute(element, "class"), matched->count);
+            for (size_t i = 0; i < matched->count; i++) {
+                const struct rule *r = matched->rules[i];
+                printf("  [%06x] %.300s %s%.100s\n", r->specificity,
+                       r->normal != NULL ? r->normal : "",
+                       r->important != NULL && r->important[0] ? "!! " : "",
+                       r->important != NULL ? r->important : "");
+            }
+        }
+    }
+#endif
     for (size_t i = 0; i < matched->count; i++) {
         if (matched->rules[i]->normal != NULL) {
             css_apply_block(style, matched->rules[i]->normal, parent);

@@ -450,6 +450,41 @@ static void fill_clipped(int x, int y, int width, int height, uint32_t colour,
     }
 }
 
+/* Fills a rectangle with colour at alpha (1-254) over what is there. */
+static void blend_clipped(int x, int y, int width, int height,
+                          uint32_t colour, int alpha, int top, int bottom) {
+    if (y < top) {
+        height -= top - y;
+        y = top;
+    }
+    if (y + height > bottom) {
+        height = bottom - y;
+    }
+    if (x < 0) {
+        width += x;
+        x = 0;
+    }
+    if (x + width > viewport_width()) {
+        width = viewport_width() - x;
+    }
+    if (width <= 0 || height <= 0 || y + height > b.canvas.height) {
+        return;
+    }
+    uint32_t r = (colour >> 16) & 255, g = (colour >> 8) & 255,
+             bl = colour & 255;
+    uint32_t keep = 255 - (uint32_t)alpha;
+    for (int row = 0; row < height; row++) {
+        uint32_t *p = b.canvas.pixels + (size_t)(y + row) * b.canvas.stride
+                    + x;
+        for (int col = 0; col < width; col++) {
+            uint32_t q = p[col];
+            p[col] = ((r * alpha + ((q >> 16) & 255) * keep) / 255) << 16
+                   | ((g * alpha + ((q >> 8) & 255) * keep) / 255) << 8
+                   | (bl * alpha + (q & 255) * keep) / 255;
+        }
+    }
+}
+
 static void paint_page(void) {
     int top = TOOLBAR_HEIGHT;
     int bottom = top + viewport_height();
@@ -471,8 +506,13 @@ static void paint_page(void) {
         }
         switch (item->kind) {
         case ITEM_RECT:
-            fill_clipped(x, y, item->width, item->height, item->colour, top,
-                         bottom);
+            if (item->transparency == 0) {
+                fill_clipped(x, y, item->width, item->height, item->colour,
+                             top, bottom);
+            } else if (item->transparency < 255) {
+                blend_clipped(x, y, item->width, item->height, item->colour,
+                              255 - item->transparency, top, bottom);
+            }
             break;
         case ITEM_OUTLINE:
             fill_clipped(x, y, item->width, 1, item->colour, top, bottom);

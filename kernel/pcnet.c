@@ -54,7 +54,9 @@
 
 static uint16_t io;
 static bool ready;
-static bool link_known; /* BCR4 reports the link */
+/* BCR4's LED0 bit has shown the link up at least once. VMware's vlance
+   never sets it, so until then the link counts as up. */
+static bool link_known;
 static uint32_t pci_id;
 static uint8_t mac[6];
 static uint8_t *memory;
@@ -189,8 +191,6 @@ bool pcnet_initialize(void) {
     csr_write(0, CSR0_IDON | CSR0_STRT);
     rx_next = 0;
     tx_next = 0;
-    /* BCR4 drives LED0, which shows the link by default (LNKSTE). */
-    link_known = (bcr_read(4) & 0x00c0) != 0;
     ready = true;
     return true;
 }
@@ -209,7 +209,9 @@ bool pcnet_link_up(void) {
     if (!ready) {
         return false;
     }
-    return !link_known || (bcr_read(4) & BCR4_LEDOUT) != 0;
+    bool led = (bcr_read(4) & BCR4_LEDOUT) != 0;
+    link_known |= led;
+    return led || !link_known;
 }
 
 bool pcnet_send(const void *frame, size_t length) {

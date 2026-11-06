@@ -302,6 +302,24 @@ static inline long opos_window_size(uint32_t *width, uint32_t *height) {
     return size;
 }
 
+/* ---------------------------------------------------------- clipboard */
+
+/* The desktop's shared clipboard (the one Ctrl+C/V use everywhere). */
+#define OPOS_SYS_CLIPBOARD_SET 0x4f500014L
+#define OPOS_SYS_CLIPBOARD_GET 0x4f500015L
+
+/* Replaces the clipboard with text (at most 64 KiB are kept). Returns the
+   number of bytes kept or a negative error. */
+static inline long opos_clipboard_set(const char *text, size_t length) {
+    return opos_syscall2(OPOS_SYS_CLIPBOARD_SET, (long)text, (long)length);
+}
+
+/* Copies up to capacity bytes of the clipboard into out (no NUL is added)
+   and returns the clipboard's full length, or a negative error. */
+static inline long opos_clipboard_get(char *out, size_t capacity) {
+    return opos_syscall2(OPOS_SYS_CLIPBOARD_GET, (long)out, (long)capacity);
+}
+
 /* ------------------------------------------------------------- memory */
 
 /* Zero-filled, readable and writable memory; up to 64 MiB in total per

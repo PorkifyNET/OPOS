@@ -3145,6 +3145,9 @@ static int64_t user_opos_update(const struct user_process *process,
 #define OPOS_SYSCALL_WINDOW_PRESENT (OPOS_SYSCALL_BASE + 0x11)
 #define OPOS_SYSCALL_WINDOW_EVENT (OPOS_SYSCALL_BASE + 0x12)
 #define OPOS_SYSCALL_WINDOW_SIZE (OPOS_SYSCALL_BASE + 0x13)
+#define OPOS_SYSCALL_CLIPBOARD_SET (OPOS_SYSCALL_BASE + 0x14)
+#define OPOS_SYSCALL_CLIPBOARD_GET (OPOS_SYSCALL_BASE + 0x15)
+#define OPOS_CLIPBOARD_MAX (64 * 1024)
 #define OPOS_WINDOW_TITLE_MAX 64
 #define OPOS_WINDOW_PIXELS_MAX 4096
 
@@ -3221,6 +3224,31 @@ static bool user_opos_window(const struct user_process *process,
     } else if (number == OPOS_SYSCALL_WINDOW_SIZE) {
         uint64_t size = desktop_app_window_size(process->id);
         result = size == 0 ? -9 : (int64_t)size;
+    } else if (number == OPOS_SYSCALL_CLIPBOARD_SET) {
+        uintptr_t address = (uintptr_t)frame->rdi;
+        size_t length = (size_t)frame->rsi;
+        if (length > OPOS_CLIPBOARD_MAX) {
+            length = OPOS_CLIPBOARD_MAX;
+        }
+        if (length != 0
+            && !paging_user_range_valid(address, length, false, false)) {
+            result = -14;
+        } else {
+            desktop_clipboard_set((const char *)address, length);
+            result = (int64_t)length;
+        }
+    } else if (number == OPOS_SYSCALL_CLIPBOARD_GET) {
+        uintptr_t address = (uintptr_t)frame->rdi;
+        size_t capacity = (size_t)frame->rsi;
+        if (capacity > OPOS_CLIPBOARD_MAX) {
+            capacity = OPOS_CLIPBOARD_MAX;
+        }
+        if (capacity != 0
+            && !paging_user_range_valid(address, capacity, true, false)) {
+            result = -14;
+        } else {
+            result = (int64_t)desktop_clipboard_get((char *)address, capacity);
+        }
     } else {
         result = -38;
     }
@@ -4550,7 +4578,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
-        && number <= OPOS_SYSCALL_WINDOW_SIZE) {
+        && number <= OPOS_SYSCALL_CLIPBOARD_GET) {
         return user_opos_window(process, frame);
     }
     if (number >= OPOS_SYSCALL_UPDATE_BEGIN

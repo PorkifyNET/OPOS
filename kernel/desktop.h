@@ -37,6 +37,10 @@ int64_t desktop_app_window_event(uint64_t owner,
                                  int64_t timeout_ms, bool *terminate);
 /* Content size as width << 32 | height, or 0 without a window. */
 uint64_t desktop_app_window_size(uint64_t owner);
+/* The shared clipboard for programs. Set keeps at most 64 KiB. Get copies
+   up to capacity bytes and returns the clipboard's full length. */
+void desktop_clipboard_set(const char *text, size_t length);
+size_t desktop_clipboard_get(char *out, size_t capacity);
 /* Every process end: its window goes away. */
 void desktop_app_process_exited(uint64_t process_id);
 

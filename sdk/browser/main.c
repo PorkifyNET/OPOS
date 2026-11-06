@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <opos.h>
+#include <opos_tls.h>
 
 #include "browser.h"
 
@@ -42,13 +43,34 @@ struct browser {
     char address[OPOS_HTTP_URL_MAX];
     size_t address_length;
     bool editing;
+    bool address_selected;        /* the next typed key replaces it all */
     char status[OPOS_HTTP_URL_MAX + 32];
     char history[HISTORY_MAX][OPOS_HTTP_URL_MAX];
     int history_count;
     int history_position;
     bool dirty;
     bool dragging_scrollbar;
+    /* The page's text as one string (words joined with spaces and line
+       breaks) and, per display item, where its text starts in it
+       (NO_TEXT for items without text). Selection and find use offsets
+       into this string. */
+    char *text;
+    size_t text_length;
+    size_t *item_start;
+    size_t selection_anchor, selection_cursor;
+    bool selecting;               /* left button held on the page */
+    bool pressed_moved;
+    int press_x, press_y;
+    bool finding;                 /* the find bar is open */
+    char find[128];
+    size_t find_length;
+    size_t match;                 /* start of the current match */
+    bool have_match;
 };
+
+#define NO_TEXT ((size_t)-1)
+#define COL_SELECTION OPOS_RGB(180, 213, 254)
+#define COL_MATCH OPOS_RGB(255, 210, 90)
 
 static struct browser b;
 
@@ -84,6 +106,277 @@ static void set_status(const char *text) {
 static void set_address(const char *url) {
     snprintf(b.address, sizeof(b.address), "%s", url);
     b.address_length = strlen(b.address);
+}
+
+/* ------------------------------------------------------------ page text */
+
+static bool is_text_item(const struct display_item *item) {
+    return item->kind == ITEM_TEXT && item->length > 0
+        && !(item->length == 1 && item->text[0] == ' ');
+}
+
+static void text_put(size_t *capacity, const char *s, size_t n) {
+    if (b.text == NULL) {
+        return;
+    }
+    if (b.text_length + n + 1 > *capacity) {
+        size_t grown = (*capacity + n + 1) * 2;
+        char *bigger = realloc(b.text, grown);
+        if (bigger == NULL) {
+            free(b.text);
+            b.text = NULL;
+            return;
+        }
+        b.text = bigger;
+        *capacity = grown;
+    }
+    memcpy(b.text + b.text_length, s, n);
+    b.text_length += n;
+    b.text[b.text_length] = '\0';
+}
+
+/* Rebuilds b.text and b.item_start from the display list. A word on a
+   new line starts with a line break (two after a gap, as between
+   paragraphs); a word after a gap on the same line starts with a space. */
+static void build_text(void) {
+    free(b.text);
+    free(b.item_start);
+    b.text = NULL;
+    b.item_start = NULL;
+    b.text_length = 0;
+    if (!b.have_page) {
+        return;
+    }
+    size_t count = b.page.item_count;
+    b.item_start = malloc((count + 1) * sizeof(size_t));
+    size_t capacity = 4096;
+    b.text = malloc(capacity);
+    if (b.item_start == NULL || b.text == NULL) {
+        free(b.item_start);
+        free(b.text);
+        b.item_start = NULL;
+        b.text = NULL;
+        return;
+    }
+    b.text[0] = '\0';
+    const struct display_item *previous = NULL;
+    for (size_t i = 0; i < count; i++) {
+        const struct display_item *item = &b.page.items[i];
+        b.item_start[i] = NO_TEXT;
+        if (!is_text_item(item)) {
+            continue;
+        }
+        if (previous != NULL) {
+            int previous_bottom = previous->y + previous->height;
+            if (item->y >= previous->y + previous->height / 2
+                || item->y + item->height <= previous->y) {
+                bool gap = item->y > previous_bottom + previous->height / 2;
+                text_put(&capacity, "\n\n", gap ? 2 : 1);
+            } else if (item->x > previous->x + previous->width
+                       || item->x < previous->x) {
+                text_put(&capacity, " ", 1);
+            }
+        }
+        if (b.text == NULL) {
+            free(b.item_start);
+            b.item_start = NULL;
+            b.text_length = 0;
+            return;
+        }
+        b.item_start[i] = b.text_length;
+        text_put(&capacity, item->text, item->length);
+        previous = item;
+    }
+    if (b.text == NULL) {
+        free(b.item_start);
+        b.item_start = NULL;
+        b.text_length = 0;
+    }
+}
+
+static size_t selection_start(void) {
+    return b.selection_anchor < b.selection_cursor ? b.selection_anchor
+                                                   : b.selection_cursor;
+}
+
+static size_t selection_end(void) {
+    return b.selection_anchor > b.selection_cursor ? b.selection_anchor
+                                                   : b.selection_cursor;
+}
+
+static void clear_selection(void) {
+    b.selection_anchor = b.selection_cursor = 0;
+    b.have_match = false;
+}
+
+/* Width of the first n bytes of a text item. */
+static int item_prefix_width(const struct display_item *item, size_t n) {
+    if (n >= item->length) {
+        return item->width;
+    }
+    return opos_font_text_width(b.fonts[item->font], item->size, item->text,
+                                n);
+}
+
+/* The text offset nearest to a point in page coordinates. */
+static size_t text_offset_at(int x, int y) {
+    if (b.item_start == NULL) {
+        return 0;
+    }
+    long best_distance = -1;
+    size_t best = 0;
+    for (size_t i = 0; i < b.page.item_count; i++) {
+        if (b.item_start[i] == NO_TEXT) {
+            continue;
+        }
+        const struct display_item *item = &b.page.items[i];
+        long dy = y < item->y ? item->y - y
+                : y >= item->y + item->height ? y - (item->y + item->height) + 1
+                : 0;
+        long dx = x < item->x ? item->x - x
+                : x >= item->x + item->width ? x - (item->x + item->width) + 1
+                : 0;
+        long distance = dy * 65536 + dx;
+        if (best_distance < 0 || distance < best_distance) {
+            best_distance = distance;
+            best = i;
+        }
+    }
+    if (best_distance < 0) {
+        return 0;
+    }
+    const struct display_item *item = &b.page.items[best];
+    size_t start = b.item_start[best];
+    if (x <= item->x) {
+        return start;
+    }
+    if (x >= item->x + item->width) {
+        return start + item->length;
+    }
+    /* Walk the characters; stop at the boundary nearest to x. */
+    int previous_width = 0;
+    size_t at = 0;
+    while (at < item->length) {
+        size_t next = at + 1;
+        while (next < item->length && (item->text[next] & 0xc0) == 0x80) {
+            next++;
+        }
+        int width = item_prefix_width(item, next);
+        if (item->x + (previous_width + width) / 2 > x) {
+            return start + at;
+        }
+        previous_width = width;
+        at = next;
+    }
+    return start + item->length;
+}
+
+/* The display item whose text holds offset, or NULL. */
+static const struct display_item *item_at_offset(size_t offset) {
+    if (b.item_start == NULL) {
+        return NULL;
+    }
+    const struct display_item *found = NULL;
+    for (size_t i = 0; i < b.page.item_count; i++) {
+        if (b.item_start[i] == NO_TEXT) {
+            continue;
+        }
+        if (b.item_start[i] > offset) {
+            break;
+        }
+        found = &b.page.items[i];
+    }
+    return found;
+}
+
+static void copy_selection(void) {
+    size_t start = selection_start(), end = selection_end();
+    if (b.text == NULL || end <= start || end > b.text_length) {
+        return;
+    }
+    long kept = opos_clipboard_set(b.text + start, end - start);
+    set_status(kept < 0 ? "Could not copy" : "Copied");
+}
+
+static char fold(char c) {
+    return c >= 'A' && c <= 'Z' ? (char)(c + 32) : c;
+}
+
+static bool match_at(size_t at) {
+    if (at + b.find_length > b.text_length) {
+        return false;
+    }
+    for (size_t i = 0; i < b.find_length; i++) {
+        char want = fold(b.find[i]);
+        char have = fold(b.text[at + i]);
+        if (want == ' ' ? (have != ' ' && have != '\n') : want != have) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Scrolls so that the text at offset is in view. */
+static void reveal_offset(size_t offset) {
+    const struct display_item *item = item_at_offset(offset);
+    if (item == NULL) {
+        return;
+    }
+    int top = item->y + MARGIN;
+    if (top < b.scroll || top + item->height > b.scroll + viewport_height()) {
+        b.scroll = top - viewport_height() / 3;
+        clamp_scroll();
+    }
+}
+
+/* Finds the query from offset onwards (backwards when step < 0), wrapping
+   around the page, and selects the match. */
+static void find_from(size_t from, int step) {
+    b.have_match = false;
+    if (b.text == NULL || b.find_length == 0
+        || b.find_length > b.text_length) {
+        b.dirty = true;
+        return;
+    }
+    size_t last = b.text_length - b.find_length;
+    if (from > last) {
+        from = step > 0 ? 0 : last;
+    }
+    size_t at = from;
+    for (size_t tried = 0; tried <= last; tried++) {
+        if (match_at(at)) {
+            b.have_match = true;
+            b.match = at;
+            b.selection_anchor = at;
+            b.selection_cursor = at + b.find_length;
+            reveal_offset(at);
+            break;
+        }
+        if (step > 0) {
+            at = at == last ? 0 : at + 1;
+        } else {
+            at = at == 0 ? last : at - 1;
+        }
+    }
+    b.dirty = true;
+}
+
+/* Number of matches, and which one the current match is (1-based). */
+static size_t count_matches(size_t *index) {
+    size_t count = 0;
+    *index = 0;
+    if (b.text == NULL || b.find_length == 0) {
+        return 0;
+    }
+    for (size_t at = 0; at + b.find_length <= b.text_length; at++) {
+        if (match_at(at)) {
+            count++;
+            if (b.have_match && at == b.match) {
+                *index = count;
+            }
+        }
+    }
+    return count;
 }
 
 /* ----------------------------------------------------------------- paint */
@@ -194,6 +487,27 @@ static void paint_page(void) {
             if (baseline - item->size > bottom || baseline + item->size < top) {
                 break;
             }
+            size_t start = b.item_start != NULL ? b.item_start[i] : NO_TEXT;
+            size_t low = selection_start(), high = selection_end();
+            if (start != NO_TEXT && high > low && high > start
+                && low < start + item->length) {
+                size_t from = low > start ? low - start : 0;
+                size_t to = high - start < item->length ? high - start
+                                                        : item->length;
+                int x0 = x + item_prefix_width(item, from);
+                int x1 = x + item_prefix_width(item, to);
+                /* Cover the space before the word too when the selection
+                   runs on from the previous word on the same line. */
+                if (from == 0 && low < start && start > 0
+                    && b.text[start - 1] == ' ') {
+                    x0 -= opos_font_text_width(b.fonts[item->font],
+                                               item->size, " ", 1);
+                }
+                bool is_match = b.have_match && low == b.match;
+                fill_clipped(x0, y, x1 - x0, item->height,
+                             is_match ? COL_MATCH : COL_SELECTION, top,
+                             bottom);
+            }
             opos_font_draw(b.fonts[item->font], canvas, x, baseline,
                            item->size, item->text, item->length,
                            item->colour);
@@ -261,6 +575,18 @@ static void paint(void) {
     int text_width = opos_font_text_width(b.fonts[0], 15, b.address,
                                           b.address_length);
     int shift = text_width > field_w - 16 ? text_width - (field_w - 16) : 0;
+    if (b.editing && b.address_selected && text_width > 0) {
+        int from = field_x + 8 - shift;
+        int width = text_width + 2;
+        if (from < field_x + 2) {
+            width -= field_x + 2 - from;
+            from = field_x + 2;
+        }
+        if (from + width > field_x + field_w - 2) {
+            width = field_x + field_w - 2 - from;
+        }
+        opos_fill_rect(canvas, from, 9, width, 22, COL_SELECTION);
+    }
     /* Draw the address, then repaint the field edges over the overflow. */
     opos_font_draw(b.fonts[0], canvas, field_x + 8 - shift, 25, 15,
                    b.address, b.address_length, COL_TEXT);
@@ -283,8 +609,39 @@ static void paint(void) {
     opos_fill_rect(canvas, 0, status_y, b.width, STATUS_HEIGHT, COL_STATUS);
     opos_draw_line(canvas, 0, status_y, b.width, status_y,
                    OPOS_RGB(200, 200, 208));
-    opos_font_draw(b.fonts[0], canvas, 6, status_y + 15, 12, b.status,
-                   strlen(b.status), OPOS_RGB(70, 70, 80));
+    if (b.finding) {
+        /* Find bar: "Find: query|   3 of 12". */
+        int label_end = opos_font_draw(b.fonts[1], canvas, 6, status_y + 15,
+                                       12, "Find:", 5, OPOS_RGB(70, 70, 80));
+        int box_x = label_end + 6;
+        int box_w = 260;
+        opos_fill_rect(canvas, box_x, status_y + 2, box_w, STATUS_HEIGHT - 3,
+                       COL_FIELD);
+        opos_draw_rect(canvas, box_x, status_y + 2, box_w, STATUS_HEIGHT - 3,
+                       OPOS_RGB(6, 69, 173));
+        int end = opos_font_draw(b.fonts[0], canvas, box_x + 4, status_y + 15,
+                                 12, b.find, b.find_length, COL_TEXT);
+        opos_fill_rect(canvas, end + 1, status_y + 4, 1, STATUS_HEIGHT - 7,
+                       COL_TEXT);
+        char result[64] = "";
+        size_t index;
+        size_t count = count_matches(&index);
+        if (b.find_length > 0) {
+            if (count == 0) {
+                snprintf(result, sizeof(result), "No matches");
+            } else {
+                snprintf(result, sizeof(result), "%u of %u", (unsigned)index,
+                         (unsigned)count);
+            }
+        }
+        opos_font_draw(b.fonts[0], canvas, box_x + box_w + 10, status_y + 15,
+                       12, result, strlen(result),
+                       count == 0 && b.find_length > 0 ? OPOS_RGB(180, 30, 30)
+                                                       : OPOS_RGB(70, 70, 80));
+    } else {
+        opos_font_draw(b.fonts[0], canvas, 6, status_y + 15, 12, b.status,
+                       strlen(b.status), OPOS_RGB(70, 70, 80));
+    }
     opos_canvas_present(canvas);
     b.dirty = false;
 }
@@ -298,6 +655,14 @@ static void relayout(void) {
     viewport_width_px = viewport_width();
     viewport_height_px = viewport_height();
     layout_page(&b.page, b.fonts, viewport_width() - 2 * MARGIN);
+    build_text();
+    /* Images that arrive change the layout, not the text: offsets stay. */
+    if (b.selection_anchor > b.text_length) {
+        b.selection_anchor = b.text_length;
+    }
+    if (b.selection_cursor > b.text_length) {
+        b.selection_cursor = b.text_length;
+    }
     clamp_scroll();
     b.dirty = true;
 }
@@ -390,6 +755,7 @@ static void install_document(const char *html, size_t length,
     snprintf(b.page.url, sizeof(b.page.url), "%s", url);
     b.have_page = true;
     b.scroll = 0;
+    clear_selection();
     relayout();
 }
 
@@ -462,15 +828,26 @@ static void load(const char *url) {
     long error = opos_http_get(url, MAX_PAGE_BYTES, &response);
     opos_http_set_progress(NULL, NULL);
     if (error != 0) {
-        char detail[160];
+        char detail[320];
+        const char *title = "Cannot reach this page";
+        /* BearSSL's certificate errors are 33 to 63 (BR_ERR_X509_*). */
+        long tls_code = -error - OPOS_TLS_ERROR_BASE;
         if (error == -OPOS_EFBIG) {
             snprintf(detail, sizeof(detail), "The page is too large.");
+        } else if (tls_code > 32 && tls_code < 64) {
+            title = "This connection is not secure";
+            snprintf(detail, sizeof(detail),
+                     "The site's certificate could not be checked: %s. "
+                     "Someone may be trying to impersonate the site, so the"
+                     " browser stopped before sending or loading anything.",
+                     opos_tls_error_text(error));
         } else {
             snprintf(detail, sizeof(detail),
-                     "Could not load the page (error %ld). Check the address"
-                     " and the network.", -error);
+                     "Could not load the page: %s (error %ld). Check the"
+                     " address and the network.",
+                     opos_tls_error_text(error), -error);
         }
-        show_message(url, "Cannot reach this page", detail);
+        show_message(url, title, detail);
         snprintf(b.url, sizeof(b.url), "%s", url);
         set_status("Failed");
         return;
@@ -670,6 +1047,7 @@ static void on_click(int x, int y) {
             }
         } else if (x >= 106) {
             b.editing = true;
+            b.address_selected = true;
         }
         b.dirty = true;
         return;
@@ -686,8 +1064,30 @@ static void on_click(int x, int y) {
     if (!b.have_page || y >= TOOLBAR_HEIGHT + viewport_height()) {
         return;
     }
+    /* Start a selection; a release without a drag follows a link. */
+    b.selecting = true;
+    b.pressed_moved = false;
+    b.press_x = x;
+    b.press_y = y;
+    b.have_match = false;
+    b.selection_anchor = b.selection_cursor = text_offset_at(
+        x - MARGIN, y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+}
+
+static void on_release(void) {
+    b.dragging_scrollbar = false;
+    if (!b.selecting) {
+        return;
+    }
+    b.selecting = false;
+    if (b.pressed_moved) {
+        return;
+    }
+    b.selection_anchor = b.selection_cursor;
+    b.dirty = true;
     const struct display_item *item = page_item_at(
-        &b.page, x - MARGIN, y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+        &b.page, b.press_x - MARGIN,
+        b.press_y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
     char url[OPOS_HTTP_URL_MAX];
     if (link_target(item, url, sizeof(url))) {
         navigate(url, true);
@@ -696,6 +1096,23 @@ static void on_click(int x, int y) {
 
 static void on_move(int x, int y) {
     char url[OPOS_HTTP_URL_MAX];
+    if (b.selecting) {
+        int dx = x - b.press_x, dy = y - b.press_y;
+        if (!b.pressed_moved && dx * dx + dy * dy < 16) {
+            return;
+        }
+        b.pressed_moved = true;
+        /* Dragging past the top or bottom scrolls the page. */
+        if (y < TOOLBAR_HEIGHT) {
+            scroll_by(-24);
+        } else if (y >= TOOLBAR_HEIGHT + viewport_height()) {
+            scroll_by(24);
+        }
+        b.selection_cursor = text_offset_at(
+            x - MARGIN, y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+        b.dirty = true;
+        return;
+    }
     if (b.dragging_scrollbar) {
         int range = viewport_height();
         b.scroll = (int)((long long)max_scroll() * (y - TOOLBAR_HEIGHT) / (range > 0 ? range : 1));
@@ -723,11 +1140,106 @@ static void on_key(uint32_t key, uint32_t modifiers) {
     bool ctrl = (modifiers & OPOS_MOD_CTRL) != 0;
     if (ctrl && (key == 'l' || key == 'L')) {
         b.editing = true;
+        b.address_selected = true;
         b.dirty = true;
         return;
     }
     if (ctrl && (key == 'r' || key == 'R')) {
         on_click(80, 10);
+        return;
+    }
+    if (ctrl && (key == 'f' || key == 'F')) {
+        b.finding = true;
+        b.editing = false;
+        if (b.find_length > 0) {
+            find_from(selection_start(), 1);
+        }
+        b.dirty = true;
+        return;
+    }
+    if (ctrl && (key == 'c' || key == 'C') && !b.editing) {
+        copy_selection();
+        return;
+    }
+    if (ctrl && (key == 'a' || key == 'A') && !b.editing) {
+        b.have_match = false;
+        b.selection_anchor = 0;
+        b.selection_cursor = b.text_length;
+        b.dirty = true;
+        return;
+    }
+    if (b.finding && !b.editing) {
+        bool shift = (modifiers & OPOS_MOD_SHIFT) != 0;
+        if (key == OPOS_KEY_ESCAPE) {
+            b.finding = false;
+            b.have_match = false;
+        } else if (key == '\n') {
+            size_t from = b.have_match ? b.match : selection_start();
+            if (shift) {
+                find_from(from == 0 ? b.text_length : from - 1, -1);
+            } else {
+                find_from(b.have_match ? from + 1 : from, 1);
+            }
+        } else if (key == '\b') {
+            if (b.find_length > 0) {
+                do {
+                    b.find_length--;
+                } while (b.find_length > 0
+                         && (b.find[b.find_length] & 0xc0) == 0x80);
+                b.find[b.find_length] = '\0';
+                find_from(b.have_match ? b.match : 0, 1);
+            }
+        } else if (key >= 32 && key < 127 && !ctrl
+                   && b.find_length + 1 < sizeof(b.find)) {
+            b.find[b.find_length++] = (char)key;
+            b.find[b.find_length] = '\0';
+            /* Typing refines the search from the current match. */
+            find_from(b.have_match ? b.match : selection_start(), 1);
+        } else {
+            goto scroll_keys;
+        }
+        b.dirty = true;
+        return;
+    }
+    /* While the whole address is selected, typing, pasting or Backspace
+       replaces it; other keys keep it and drop the selection. */
+    if (b.editing && b.address_selected) {
+        bool replaces = (ctrl && (key == 'v' || key == 'V')) || key == '\b'
+                     || (key >= 32 && key < 127 && !ctrl);
+        if (replaces) {
+            b.address_length = 0;
+            b.address[0] = '\0';
+            if (key == '\b') {
+                b.address_selected = false;
+                b.dirty = true;
+                return;
+            }
+        }
+        if (key != '\n' && !(ctrl && (key == 'c' || key == 'C'))) {
+            b.address_selected = false;
+        }
+    }
+    if (b.editing && ctrl && (key == 'c' || key == 'C')) {
+        opos_clipboard_set(b.address, b.address_length);
+        return;
+    }
+    if (b.editing && ctrl && (key == 'v' || key == 'V')) {
+        char pasted[OPOS_HTTP_URL_MAX];
+        long length = opos_clipboard_get(pasted, sizeof(pasted));
+        if (length > (long)sizeof(pasted)) {
+            length = sizeof(pasted);
+        }
+        for (long i = 0; i < length; i++) {
+            unsigned char ch = (unsigned char)pasted[i];
+            if (ch == '\n' || ch == '\t') {
+                ch = ' ';
+            }
+            if (ch >= 32 && b.address_length + 1 < sizeof(b.address)) {
+                b.address[b.address_length++] = (char)ch;
+            }
+        }
+        b.address[b.address_length] = '\0';
+        b.dirty = true;
         return;
     }
     if (b.editing) {
@@ -753,6 +1265,7 @@ static void on_key(uint32_t key, uint32_t modifiers) {
         b.dirty = true;
         return;
     }
+scroll_keys:;
     int page = viewport_height() - 40;
     switch (key) {
     case OPOS_KEY_UP: scroll_by(-48); break;
@@ -841,7 +1354,9 @@ int main(int argc, char **argv) {
             }
             break;
         case OPOS_EVENT_MOUSE_UP:
-            b.dragging_scrollbar = false;
+            if (event.button == OPOS_BUTTON_LEFT) {
+                on_release();
+            }
             break;
         case OPOS_EVENT_MOUSE_MOVE:
             on_move(event.x, event.y);

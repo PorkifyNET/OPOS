@@ -104,6 +104,10 @@ for (;;) {
   | `OPOS_EVENT_WHEEL` | `x`, `y`, `buttons`; `OPOS_WHEEL_NOTCHES(event)` is the signed number of wheel notches, positive = scroll up. Sent for the mouse wheel and two-finger touchpad scrolling while the pointer is over the window, even when the window is not focused |
 
 - `opos_window_size(&width, &height)` reads the current content size.
+- `opos_clipboard_set(text, length)` replaces the desktop's shared
+  clipboard (the one Ctrl+C/V use in every window; at most 64 KiB are
+  kept). `opos_clipboard_get(buffer, capacity)` copies up to capacity bytes
+  and returns the clipboard's full length.
 - The desktop keeps the Super shortcuts; every other key goes to the
   focused program window.
 - Windows only open from the desktop. From the kernel shell,
@@ -178,6 +182,8 @@ there too. A program has 64 MiB of such memory in total, including its
   | 0x4f500011 | `opos_window_present(pixels, w, h, stride)` | 0 |
   | 0x4f500012 | `opos_window_event(&event, timeout_ms)` | 1 (event) or 0 |
   | 0x4f500013 | `opos_window_size(&w, &h)` | content area size |
+  | 0x4f500014 | `opos_clipboard_set(text, length)` | bytes kept |
+  | 0x4f500015 | `opos_clipboard_get(buffer, capacity)` | full clipboard length |
 
 - Errors are negative error numbers (`-OPOS_EACCES`, ...).
 - Every file carries an ELF note named `OPOS` (type 1) with the ABI

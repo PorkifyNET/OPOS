@@ -304,6 +304,18 @@ static void clipboard_set(const char *text, size_t length) {
     clipboard_length = length;
 }
 
+void desktop_clipboard_set(const char *text, size_t length) {
+    clipboard_set(text, length);
+}
+
+size_t desktop_clipboard_get(char *out, size_t capacity) {
+    size_t count = clipboard_length < capacity ? clipboard_length : capacity;
+    for (size_t i = 0; i < count; i++) {
+        out[i] = clipboard[i];
+    }
+    return clipboard_length;
+}
+
 /*
  * Ctrl shortcuts for one-line inputs, which type and delete at the end of
  * the text: Ctrl+C copies the whole text, Ctrl+X cuts it, Ctrl+V pastes the

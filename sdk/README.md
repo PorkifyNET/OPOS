@@ -8,22 +8,34 @@ you need: a header, a start-up file and a linker script.
 On Linux or WSL with GCC (or Clang as `CC=clang`):
 
 ```sh
-make                # builds build/hello, build/permtest and build/sketch
+make                # builds build/libopos.a and the examples
 make APP=myapp      # builds build/myapp from myapp.c in this folder
 ```
 
-A program is a static x86-64 ELF file of at most 64 KiB, with no C library.
-`include/opos.h` has the system calls and a few helpers (`opos_print`,
-`opos_print_number`, `opos_strlen`).
+A program is a static x86-64 ELF file of at most 1 MiB, using up to 2 MiB
+of memory for its code and data. It links `build/crt0.o` and
+`build/libopos.a`:
+
+- `include/opos.h`: the system calls, and helpers such as `opos_print`.
+- `include/stdio.h`, `stdlib.h`, `string.h`, `ctype.h`: a small C library.
+  It has `printf`, `snprintf` and `puts`, `malloc`, `calloc`, `realloc`
+  and `free`, `strtol` and `atoi`, the usual string and memory functions,
+  and character classes. There is no floating-point formatting and there
+  are no `FILE` streams.
+- `include/opos_gfx.h`: drawing into a pixel canvas (rectangles, lines,
+  text in the system font) and showing it in the program's window.
 
 ```c
-#include <opos.h>
+#include <stdio.h>
 
 int main(int argc, char **argv, char **envp) {
-    opos_print("Hello, OPOS!\n");
+    printf("Hello, OPOS! I got %d arguments.\n", argc - 1);
     return 0;
 }
 ```
+
+`main` runs on a 128 KiB stack with a guard page below it (set up by
+`src/crt0.S`), so ordinary local arrays are fine.
 
 ## Run
 
@@ -79,7 +91,7 @@ for (;;) {
 
   | Type | Fields |
   | --- | --- |
-  | `OPOS_EVENT_KEY` | `key`: printable ASCII, `'\n'`, `'\b'`, `'\t'`, or `OPOS_KEY_*` (arrows, Home, End, Page Up/Down, Delete, Escape) |
+  | `OPOS_EVENT_KEY` | `key`: printable ASCII, `'\n'`, `'\b'`, `'\t'`, or `OPOS_KEY_*` (arrows, Home, End, Page Up/Down, Delete, Escape); `buttons`: `OPOS_MOD_CTRL`, `OPOS_MOD_SHIFT` held. Shift already makes letters upper case |
   | `OPOS_EVENT_MOUSE_DOWN`, `_UP` | `x`, `y` in the content area; `button` (`OPOS_BUTTON_LEFT` or `_RIGHT`); `buttons` held |
   | `OPOS_EVENT_MOUSE_MOVE` | `x`, `y`, `buttons`. Sent while the pointer is over the focused window, or while a button pressed in it is held (then `x`, `y` can be outside) |
   | `OPOS_EVENT_RESIZE` | `width`, `height` of the content area |
@@ -91,11 +103,19 @@ for (;;) {
 - Windows only open from the desktop. From the kernel shell,
   `opos_window_create` returns `-19`.
 
-`examples/sketch.c` is a small drawing program built on these calls:
-`run /disk/sketch [width height]`.
+Examples built on these calls:
 
-Memory: `opos_alloc(size)` returns zeroed memory (`mmap`), up to 4 MiB per
-program in total; `opos_free(address, size)` returns it.
+- `examples/sketch.c` is a small drawing program: `run /disk/sketch
+  [width height]`.
+- `examples/notepad.c` is the OPOS text editor. It is built with the OS
+  and shipped as `/bin/notepad`. The Start menu's Text Editor and Files
+  (for text files) open it. It shows text drawing, keyboard shortcuts
+  with modifiers, mouse selection, and loading and saving files.
+
+Memory: `opos_alloc(size)` returns zeroed memory (`mmap`);
+`opos_free(address, size)` returns it. `malloc` takes its memory from
+there too. A program has 4 MiB of such memory in total, including its
+128 KiB stack.
 
 ## The ABI
 
@@ -135,10 +155,11 @@ See `docs/security-model.md`.
 
 ## Limits
 
-- No C library yet: no `printf`, `malloc` (use `brk`/`mmap` through
-  `opos_syscall*`), or floating-point formatting.
-- One window per program, one program at a time. No text drawing or
-  widgets: programs draw their own pixels.
-- The user stack is one page (4 KiB): keep big arrays in `opos_alloc`
-  memory, not in local variables.
-- Images over 64 KiB do not load.
+- Each program gets one window, and only one program runs at a time.
+- There are no widgets: programs draw their own pixels and text.
+- The C library is small. It has no floating-point formatting, no
+  `FILE` streams and no `qsort`, `time` or `locale`.
+- Program files over 1 MiB do not load. Memory from `opos_alloc`,
+  `malloc` and the stack shares 4 MiB per program.
+- Notepad's clipboard is its own; there is no system clipboard for
+  programs yet.

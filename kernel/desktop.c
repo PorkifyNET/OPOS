@@ -462,8 +462,8 @@ enum run_result {
 };
 
 /* Program images are loaded here first (the loader copies them). Same
-   64 KiB limit as the shell's "disk run". */
-static uint8_t program_image[64 * 1024];
+   1 MiB limit as the shell's "disk run" and execve. */
+static uint8_t program_image[1024 * 1024];
 
 /*
  * Runs an ELF program from the initramfs (/bin, /lib) or a disk (/disk...)
@@ -511,7 +511,7 @@ static const char *run_result_text(enum run_result result) {
     switch (result) {
     case RUN_NOT_FOUND: return "FILE NOT FOUND";
     case RUN_DENIED: return "ACCESS DENIED";
-    case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (64 KIB LIMIT)";
+    case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (1 MIB LIMIT)";
     case RUN_NOT_PROGRAM: return "NOT A PROGRAM (NO ELF HEADER)";
     case RUN_FAILED: return "PROGRAM COULD NOT START";
     case RUN_BUSY: return "ANOTHER PROGRAM IS RUNNING";
@@ -2203,6 +2203,47 @@ static size_t files_entry_path(size_t index, char *path, size_t capacity) {
     return length;
 }
 
+/*
+ * Opens Notepad (/bin/notepad, an ordinary SDK program from sdk/) on a
+ * file, or empty without one. Returns false when it cannot start: another
+ * program is running, or the initramfs has no Notepad. Callers then fall
+ * back to the built-in editor.
+ */
+static bool notepad_launch(const char *path, size_t length) {
+    static const char notepad[] = "/bin/notepad";
+    struct initramfs_file file;
+    if (program_running || !initramfs_find_file(notepad + 1, &file)) {
+        return false;
+    }
+    char arguments[FILES_PATH_CAPACITY + 3];
+    size_t used = 0;
+    if (length != 0) {
+        if (length + 3 > sizeof(arguments)) {
+            return false;
+        }
+        arguments[used++] = '"';
+        for (size_t i = 0; i < length; i++) {
+            arguments[used++] = path[i];
+        }
+        arguments[used++] = '"';
+    }
+    uint64_t exit_status = 1;
+    terminal_capture_begin();
+    enum run_result result = run_program_file(notepad, sizeof(notepad) - 1,
+                                              arguments, used, &exit_status);
+    terminal_capture_end();
+    if (windows[WINDOW_FILES].open) {
+        files_refresh(); /* the file may have changed */
+    }
+    if (result != RUN_STARTED) {
+        return false;
+    }
+    if (exit_status != 0) {
+        set_status("NOTEPAD EXITED WITH ERROR");
+    }
+    return true;
+}
+
 static void files_run_program(const char *path, size_t length) {
     uint64_t exit_status = 1;
     /* Output goes to the Terminal, which comes up if it was closed. */
@@ -2213,6 +2254,7 @@ static void files_run_program(const char *path, size_t length) {
         terminal_capture_begin();
         result = run_program_file(path, length, NULL, 0, &exit_status);
         terminal_capture_end();
+        files_refresh(); /* the program may have changed files */
     }
     if (result == RUN_STARTED) {
         terminal_report_exit(true, exit_status);
@@ -2221,7 +2263,17 @@ static void files_run_program(const char *path, size_t length) {
         window_raise(previous);
     }
     if (result == RUN_NOT_PROGRAM) {
-        (void)editor_open(path, length); /* everything else is text */
+        /* Everything else is text, for Notepad. Programs cannot change
+           system files, so an administrator editing one gets the
+           built-in editor, which can. */
+        struct permission_identity identity = permission_session_identity();
+        bool system_file =
+            permission_ui_allows(path, length, PERMISSION_WRITE)
+            && !permission_program_allows(&identity, path, length,
+                                          PERMISSION_WRITE);
+        if (system_file || !notepad_launch(path, length)) {
+            (void)editor_open(path, length);
+        }
     } else if (result != RUN_STARTED) {
         set_status(run_result_text(result));
     } else {
@@ -5085,7 +5137,9 @@ static enum desktop_result menu_activate(enum menu_action action) {
         window_open(WINDOW_FILES);
         break;
     case MENU_TEXT_EDITOR:
-        editor_new();
+        if (!notepad_launch(NULL, 0)) {
+            editor_new();
+        }
         break;
     case MENU_SYSTEM_INFO:
         window_open(WINDOW_SYSTEM_INFO);
@@ -6316,8 +6370,11 @@ static struct rect app_content(void) {
 }
 
 static void app_key(char character) {
+    /* For keys, buttons holds the modifiers: 1 Ctrl, 2 Shift. */
     struct desktop_app_event event = {
         .type = APP_EVENT_KEY, .key = (uint8_t)character,
+        .buttons = (keyboard_last_ctrl() ? 1u : 0u)
+                 | (keyboard_last_shift() ? 2u : 0u),
     };
     app_push(&event);
 }

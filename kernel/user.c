@@ -57,7 +57,9 @@
 #define USER_PIPE_BUFFER_CAPACITY 4096
 #define USER_FILE_PATH_CAPACITY 256
 #define USER_FILE_IO_MAX 4096
-#define USER_EXEC_IMAGE_MAX 65536
+/* Largest program file; interpreters (ld.so) are smaller. */
+#define USER_EXEC_IMAGE_MAX (1024 * 1024)
+#define USER_INTERPRETER_IMAGE_MAX 65536
 #define USER_EXEC_VECTOR_MAX 16
 #define USER_EXEC_STRING_MAX 1024
 #define USER_MMAP_BASE 0x10000000ULL
@@ -368,8 +370,33 @@ static uint64_t next_process_id = 1;
 static struct user_process process_slots[SCHEDULER_TASK_CAPACITY];
 static struct user_file_descriptor open_files[USER_OPEN_FILE_CAPACITY];
 static struct user_pipe pipes[USER_PIPE_CAPACITY];
-static uint8_t user_exec_images[SCHEDULER_TASK_CAPACITY][USER_EXEC_IMAGE_MAX];
-static uint8_t user_interpreter_images[SCHEDULER_TASK_CAPACITY][USER_EXEC_IMAGE_MAX];
+static uint8_t user_interpreter_images[SCHEDULER_TASK_CAPACITY][USER_INTERPRETER_IMAGE_MAX];
+
+/* execve reads the new program here. 1 MiB per task would be a lot of
+   kernel memory up front, so each buffer is allocated on first use and
+   kept (the contiguous allocator cannot free). */
+static uint8_t *user_exec_image_buffer(size_t task_slot) {
+    static uint8_t *buffers[SCHEDULER_TASK_CAPACITY];
+    if (task_slot >= SCHEDULER_TASK_CAPACITY) {
+        return NULL;
+    }
+    if (buffers[task_slot] == NULL) {
+        uint64_t physical = physical_pages_alloc_contiguous(
+            USER_EXEC_IMAGE_MAX / PAGE_SIZE);
+        if (physical != 0) {
+            buffers[task_slot] = physical_page_to_hhdm(physical);
+        }
+    }
+    return buffers[task_slot];
+}
+
+struct user_load_pages {
+    uint64_t image_physical[ELF_MAX_SEGMENT_PAGES];
+    uint8_t *image_buffers[ELF_MAX_SEGMENT_PAGES];
+    uint64_t interpreter_physical[ELF_MAX_SEGMENT_PAGES];
+    uint8_t *interpreter_buffers[ELF_MAX_SEGMENT_PAGES];
+};
+static struct user_load_pages user_load_scratch[SCHEDULER_TASK_CAPACITY];
 static struct user_child_job child_jobs[SCHEDULER_TASK_CAPACITY - 1];
 static struct user_thread user_threads[SCHEDULER_TASK_CAPACITY];
 static struct user_thread_job thread_jobs[SCHEDULER_TASK_CAPACITY - 1];
@@ -2632,13 +2659,17 @@ static int64_t user_linux_execve(struct user_process *process,
     if (task_slot >= SCHEDULER_TASK_CAPACITY) {
         return -5;
     }
+    uint8_t *exec_image = user_exec_image_buffer(task_slot);
+    if (exec_image == NULL) {
+        return -12;
+    }
     size_t image_size;
-    if (!vfs_read_file(path, path_length, user_exec_images[task_slot],
-                       USER_EXEC_IMAGE_MAX, &image_size)) {
-        return -2;
+    if (!vfs_read_file(path, path_length, exec_image, USER_EXEC_IMAGE_MAX,
+                       &image_size)) {
+        return image_size > USER_EXEC_IMAGE_MAX ? -7 : -2;
     }
     struct elf_load_plan plan = {0};
-    if (!elf_inspect_user_image(user_exec_images[task_slot], image_size,
+    if (!elf_inspect_user_image(exec_image, image_size,
                                 PAGE_SIZE, USER_PIE_BASE,
                                 USER_APP_MIN_ADDRESS,
                                 USER_MMAP_BASE, &plan)) {
@@ -2657,7 +2688,7 @@ static int64_t user_linux_execve(struct user_process *process,
         if (!vfs_read_file(plan.interpreter_path,
                            plan.interpreter_path_length,
                            user_interpreter_images[task_slot],
-                           USER_EXEC_IMAGE_MAX, &interpreter_size)) {
+                           USER_INTERPRETER_IMAGE_MAX, &interpreter_size)) {
             return -2;
         }
         if (!elf_inspect_user_interpreter(
@@ -2669,10 +2700,14 @@ static int64_t user_linux_execve(struct user_process *process,
         }
     }
 
-    uint64_t image_physical[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint8_t *image_buffers[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint64_t interpreter_physical[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint8_t *interpreter_buffers[ELF_MAX_SEGMENT_PAGES] = {0};
+    /* Page lists for up to ELF_MAX_SEGMENT_PAGES pages are too big for
+       the kernel stack; each task has its own. */
+    struct user_load_pages *load = &user_load_scratch[task_slot];
+    *load = (struct user_load_pages) {0};
+    uint64_t *image_physical = load->image_physical;
+    uint8_t **image_buffers = load->image_buffers;
+    uint64_t *interpreter_physical = load->interpreter_physical;
+    uint8_t **interpreter_buffers = load->interpreter_buffers;
     uint64_t stack_physical[1] = {0};
     uint8_t *stack_buffers[1] = {0};
     if (!allocate_user_pages(plan.total_page_count, image_physical,
@@ -2689,7 +2724,7 @@ static int64_t user_linux_execve(struct user_process *process,
     zero_user_pages(plan.total_page_count, image_buffers);
     zero_user_pages(interpreter_plan.total_page_count, interpreter_buffers);
     zero_user_pages(1, stack_buffers);
-    if (!elf_load_user_image(user_exec_images[task_slot], image_size, &plan,
+    if (!elf_load_user_image(exec_image, image_size, &plan,
                              image_buffers, plan.total_page_count, PAGE_SIZE)
         || (plan.has_interpreter
             && !elf_load_user_image(
@@ -4388,7 +4423,7 @@ static bool user_process_run_image(enum user_program program,
             if (!vfs_read_file(elf_plan.interpreter_path,
                                elf_plan.interpreter_path_length,
                                user_interpreter_images[task_slot],
-                               USER_EXEC_IMAGE_MAX, &interpreter_size)
+                               USER_INTERPRETER_IMAGE_MAX, &interpreter_size)
                 || !elf_inspect_user_interpreter(
                     user_interpreter_images[task_slot], interpreter_size,
                     PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_BASE,
@@ -4456,10 +4491,14 @@ static bool user_process_run_image(enum user_program program,
         };
     }
 
-    uint64_t image_physical[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint8_t *image_buffers[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint64_t interpreter_physical[ELF_MAX_SEGMENT_PAGES] = {0};
-    uint8_t *interpreter_buffers[ELF_MAX_SEGMENT_PAGES] = {0};
+    /* Page lists for up to ELF_MAX_SEGMENT_PAGES pages are too big for
+       the kernel stack; each task has its own. */
+    struct user_load_pages *load = &user_load_scratch[task_slot];
+    *load = (struct user_load_pages) {0};
+    uint64_t *image_physical = load->image_physical;
+    uint8_t **image_buffers = load->image_buffers;
+    uint64_t *interpreter_physical = load->interpreter_physical;
+    uint8_t **interpreter_buffers = load->interpreter_buffers;
     uint64_t stack_physical[1] = {0};
     uint8_t *stack_buffers[1] = {0};
     if (!allocate_user_pages(elf_plan.total_page_count,

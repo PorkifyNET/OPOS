@@ -152,12 +152,17 @@ static inline long opos_user_info(struct opos_user_info *info) {
 #define OPOS_SYS_WINDOW_SIZE 0x4f500013L
 
 #define OPOS_EVENT_NONE 0
-#define OPOS_EVENT_KEY 1        /* key */
+#define OPOS_EVENT_KEY 1        /* key, buttons = OPOS_MOD_* held */
 #define OPOS_EVENT_MOUSE_DOWN 2 /* x, y, button, buttons */
 #define OPOS_EVENT_MOUSE_UP 3   /* x, y, button, buttons */
 #define OPOS_EVENT_MOUSE_MOVE 4 /* x, y, buttons */
 #define OPOS_EVENT_RESIZE 5     /* width, height of the content area */
 #define OPOS_EVENT_CLOSE 6      /* the user closed the window */
+
+/* Modifiers held with a key. Letters typed with Shift already arrive in
+   upper case; Ctrl+S arrives as 's' with OPOS_MOD_CTRL. */
+#define OPOS_MOD_CTRL 1u
+#define OPOS_MOD_SHIFT 2u
 
 #define OPOS_BUTTON_LEFT 1u
 #define OPOS_BUTTON_RIGHT 2u
@@ -180,7 +185,7 @@ struct opos_event {
     int32_t x;        /* MOUSE_*: position in the content area; may be */
     int32_t y;        /*   outside it while a button is held */
     uint32_t button;  /* MOUSE_DOWN/UP: the button that changed */
-    uint32_t buttons; /* MOUSE_*: buttons held now */
+    uint32_t buttons; /* MOUSE_*: buttons held now; KEY: OPOS_MOD_* */
     uint32_t width;   /* RESIZE */
     uint32_t height;
 };

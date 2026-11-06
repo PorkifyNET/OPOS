@@ -22,6 +22,10 @@ MUSL_TEST_ELF := $(BUILD)/musl-test.elf
 MUSL_PTHREAD_TEST_ELF := $(BUILD)/musl-pthread-test.elf
 MUSL_SIGNAL_TEST_ELF := $(BUILD)/musl-signal-test.elf
 INITRAMFS := $(BUILD)/initramfs.tar
+# Notepad is an ordinary SDK program (sdk/examples/notepad.c) shipped in
+# the initramfs as /bin/notepad.
+SDK_NOTEPAD := sdk/build/notepad
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c
 INSTALL_TAR := $(BUILD)/install.tar
 BIOS_BOOT := $(BUILD)/bios-boot.bin
 TEST_DISK := $(BUILD)/fat16-test.img
@@ -143,7 +147,10 @@ $(MUSL_SIGNAL_TEST_ELF): kernel/musl_signal_test.c
 	mkdir -p $(BUILD)
 	$(MUSL_CC) -static -Os -s -fno-stack-protector -Wl,--build-id=none $< -o $@
 
-$(INITRAMFS): $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF)
+$(SDK_NOTEPAD): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/notepad
+
+$(INITRAMFS): $(SDK_NOTEPAD) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib
 	cp $(USER_ELF) $(BUILD)/initramfs_root/bin/elf-test
@@ -156,6 +163,7 @@ $(INITRAMFS): $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAI
 	cp $(MUSL_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-test
 	cp $(MUSL_PTHREAD_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-pthread-test
 	cp $(MUSL_SIGNAL_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-signal-test
+	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
 	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin lib
 
 $(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
@@ -199,3 +207,4 @@ $(ISO): $(LIMINE_DIR)/limine $(KERNEL) $(USER_ELF) $(INITRAMFS) $(INSTALL_TAR) l
 
 clean:
 	rm -rf $(BUILD)
+	$(MAKE) -C sdk clean

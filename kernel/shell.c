@@ -22,7 +22,7 @@
 
 #define SHELL_LINE_CAPACITY 2048
 #define FAT16_DISPLAY_CAPACITY 1024
-#define FAT16_EXECUTABLE_CAPACITY (64 * 1024)
+#define FAT16_EXECUTABLE_CAPACITY (1024 * 1024)
 #define TIMER_TICKS_PER_SECOND 100
 
 static char input_line[SHELL_LINE_CAPACITY];
@@ -182,7 +182,7 @@ static void disk_run_executable(const char *text, size_t length) {
     if (!vfs_read_file(path, path_length, fat16_executable,
                        sizeof(fat16_executable), &file_size)) {
         if (file_size > sizeof(fat16_executable)) {
-            console_write_string("Executable exceeds the 64 KiB load limit.\n");
+            console_write_string("Executable exceeds the 1 MiB load limit.\n");
         } else {
             console_write_error("FAT16 executable could not be read.\n");
         }

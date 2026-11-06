@@ -24,8 +24,9 @@ are goals, not current features.
 - Files: browse folders, open and run files, rename, delete, and create files
   and folders (right-click menu); sidebar with home folders and every mounted
   volume; back/forward/up buttons and an address bar (Ctrl+L).
-- Text Editor: selection, clipboard, common Ctrl shortcuts, CRLF-preserving
-  save.
+- Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
+  selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
+  editor remains for administrators editing system files and as a fallback.
 - User accounts with optional passwords (salted, iterated SHA-256), a login
   screen, and per-user home folders and settings. Programs run as their
   account: they cannot change system files, read password hashes, or open
@@ -55,7 +56,8 @@ are goals, not current features.
   write-protected user code, SMEP and UMIP when the CPU has them.
 - Native application SDK in [sdk/](sdk/README.md): build an OPOS program
   with any x86-64 GCC, copy it to the disk and run it with arguments. Programs
-  can open a window, draw pixels and get keyboard and mouse events.
+  get a small C library (`printf`, `malloc`, strings), can open a window, draw
+  pixels and text in the system font, and get keyboard and mouse events.
 - ELF loader with a small dynamic interpreter, and a subset of Linux x86-64
   syscalls (files, pipes, fork/execve/wait, mmap, threads with futexes) that
   runs static musl programs. See [docs/linux-compat.md](docs/linux-compat.md).

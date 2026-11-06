@@ -204,7 +204,7 @@ virtual offsets may differ and need only be page-congruent. Process ownership,
 fork cloning, exec replacement, fault cleanup, and normal exit preserve every
 segment's R/RX/RW permissions.
 The current bounded implementation accepts at most 16 arguments, 16 environment
-entries, 1024 total string bytes, and a 64 KiB executable image. The regression
+entries, 1024 total string bytes, a 1 MiB executable file (2 MiB of loaded segments), and a 64 KiB interpreter. The regression
 executes `/bin/exec-test` and verifies replacement, arguments, descriptor
 inheritance, close-on-exec, FS reset, private file mappings, dynamic-interpreter
 handoff, eager `JUMP_SLOT` relocation, a call into `/lib/libopos-test.so`, and

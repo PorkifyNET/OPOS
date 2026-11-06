@@ -305,6 +305,7 @@ static const char *const style_names[WALLPAPER_STYLE_COUNT] = {
 
 static enum wallpaper_style current_style = WALLPAPER_FILL;
 static enum taskbar_position current_taskbar = TASKBAR_BOTTOM;
+static bool taskbar_autohide;
 static const char *const taskbar_names[TASKBAR_POSITION_COUNT] = {
     "BOTTOM", "TOP", "LEFT", "RIGHT",
 };
@@ -347,6 +348,7 @@ static void config_defaults(void) {
     current_theme = THEME_OCEAN;
     current_style = WALLPAPER_FILL;
     current_taskbar = TASKBAR_BOTTOM;
+    taskbar_autohide = false;
     append(wallpaper_path, sizeof(wallpaper_path), 0, DEFAULT_WALLPAPER);
 }
 
@@ -396,6 +398,9 @@ static void config_parse(const char *text, size_t size) {
                        && parse_name(value, value_length, taskbar_names,
                                      TASKBAR_POSITION_COUNT, &index)) {
                 current_taskbar = (enum taskbar_position)index;
+            } else if (same_ignoring_case(key, key_length, "autohide")) {
+                taskbar_autohide =
+                    same_ignoring_case(value, value_length, "on");
             } else if (same_ignoring_case(key, key_length, "tap")) {
                 touchpad_options.tap_to_click =
                     !same_ignoring_case(value, value_length, "off");
@@ -494,6 +499,8 @@ static void config_save(void) {
     used = append(text, sizeof(text), used, style_names[current_style]);
     used = append(text, sizeof(text), used, "\ntaskbar=");
     used = append(text, sizeof(text), used, taskbar_names[current_taskbar]);
+    used = append(text, sizeof(text), used, "\nautohide=");
+    used = append(text, sizeof(text), used, taskbar_autohide ? "on" : "off");
     used = append(text, sizeof(text), used, "\ntap=");
     used = append(text, sizeof(text), used,
                   touchpad_options.tap_to_click ? "on" : "off");
@@ -545,6 +552,18 @@ void appearance_set_taskbar(enum taskbar_position position) {
         return;
     }
     current_taskbar = position;
+    config_save();
+}
+
+bool appearance_taskbar_autohide(void) {
+    return taskbar_autohide;
+}
+
+void appearance_set_taskbar_autohide(bool hide) {
+    if (hide == taskbar_autohide) {
+        return;
+    }
+    taskbar_autohide = hide;
     config_save();
 }
 

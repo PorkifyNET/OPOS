@@ -32,6 +32,8 @@ uint64_t keyboard_dropped_characters(void);
 bool keyboard_ctrl_held(void);
 /* Whether Shift is held now (for Shift+click). */
 bool keyboard_shift_held(void);
+/* Whether Super (the Windows key) is held now. */
+bool keyboard_super_held(void);
 /* Whether Ctrl was held when the last character read was typed. Use this
    for shortcuts: Ctrl may be released before the character is handled. */
 bool keyboard_last_ctrl(void);

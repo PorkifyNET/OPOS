@@ -1130,9 +1130,9 @@ void kmain(void) {
         serial_write_string("OPOS: running from installation media\n");
     }
     struct initramfs_file elf_test;
-    if (!initramfs_find_file("bin/elf-test", &elf_test)
+    if (!initramfs_find_file("tests/elf-test", &elf_test)
         || !user_set_elf_image(elf_test.data, elf_test.size)) {
-        console_write_string("OPOS: /bin/elf-test missing from initramfs\n");
+        console_write_string("OPOS: /tests/elf-test missing from initramfs\n");
         halt();
     }
     bool acpi_shutdown_ready = rsdp_request.response != NULL
@@ -1173,7 +1173,7 @@ void kmain(void) {
     }
     console_write_string("OPOS: physical page allocator ready\n");
     console_write_string("OPOS: page-table manager ready\n");
-    console_write_string("OPOS: initramfs loaded with /bin/elf-test\n");
+    console_write_string("OPOS: initramfs loaded with /tests/elf-test\n");
     if (!paging_self_test()) {
         console_write_string("OPOS: page-table manager test failed\n");
         halt();

@@ -4977,8 +4977,8 @@ static void user_child_worker(void *argument) {
             job->elf_image ? job->image_data : NULL,
             job->elf_image ? job->image_size : 0,
             job->cwd, job->cwd_length,
-            job->elf_image ? "/bin/elf-test" : NULL,
-            job->elf_image ? sizeof("/bin/elf-test") - 1 : 0,
+            job->elf_image ? "/tests/elf-test" : NULL,
+            job->elf_image ? sizeof("/tests/elf-test") - 1 : 0,
             &job->identity, NULL, 0, &job->process_id, &job->exit_status);
     }
 

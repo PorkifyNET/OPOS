@@ -425,7 +425,7 @@ user_spawn_message:
     .ascii "OPOS: ring-3 spawn/wait passed\n"
 user_spawn_message_end:
 user_spawn_child_path:
-    .ascii "/bin/elf-test"
+    .ascii "/tests/elf-test"
 user_spawn_child_path_end:
 user_spawn_program_end:
 

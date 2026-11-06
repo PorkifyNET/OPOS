@@ -147,6 +147,6 @@ data_sentinel:
 opos_main_rodata:
     .quad 67
 musl_test_path:
-    .asciz "/bin/musl-test"
+    .asciz "/tests/musl-test"
 
 .section .note.GNU-stack,"",@progbits

@@ -79,6 +79,10 @@ void appearance_set_wallpaper_style(enum wallpaper_style style);
 enum taskbar_position appearance_taskbar(void);
 const char *appearance_taskbar_name(enum taskbar_position position);
 void appearance_set_taskbar(enum taskbar_position position);
+/* Auto-hide: the taskbar shows only while it is needed (see desktop.c
+   taskbar_shown) and windows get the whole screen. */
+bool appearance_taskbar_autohide(void);
+void appearance_set_taskbar_autohide(bool hide);
 
 /* Touchpad gestures (tap-to-click, scroll direction, pointer speed),
    saved with the other choices; applied to the touchpad on load. */

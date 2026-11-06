@@ -504,13 +504,13 @@ _start:
 
 .section .rodata
 expected_path:
-    .asciz "/bin/exec-test"
+    .asciz "/tests/exec-test"
 expected_argument:
     .asciz "ok"
 exec_test_path:
-    .asciz "/bin/exec-test"
+    .asciz "/tests/exec-test"
 dynamic_test_path:
-    .asciz "/bin/pie-test"
+    .asciz "/tests/pie-test"
 dynamic_test_argument:
     .asciz "pie"
 pipe_part_one:

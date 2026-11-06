@@ -27,14 +27,14 @@ synchronous and does not provide scheduling. `run user-shell` launches a
 ring-3 prompt with `help`, `echo`, and `exit` commands; the kernel shell resumes
 after it exits.
 `ls` lists files in a read-only USTAR initramfs bundled on the boot ISO.
-`run elf` is a shortcut for `run /bin/elf-test`; `run path` and `run /path` look up that
+`run elf` is a shortcut for `run /tests/elf-test`; `run path` and `run /path` look up that
 archive path and loads the file as an ELF executable in ring 3, with
 `argv[0]` and `AT_EXECFN` set to the absolute path. A dynamically linked file
 starts in its `PT_INTERP` interpreter with `AT_BASE`, exactly as after
-`execve`, so `run /bin/pie-test` and `run /bin/dynamic-test` link and run
+`execve`, so `run /tests/pie-test` and `run /tests/dynamic-test` link and run
 directly. The archive is
 validated during boot, including USTAR checksums and file bounds. The archive is
-also the VFS root, so Linux applications can open `/bin/elf-test` and enumerate
+also the VFS root, so Linux applications can open `/tests/elf-test` and enumerate
 `/` or `/bin`; its contents remain packaged into the boot image. Writable
 applications use the mounted FAT16 `/disk` namespace.
 The archive packages the primary ELF regression, static and dynamic
@@ -205,7 +205,7 @@ fork cloning, exec replacement, fault cleanup, and normal exit preserve every
 segment's R/RX/RW permissions.
 The current bounded implementation accepts at most 16 arguments, 16 environment
 entries, 1024 total string bytes, a 1 MiB executable file (2 MiB of loaded segments), and a 64 KiB interpreter. The regression
-executes `/bin/exec-test` and verifies replacement, arguments, descriptor
+executes `/tests/exec-test` and verifies replacement, arguments, descriptor
 inheritance, close-on-exec, FS reset, private file mappings, dynamic-interpreter
 handoff, eager `JUMP_SLOT` relocation, a call into `/lib/libopos-test.so`, and
 a transitive call from that System V-hashed consumer into the GNU-hashed
@@ -242,10 +242,10 @@ R, and RW load segments. Main read-only data is accessed before dynamic calls,
 the interpreter reads its isolated `.rodata`, both RW segments begin at page
 offset `0x20`, and repeated process runs prove segment-page ownership is
 reusable.
-The exec-replacement chain now runs `/bin/exec-test`, dynamically linked
-`ET_DYN` `/bin/pie-test`, non-PIE `/bin/dynamic-test`, and a real statically
-musl-linked `/bin/musl-test`, which replaces itself with the real
-`/bin/musl-pthread-test`, in sequence. The pthread program creates and joins a
+The exec-replacement chain now runs `/tests/exec-test`, dynamically linked
+`ET_DYN` `/tests/pie-test`, non-PIE `/tests/dynamic-test`, and a real statically
+musl-linked `/tests/musl-test`, which replaces itself with the real
+`/tests/musl-pthread-test`, in sequence. The pthread program creates and joins a
 pair of threads, forces mutex contention while each sleeps, verifies their
 shared-memory result and return values, then exits normally.
 The PIE resolves shared-library calls
@@ -290,7 +290,7 @@ moved directory handle, detached-anchor rejection after `rmdir`, deferred file a
 reclamation, directory parent repair, cycle rejection, cross-cluster directory
 growth, paginated enumeration, EOF, and directory rewind. Running it twice also proves automatic
 descriptor cleanup between processes. The ELF test opens, reads, and stats
-`/bin/elf-test`, proves duplicated descriptors share offsets and last-close
+`/tests/elf-test`, proves duplicated descriptors share offsets and last-close
 lifetime, enumerates the root mount namespace, changes cwd to `/`, and
 verifies read-only initramfs mutation errors and per-mount `st_dev` values. It
 also uses `brk` (12) to allocate,
@@ -314,7 +314,7 @@ the syscall entry state select the current task's kernel-entry stack. Multiple
 processes can run concurrently under timer preemption. The bounded OPOS
 spawn/wait ABI owns child jobs by parent PID, blocks parents on scheduler events,
 and releases unwaited orphan jobs after their child exits. `run spawntest` proves
-a ring-3 parent can launch one built-in child and `/bin/elf-test`, then wait for
+a ring-3 parent can launch one built-in child and `/tests/elf-test`, then wait for
 both with distinct PIDs. Linux `fork` eagerly copies the current code, data,
 stack, heap, and anonymous mappings into an isolated address space; cwd, FS base,
 and descriptor table are inherited, while open-file descriptions and offsets

@@ -589,21 +589,31 @@ page_boundary_test:
     leaq mount_buffer(%rip), %rsi
     movq $512, %rdx
     syscall
-    cmpq $120, %rax
-    je 8f
+    # The root lists the mounts (disk, cdrom, ...) and the initramfs
+    # folders; walk the records and require "bin" and "lib" among them.
     cmpq $96, %rax
-    jne 1f
-    cmpl $0x006e6962, mount_buffer+67(%rip)
-    jne 1f
-    cmpl $0x0062696c, mount_buffer+91(%rip)
-    jne 1f
-    jmp 9f
-8:
-    cmpl $0x6b736964, mount_buffer+67(%rip)
-    jne 1f
-    cmpl $0x006e6962, mount_buffer+91(%rip)
-    jne 1f
-    cmpl $0x0062696c, mount_buffer+115(%rip)
+    jb 1f
+    leaq mount_buffer(%rip), %rcx
+    leaq (%rcx,%rax), %rdx
+    xorl %r8d, %r8d
+2:
+    cmpq %rdx, %rcx
+    jae 3f
+    cmpl $0x006e6962, 19(%rcx)
+    jne 4f
+    orl $1, %r8d
+4:
+    cmpl $0x0062696c, 19(%rcx)
+    jne 5f
+    orl $2, %r8d
+5:
+    movzwq 16(%rcx), %r9
+    testq %r9, %r9
+    jz 1f
+    addq %r9, %rcx
+    jmp 2b
+3:
+    cmpl $3, %r8d
     jne 1f
 9:
     movq $4, %rax
@@ -853,7 +863,7 @@ message_split:
     .ascii "image loaded\n"
 message_end:
 initramfs_elf_path:
-    .asciz "/bin/elf-test"
+    .asciz "/tests/elf-test"
 root_path:
     .asciz "/"
 read_only_new_path:
@@ -865,7 +875,7 @@ fat_rename_path:
 fat_root_path:
     .asciz "/disk"
 exec_test_path:
-    .asciz "/bin/exec-test"
+    .asciz "/tests/exec-test"
 exec_test_argument:
     .asciz "ok"
 

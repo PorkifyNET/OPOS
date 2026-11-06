@@ -189,11 +189,11 @@ opos_tlsdesc_undefweak:
 
 .section .rodata
 expected_path:
-    .asciz "/bin/dynamic-test"
+    .asciz "/tests/dynamic-test"
 expected_argument:
     .asciz "dyn"
 expected_pie_path:
-    .asciz "/bin/pie-test"
+    .asciz "/tests/pie-test"
 expected_pie_argument:
     .asciz "pie"
 

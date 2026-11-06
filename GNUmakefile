@@ -163,21 +163,21 @@ sdk/lib/image.c: kernel/image.c
 
 $(INITRAMFS): $(WALLPAPERS) $(SDK_NOTEPAD) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
-	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib
-	cp $(USER_ELF) $(BUILD)/initramfs_root/bin/elf-test
-	cp $(EXEC_TEST_ELF) $(BUILD)/initramfs_root/bin/exec-test
-	cp $(DYNAMIC_MAIN_ELF) $(BUILD)/initramfs_root/bin/dynamic-test
-	cp $(DYNAMIC_PIE_MAIN_ELF) $(BUILD)/initramfs_root/bin/pie-test
+	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
+	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
+	cp $(EXEC_TEST_ELF) $(BUILD)/initramfs_root/tests/exec-test
+	cp $(DYNAMIC_MAIN_ELF) $(BUILD)/initramfs_root/tests/dynamic-test
+	cp $(DYNAMIC_PIE_MAIN_ELF) $(BUILD)/initramfs_root/tests/pie-test
 	cp $(DYNAMIC_INTERPRETER_ELF) $(BUILD)/initramfs_root/lib/opos-ld.so
 	cp $(DYNAMIC_LIBRARY_ELF) $(BUILD)/initramfs_root/lib/libopos-test.so
 	cp $(DYNAMIC_BASE_LIBRARY_ELF) $(BUILD)/initramfs_root/lib/libopos-base.so
-	cp $(MUSL_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-test
-	cp $(MUSL_PTHREAD_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-pthread-test
-	cp $(MUSL_SIGNAL_TEST_ELF) $(BUILD)/initramfs_root/bin/musl-signal-test
+	cp $(MUSL_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-test
+	cp $(MUSL_PTHREAD_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-pthread-test
+	cp $(MUSL_SIGNAL_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-signal-test
 	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
 	mkdir -p $(BUILD)/initramfs_root/share/wallpapers
 	cp $(WALLPAPERS) $(BUILD)/initramfs_root/share/wallpapers/
-	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin lib share
+	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin lib share tests
 
 $(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/storage.c kernel/storage.h kernel/optical.c kernel/optical.h kernel/iso9660.c kernel/iso9660.h kernel/xhci.c kernel/xhci.h kernel/usb_storage.c kernel/usb_storage.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/image.c kernel/image.h kernel/appearance.c kernel/appearance.h kernel/boot_display.c kernel/boot_display.h kernel/sdhci.c kernel/sdhci.h kernel/acpi_dump.c kernel/acpi_dump.h kernel/i2c_hid.c kernel/i2c_hid.h kernel/touchpad_gesture.c kernel/touchpad_gesture.h kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
 	$(CC) $(CFLAGS) -Ikernel -I$(dir $(LIMINE_HEADER)) $(LDFLAGS) -o $@ kernel/main.c kernel/interrupts.c kernel/interrupts.S kernel/pci.c kernel/ahci.c kernel/ata.c kernel/nvme.c kernel/pvscsi.c kernel/mpt.c kernel/buslogic.c kernel/scsi.c kernel/partition.c kernel/block.c kernel/fat16.c kernel/storage.c kernel/optical.c kernel/iso9660.c kernel/xhci.c kernel/usb_storage.c kernel/vfs.c kernel/keyboard.c kernel/mouse.c kernel/desktop.c kernel/cmos.c kernel/memory.c kernel/paging.c kernel/power.c kernel/scheduler.c kernel/shell.c kernel/timer.c kernel/user.c kernel/elf.c kernel/initramfs.c kernel/font.c kernel/svga.c kernel/vmware.c kernel/installer.c kernel/accounts.c kernel/sha256.c kernel/permissions.c kernel/image.c kernel/appearance.c kernel/boot_display.c kernel/sdhci.c kernel/acpi_dump.c kernel/i2c_hid.c kernel/touchpad_gesture.c kernel/user.S kernel/vbrstub.S

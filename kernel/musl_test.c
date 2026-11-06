@@ -2,7 +2,7 @@
 
 int main(void) {
     static const char message[] = "OPOS: real musl libc process passed\n";
-    static char path[] = "/bin/musl-pthread-test";
+    static char path[] = "/tests/musl-pthread-test";
     char *const arguments[] = {path, 0};
     char *const environment[] = {0};
     if (write(STDOUT_FILENO, message, sizeof(message) - 1)

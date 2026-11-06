@@ -51,7 +51,7 @@ pie_message:
     .ascii "OPOS: PIE main loaded at 0x04000000\n"
 pie_message_end:
 dynamic_test_path:
-    .asciz "/bin/dynamic-test"
+    .asciz "/tests/dynamic-test"
 dynamic_test_argument:
     .asciz "dyn"
 

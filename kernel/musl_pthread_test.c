@@ -21,7 +21,7 @@ static void *worker(void *argument) {
 
 int main(void) {
     static const char passed[] = "OPOS: real musl pthread passed\n";
-    static char signal_test[] = "/bin/musl-signal-test";
+    static char signal_test[] = "/tests/musl-signal-test";
     static char *signal_arguments[] = {signal_test, 0};
     static char *signal_environment[] = {0};
     int values[2] = {21, 42};

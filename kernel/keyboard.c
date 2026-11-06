@@ -344,6 +344,10 @@ bool keyboard_ctrl_held(void) {
     return ctrl_down;
 }
 
+bool keyboard_super_held(void) {
+    return super_down;
+}
+
 bool keyboard_shift_held(void) {
     return left_shift || right_shift;
 }

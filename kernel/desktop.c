@@ -106,6 +106,11 @@ static size_t z_count;
 /* Tiling order: windows in the order they were opened. */
 static enum window_kind tile_order[WINDOW_COUNT];
 static size_t tile_count;
+/* Taskbar button order: opening order too, but the user can drag the
+   buttons around without moving the tiles. Holds the same windows as
+   tile_order. */
+static enum window_kind bar_order[WINDOW_COUNT];
+static size_t bar_count;
 static bool tiled_layout = true;
 /* Dwindle split i gives tile_order[i] this share of its area, in permille. */
 #define SPLIT_DEFAULT 500
@@ -115,6 +120,7 @@ static uint16_t split_ratio[WINDOW_COUNT];
 static void layout_load(void);
 static void layout_toggle(void);
 static void taskbar_move(enum taskbar_position position);
+static void taskbar_set_autohide(bool hide);
 static void welcome_open_first_time(void);
 static bool start_menu_open;
 static bool programs_open; /* Start > PROGRAMS submenu (see programs_*) */
@@ -624,9 +630,13 @@ static struct rect taskbar_rect(void) {
     }
 }
 
-/* The screen without the taskbar. */
+/* The screen without the taskbar; all of it when the taskbar auto-hides,
+   since it then only shows over the windows for a moment. */
 static struct rect desktop_area(void) {
     struct rect area = {0, 0, screen_width(), screen_height()};
+    if (appearance_taskbar_autohide()) {
+        return area;
+    }
     struct rect bar = taskbar_rect();
     switch (appearance_taskbar()) {
     case TASKBAR_TOP:
@@ -775,6 +785,7 @@ static void window_open(enum window_kind kind) {
         split_ratio[tile_count - 1] = SPLIT_DEFAULT;
     }
     tile_order[tile_count++] = kind;
+    bar_order[bar_count++] = kind;
     if (kind == WINDOW_TERMINAL) {
         terminal_reset();
     }
@@ -814,6 +825,7 @@ static void window_close(enum window_kind kind) {
     }
     remove_from(z_order, &z_count, kind);
     remove_from(tile_order, &tile_count, kind);
+    remove_from(bar_order, &bar_count, kind);
 }
 
 /* Returns the topmost window under the pointer, or WINDOW_COUNT. */
@@ -3338,6 +3350,7 @@ enum setting_row_kind {
     ROW_POINTER_SPEED,
     ROW_LAYOUT,
     ROW_TASKBAR_POSITION,
+    ROW_TASKBAR_AUTOHIDE,
 };
 
 /* Settings pages, listed in the window's sidebar. */
@@ -3378,6 +3391,8 @@ static const struct setting_row setting_rows[] = {
      ROW_WALLPAPER_BROWSE, 0, CATEGORY_APPEARANCE},
     {"WINDOW LAYOUT (SUPER+T)", ROW_LAYOUT, 0, CATEGORY_DESKTOP},
     {"TASKBAR POSITION", ROW_TASKBAR_POSITION, 0, CATEGORY_DESKTOP},
+    {"AUTO-HIDE TASKBAR (SHOWN WHILE SUPER IS HELD)", ROW_TASKBAR_AUTOHIDE,
+     0, CATEGORY_DESKTOP},
     {"12-HOUR CLOCK", ROW_TOGGLE, SETTING_CLOCK_12H, CATEGORY_DATE_TIME},
     {"DATE FORMAT", ROW_DATE_FORMAT, 0, CATEGORY_DATE_TIME},
     {"YEAR", ROW_YEAR, 0, CATEGORY_DATE_TIME},
@@ -3568,6 +3583,10 @@ static void setting_value_text(const struct setting_row *row,
     case ROW_TASKBAR_POSITION:
         length = append_text(text, capacity, length,
                              appearance_taskbar_name(appearance_taskbar()));
+        break;
+    case ROW_TASKBAR_AUTOHIDE:
+        length = append_text(text, capacity, length,
+                             appearance_taskbar_autohide() ? "ON" : "OFF");
         break;
     case ROW_TAP_TO_CLICK:
         length = append_text(text, capacity, length,
@@ -3855,6 +3874,10 @@ static void settings_change(size_t index, int delta) {
     if (row->kind == ROW_TASKBAR_POSITION) {
         taskbar_move((enum taskbar_position)wrap_step(
             appearance_taskbar(), delta, 0, TASKBAR_POSITION_COUNT - 1));
+        return;
+    }
+    if (row->kind == ROW_TASKBAR_AUTOHIDE) {
+        taskbar_set_autohide(!appearance_taskbar_autohide());
         return;
     }
     if (row->kind == ROW_TAP_TO_CLICK || row->kind == ROW_SCROLL_DIRECTION
@@ -6239,6 +6262,7 @@ enum taskbar_menu_item {
     TASKBAR_MENU_TOP,
     TASKBAR_MENU_LEFT,
     TASKBAR_MENU_RIGHT,
+    TASKBAR_MENU_AUTOHIDE,
     TASKBAR_MENU_TASKS,
     TASKBAR_MENU_SETTINGS,
     TASKBAR_MENU_COUNT
@@ -6248,6 +6272,45 @@ static bool taskbar_menu_open;
 static size_t taskbar_menu_selection;
 static int64_t taskbar_menu_x;
 static int64_t taskbar_menu_y;
+
+/*
+ * Auto-hide: the taskbar shows while Super is held, while the Start menu or
+ * the taskbar menu is open, and while the pointer is on it (it appears when
+ * the pointer touches that screen edge, and stays while a button is being
+ * dragged).
+ */
+static bool taskbar_pointer_reveal;
+
+static bool taskbar_shown(void) {
+    return !appearance_taskbar_autohide() || start_menu_open
+        || taskbar_menu_open || taskbar_pointer_reveal
+        || keyboard_super_held();
+}
+
+/* Returns true when the pointer revealed or hid the taskbar. */
+static bool taskbar_track_pointer(int32_t x, int32_t y, bool dragging) {
+    bool before = taskbar_pointer_reveal;
+    bool at_edge;
+    switch (appearance_taskbar()) {
+    case TASKBAR_TOP:
+        at_edge = y <= 1;
+        break;
+    case TASKBAR_LEFT:
+        at_edge = x <= 1;
+        break;
+    case TASKBAR_RIGHT:
+        at_edge = x >= screen_width() - 2;
+        break;
+    default:
+        at_edge = y >= screen_height() - 2;
+        break;
+    }
+    taskbar_pointer_reveal =
+        appearance_taskbar_autohide()
+        && (at_edge || dragging
+            || (before && rect_contains(taskbar_rect(), x, y)));
+    return taskbar_pointer_reveal != before;
+}
 
 static struct rect taskbar_menu_rect(void) {
     return taskbar_popup_rect(taskbar_menu_x, taskbar_menu_y,
@@ -6264,12 +6327,18 @@ static struct rect taskbar_menu_item_rect(size_t index) {
 
 static void taskbar_menu_label(size_t item, char *text, size_t capacity) {
     static const char *const labels[TASKBAR_MENU_COUNT] = {
-        "", "BOTTOM", "TOP", "LEFT", "RIGHT", "TASK MANAGER",
+        "", "BOTTOM", "TOP", "LEFT", "RIGHT", "", "TASK MANAGER",
         "TASKBAR SETTINGS",
     };
     if (item == TASKBAR_MENU_LAYOUT) {
         append_text(text, capacity, 0,
                     tiled_layout ? "SWITCH TO FLOATING" : "SWITCH TO TILING");
+        return;
+    }
+    if (item == TASKBAR_MENU_AUTOHIDE) {
+        append_text(text, capacity, 0,
+                    appearance_taskbar_autohide() ? "* AUTO-HIDE TASKBAR"
+                                                  : "  AUTO-HIDE TASKBAR");
         return;
     }
     size_t length = 0;
@@ -6309,13 +6378,13 @@ static void draw_taskbar(void) {
         break;
     }
     draw_button(start_button_rect(), "START", start_menu_open);
-    for (size_t i = 0; i < tile_count; i++) {
+    for (size_t i = 0; i < bar_count; i++) {
         struct rect button = task_button_rect(i);
         if (!task_button_fits(button)) {
             break;
         }
-        draw_button(button, window_title(tile_order[i]),
-                    window_focused(tile_order[i]));
+        draw_button(button, window_title(bar_order[i]),
+                    window_focused(bar_order[i]));
     }
 
     char date[16] = "";
@@ -6659,9 +6728,9 @@ static void draw_status(void) {
         return;
     }
     int64_t text_width = (int64_t)text_length(status_text) * CHAR_WIDTH;
-    if (!taskbar_vertical()) {
+    if (!taskbar_vertical() && taskbar_shown()) {
         size_t shown = 0;
-        while (shown < tile_count && task_button_fits(task_button_rect(shown))) {
+        while (shown < bar_count && task_button_fits(task_button_rect(shown))) {
             shown++;
         }
         int64_t x = task_button_rect(shown).x;
@@ -6706,7 +6775,9 @@ static void draw_scene(void) {
     }
     draw_files_menu();
     draw_files_drag();
-    draw_taskbar();
+    if (taskbar_shown()) {
+        draw_taskbar();
+    }
     draw_status();
     if (start_menu_open) {
         draw_start_menu();
@@ -6743,6 +6814,12 @@ static void taskbar_move(enum taskbar_position position) {
     windows_fit_screen();
 }
 
+static void taskbar_set_autohide(bool hide) {
+    appearance_set_taskbar_autohide(hide);
+    taskbar_pointer_reveal = false;
+    windows_fit_screen();
+}
+
 static void settings_open_category(enum settings_category category) {
     window_open(WINDOW_SETTINGS);
     settings_show_category(category);
@@ -6760,6 +6837,9 @@ static void taskbar_menu_activate(size_t item) {
     case TASKBAR_MENU_LEFT:
     case TASKBAR_MENU_RIGHT:
         taskbar_move((enum taskbar_position)(item - TASKBAR_MENU_BOTTOM));
+        break;
+    case TASKBAR_MENU_AUTOHIDE:
+        taskbar_set_autohide(!appearance_taskbar_autohide());
         break;
     case TASKBAR_MENU_TASKS:
         tasks_open();
@@ -7970,7 +8050,8 @@ enum drag_mode {
     DRAG_MOVE,
     DRAG_RESIZE,
     DRAG_SPLIT,
-    DRAG_FILES /* the Files selection (files_drag_*) */
+    DRAG_FILES, /* the Files selection (files_drag_*) */
+    DRAG_TASKBAR /* a taskbar button (taskbar_drag_motion) */
 };
 
 #define EDGE_LEFT 1
@@ -8181,6 +8262,47 @@ static bool handle_split(const struct drag_state *drag, int32_t x, int32_t y) {
     return true;
 }
 
+/*
+ * A taskbar button being dragged takes the place of the button under the
+ * pointer; only the coordinate along the bar counts, so the pointer may
+ * stray off the bar sideways.
+ */
+static bool taskbar_drag_motion(const struct drag_state *drag, int32_t x,
+                                int32_t y) {
+    size_t from = 0;
+    while (from < bar_count && bar_order[from] != drag->kind) {
+        from++;
+    }
+    if (from == bar_count) {
+        return false;
+    }
+    for (size_t to = 0; to < bar_count; to++) {
+        struct rect button = task_button_rect(to);
+        if (!task_button_fits(button)) {
+            break;
+        }
+        bool under = taskbar_vertical()
+                         ? y >= button.y && y < button.y + button.height
+                         : x >= button.x && x < button.x + button.width;
+        if (!under || to == from) {
+            continue;
+        }
+        enum window_kind moving = bar_order[from];
+        if (to < from) {
+            for (size_t i = from; i > to; i--) {
+                bar_order[i] = bar_order[i - 1];
+            }
+        } else {
+            for (size_t i = from; i < to; i++) {
+                bar_order[i] = bar_order[i + 1];
+            }
+        }
+        bar_order[to] = moving;
+        return true;
+    }
+    return false;
+}
+
 static enum desktop_result handle_press(int32_t x, int32_t y,
                                         struct drag_state *drag) {
     if (login_active) {
@@ -8236,16 +8358,20 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         }
     }
 
-    if (rect_contains(taskbar_rect(), x, y)) {
+    if (taskbar_shown() && rect_contains(taskbar_rect(), x, y)) {
         if (rect_contains(start_button_rect(), x, y)) {
             start_menu_open = true;
             menu_selection = 0;
             programs_open = false;
         } else {
-            for (size_t i = 0; i < tile_count; i++) {
+            for (size_t i = 0; i < bar_count; i++) {
                 if (task_button_fits(task_button_rect(i))
                     && rect_contains(task_button_rect(i), x, y)) {
-                    window_raise(tile_order[i]);
+                    window_raise(bar_order[i]);
+                    /* Dragging the button along the bar reorders it. */
+                    drag->active = true;
+                    drag->mode = DRAG_TASKBAR;
+                    drag->kind = bar_order[i];
                     break;
                 }
             }
@@ -8567,7 +8693,7 @@ static void handle_right_press(int32_t x, int32_t y) {
     start_menu_open = false;
     files_menu_open = false;
     taskbar_menu_open = false;
-    if (rect_contains(taskbar_rect(), x, y)) {
+    if (taskbar_shown() && rect_contains(taskbar_rect(), x, y)) {
         taskbar_menu_open = true;
         taskbar_menu_selection = 0;
         taskbar_menu_x = x;
@@ -9720,6 +9846,7 @@ static struct mouse_state loop_mouse;
 static uint8_t loop_previous_buttons;
 static struct drag_state loop_drag;
 static uint64_t loop_drawn_tick;
+static bool loop_taskbar_shown = true;
 
 static size_t removable_disk_count(void) {
     size_t count = 0;
@@ -9875,6 +10002,10 @@ static bool desktop_step(void) {
         struct mouse_state mouse = loop_mouse;
         bool pressed = (mouse.buttons & 1) != 0;
         bool was_pressed = (loop_previous_buttons & 1) != 0;
+        /* Before the press, so a click on a just-revealed taskbar works. */
+        redraw |= taskbar_track_pointer(
+            mouse.x, mouse.y,
+            pressed && loop_drag.active && loop_drag.mode == DRAG_TASKBAR);
         if (pressed && !was_pressed) {
             status_text[0] = '\0';
             if (handle_press(mouse.x, mouse.y, &loop_drag) == DESKTOP_EXIT) {
@@ -9888,6 +10019,8 @@ static bool desktop_step(void) {
                 redraw |= handle_split(&loop_drag, mouse.x, mouse.y);
             } else if (loop_drag.mode == DRAG_FILES) {
                 redraw |= files_drag_motion(mouse.x, mouse.y);
+            } else if (loop_drag.mode == DRAG_TASKBAR) {
+                redraw |= taskbar_drag_motion(&loop_drag, mouse.x, mouse.y);
             } else {
                 redraw |= handle_drag(&loop_drag, mouse.x, mouse.y);
             }
@@ -9910,6 +10043,12 @@ static bool desktop_step(void) {
     }
     apps_check_resize();
     redraw |= programs_close_check();
+    /* Holding or releasing Super shows or hides an auto-hidden taskbar. */
+    bool taskbar_now = taskbar_shown();
+    if (taskbar_now != loop_taskbar_shown) {
+        loop_taskbar_shown = taskbar_now;
+        redraw = true;
+    }
     if (exit_to_shell) {
         return true;
     }
@@ -9945,6 +10084,7 @@ void desktop_run(void) {
     }
     z_count = 0;
     tile_count = 0;
+    bar_count = 0;
     start_menu_open = false;
     status_text[0] = '\0';
     exit_to_shell = false;

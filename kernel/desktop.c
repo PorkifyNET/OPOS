@@ -62,6 +62,7 @@ enum window_kind {
     WINDOW_EDITOR,
     WINDOW_INSTALLER,
     WINDOW_ACCOUNTS,
+    WINDOW_TASKS,
     /* Program windows: one kind per slot (see "program windows"). */
     WINDOW_APP,
     WINDOW_APP_LAST = WINDOW_APP + 3,
@@ -75,7 +76,7 @@ static bool window_is_app(enum window_kind kind) {
 
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "SYSTEM INFO", "WELCOME", "SETTINGS", "TEXT EDITOR",
-    "INSTALL OPOS", "ACCOUNTS", "PROGRAM"
+    "INSTALL OPOS", "ACCOUNTS", "TASK MANAGER", "PROGRAM"
 };
 
 static const char *app_window_title(size_t slot);
@@ -117,6 +118,7 @@ enum menu_action {
     MENU_FILES,
     MENU_TEXT_EDITOR,
     MENU_SYSTEM_INFO,
+    MENU_TASK_MANAGER,
     MENU_TOGGLE_LAYOUT,
     MENU_SETTINGS,
     MENU_ACCOUNTS,
@@ -128,7 +130,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "SYSTEM INFO", "TOGGLE TILING", "SETTINGS", "ACCOUNTS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "SYSTEM INFO", "TASK MANAGER", "TOGGLE TILING", "SETTINGS", "ACCOUNTS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -385,6 +387,10 @@ static void app_key(size_t slot, char character);
 static void app_mouse_press(size_t slot, int32_t x, int32_t y,
                             uint32_t button);
 static void draw_app(size_t slot, struct rect area);
+static void tasks_open(void);
+static void draw_tasks(struct rect area, bool focused);
+static void tasks_click(struct rect area, int32_t x, int32_t y);
+static void tasks_key(char character);
 static const char *window_title(enum window_kind kind);
 
 static void terminal_output_flush(void) {
@@ -2514,6 +2520,7 @@ static void draw_welcome(struct rect area) {
         "SUPER+ENTER: TERMINAL  SUPER+E: FILES",
         "SUPER+Q: CLOSE  SUPER+T: TILE/FLOAT",
         "SUPER+TAB: CYCLE FOCUS",
+        "CTRL+SHIFT+ESC: TASK MANAGER",
         "DRAG TITLE BARS IN FLOATING MODE",
         "LINUX ELF PROGRAMS RUN FROM FILES",
     };
@@ -4829,6 +4836,9 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_SYSTEM_INFO:
         draw_system_info(content);
         break;
+    case WINDOW_TASKS:
+        draw_tasks(content, focused);
+        break;
     case WINDOW_SETTINGS:
         draw_settings(content, focused);
         break;
@@ -5079,6 +5089,9 @@ static enum desktop_result menu_activate(enum menu_action action) {
         if (!notepad_launch(NULL, 0)) {
             editor_new();
         }
+        break;
+    case MENU_TASK_MANAGER:
+        tasks_open();
         break;
     case MENU_SYSTEM_INFO:
         window_open(WINDOW_SYSTEM_INFO);
@@ -5966,6 +5979,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         installer_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_ACCOUNTS) {
         accounts_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_TASKS) {
+        tasks_click(content_rect(frame), x, y);
     } else if (window_is_app(kind)) {
         app_mouse_press(kind - WINDOW_APP, x, y, 1);
     } else if (kind == WINDOW_SETTINGS) {
@@ -6189,6 +6204,12 @@ static enum desktop_result handle_key(char character, bool super) {
         menu_selection = 0;
         return DESKTOP_CONTINUE;
     }
+    if (character == KEY_ESCAPE && keyboard_last_ctrl()
+        && keyboard_last_shift()) {
+        start_menu_open = false;
+        tasks_open();
+        return DESKTOP_CONTINUE;
+    }
     if (start_menu_open) {
         if (character == KEY_UP) {
             menu_selection = (menu_selection + menu_visible_count() - 1)
@@ -6212,6 +6233,8 @@ static enum desktop_result handle_key(char character, bool super) {
         installer_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_ACCOUNTS) {
         accounts_key(character);
+    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_TASKS) {
+        tasks_key(character);
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
         app_key(z_order[z_count - 1] - WINDOW_APP, character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
@@ -6994,6 +7017,224 @@ static void app_job_report(struct app_job *job) {
 }
 
 /*
+ * Task Manager: the running programs with their CPU share over the last
+ * second, memory and threads. End Program (or Delete) ends the selected
+ * one, as the Terminal's kill does.
+ */
+#define TASKS_CAPACITY 16
+#define TASKS_ROW_HEIGHT 24
+#define TASKS_SAMPLE_TICKS 100
+
+struct tasks_row {
+    uint64_t id;
+    char name[32];
+    size_t threads;
+    size_t memory_pages;
+    uint64_t cpu_ticks;
+    uint32_t cpu_percent;
+};
+
+static struct tasks_row tasks_rows[TASKS_CAPACITY];
+static size_t tasks_row_count;
+static uint64_t tasks_selected; /* process ID */
+static uint64_t tasks_sample_tick;
+static uint64_t tasks_idle_sample;
+static uint32_t tasks_busy_percent;
+static char tasks_message[48];
+
+static uint32_t tasks_percent(uint64_t part, uint64_t whole) {
+    if (whole == 0) {
+        return 0;
+    }
+    uint64_t percent = (part * 100 + whole / 2) / whole;
+    return percent > 100 ? 100 : (uint32_t)percent;
+}
+
+static void tasks_sample(void) {
+    struct user_process_info info[TASKS_CAPACITY];
+    size_t count = user_process_list(info, TASKS_CAPACITY);
+    uint64_t now = timer_ticks();
+    uint64_t idle = scheduler_idle_ticks();
+    bool first = tasks_sample_tick == 0;
+    uint64_t elapsed = now - tasks_sample_tick;
+    struct tasks_row rows[TASKS_CAPACITY];
+    for (size_t i = 0; i < count; i++) {
+        rows[i] = (struct tasks_row){
+            .id = info[i].id,
+            .threads = info[i].threads,
+            .memory_pages = info[i].memory_pages,
+            .cpu_ticks = info[i].cpu_ticks,
+        };
+        for (size_t j = 0; j < sizeof(rows[i].name); j++) {
+            rows[i].name[j] = info[i].name[j];
+        }
+        rows[i].name[sizeof(rows[i].name) - 1] = '\0';
+        for (size_t j = 0; !first && j < tasks_row_count; j++) {
+            if (tasks_rows[j].id == rows[i].id
+                && rows[i].cpu_ticks >= tasks_rows[j].cpu_ticks) {
+                rows[i].cpu_percent = tasks_percent(
+                    rows[i].cpu_ticks - tasks_rows[j].cpu_ticks, elapsed);
+            }
+        }
+    }
+    tasks_busy_percent = first ? 0
+        : 100 - tasks_percent(idle - tasks_idle_sample, elapsed);
+    for (size_t i = 0; i < count; i++) {
+        tasks_rows[i] = rows[i];
+    }
+    tasks_row_count = count;
+    tasks_sample_tick = now;
+    tasks_idle_sample = idle;
+    bool selected = false;
+    for (size_t i = 0; i < count; i++) {
+        selected |= tasks_rows[i].id == tasks_selected;
+    }
+    if (!selected) {
+        tasks_selected = count != 0 ? tasks_rows[0].id : 0;
+    }
+}
+
+static void tasks_open(void) {
+    window_open(WINDOW_TASKS);
+    tasks_sample_tick = 0;
+    tasks_row_count = 0;
+    tasks_message[0] = '\0';
+    tasks_sample();
+}
+
+static size_t tasks_selected_index(void) {
+    for (size_t i = 0; i < tasks_row_count; i++) {
+        if (tasks_rows[i].id == tasks_selected) {
+            return i;
+        }
+    }
+    return tasks_row_count;
+}
+
+static struct rect tasks_end_button(struct rect area) {
+    return (struct rect){area.x + area.width - 16 - 15 * CHAR_WIDTH,
+                         area.y + area.height - 40, 15 * CHAR_WIDTH, 28};
+}
+
+static struct rect tasks_row_rect(struct rect area, size_t index) {
+    return (struct rect){area.x + 8, area.y + 72
+                         + (int64_t)index * TASKS_ROW_HEIGHT,
+                         area.width - 16, TASKS_ROW_HEIGHT};
+}
+
+static void tasks_end_selected(void) {
+    size_t index = tasks_selected_index();
+    if (index == tasks_row_count) {
+        return;
+    }
+    size_t length = append_text(tasks_message, sizeof(tasks_message), 0,
+                                user_process_kill(tasks_rows[index].id)
+                                ? "ENDING " : "ALREADY ENDED: ");
+    append_text(tasks_message, sizeof(tasks_message), length,
+                tasks_rows[index].name);
+}
+
+static void draw_tasks(struct rect area, bool focused) {
+    fill(area, 24, 30, 46);
+    int64_t x = area.x + 16;
+    int64_t width = area.width - 32;
+    uint64_t total = memory_total_pages();
+    uint64_t free = memory_free_pages();
+    uint64_t used = total > free ? total - free : 0;
+    char summary[80] = "CPU ";
+    size_t length = append_decimal(summary, sizeof(summary), 4,
+                                   tasks_busy_percent);
+    length = append_text(summary, sizeof(summary), length, "%   MEMORY ");
+    length = append_decimal(summary, sizeof(summary), length,
+                            used * 4096 / (1024 * 1024));
+    length = append_text(summary, sizeof(summary), length, " OF ");
+    length = append_decimal(summary, sizeof(summary), length,
+                            total * 4096 / (1024 * 1024));
+    append_text(summary, sizeof(summary), length, " MB IN USE");
+    draw_text_clipped(x, area.y + 14, width, summary, 151, 190, 255);
+
+    static const char *const headings[] = {
+        "PID", "NAME", "CPU", "MEMORY", "THREADS"
+    };
+    static const int64_t columns[] = {0, 7, 28, 35, 46};
+    for (size_t i = 0; i < 5; i++) {
+        draw_text_clipped(x + columns[i] * CHAR_WIDTH, area.y + 46,
+                          width - columns[i] * CHAR_WIDTH, headings[i],
+                          150, 160, 185);
+    }
+    struct rect button = tasks_end_button(area);
+    size_t selected = tasks_selected_index();
+    for (size_t i = 0; i < tasks_row_count; i++) {
+        struct rect row = tasks_row_rect(area, i);
+        if (row.y + row.height > button.y - 8) {
+            break;
+        }
+        const struct tasks_row *task = &tasks_rows[i];
+        if (i == selected) {
+            fill(row, focused ? 52 : 40, focused ? 82 : 52,
+                 focused ? 140 : 80);
+        }
+        char cells[5][32];
+        append_decimal(cells[0], sizeof(cells[0]), 0, task->id);
+        text_copy(cells[1], 20, task->name);
+        length = append_decimal(cells[2], sizeof(cells[2]), 0,
+                                task->cpu_percent);
+        append_text(cells[2], sizeof(cells[2]), length, "%");
+        uint64_t kib = (uint64_t)task->memory_pages * 4;
+        length = kib >= 10240
+            ? append_decimal(cells[3], sizeof(cells[3]), 0, kib / 1024)
+            : append_decimal(cells[3], sizeof(cells[3]), 0, kib);
+        append_text(cells[3], sizeof(cells[3]), length,
+                    kib >= 10240 ? " MB" : " KB");
+        append_decimal(cells[4], sizeof(cells[4]), 0, task->threads);
+        for (size_t c = 0; c < 5; c++) {
+            draw_text_clipped(x + columns[c] * CHAR_WIDTH, row.y + 5,
+                              width - columns[c] * CHAR_WIDTH, cells[c],
+                              230, 238, 255);
+        }
+    }
+    if (tasks_row_count == 0) {
+        draw_text_clipped(x, area.y + 77, width, "NO PROGRAMS RUNNING",
+                          200, 214, 255);
+    }
+    draw_text_clipped(x, button.y + 7, button.x - x - 16,
+                      tasks_message[0] != '\0' ? tasks_message
+                      : "ARROWS: SELECT  DELETE: END PROGRAM",
+                      tasks_message[0] != '\0' ? 240 : 150,
+                      tasks_message[0] != '\0' ? 205 : 160,
+                      tasks_message[0] != '\0' ? 100 : 185);
+    bool enabled = selected != tasks_row_count;
+    fill(button, enabled ? 150 : 50, enabled ? 60 : 56, enabled ? 70 : 72);
+    draw_text_clipped(button.x + 12, button.y + 7, button.width - 24,
+                      "END PROGRAM", enabled ? 255 : 130,
+                      enabled ? 255 : 136, enabled ? 255 : 150);
+}
+
+static void tasks_click(struct rect area, int32_t x, int32_t y) {
+    if (rect_contains(tasks_end_button(area), x, y)) {
+        tasks_end_selected();
+        return;
+    }
+    for (size_t i = 0; i < tasks_row_count; i++) {
+        if (rect_contains(tasks_row_rect(area, i), x, y)) {
+            tasks_selected = tasks_rows[i].id;
+            tasks_message[0] = '\0';
+        }
+    }
+}
+
+static void tasks_key(char character) {
+    size_t index = tasks_selected_index();
+    if (character == KEY_UP && index != tasks_row_count && index != 0) {
+        tasks_selected = tasks_rows[index - 1].id;
+    } else if (character == KEY_DOWN && index + 1 < tasks_row_count) {
+        tasks_selected = tasks_rows[index + 1].id;
+    } else if (character == KEY_DELETE) {
+        tasks_end_selected();
+    }
+}
+
+/*
  * The desktop's side of programs, once per pass: opens and frees windows,
  * ends programs that ignore a close, shows output, reports ended jobs.
  * Returns true when the screen needs drawing.
@@ -7037,6 +7278,11 @@ static bool apps_poll(void) {
         }
         redraw = true;
     }
+    if (windows[WINDOW_TASKS].open
+        && now - tasks_sample_tick >= TASKS_SAMPLE_TICKS) {
+        tasks_sample();
+        redraw = true;
+    }
     if (app_input_readers != app_input_readers_drawn) {
         app_input_readers_drawn = app_input_readers;
         redraw = true;
@@ -7054,8 +7300,8 @@ static bool apps_poll(void) {
 
 /*
  * Log out, the shell: every program ends first (they run as the account
- * that is leaving). Programs get up to 3 seconds; one stuck waiting
- * outside the desktop (a pipe, a thread) is left behind after that.
+ * that is leaving). Ending wakes programs from any wait; this gives them
+ * up to 3 seconds in case one is stuck in the kernel anyway.
  */
 static void apps_stop_all(void) {
     apps_stopping = true;

@@ -75,9 +75,9 @@ no home folder (for example the live session started from the ISO).
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none
-keeps running as the account that left. A program blocked on a pipe, a
-child or another thread ends only when it wakes. The desktop waits 3
-seconds for it, then goes on without it.
+keeps running as the account that left. Ending a program also wakes it
+from any wait (a pipe, a child, a futex, the keyboard), so it cannot
+hide there.
 
 Denied calls return `EACCES` (13). Files shows "ACCESS DENIED".
 

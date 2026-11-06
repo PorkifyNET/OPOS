@@ -23,6 +23,7 @@ static size_t current_range;
 static struct free_page *free_pages;
 static uint64_t direct_map_offset;
 static uint64_t total_pages;
+static uint64_t free_list_pages;
 
 bool memory_initialize(const struct limine_memmap_response *memory_map,
                        uint64_t hhdm_offset) {
@@ -83,6 +84,7 @@ uint64_t physical_page_alloc(void) {
     if (free_pages != NULL) {
         struct free_page *page = free_pages;
         free_pages = page->next;
+        free_list_pages--;
         return (uint64_t)(uintptr_t)page - direct_map_offset;
     }
 
@@ -129,6 +131,7 @@ bool physical_page_free(uint64_t physical_address) {
 
     page->next = free_pages;
     free_pages = page;
+    free_list_pages++;
     return true;
 }
 
@@ -141,6 +144,14 @@ void *physical_page_to_hhdm(uint64_t physical_address) {
 
 uint64_t memory_total_pages(void) {
     return total_pages;
+}
+
+uint64_t memory_free_pages(void) {
+    uint64_t pages = free_list_pages;
+    for (size_t i = 0; i < usable_range_count; i++) {
+        pages += (usable_ranges[i].end - usable_ranges[i].next) / PAGE_SIZE;
+    }
+    return pages;
 }
 
 uint64_t physical_pages_alloc_contiguous(uint64_t count) {

@@ -70,6 +70,7 @@
 #define USER_PROT_EXEC 0x04
 #define USER_PROT_READ 0x01
 #define USER_MMAP_RESERVED (1ULL << 62)
+#define USER_ADDRESS_LIMIT 0x00007ffffffff000ULL
 #define LINUX_CLONE_VM 0x00000100ULL
 #define LINUX_CLONE_FS 0x00000200ULL
 #define LINUX_CLONE_FILES 0x00000400ULL
@@ -288,6 +289,10 @@ struct user_process {
     uint64_t fault_status;
     bool faulted;
     volatile bool kill_requested;
+    /* exit_group with other threads alive: they end with this status. */
+    volatile bool group_exit;
+    uint64_t group_status;
+    char name[32];
     bool elf_image;
     uintptr_t initial_break;
     uintptr_t current_break;
@@ -403,6 +408,43 @@ static struct user_thread user_threads[SCHEDULER_TASK_CAPACITY];
 static struct user_thread_job thread_jobs[SCHEDULER_TASK_CAPACITY - 1];
 static struct user_futex_queue futex_queues[SCHEDULER_TASK_CAPACITY];
 static uint64_t next_child_handle = 1;
+
+/* A process's name for the Task Manager: the last part of its path. */
+static void user_set_process_name(struct user_process *process,
+                                  const char *path, size_t length) {
+    size_t start = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (path[i] == '/') {
+            start = i + 1;
+        }
+    }
+    size_t used = 0;
+    if (path == NULL || start == length) {
+        static const char builtin[] = "BUILT-IN";
+        for (; builtin[used] != '\0'; used++) {
+            process->name[used] = builtin[used];
+        }
+    } else {
+        for (size_t i = start; i < length && used + 1 < sizeof(process->name);
+             i++) {
+            process->name[used++] = path[i];
+        }
+    }
+    process->name[used] = '\0';
+}
+
+/* Wakes every thread of a process from its waits (see
+   scheduler_interrupt_task); they then end on the way back to user mode. */
+static void user_process_interrupt_threads(struct user_process *process) {
+    for (size_t slot = 0; slot < SCHEDULER_TASK_CAPACITY; slot++) {
+        if (user_threads[slot].active
+            && user_threads[slot].process == process
+            && slot != scheduler_current_slot()) {
+            scheduler_interrupt_task(slot);
+        }
+    }
+}
+
 static uint64_t user_random_sequence = 0x6a09e667f3bcc909ULL;
 static const uint8_t *user_elf_image;
 static size_t user_elf_image_size;
@@ -2504,8 +2546,13 @@ static int64_t user_linux_fork(struct user_process *parent,
     if (parent == NULL || frame == NULL || next_process_id == 0) {
         return -11;
     }
+    /* The stack may be the initial page or mmap memory (the SDK's crt0
+       moves it there); both are copied for the child. */
     uintptr_t user_stack = scheduler_linux_syscall_user_stack();
-    if (user_stack < USER_STACK_ADDRESS || user_stack > USER_STACK_TOP) {
+    if (user_stack < USER_APP_MIN_ADDRESS + sizeof(uint64_t)
+        || user_stack >= USER_ADDRESS_LIMIT
+        || !paging_user_range_valid(user_stack - sizeof(uint64_t),
+                                    sizeof(uint64_t), true, false)) {
         return -14;
     }
     struct user_child_job *job = NULL;
@@ -2551,6 +2598,9 @@ static int64_t user_linux_fork(struct user_process *parent,
         child->image_segments[i] = parent->image_segments[i];
     }
     child->identity = parent->identity;
+    for (size_t i = 0; i < sizeof(child->name); i++) {
+        child->name[i] = parent->name[i];
+    }
     child->cwd_length = parent->cwd_length;
     for (size_t i = 0; i < parent->cwd_length; i++) {
         child->cwd[i] = parent->cwd[i];
@@ -2828,6 +2878,7 @@ static int64_t user_linux_execve(struct user_process *process,
     process->heap_base = (process->initial_break + PAGE_SIZE - 1)
         & ~(uintptr_t)(PAGE_SIZE - 1);
     process->heap_page_count = 0;
+    user_set_process_name(process, path, path_length);
     process->image_segment_count = plan.segment_count;
     process->image_page_count = plan.total_page_count;
     for (size_t i = 0; i < plan.segment_count; i++) {
@@ -4121,6 +4172,12 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     }
 
     if (number == 60 || number == 231) {
+        if (number == 231 && process->active_threads > 1) {
+            /* The other threads end too, with the same status. */
+            process->group_status = file_descriptor;
+            process->group_exit = true;
+            user_process_interrupt_threads(process);
+        }
         frame->rax = file_descriptor;
         return true;
     }
@@ -4139,7 +4196,6 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
  * - FS base: WRMSR with a non-canonical value faults in ring 0.
  * A bad value ends the process (SIGSEGV) instead of crashing the kernel.
  */
-#define USER_ADDRESS_LIMIT 0x00007ffffffff000ULL
 #define USER_RFLAGS_ALLOWED 0x00240cd5ULL
 #define USER_RFLAGS_FORCED 0x00000202ULL
 
@@ -4172,6 +4228,10 @@ bool user_linux_signal_deliver(void *saved_registers) {
     }
     if (process->kill_requested) {
         frame->rax = 128 + LINUX_SIGKILL;
+        return true;
+    }
+    if (process->group_exit) {
+        frame->rax = process->group_status;
         return true;
     }
 
@@ -4254,6 +4314,9 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
     while (process->active_threads > 1) {
         uint64_t flags;
         __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+        /* A kill interrupts this thread too; here it must still wait for
+           the others to end. */
+        scheduler_clear_interrupt();
         if (process->active_threads > 1) {
             (void)scheduler_block_current_locked(process);
         }
@@ -4270,6 +4333,8 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
     scheduler_set_current_context(NULL);
     process->state = USER_PROCESS_EXITED;
     process->kill_requested = false;
+    process->group_exit = false;
+    scheduler_clear_interrupt();
     desktop_app_process_exited(process->id);
     user_orphan_children(process->id);
     if (process->faulted) {
@@ -4399,6 +4464,7 @@ static bool user_process_run_image(enum user_program program,
        parent program. */
     process->identity = identity != NULL ? *identity
                                          : permission_session_identity();
+    user_set_process_name(process, initial_execfn, initial_execfn_length);
     static const char default_cwd[] = "/";
     const char *cwd = initial_cwd != NULL ? initial_cwd : default_cwd;
     size_t cwd_length = initial_cwd != NULL
@@ -4773,6 +4839,7 @@ bool user_process_kill(uint64_t process_id) {
         if (process_slots[i].state == USER_PROCESS_RUNNING
             && process_slots[i].id == process_id) {
             process_slots[i].kill_requested = true;
+            user_process_interrupt_threads(&process_slots[i]);
             return true;
         }
     }
@@ -4784,6 +4851,7 @@ size_t user_process_kill_all(void) {
     for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
         if (process_slots[i].state == USER_PROCESS_RUNNING) {
             process_slots[i].kill_requested = true;
+            user_process_interrupt_threads(&process_slots[i]);
             running++;
         }
     }
@@ -4809,10 +4877,44 @@ uint64_t user_task_process_id(uint64_t task_id) {
     return process_slots[slot].id;
 }
 
+size_t user_process_list(struct user_process_info *list, size_t capacity) {
+    size_t count = 0;
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY && count < capacity;
+         i++) {
+        const struct user_process *process = &process_slots[i];
+        if (process->state != USER_PROCESS_RUNNING) {
+            continue;
+        }
+        struct user_process_info *info = &list[count++];
+        *info = (struct user_process_info){
+            .id = process->id,
+            .threads = process->active_threads,
+            .memory_pages = process->image_page_count
+                + process->heap_page_count + 1,
+        };
+        for (size_t j = 0; j < sizeof(info->name); j++) {
+            info->name[j] = process->name[j];
+        }
+        for (size_t page = 0; page < USER_MMAP_MAX_PAGES; page++) {
+            if (process->mmap_pages[page] != 0
+                && process->mmap_pages[page] != USER_MMAP_RESERVED) {
+                info->memory_pages++;
+            }
+        }
+        for (size_t slot = 0; slot < SCHEDULER_TASK_CAPACITY; slot++) {
+            if (user_threads[slot].active
+                && user_threads[slot].process == process) {
+                info->cpu_ticks += scheduler_task_run_ticks(slot);
+            }
+        }
+    }
+    return count;
+}
+
 void *user_preempt_check(void *interrupt_frame) {
     struct user_process *process = scheduler_current_context();
     if (interrupt_frame == NULL || process == NULL
-        || !process->kill_requested) {
+        || (!process->kill_requested && !process->group_exit)) {
         return interrupt_frame;
     }
     /* The timer stub saves 15 registers below the exception frame. */
@@ -4821,8 +4923,13 @@ void *user_preempt_check(void *interrupt_frame) {
     if ((frame->code_segment & 3) != 3) {
         return interrupt_frame;
     }
-    process->fault_status = 128 + LINUX_SIGKILL;
-    process->faulted = true;
+    if (process->kill_requested) {
+        process->fault_status = 128 + LINUX_SIGKILL;
+        process->faulted = true;
+    } else {
+        /* RAX, the first register the stub saved, is the exit status. */
+        ((uint64_t *)interrupt_frame)[14] = process->group_status;
+    }
     frame->instruction_pointer = (uintptr_t)user_exit_trampoline;
     frame->code_segment = KERNEL_CODE_SELECTOR;
     frame->flags = 0x202;

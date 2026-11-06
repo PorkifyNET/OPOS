@@ -12,6 +12,10 @@ typedef void (*scheduler_task_entry)(void *argument);
 
 void scheduler_initialize(void);
 void *scheduler_timer_tick(void *interrupt_frame);
+/* The yield interrupt (SCHEDULER_YIELD_VECTOR): a task that just went to
+   sleep or blocked hands the processor on at once. */
+#define SCHEDULER_YIELD_VECTOR 0x81
+void *scheduler_yield(void *interrupt_frame);
 bool scheduler_spawn(scheduler_task_entry entry, void *argument,
                      uint64_t *task_id);
 bool scheduler_task_finished(uint64_t task_id);
@@ -45,6 +49,16 @@ bool scheduler_block_current_until_locked(const void *event,
  * changing shared kernel state.
  */
 void scheduler_set_kernel_preemption(bool enabled);
+/*
+ * Interrupts a task's waits: a blocked or sleeping task wakes, and until
+ * scheduler_clear_interrupt its blocking waits return false at once
+ * (sleeps return early). Used to end processes stuck in a wait.
+ */
+void scheduler_interrupt_task(size_t slot);
+void scheduler_clear_interrupt(void);
+/* Timer ticks a task was running for, and ticks nothing was running. */
+uint64_t scheduler_task_run_ticks(size_t slot);
+uint64_t scheduler_idle_ticks(void);
 void scheduler_wake_event(const void *event);
 size_t scheduler_wake_event_count(const void *event, size_t maximum);
 

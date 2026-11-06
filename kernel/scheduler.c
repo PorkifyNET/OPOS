@@ -69,6 +69,8 @@ struct scheduler_task {
     uint64_t wake_tick;
     const void *wait_event;
     bool kernel_preemptible;
+    volatile bool interrupted;
+    uint64_t run_ticks;
     bool kernel_gs_active;
     uint64_t user_fs_base;
     uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
@@ -85,6 +87,7 @@ static struct scheduler_task tasks[SCHEDULER_TASK_CAPACITY];
 static size_t current_task;
 static uint64_t next_task_id;
 static bool scheduler_ready;
+static uint64_t idle_ticks;
 static uint8_t initial_fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 
 static void scheduler_save_fpu(uint8_t state[FPU_STATE_SIZE]) {
@@ -184,6 +187,8 @@ void scheduler_initialize(void) {
     scheduler_ready = true;
 }
 
+static void *scheduler_switch(void *interrupt_frame);
+
 void *scheduler_timer_tick(void *interrupt_frame) {
     if (!scheduler_ready || interrupt_frame == NULL) {
         return interrupt_frame;
@@ -191,8 +196,13 @@ void *scheduler_timer_tick(void *interrupt_frame) {
 
     struct scheduler_task *current = &tasks[current_task];
     current->frame = interrupt_frame;
-    struct scheduler_interrupt_frame *frame = interrupt_frame;
     uint64_t now = timer_ticks();
+    /* A task waiting in hlt is not running: that tick was idle. */
+    if (current->state == SCHEDULER_TASK_RUNNING) {
+        current->run_ticks++;
+    } else {
+        idle_ticks++;
+    }
     for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
         if ((tasks[i].state == SCHEDULER_TASK_SLEEPING
              || (tasks[i].state == SCHEDULER_TASK_BLOCKED
@@ -201,6 +211,21 @@ void *scheduler_timer_tick(void *interrupt_frame) {
             tasks[i].state = SCHEDULER_TASK_RUNNABLE;
         }
     }
+    return scheduler_switch(interrupt_frame);
+}
+
+void *scheduler_yield(void *interrupt_frame) {
+    if (!scheduler_ready || interrupt_frame == NULL) {
+        return interrupt_frame;
+    }
+    tasks[current_task].frame = interrupt_frame;
+    return scheduler_switch(interrupt_frame);
+}
+
+/* Picks the next task to run (round robin) and switches to it. */
+static void *scheduler_switch(void *interrupt_frame) {
+    struct scheduler_task *current = &tasks[current_task];
+    struct scheduler_interrupt_frame *frame = interrupt_frame;
     if ((current->context != NULL || !current->kernel_preemptible)
         && (frame->code_segment & 3) == 0
         && current->state == SCHEDULER_TASK_RUNNING) {
@@ -296,6 +321,8 @@ bool scheduler_spawn(scheduler_task_entry entry, void *argument,
     task->wake_tick = 0;
     task->wait_event = NULL;
     task->kernel_preemptible = false;
+    task->interrupted = false;
+    task->run_ticks = 0;
     task->kernel_gs_active = false;
     task->user_fs_base = 0;
     scheduler_save_fpu(tasks[current_task].fpu_state);
@@ -446,8 +473,15 @@ bool scheduler_sleep_until(uint64_t wake_tick) {
     uint64_t flags;
     __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
     struct scheduler_task *task = &tasks[current_task];
+    if (task->interrupted) {
+        if ((flags & (1u << 9)) != 0) {
+            __asm__ volatile ("sti" : : : "memory");
+        }
+        return true;
+    }
     task->wake_tick = wake_tick;
     task->state = SCHEDULER_TASK_SLEEPING;
+    __asm__ volatile ("int $0x81" : : : "memory");
     while (task->state == SCHEDULER_TASK_SLEEPING) {
         __asm__ volatile ("sti; hlt; cli" : : : "memory");
     }
@@ -469,12 +503,16 @@ bool scheduler_block_current_until_locked(const void *event,
     }
 
     struct scheduler_task *task = &tasks[current_task];
+    if (task->interrupted) {
+        return false;
+    }
     if (wake_tick != 0 && timer_ticks() >= wake_tick) {
         return true;
     }
     task->wait_event = event;
     task->wake_tick = wake_tick;
     task->state = SCHEDULER_TASK_BLOCKED;
+    __asm__ volatile ("int $0x81" : : : "memory");
     while (task->state == SCHEDULER_TASK_BLOCKED) {
         __asm__ volatile ("sti; hlt; cli" : : : "memory");
     }
@@ -483,11 +521,43 @@ bool scheduler_block_current_until_locked(const void *event,
     if (task->state == SCHEDULER_TASK_RUNNABLE) {
         task->state = SCHEDULER_TASK_RUNNING;
     }
-    return true;
+    return !task->interrupted;
 }
 
 void scheduler_set_kernel_preemption(bool enabled) {
     tasks[current_task].kernel_preemptible = enabled;
+}
+
+void scheduler_interrupt_task(size_t slot) {
+    if (!scheduler_ready || slot >= SCHEDULER_TASK_CAPACITY) {
+        return;
+    }
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    struct scheduler_task *task = &tasks[slot];
+    if (task->state != SCHEDULER_TASK_UNUSED
+        && task->state != SCHEDULER_TASK_FINISHED) {
+        task->interrupted = true;
+        if (task->state == SCHEDULER_TASK_BLOCKED
+            || task->state == SCHEDULER_TASK_SLEEPING) {
+            task->state = SCHEDULER_TASK_RUNNABLE;
+        }
+    }
+    if ((flags & (1u << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+}
+
+void scheduler_clear_interrupt(void) {
+    tasks[current_task].interrupted = false;
+}
+
+uint64_t scheduler_task_run_ticks(size_t slot) {
+    return slot < SCHEDULER_TASK_CAPACITY ? tasks[slot].run_ticks : 0;
+}
+
+uint64_t scheduler_idle_ticks(void) {
+    return idle_ticks;
 }
 
 void scheduler_wake_event(const void *event) {

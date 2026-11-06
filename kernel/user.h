@@ -61,6 +61,16 @@ bool user_current_killed(void);
 uint64_t user_current_process_id(void);
 /* The process a scheduler task runs, or 0. */
 uint64_t user_task_process_id(uint64_t task_id);
+/* What the Task Manager shows about a running process. */
+struct user_process_info {
+    uint64_t id;
+    char name[32];
+    size_t threads;
+    size_t memory_pages;
+    uint64_t cpu_ticks;
+};
+size_t user_process_list(struct user_process_info *list, size_t capacity);
+
 /* Timer interrupt return path: sends a killed process to its exit. */
 void *user_preempt_check(void *interrupt_frame);
 

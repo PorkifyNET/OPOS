@@ -29,8 +29,9 @@ are goals, not current features.
   editor remains for administrators editing system files and as a fallback.
 - Programs run side by side, each on its own task, with up to four program
   windows open at once; the desktop stays responsive while they compute. The
-  Terminal's `ps` lists them, `kill PID` or Ctrl+C ends one, and logging out
-  ends them all.
+  Task Manager (Ctrl+Shift+Esc) shows their CPU and memory use and ends them;
+  the Terminal's `ps`, `kill PID` and Ctrl+C do too. Logging out ends them
+  all.
 - User accounts with optional passwords (salted, iterated SHA-256), a login
   screen, and per-user home folders and settings. Programs run as their
   account: they cannot change system files, read password hashes, or open

@@ -14,5 +14,7 @@ uint64_t physical_pages_alloc_contiguous(uint64_t count);
 bool physical_page_free(uint64_t physical_address);
 void *physical_page_to_hhdm(uint64_t physical_address);
 uint64_t memory_total_pages(void);
+/* Pages not handed out (never used, or freed again). */
+uint64_t memory_free_pages(void);
 
 #endif

@@ -134,11 +134,12 @@ extern void irq_stub_13(void);
 extern void irq_stub_14(void);
 extern void irq_stub_15(void);
 extern void syscall_stub(void);
+extern void yield_stub(void);
 extern void syscall_entry(void);
 extern void gdt_load(const struct gdt_register *gdtr);
 extern void tss_load(uint16_t selector);
 
-static struct idt_entry idt[SYSCALL_VECTOR + 1] __attribute__((aligned(16)));
+static struct idt_entry idt[SCHEDULER_YIELD_VECTOR + 1] __attribute__((aligned(16)));
 static uint64_t gdt[GDT_ENTRY_COUNT] __attribute__((aligned(16)));
 static struct tss task_state_segment;
 static uint8_t kernel_stack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
@@ -306,6 +307,7 @@ void interrupts_initialize(void) {
         idt_set_gate(PIC1_OFFSET + irq, (uintptr_t)irq_stubs[irq], 0x8e);
     }
     idt_set_gate(SYSCALL_VECTOR, (uintptr_t)syscall_stub, 0xee);
+    idt_set_gate(SCHEDULER_YIELD_VECTOR, (uintptr_t)yield_stub, 0x8e);
 
     const struct idt_register idtr = {
         .limit = sizeof(idt) - 1,
@@ -334,6 +336,10 @@ void interrupts_unmask_irq(uint8_t irq) {
 }
 
 void *irq_handler(uint64_t vector, void *interrupt_frame) {
+    if (vector == SCHEDULER_YIELD_VECTOR) {
+        /* Not a hardware interrupt: no end-of-interrupt to send. */
+        return user_preempt_check(scheduler_yield(interrupt_frame));
+    }
     if (vector == PIC1_OFFSET) {
         timer_irq_handler();
     } else if (vector == PIC1_OFFSET + 1) {

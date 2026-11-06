@@ -139,7 +139,8 @@ static inline long opos_user_info(struct opos_user_info *info) {
 /*
  * One window per program, drawn by the desktop. Draw 0x00RRGGBB pixels in
  * your own memory and present them; the desktop shows them at the top left
- * of the window's content area (at most 1024 x 768 pixels are kept).
+ * of the window's content area (up to the screen's size is kept, so a
+ * program should draw as large as its latest OPOS_EVENT_RESIZE).
  * Then wait for events. While a program waits, the desktop keeps working.
  *
  * The window closes when the program ends. When the user closes it, the
@@ -226,7 +227,7 @@ static inline long opos_window_size(uint32_t *width, uint32_t *height) {
 
 /* ------------------------------------------------------------- memory */
 
-/* Zero-filled, readable and writable memory; up to 4 MiB in total per
+/* Zero-filled, readable and writable memory; up to 64 MiB in total per
    program. Returns NULL on failure. */
 static inline void *opos_alloc(size_t size) {
     long address = opos_syscall6(9, 0, (long)size, 3 /* read, write */,

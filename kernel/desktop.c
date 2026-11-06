@@ -6291,9 +6291,11 @@ static void handle_right_press(int32_t x, int32_t y) {
  * Each program may have one window, and APP_WINDOW_COUNT can be open at
  * once. A program draws into its own memory and presents it; the kernel
  * copies the pixels into the window's surface, shown at its top left.
+ * A surface starts at the screen's size and grows (a new allocation) when
+ * a program presents more than that, e.g. after the host enlarged the
+ * screen; the contiguous allocator cannot free, so each slot keeps its
+ * largest surface for later programs.
  */
-#define APP_SURFACE_WIDTH 1024
-#define APP_SURFACE_HEIGHT 768
 #define APP_EVENT_CAPACITY 64
 #define APP_EVENT_KEY 1
 #define APP_EVENT_MOUSE_DOWN 2
@@ -6319,6 +6321,8 @@ struct app_window {
     uint32_t requested_width;
     uint32_t requested_height;
     uint32_t *surface;     /* kept for the slot's next program */
+    uint32_t surface_width;  /* surface size; also its row stride */
+    uint32_t surface_height;
     uint32_t width;        /* presented size */
     uint32_t height;
     char title[32];
@@ -6500,8 +6504,9 @@ static void draw_app(size_t slot, struct rect area) {
                         (uint64_t)(area.y + skip_y),
                         (uint64_t)(width - skip_x),
                         (uint64_t)(height - skip_y),
-                        window->surface + skip_y * APP_SURFACE_WIDTH + skip_x,
-                        APP_SURFACE_WIDTH);
+                        window->surface + skip_y * window->surface_width
+                            + skip_x,
+                        window->surface_width);
 }
 
 /* The window went away (close button, Super+Q): the program gets CLOSE,
@@ -6524,8 +6529,58 @@ static void app_window_release(size_t slot) {
         window_close(WINDOW_APP + slot);
     }
     uint32_t *surface = window->surface;
+    uint32_t surface_width = window->surface_width;
+    uint32_t surface_height = window->surface_height;
     *window = (struct app_window){0};
     window->surface = surface;
+    window->surface_width = surface_width;
+    window->surface_height = surface_height;
+}
+
+/*
+ * Makes the slot's surface at least width x height (never larger than the
+ * screen). On failure the old surface stays; false if there is none.
+ */
+static bool app_surface_fit(struct app_window *window, uint32_t width,
+                            uint32_t height) {
+    if (width > (uint32_t)screen_width()) {
+        width = (uint32_t)screen_width();
+    }
+    if (height > (uint32_t)screen_height()) {
+        height = (uint32_t)screen_height();
+    }
+    if (window->surface != NULL && width <= window->surface_width
+        && height <= window->surface_height) {
+        return true;
+    }
+    if (window->surface != NULL) {
+        /* Grow in both directions so one enlargement is enough. */
+        if (width < window->surface_width) {
+            width = window->surface_width;
+        }
+        if (height < window->surface_height) {
+            height = window->surface_height;
+        }
+    }
+    uint64_t bytes = (uint64_t)width * height * sizeof(uint32_t);
+    uint64_t physical = physical_pages_alloc_contiguous((bytes + 4095) / 4096);
+    if (physical == 0) {
+        return window->surface != NULL;
+    }
+    uint32_t *surface = physical_page_to_hhdm(physical);
+    /* Keep what is shown until the program presents again. */
+    for (uint32_t row = 0; row < window->surface_height && row < height;
+         row++) {
+        for (uint32_t column = 0; column < window->surface_width; column++) {
+            surface[(uint64_t)row * width + column] =
+                window->surface[(uint64_t)row * window->surface_width
+                                + column];
+        }
+    }
+    window->surface = surface;
+    window->surface_width = width;
+    window->surface_height = height;
+    return true;
 }
 
 /* The desktop's pass: opens a newly created window. */
@@ -6577,24 +6632,22 @@ int64_t desktop_app_window_create(uint64_t owner, const char *title,
         return -16; /* EBUSY: every window slot is taken */
     }
     struct app_window *window = &app_windows[slot];
-    if (window->surface == NULL) {
-        uint64_t bytes = (uint64_t)APP_SURFACE_WIDTH * APP_SURFACE_HEIGHT
-            * sizeof(uint32_t);
-        uint64_t physical = physical_pages_alloc_contiguous(
-            (bytes + 4095) / 4096);
-        if (physical == 0) {
-            return -12;
-        }
-        window->surface = physical_page_to_hhdm(physical);
+    if (!app_surface_fit(window, (uint32_t)screen_width(),
+                         (uint32_t)screen_height())) {
+        return -12; /* ENOMEM */
     }
     uint32_t *surface = window->surface;
+    uint32_t surface_width = window->surface_width;
+    uint32_t surface_height = window->surface_height;
     *window = (struct app_window){
         .owner = owner,
         .surface = surface,
-        .requested_width = width == 0 ? 320 : width > APP_SURFACE_WIDTH
-            ? APP_SURFACE_WIDTH : width,
-        .requested_height = height == 0 ? 240 : height > APP_SURFACE_HEIGHT
-            ? APP_SURFACE_HEIGHT : height,
+        .surface_width = surface_width,
+        .surface_height = surface_height,
+        .requested_width = width == 0 ? 320 : width > surface_width
+            ? surface_width : width,
+        .requested_height = height == 0 ? 240 : height > surface_height
+            ? surface_height : height,
         .mouse_x = -1,
         .mouse_y = -1,
         .reported_width = -1,
@@ -6632,14 +6685,15 @@ int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
     if (window->closed || window->surface == NULL) {
         return 0;
     }
-    uint32_t copy_width = width > APP_SURFACE_WIDTH ? APP_SURFACE_WIDTH
-                                                    : width;
-    uint32_t copy_height = height > APP_SURFACE_HEIGHT ? APP_SURFACE_HEIGHT
-                                                       : height;
+    (void)app_surface_fit(window, width, height);
+    uint32_t copy_width = width > window->surface_width
+        ? window->surface_width : width;
+    uint32_t copy_height = height > window->surface_height
+        ? window->surface_height : height;
     for (uint32_t row = 0; row < copy_height; row++) {
         const uint32_t *source = pixels + (uint64_t)row * stride;
         uint32_t *target = window->surface
-            + (uint64_t)row * APP_SURFACE_WIDTH;
+            + (uint64_t)row * window->surface_width;
         for (uint32_t column = 0; column < copy_width; column++) {
             target[column] = source[column];
         }

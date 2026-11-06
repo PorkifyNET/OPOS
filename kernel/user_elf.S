@@ -785,7 +785,7 @@ page_boundary_test:
 
     movq $9, %rax
     xorq %rdi, %rdi
-    movq $(1024 * 4096 + 1), %rsi
+    movq $(16384 * 4096 + 1), %rsi
     movq $3, %rdx
     movq $0x22, %r10
     movq $-1, %r8

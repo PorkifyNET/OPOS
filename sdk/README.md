@@ -119,7 +119,7 @@ Examples built on these calls:
 
 Memory: `opos_alloc(size)` returns zeroed memory (`mmap`);
 `opos_free(address, size)` returns it. `malloc` takes its memory from
-there too. A program has 4 MiB of such memory in total, including its
+there too. A program has 64 MiB of such memory in total, including its
 128 KiB stack.
 
 ## The ABI
@@ -166,6 +166,6 @@ See `docs/security-model.md`.
 - The C library is small. It has no floating-point formatting, no
   `FILE` streams and no `qsort`, `time` or `locale`.
 - Program files over 1 MiB do not load. Memory from `opos_alloc`,
-  `malloc` and the stack shares 4 MiB per program.
+  `malloc` and the stack shares 64 MiB per program.
 - Notepad's clipboard is its own; there is no system clipboard for
   programs yet.

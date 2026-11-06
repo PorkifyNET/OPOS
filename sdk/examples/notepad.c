@@ -639,6 +639,26 @@ static void draw(void) {
     opos_canvas_present_area(&canvas, width, height);
 }
 
+/* A bigger window needs a bigger canvas; it never shrinks. If memory runs
+   out the old canvas stays and draws clip to it. */
+static void grow_canvas(int width, int height) {
+    if (width <= canvas.width && height <= canvas.height) {
+        return;
+    }
+    if (width < canvas.width) {
+        width = canvas.width;
+    }
+    if (height < canvas.height) {
+        height = canvas.height;
+    }
+    struct opos_canvas bigger = opos_canvas_create(width, height);
+    if (bigger.pixels == NULL) {
+        return;
+    }
+    opos_canvas_destroy(&canvas);
+    canvas = bigger;
+}
+
 /* --------------------------------------------------------------- main */
 
 int main(int argc, char **argv, char **envp) {
@@ -679,6 +699,7 @@ int main(int argc, char **argv, char **envp) {
         case OPOS_EVENT_RESIZE:
             view_width = (int)event.width;
             view_height = (int)event.height;
+            grow_canvas(view_width, view_height);
             break;
         case OPOS_EVENT_KEY:
             if (!key_pressed(event.key, event.buttons)) {

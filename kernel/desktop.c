@@ -62,20 +62,28 @@ enum window_kind {
     WINDOW_EDITOR,
     WINDOW_INSTALLER,
     WINDOW_ACCOUNTS,
+    /* Program windows: one kind per slot (see "program windows"). */
     WINDOW_APP,
+    WINDOW_APP_LAST = WINDOW_APP + 3,
     WINDOW_COUNT
 };
+#define APP_WINDOW_COUNT ((size_t)(WINDOW_APP_LAST - WINDOW_APP + 1))
+
+static bool window_is_app(enum window_kind kind) {
+    return kind >= WINDOW_APP && kind <= WINDOW_APP_LAST;
+}
 
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "SYSTEM INFO", "WELCOME", "SETTINGS", "TEXT EDITOR",
     "INSTALL OPOS", "ACCOUNTS", "PROGRAM"
 };
 
-static char app_title[32];
+static const char *app_window_title(size_t slot);
 
 /* A program's window shows the title the program chose. */
 static const char *window_title(enum window_kind kind) {
-    return kind == WINDOW_APP ? app_title : window_titles[kind];
+    return window_is_app(kind) ? app_window_title(kind - WINDOW_APP)
+                               : window_titles[kind];
 }
 
 struct window {
@@ -360,25 +368,23 @@ static void terminal_reset(void) {
 }
 
 /*
- * While a program runs, its standard output and error land in the
- * Terminal window, a line at a time, and the screen is redrawn so the
- * output (and the echo of what the program reads) shows up at once.
+ * Programs run next to the desktop (see "program windows" at the end of
+ * this file). Their standard output and error land in the Terminal a line
+ * at a time; terminal_output collects the current line.
  */
 static char terminal_output[TERMINAL_COLUMNS];
 static size_t terminal_output_length;
 static void draw_scene(void);
 static void window_open(enum window_kind kind);
 static void window_raise(enum window_kind kind);
-static bool program_running;
 static bool desktop_active;
-static bool desktop_exit_pending;
-static bool terminal_output_shown;
-static bool app_window_live(void);
-static void app_program_finished(void);
-static void app_window_closed(void);
-static void app_key(char character);
-static void app_mouse_press(int32_t x, int32_t y, uint32_t button);
-static void draw_app(struct rect area);
+/* Programs waiting to read a line typed into the Terminal. */
+static size_t app_input_readers;
+static void app_window_closed(size_t slot);
+static void app_key(size_t slot, char character);
+static void app_mouse_press(size_t slot, int32_t x, int32_t y,
+                            uint32_t button);
+static void draw_app(size_t slot, struct rect area);
 static const char *window_title(enum window_kind kind);
 
 static void terminal_output_flush(void) {
@@ -389,68 +395,30 @@ static void terminal_output_flush(void) {
     }
 }
 
-static void terminal_output_sink(const char *data, size_t length,
-                                 bool error) {
-    (void)error;
-    if (!terminal_output_shown && !app_window_live()) {
-        terminal_output_shown = true;
-        window_open(WINDOW_TERMINAL);
-    }
-    for (size_t i = 0; i < length; i++) {
-        char c = data[i];
-        if (c == '\n') {
-            terminal_output[terminal_output_length] = '\0';
-            terminal_print(terminal_output);
-            terminal_output_length = 0;
-        } else if (c == '\b') {
-            if (terminal_output_length != 0) {
-                terminal_output_length--;
-            }
-        } else if (c == '\t' || (c >= ' ' && c <= '~')) {
-            terminal_output[terminal_output_length++] = c == '\t' ? ' ' : c;
-            if (terminal_output_length + 1 == TERMINAL_COLUMNS) {
-                terminal_output_flush();
-            }
+static void terminal_output_put(char c) {
+    if (c == '\n') {
+        terminal_output[terminal_output_length] = '\0';
+        terminal_print(terminal_output);
+        terminal_output_length = 0;
+    } else if (c == '\b') {
+        if (terminal_output_length != 0) {
+            terminal_output_length--;
+        }
+    } else if (c == '\t' || (c >= ' ' && c <= '~')) {
+        terminal_output[terminal_output_length++] = c == '\t' ? ' ' : c;
+        if (terminal_output_length + 1 == TERMINAL_COLUMNS) {
+            terminal_output_flush();
         }
     }
-    draw_scene();
-}
-
-/* The Terminal opens when the program first writes something. */
-static void terminal_capture_begin(void) {
-    terminal_output_length = 0;
-    terminal_output_shown = false;
-    program_running = true;
-    user_set_console_sink(terminal_output_sink);
-}
-
-static void terminal_capture_end(void) {
-    user_set_console_sink(NULL);
-    terminal_output_flush();
-    program_running = false;
-    app_program_finished();
 }
 
 static void terminal_report_exit(bool started, uint64_t exit_status) {
     terminal_print(!started ? "APPLICATION COULD NOT START"
                    : exit_status == 0 ? "APPLICATION EXITED WITH STATUS 0"
-                                      : "APPLICATION EXITED WITH ERROR");
+                   : exit_status == 128 + 9 ? "APPLICATION WAS ENDED"
+                                            : "APPLICATION EXITED WITH ERROR");
 }
 
-static void terminal_launch(enum user_program program) {
-    uint64_t process_id;
-    uint64_t exit_status = 1;
-    if (program_running) {
-        terminal_print("ANOTHER PROGRAM IS RUNNING");
-        return;
-    }
-    terminal_capture_begin();
-    bool started = user_process_run(program, &process_id, &exit_status);
-    terminal_capture_end();
-    terminal_report_exit(started, exit_status);
-}
-
-/* Runs an initramfs program; path may start with '/'. */
 enum run_result {
     RUN_STARTED,
     RUN_NOT_FOUND,
@@ -461,51 +429,24 @@ enum run_result {
     RUN_BUSY,
 };
 
-/* Program images are loaded here first (the loader copies them). Same
-   1 MiB limit as the shell's "disk run" and execve. */
-static uint8_t program_image[1024 * 1024];
+/* Who started a program decides what happens when it ends. */
+enum app_origin {
+    APP_FROM_TERMINAL,
+    APP_FROM_FILES,
+    APP_FROM_NOTEPAD,
+};
 
-/*
- * Runs an ELF program from the initramfs (/bin, /lib) or a disk (/disk...)
- * as the logged-in account, after the same permission check Files uses.
- */
-static enum run_result run_program_file(const char *typed,
-                                        size_t typed_length,
-                                        const char *arguments,
-                                        size_t arguments_length,
-                                        uint64_t *exit_status) {
-    char path[256];
-    size_t length = permission_canonicalize(typed, typed_length, path,
-                                            sizeof(path));
-    if (length < 2) {
-        return RUN_NOT_FOUND;
-    }
-    if (!permission_ui_allows(path, length, PERMISSION_READ)) {
-        return RUN_DENIED;
-    }
-    const uint8_t *image = program_image;
-    size_t size = 0;
-    struct initramfs_file file;
-    bool on_disk = length >= 5 && (path[1] | 32) == 'd'
-        && (path[2] | 32) == 'i' && (path[3] | 32) == 's'
-        && (path[4] | 32) == 'k';
-    if (!on_disk && initramfs_find_file(path + 1, &file)) {
-        image = file.data;
-        size = file.size;
-    } else if (!vfs_read_file(path, length, program_image,
-                              sizeof(program_image), &size)) {
-        return size > sizeof(program_image) ? RUN_TOO_LARGE : RUN_NOT_FOUND;
-    }
-    if (size < 4 || image[0] != 0x7f || image[1] != 'E' || image[2] != 'L'
-        || image[3] != 'F') {
-        return RUN_NOT_PROGRAM;
-    }
-    uint64_t process_id;
-    return user_process_run_elf_args(image, size, path, length, arguments,
-                                     arguments_length, &process_id,
-                                     exit_status)
-        ? RUN_STARTED : RUN_FAILED;
-}
+static enum run_result app_launch(enum app_origin origin, const char *typed,
+                                  size_t typed_length, const char *arguments,
+                                  size_t arguments_length,
+                                  const char *document,
+                                  size_t document_length);
+static enum run_result app_launch_builtin(enum user_program program,
+                                          const char *name);
+static bool app_kill_terminal_job(void);
+static void app_input_push(char character);
+static void apps_list(void);
+static void apps_stop_all(void);
 
 static const char *run_result_text(enum run_result result) {
     switch (result) {
@@ -514,7 +455,7 @@ static const char *run_result_text(enum run_result result) {
     case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (1 MIB LIMIT)";
     case RUN_NOT_PROGRAM: return "NOT A PROGRAM (NO ELF HEADER)";
     case RUN_FAILED: return "PROGRAM COULD NOT START";
-    case RUN_BUSY: return "ANOTHER PROGRAM IS RUNNING";
+    case RUN_BUSY: return "TOO MANY PROGRAMS RUNNING";
     default: return "";
     }
 }
@@ -549,7 +490,8 @@ static bool terminal_execute(void) {
 
     if (text_equals(terminal_line, terminal_length, "help")) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
-        terminal_print("SHELL REBOOT SHUTDOWN EXIT");
+        terminal_print("PS KILL PID  SHELL REBOOT SHUTDOWN EXIT");
+        terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
     } else if (text_equals(terminal_line, terminal_length, "clear")) {
@@ -561,9 +503,17 @@ static bool terminal_execute(void) {
         append_text(line, sizeof(line), length, " SECONDS");
         terminal_print(line);
     } else if (text_equals(terminal_line, terminal_length, "elf")) {
-        terminal_launch(USER_PROGRAM_MODULE_ELF);
+        enum run_result result =
+            app_launch_builtin(USER_PROGRAM_MODULE_ELF, "ELF");
+        if (result != RUN_STARTED) {
+            terminal_print(run_result_text(result));
+        }
     } else if (text_equals(terminal_line, terminal_length, "demo")) {
-        terminal_launch(USER_PROGRAM_DEMO);
+        enum run_result result = app_launch_builtin(USER_PROGRAM_DEMO,
+                                                    "DEMO");
+        if (result != RUN_STARTED) {
+            terminal_print(run_result_text(result));
+        }
     } else if (terminal_length > 4 && text_equals(terminal_line, 4, "run ")) {
         /* run PATH [ARGUMENTS]. A path with spaces goes in double
            quotes. A name without a leading '/' is looked up from the
@@ -589,28 +539,26 @@ static bool terminal_execute(void) {
             }
             path[length++] = c;
         }
-        uint64_t exit_status = 1;
-        enum run_result result = RUN_BUSY;
-        if (!program_running) {
-            /* The prompt empties while the program runs, so the Terminal
-               stays usable (other commands work meanwhile). */
-            char arguments[sizeof(terminal_line)];
-            size_t arguments_length = terminal_length - i;
-            for (size_t j = 0; j < arguments_length; j++) {
-                arguments[j] = terminal_line[i + j];
-            }
-            terminal_length = 0;
-            terminal_line[0] = '\0';
-            terminal_capture_begin();
-            result = run_program_file(path, length, arguments,
-                                      arguments_length, &exit_status);
-            terminal_capture_end();
-        }
+        /* The program runs next to the Terminal, which stays usable;
+           its output and exit status show up here. */
+        enum run_result result = app_launch(
+            APP_FROM_TERMINAL, path, length, terminal_line + i,
+            terminal_length - i, NULL, 0);
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
-        } else {
-            terminal_report_exit(true, exit_status);
         }
+    } else if (text_equals(terminal_line, terminal_length, "ps")) {
+        apps_list();
+    } else if (terminal_length > 5 && text_equals(terminal_line, 5, "kill ")) {
+        uint64_t process_id = 0;
+        size_t i = 5;
+        while (i < terminal_length && terminal_line[i] >= '0'
+               && terminal_line[i] <= '9' && process_id < 100000000) {
+            process_id = process_id * 10 + (uint64_t)(terminal_line[i] - '0');
+            i++;
+        }
+        terminal_print(i == terminal_length && user_process_kill(process_id)
+                       ? "ENDING PROGRAM" : "NO SUCH PROGRAM");
     } else if (text_equals(terminal_line, terminal_length, "reboot")) {
         power_reboot();
     } else if (text_equals(terminal_line, terminal_length, "shutdown")) {
@@ -778,8 +726,8 @@ static void window_open(enum window_kind kind) {
 }
 
 static void window_close(enum window_kind kind) {
-    if (kind == WINDOW_APP) {
-        app_window_closed();
+    if (window_is_app(kind)) {
+        app_window_closed(kind - WINDOW_APP);
     }
     if (kind == WINDOW_EDITOR) {
         if (!editor_may_discard()) {
@@ -844,6 +792,24 @@ static void draw_terminal(struct rect area, bool focused) {
         }
         draw_text_clipped(text_x, y, text_width, line, red, green, blue);
         y += LINE_HEIGHT;
+    }
+    if (app_input_readers != 0) {
+        /* A program reads a line: show what it printed and the echo. */
+        char pending[TERMINAL_COLUMNS];
+        for (size_t i = 0; i < terminal_output_length; i++) {
+            pending[i] = terminal_output[i];
+        }
+        pending[terminal_output_length] = '\0';
+        draw_text_clipped(text_x, prompt_y, text_width, pending,
+                          240, 245, 255);
+        int64_t caret_x = text_x
+            + (int64_t)terminal_output_length * CHAR_WIDTH;
+        if (focused && caret_x + CHAR_WIDTH < area.x + area.width
+            && (timer_ticks() / 50) % 2 == 0) {
+            fill((struct rect){caret_x, prompt_y, CHAR_WIDTH - 2,
+                               CHAR_HEIGHT}, 120, 210, 170);
+        }
+        return;
     }
     draw_text_clipped(text_x, prompt_y, text_width, "OPOS>", 120, 210, 170);
     int64_t line_x = text_x + 6 * CHAR_WIDTH;
@@ -2205,14 +2171,14 @@ static size_t files_entry_path(size_t index, char *path, size_t capacity) {
 
 /*
  * Opens Notepad (/bin/notepad, an ordinary SDK program from sdk/) on a
- * file, or empty without one. Returns false when it cannot start: another
- * program is running, or the initramfs has no Notepad. Callers then fall
- * back to the built-in editor.
+ * file, or empty without one. Returns false when it cannot start: too many
+ * programs run, or the initramfs has no Notepad. If it starts but cannot
+ * run, the built-in editor opens instead (see apps_poll).
  */
 static bool notepad_launch(const char *path, size_t length) {
     static const char notepad[] = "/bin/notepad";
     struct initramfs_file file;
-    if (program_running || !initramfs_find_file(notepad + 1, &file)) {
+    if (!initramfs_find_file(notepad + 1, &file)) {
         return false;
     }
     char arguments[FILES_PATH_CAPACITY + 3];
@@ -2227,58 +2193,29 @@ static bool notepad_launch(const char *path, size_t length) {
         }
         arguments[used++] = '"';
     }
-    uint64_t exit_status = 1;
-    terminal_capture_begin();
-    enum run_result result = run_program_file(notepad, sizeof(notepad) - 1,
-                                              arguments, used, &exit_status);
-    terminal_capture_end();
-    if (windows[WINDOW_FILES].open) {
-        files_refresh(); /* the file may have changed */
-    }
-    if (result != RUN_STARTED) {
-        return false;
-    }
-    if (exit_status != 0) {
-        set_status("NOTEPAD EXITED WITH ERROR");
-    }
-    return true;
+    return app_launch(APP_FROM_NOTEPAD, notepad, sizeof(notepad) - 1,
+                      arguments, used, path, length) == RUN_STARTED;
 }
 
+/* Text files open in Notepad. Programs cannot change system files, so an
+   administrator editing one gets the built-in editor, which can. */
+static void files_open_text(const char *path, size_t length) {
+    struct permission_identity identity = permission_session_identity();
+    bool system_file = permission_ui_allows(path, length, PERMISSION_WRITE)
+        && !permission_program_allows(&identity, path, length,
+                                      PERMISSION_WRITE);
+    if (system_file || !notepad_launch(path, length)) {
+        (void)editor_open(path, length);
+    }
+}
+
+/* Starts a program; a file that is not one opens as text when the
+   attempt ends (apps_poll). */
 static void files_run_program(const char *path, size_t length) {
-    uint64_t exit_status = 1;
-    /* Output goes to the Terminal, which comes up if it was closed. */
-    enum window_kind previous = z_count != 0 ? z_order[z_count - 1]
-                                             : WINDOW_COUNT;
-    enum run_result result = RUN_BUSY;
-    if (!program_running) {
-        terminal_capture_begin();
-        result = run_program_file(path, length, NULL, 0, &exit_status);
-        terminal_capture_end();
-        files_refresh(); /* the program may have changed files */
-    }
-    if (result == RUN_STARTED) {
-        terminal_report_exit(true, exit_status);
-    }
-    if (previous != WINDOW_COUNT) {
-        window_raise(previous);
-    }
-    if (result == RUN_NOT_PROGRAM) {
-        /* Everything else is text, for Notepad. Programs cannot change
-           system files, so an administrator editing one gets the
-           built-in editor, which can. */
-        struct permission_identity identity = permission_session_identity();
-        bool system_file =
-            permission_ui_allows(path, length, PERMISSION_WRITE)
-            && !permission_program_allows(&identity, path, length,
-                                          PERMISSION_WRITE);
-        if (system_file || !notepad_launch(path, length)) {
-            (void)editor_open(path, length);
-        }
-    } else if (result != RUN_STARTED) {
+    enum run_result result = app_launch(APP_FROM_FILES, path, length, NULL,
+                                        0, path, length);
+    if (result != RUN_STARTED) {
         set_status(run_result_text(result));
-    } else {
-        set_status(exit_status == 0 ? "PROGRAM EXITED WITH STATUS 0"
-                                    : "PROGRAM EXITED WITH ERROR");
     }
 }
 
@@ -3472,6 +3409,7 @@ static void desktop_session_end(void) {
     if (!editor_may_discard()) {
         return;
     }
+    apps_stop_all(); /* nothing keeps running as the old account */
     while (z_count != 0) {
         window_close(z_order[z_count - 1]);
     }
@@ -4903,11 +4841,12 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_ACCOUNTS:
         draw_accounts(content, focused);
         break;
-    case WINDOW_APP:
-        draw_app(content);
-        break;
     default:
-        draw_welcome(content);
+        if (window_is_app(kind)) {
+            draw_app(kind - WINDOW_APP, content);
+        } else {
+            draw_welcome(content);
+        }
         break;
     }
     console_clear_clip();
@@ -6027,8 +5966,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         installer_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_ACCOUNTS) {
         accounts_click(content_rect(frame), x, y);
-    } else if (kind == WINDOW_APP) {
-        app_mouse_press(x, y, 1);
+    } else if (window_is_app(kind)) {
+        app_mouse_press(kind - WINDOW_APP, x, y, 1);
     } else if (kind == WINDOW_SETTINGS) {
         struct rect area = content_rect(frame);
         for (size_t i = 0; i < SETTING_ROW_COUNT; i++) {
@@ -6075,6 +6014,17 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
 
 /* Returns true when the focused terminal consumed the character. */
 static bool terminal_key(char character) {
+    if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
+        && app_kill_terminal_job()) {
+        terminal_output_flush();
+        terminal_print("^C");
+        return true;
+    }
+    if (app_input_readers != 0) {
+        /* A program waits for a line: typing goes to it (it echoes). */
+        app_input_push(character);
+        return true;
+    }
     if (line_ctrl_key(terminal_line, &terminal_length,
                       sizeof(terminal_line) - 1, false, character)) {
         return true;
@@ -6262,8 +6212,8 @@ static enum desktop_result handle_key(char character, bool super) {
         installer_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_ACCOUNTS) {
         accounts_key(character);
-    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_APP) {
-        app_key(character);
+    } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
+        app_key(z_order[z_count - 1] - WINDOW_APP, character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
         if (character == KEY_UP) {
             settings_selection = (settings_selection + SETTING_ROW_COUNT - 1)
@@ -6296,8 +6246,8 @@ static void handle_right_press(int32_t x, int32_t y) {
     struct rect content = content_rect(frame);
     if (kind == WINDOW_FILES && rect_contains(content, x, y)) {
         files_context(content, x, y);
-    } else if (kind == WINDOW_APP) {
-        app_mouse_press(x, y, 2);
+    } else if (window_is_app(kind)) {
+        app_mouse_press(kind - WINDOW_APP, x, y, 2);
     }
 }
 
@@ -6305,14 +6255,19 @@ static void handle_right_press(int32_t x, int32_t y) {
 /* ------------------------------------------------------- program windows */
 
 /*
- * One window for a running program (sdk/include/opos.h). Programs run on
- * the desktop's own kernel task, so while a program waits for an event the
- * desktop keeps running from inside that system call (desktop_step): the
- * user can still move windows, type in the Terminal or browse Files. Only
- * one program runs at a time.
+ * Programs run on scheduler tasks of their own (app jobs, below), next to
+ * the desktop and to each other. Their system calls reach the desktop
+ * through the desktop_app_* functions and the Terminal's output and input
+ * queues, all of which run on the program's task. The desktop task is
+ * never preempted in the middle of a pass of its loop (see
+ * scheduler_set_kernel_preemption), so those calls only ever find it
+ * asleep between two passes. They fill in mailboxes (a window's pixels,
+ * its event queue, the Terminal's queues) and wait; the next pass
+ * (apps_poll) opens and closes windows and redraws.
  *
- * The program draws into its own memory and presents it; the kernel copies
- * the pixels into app_surface, which the window shows at its top left.
+ * Each program may have one window, and APP_WINDOW_COUNT can be open at
+ * once. A program draws into its own memory and presents it; the kernel
+ * copies the pixels into the window's surface, shown at its top left.
  */
 #define APP_SURFACE_WIDTH 1024
 #define APP_SURFACE_HEIGHT 768
@@ -6323,140 +6278,198 @@ static void handle_right_press(int32_t x, int32_t y) {
 #define APP_EVENT_MOUSE_MOVE 4
 #define APP_EVENT_RESIZE 5
 #define APP_EVENT_CLOSE 6
+/* After its window closes a program has this long to exit (3 s). */
+#define APP_CLOSE_GRACE_TICKS 300
+/* Waiting programs look at least this often whether they were ended. */
+#define APP_WAIT_RECHECK_TICKS 10
 
-static uint32_t *app_surface;
-static uint32_t app_width;
-static uint32_t app_height;
-static uint64_t app_owner;
-static bool app_closed;
-static bool app_close_sent;
-static bool app_pumping;
-static char app_title[32] = "PROGRAM";
-static struct desktop_app_event app_events[APP_EVENT_CAPACITY];
-static size_t app_event_head;
-static size_t app_event_count;
-static uint32_t app_buttons_down;
-static int32_t app_mouse_x;
-static int32_t app_mouse_y;
-static int64_t app_reported_width;
-static int64_t app_reported_height;
+struct app_window {
+    uint64_t owner;        /* process ID; 0: the slot is free */
+    bool open_pending;     /* created; the desktop opens it next pass */
+    bool opened;
+    bool closed;           /* the user closed it */
+    bool close_sent;       /* the program got its CLOSE event */
+    volatile bool owner_exited;
+    bool dirty;            /* new pixels to show */
+    bool waiting;          /* the program waits for an event */
+    uint64_t close_tick;
+    uint32_t requested_width;
+    uint32_t requested_height;
+    uint32_t *surface;     /* kept for the slot's next program */
+    uint32_t width;        /* presented size */
+    uint32_t height;
+    char title[32];
+    struct desktop_app_event events[APP_EVENT_CAPACITY];
+    size_t event_head;
+    size_t event_count;
+    uint32_t buttons_down;
+    int32_t mouse_x;
+    int32_t mouse_y;
+    int64_t reported_width;
+    int64_t reported_height;
+};
 
-static bool app_window_live(void) {
-    return app_owner != 0 && !app_closed && windows[WINDOW_APP].open;
+static struct app_window app_windows[APP_WINDOW_COUNT];
+
+static const char *app_window_title(size_t slot) {
+    return app_windows[slot].title[0] != '\0' ? app_windows[slot].title
+                                              : "PROGRAM";
 }
 
-static void app_push(const struct desktop_app_event *event) {
-    if (!app_window_live()) {
+static bool app_window_live(size_t slot) {
+    const struct app_window *window = &app_windows[slot];
+    return window->owner != 0 && window->opened && !window->closed
+        && !window->owner_exited && windows[WINDOW_APP + slot].open;
+}
+
+static struct app_window *app_window_of(uint64_t owner) {
+    if (owner == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < APP_WINDOW_COUNT; i++) {
+        if (app_windows[i].owner == owner && !app_windows[i].owner_exited) {
+            return &app_windows[i];
+        }
+    }
+    return NULL;
+}
+
+static void app_push(size_t slot, const struct desktop_app_event *event) {
+    struct app_window *window = &app_windows[slot];
+    if (!app_window_live(slot)) {
         return;
     }
-    if (event->type == APP_EVENT_MOUSE_MOVE && app_event_count != 0) {
-        struct desktop_app_event *last = &app_events[
-            (app_event_head + app_event_count - 1) % APP_EVENT_CAPACITY];
+    if (event->type == APP_EVENT_MOUSE_MOVE && window->event_count != 0) {
+        struct desktop_app_event *last = &window->events[
+            (window->event_head + window->event_count - 1)
+            % APP_EVENT_CAPACITY];
         if (last->type == APP_EVENT_MOUSE_MOVE) {
             *last = *event;
             return;
         }
     }
-    if (app_event_count == APP_EVENT_CAPACITY) {
+    if (window->event_count == APP_EVENT_CAPACITY) {
         return; /* the program is not keeping up; drop the newest */
     }
-    app_events[(app_event_head + app_event_count) % APP_EVENT_CAPACITY] =
-        *event;
-    app_event_count++;
+    window->events[(window->event_head + window->event_count)
+                   % APP_EVENT_CAPACITY] = *event;
+    window->event_count++;
+    scheduler_wake_event(window);
 }
 
-static struct rect app_content(void) {
-    return content_rect(window_rect(WINDOW_APP));
+static struct rect app_content(size_t slot) {
+    return content_rect(window_rect(WINDOW_APP + slot));
 }
 
-static void app_key(char character) {
+static void app_key(size_t slot, char character) {
     /* For keys, buttons holds the modifiers: 1 Ctrl, 2 Shift. */
     struct desktop_app_event event = {
         .type = APP_EVENT_KEY, .key = (uint8_t)character,
         .buttons = (keyboard_last_ctrl() ? 1u : 0u)
                  | (keyboard_last_shift() ? 2u : 0u),
     };
-    app_push(&event);
+    app_push(slot, &event);
 }
 
-static void app_mouse_press(int32_t x, int32_t y, uint32_t button) {
-    struct rect area = app_content();
-    if (!app_window_live() || !rect_contains(area, x, y)) {
+static void app_mouse_press(size_t slot, int32_t x, int32_t y,
+                            uint32_t button) {
+    struct app_window *window = &app_windows[slot];
+    struct rect area = app_content(slot);
+    if (!app_window_live(slot) || !rect_contains(area, x, y)) {
         return;
     }
-    app_buttons_down |= button;
-    app_mouse_x = x - (int32_t)area.x;
-    app_mouse_y = y - (int32_t)area.y;
+    window->buttons_down |= button;
+    window->mouse_x = x - (int32_t)area.x;
+    window->mouse_y = y - (int32_t)area.y;
     struct desktop_app_event event = {
-        .type = APP_EVENT_MOUSE_DOWN, .x = app_mouse_x, .y = app_mouse_y,
-        .button = button, .buttons = app_buttons_down,
+        .type = APP_EVENT_MOUSE_DOWN, .x = window->mouse_x,
+        .y = window->mouse_y, .button = button,
+        .buttons = window->buttons_down,
     };
-    app_push(&event);
+    app_push(slot, &event);
 }
 
 /* Releases and movement; presses come from handle_press. */
-static void app_mouse_update(int32_t x, int32_t y, uint8_t buttons) {
-    if (!app_window_live()) {
-        app_buttons_down = 0;
+static void app_mouse_update(size_t slot, int32_t x, int32_t y,
+                             uint8_t buttons) {
+    struct app_window *window = &app_windows[slot];
+    if (!app_window_live(slot)) {
+        window->buttons_down = 0;
         return;
     }
-    struct rect area = app_content();
+    struct rect area = app_content(slot);
     int32_t local_x = x - (int32_t)area.x;
     int32_t local_y = y - (int32_t)area.y;
     for (uint32_t button = 1; button <= 2; button <<= 1) {
-        if ((app_buttons_down & button) != 0 && (buttons & button) == 0) {
-            app_buttons_down &= ~button;
+        if ((window->buttons_down & button) != 0 && (buttons & button) == 0) {
+            window->buttons_down &= ~button;
             struct desktop_app_event event = {
                 .type = APP_EVENT_MOUSE_UP, .x = local_x, .y = local_y,
-                .button = button, .buttons = app_buttons_down,
+                .button = button, .buttons = window->buttons_down,
             };
-            app_push(&event);
+            app_push(slot, &event);
         }
     }
-    bool hovering = window_focused(WINDOW_APP) && rect_contains(area, x, y)
-        && window_at(x, y) == WINDOW_APP;
-    if ((app_buttons_down != 0 || hovering)
-        && (local_x != app_mouse_x || local_y != app_mouse_y)) {
-        app_mouse_x = local_x;
-        app_mouse_y = local_y;
+    enum window_kind kind = WINDOW_APP + slot;
+    bool hovering = window_focused(kind) && rect_contains(area, x, y)
+        && window_at(x, y) == kind;
+    if ((window->buttons_down != 0 || hovering)
+        && (local_x != window->mouse_x || local_y != window->mouse_y)) {
+        window->mouse_x = local_x;
+        window->mouse_y = local_y;
         struct desktop_app_event event = {
             .type = APP_EVENT_MOUSE_MOVE, .x = local_x, .y = local_y,
-            .buttons = app_buttons_down,
+            .buttons = window->buttons_down,
         };
-        app_push(&event);
+        app_push(slot, &event);
     }
 }
 
-/* Tells the program when its content area changes size. */
-static void app_check_resize(void) {
-    if (!app_window_live()) {
+static void apps_mouse_update(int32_t x, int32_t y, uint8_t buttons) {
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        app_mouse_update(slot, x, y, buttons);
+    }
+}
+
+/* Tells a program when its content area changes size. */
+static void app_check_resize(size_t slot) {
+    struct app_window *window = &app_windows[slot];
+    if (!app_window_live(slot)) {
         return;
     }
-    struct rect area = app_content();
+    struct rect area = app_content(slot);
     int64_t width = area.width < 0 ? 0 : area.width;
     int64_t height = area.height < 0 ? 0 : area.height;
-    if (width != app_reported_width || height != app_reported_height) {
-        app_reported_width = width;
-        app_reported_height = height;
+    if (width != window->reported_width || height != window->reported_height) {
+        window->reported_width = width;
+        window->reported_height = height;
         struct desktop_app_event event = {
             .type = APP_EVENT_RESIZE,
             .width = (uint32_t)width, .height = (uint32_t)height,
         };
-        app_push(&event);
+        app_push(slot, &event);
     }
 }
 
-static void draw_app(struct rect area) {
+static void apps_check_resize(void) {
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        app_check_resize(slot);
+    }
+}
+
+static void draw_app(size_t slot, struct rect area) {
+    const struct app_window *window = &app_windows[slot];
     fill(area, 12, 16, 26);
-    if (app_surface == NULL || app_width == 0 || app_height == 0) {
+    if (window->surface == NULL || window->width == 0
+        || window->height == 0) {
         return;
     }
     int64_t skip_x = area.x < 0 ? -area.x : 0;
     int64_t skip_y = area.y < 0 ? -area.y : 0;
-    int64_t width = (int64_t)app_width < area.width
-        ? (int64_t)app_width : area.width;
-    int64_t height = (int64_t)app_height < area.height
-        ? (int64_t)app_height : area.height;
+    int64_t width = (int64_t)window->width < area.width
+        ? (int64_t)window->width : area.width;
+    int64_t height = (int64_t)window->height < area.height
+        ? (int64_t)window->height : area.height;
     if (width <= skip_x || height <= skip_y) {
         return;
     }
@@ -6464,31 +6477,64 @@ static void draw_app(struct rect area) {
                         (uint64_t)(area.y + skip_y),
                         (uint64_t)(width - skip_x),
                         (uint64_t)(height - skip_y),
-                        app_surface + skip_y * APP_SURFACE_WIDTH + skip_x,
+                        window->surface + skip_y * APP_SURFACE_WIDTH + skip_x,
                         APP_SURFACE_WIDTH);
 }
 
-/* The window went away (close button, Super+Q, log out). */
-static void app_window_closed(void) {
-    if (app_owner != 0) {
-        app_closed = true;
-        app_event_count = 0;
-        app_buttons_down = 0;
+/* The window went away (close button, Super+Q): the program gets CLOSE,
+   and is ended if it has not exited after APP_CLOSE_GRACE_TICKS. */
+static void app_window_closed(size_t slot) {
+    struct app_window *window = &app_windows[slot];
+    if (window->owner != 0 && !window->closed) {
+        window->closed = true;
+        window->close_tick = timer_ticks();
+        window->event_count = 0;
+        window->buttons_down = 0;
+        scheduler_wake_event(window);
     }
 }
 
-/* Called after every program ends: its window goes with it. */
-static void app_program_finished(void) {
-    app_owner = 0;
-    if (windows[WINDOW_APP].open) {
-        window_close(WINDOW_APP);
+/* Frees a slot whose program has ended. */
+static void app_window_release(size_t slot) {
+    struct app_window *window = &app_windows[slot];
+    if (windows[WINDOW_APP + slot].open) {
+        window_close(WINDOW_APP + slot);
     }
-    app_closed = false;
-    app_close_sent = false;
-    app_event_count = 0;
-    app_buttons_down = 0;
-    app_width = 0;
-    app_height = 0;
+    uint32_t *surface = window->surface;
+    *window = (struct app_window){0};
+    window->surface = surface;
+}
+
+/* The desktop's pass: opens a newly created window. */
+static void app_window_open(size_t slot) {
+    struct app_window *window = &app_windows[slot];
+    enum window_kind kind = WINDOW_APP + slot;
+    window->open_pending = false;
+    window_open(kind);
+    struct rect area = workspace_area();
+    int64_t frame_width = (int64_t)window->requested_width + 2 * BORDER;
+    int64_t frame_height = (int64_t)window->requested_height + 2 * BORDER
+        + TITLE_HEIGHT;
+    if (frame_width > area.width) {
+        frame_width = area.width;
+    }
+    if (frame_height > area.height) {
+        frame_height = area.height;
+    }
+    /* Centred, each slot a little further down and right. */
+    int64_t offset = 30 * (int64_t)slot;
+    int64_t x = area.x + (area.width - frame_width) / 2 + offset;
+    int64_t y = area.y + (area.height - frame_height) / 2 + offset;
+    if (x + frame_width > area.x + area.width) {
+        x = area.x + area.width - frame_width;
+    }
+    if (y + frame_height > area.y + area.height) {
+        y = area.y + area.height - frame_height;
+    }
+    windows[kind].floating = (struct rect){x, y, frame_width, frame_height};
+    window->opened = true;
+    app_check_resize(slot);
+    scheduler_wake_event(window);
 }
 
 int64_t desktop_app_window_create(uint64_t owner, const char *title,
@@ -6497,10 +6543,18 @@ int64_t desktop_app_window_create(uint64_t owner, const char *title,
     if (!desktop_active || login_active) {
         return -19; /* ENODEV: no desktop (kernel shell) */
     }
-    if (owner == 0 || app_owner != 0 || app_closed) {
+    if (owner == 0 || app_window_of(owner) != NULL) {
         return -16; /* EBUSY: one window per program */
     }
-    if (app_surface == NULL) {
+    size_t slot = 0;
+    while (slot < APP_WINDOW_COUNT && app_windows[slot].owner != 0) {
+        slot++;
+    }
+    if (slot == APP_WINDOW_COUNT) {
+        return -16; /* EBUSY: every window slot is taken */
+    }
+    struct app_window *window = &app_windows[slot];
+    if (window->surface == NULL) {
         uint64_t bytes = (uint64_t)APP_SURFACE_WIDTH * APP_SURFACE_HEIGHT
             * sizeof(uint32_t);
         uint64_t physical = physical_pages_alloc_contiguous(
@@ -6508,67 +6562,51 @@ int64_t desktop_app_window_create(uint64_t owner, const char *title,
         if (physical == 0) {
             return -12;
         }
-        app_surface = physical_page_to_hhdm(physical);
+        window->surface = physical_page_to_hhdm(physical);
     }
+    uint32_t *surface = window->surface;
+    *window = (struct app_window){
+        .owner = owner,
+        .surface = surface,
+        .requested_width = width == 0 ? 320 : width > APP_SURFACE_WIDTH
+            ? APP_SURFACE_WIDTH : width,
+        .requested_height = height == 0 ? 240 : height > APP_SURFACE_HEIGHT
+            ? APP_SURFACE_HEIGHT : height,
+        .mouse_x = -1,
+        .mouse_y = -1,
+        .reported_width = -1,
+        .reported_height = -1,
+    };
     size_t used = 0;
-    for (size_t i = 0; i < title_length && used + 1 < sizeof(app_title);
+    for (size_t i = 0; i < title_length && used + 1 < sizeof(window->title);
          i++) {
         char c = title[i];
         if (c >= ' ' && c <= '~') {
-            app_title[used++] = c;
+            window->title[used++] = c;
         }
     }
-    if (used == 0) {
-        static const char fallback[] = "PROGRAM";
-        for (; fallback[used] != '\0'; used++) {
-            app_title[used] = fallback[used];
+    window->title[used] = '\0';
+    window->open_pending = true;
+    /* The desktop opens it on its next pass. */
+    while (!window->opened) {
+        if (user_current_killed() || !desktop_active
+            || window->owner != owner) {
+            return -4; /* EINTR */
         }
+        (void)scheduler_block_current_until_locked(
+            window, timer_ticks() + APP_WAIT_RECHECK_TICKS);
     }
-    app_title[used] = '\0';
-    width = width == 0 ? 320 : width > APP_SURFACE_WIDTH
-        ? APP_SURFACE_WIDTH : width;
-    height = height == 0 ? 240 : height > APP_SURFACE_HEIGHT
-        ? APP_SURFACE_HEIGHT : height;
-
-    app_owner = owner;
-    app_closed = false;
-    app_close_sent = false;
-    app_event_head = 0;
-    app_event_count = 0;
-    app_buttons_down = 0;
-    app_width = 0;
-    app_height = 0;
-    app_reported_width = -1;
-    app_reported_height = -1;
-    app_mouse_x = -1;
-    app_mouse_y = -1;
-    window_open(WINDOW_APP);
-    struct rect area = workspace_area();
-    int64_t frame_width = (int64_t)width + 2 * BORDER;
-    int64_t frame_height = (int64_t)height + 2 * BORDER + TITLE_HEIGHT;
-    if (frame_width > area.width) {
-        frame_width = area.width;
-    }
-    if (frame_height > area.height) {
-        frame_height = area.height;
-    }
-    windows[WINDOW_APP].floating = (struct rect){
-        area.x + (area.width - frame_width) / 2,
-        area.y + (area.height - frame_height) / 2,
-        frame_width, frame_height
-    };
-    app_check_resize();
-    draw_scene();
     return 0;
 }
 
 int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
                                    uint32_t width, uint32_t height,
                                    uint32_t stride) {
-    if (owner == 0 || owner != app_owner) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
         return -9; /* EBADF: no window */
     }
-    if (app_closed) {
+    if (window->closed || window->surface == NULL) {
         return 0;
     }
     uint32_t copy_width = width > APP_SURFACE_WIDTH ? APP_SURFACE_WIDTH
@@ -6577,97 +6615,485 @@ int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
                                                        : height;
     for (uint32_t row = 0; row < copy_height; row++) {
         const uint32_t *source = pixels + (uint64_t)row * stride;
-        uint32_t *target = app_surface + (uint64_t)row * APP_SURFACE_WIDTH;
+        uint32_t *target = window->surface
+            + (uint64_t)row * APP_SURFACE_WIDTH;
         for (uint32_t column = 0; column < copy_width; column++) {
             target[column] = source[column];
         }
     }
-    app_width = copy_width;
-    app_height = copy_height;
-    draw_scene();
+    window->width = copy_width;
+    window->height = copy_height;
+    window->dirty = true;
     return 0;
 }
 
 uint64_t desktop_app_window_size(uint64_t owner) {
-    if (owner == 0 || owner != app_owner || !app_window_live()) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL || !app_window_live((size_t)(window - app_windows))
+        || window->reported_width < 0 || window->reported_height < 0) {
         return 0;
     }
-    struct rect area = app_content();
-    uint64_t width = area.width < 0 ? 0 : (uint64_t)area.width;
-    uint64_t height = area.height < 0 ? 0 : (uint64_t)area.height;
-    return width << 32 | height;
+    return (uint64_t)window->reported_width << 32
+        | (uint64_t)window->reported_height;
 }
-
-static bool desktop_step(bool in_program);
 
 int64_t desktop_app_window_event(uint64_t owner,
                                  struct desktop_app_event *event,
                                  int64_t timeout_ms, bool *terminate) {
     *terminate = false;
-    if (owner == 0 || owner != app_owner) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
         return -9;
     }
-    if (app_pumping) {
+    if (window->waiting) {
         return -16; /* another thread of the program is already waiting */
     }
     uint64_t deadline = timeout_ms > 0
         ? timer_ticks() + ((uint64_t)timeout_ms + 9) / 10 : 0;
-    uint64_t flags;
-    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
-    /* System calls start with interrupts off; the desktop needs the
-       keyboard, mouse and timer while it runs. */
-    __asm__ volatile ("sti" : : : "memory");
-    app_pumping = true;
+    window->waiting = true;
     int64_t result = 0;
     for (;;) {
-        if (app_closed) {
-            if (app_close_sent) {
+        if (user_current_killed()) {
+            break; /* the system call return ends the program */
+        }
+        if (window->closed) {
+            if (window->close_sent) {
                 /* Asked to close and still waiting: end it. */
                 *terminate = true;
                 break;
             }
-            app_close_sent = true;
+            window->close_sent = true;
             *event = (struct desktop_app_event){.type = APP_EVENT_CLOSE};
             result = 1;
             break;
         }
-        if (app_event_count != 0) {
-            *event = app_events[app_event_head];
-            app_event_head = (app_event_head + 1) % APP_EVENT_CAPACITY;
-            app_event_count--;
+        if (window->event_count != 0) {
+            *event = window->events[window->event_head];
+            window->event_head = (window->event_head + 1) % APP_EVENT_CAPACITY;
+            window->event_count--;
             result = 1;
             break;
         }
-        if (timeout_ms == 0
-            || (timeout_ms > 0 && timer_ticks() >= deadline)) {
+        uint64_t now = timer_ticks();
+        if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) {
             break;
         }
-        if (desktop_step(true)) {
-            /* Log out, shell or power: the program goes first. */
-            desktop_exit_pending = true;
-            window_close(WINDOW_APP);
+        uint64_t wake = now + APP_WAIT_RECHECK_TICKS;
+        if (timeout_ms > 0 && deadline < wake) {
+            wake = deadline;
         }
+        (void)scheduler_block_current_until_locked(window, wake);
     }
-    app_pumping = false;
-    if ((flags & (1u << 9)) == 0) {
-        __asm__ volatile ("cli" : : : "memory");
-    }
+    window->waiting = false;
     return result;
 }
 
+void desktop_app_process_exited(uint64_t process_id) {
+    for (size_t i = 0; i < APP_WINDOW_COUNT; i++) {
+        if (process_id != 0 && app_windows[i].owner == process_id) {
+            app_windows[i].owner_exited = true;
+        }
+    }
+}
+
 /*
- * One pass of the desktop: input, host resize, mouse, clock. Returns true
- * when the desktop should end (shell, log out to the shell). in_program:
- * called from a program waiting for events, which lets other threads run
- * while idle instead of halting.
+ * Standard output and error of every program go to the Terminal, through
+ * this queue: a program waits while it is full, and the desktop empties it
+ * on each pass.
+ */
+#define APP_OUTPUT_CAPACITY 4096
+static char app_output[APP_OUTPUT_CAPACITY];
+static size_t app_output_head;
+static size_t app_output_count;
+/* Output from a program without a window brings up the Terminal. */
+static bool app_output_windowless;
+
+static void app_output_sink(const char *data, size_t length, bool error) {
+    (void)error;
+    if (app_window_of(user_current_process_id()) == NULL) {
+        app_output_windowless = true;
+    }
+    for (size_t i = 0; i < length; i++) {
+        while (app_output_count == APP_OUTPUT_CAPACITY) {
+            if (user_current_killed() || !desktop_active) {
+                return;
+            }
+            (void)scheduler_sleep_until(timer_ticks() + 1);
+        }
+        app_output[(app_output_head + app_output_count)
+                   % APP_OUTPUT_CAPACITY] = data[i];
+        app_output_count++;
+    }
+}
+
+/*
+ * Standard input: while a program reads it, what is typed into the
+ * Terminal goes to the program instead of the command line.
+ */
+#define APP_INPUT_CAPACITY 256
+static char app_input[APP_INPUT_CAPACITY];
+static size_t app_input_head;
+static size_t app_input_count;
+static size_t app_input_readers_drawn;
+
+static void app_input_push(char character) {
+    if ((character != '\n' && character != '\b'
+         && (character < ' ' || character > '~'))
+        || app_input_count == APP_INPUT_CAPACITY) {
+        return;
+    }
+    app_input[(app_input_head + app_input_count) % APP_INPUT_CAPACITY] =
+        character;
+    app_input_count++;
+    scheduler_wake_event(&app_input_readers);
+}
+
+static bool app_console_input(char *character) {
+    for (;;) {
+        if (user_current_killed() || !desktop_active) {
+            return false;
+        }
+        if (app_input_count != 0) {
+            *character = app_input[app_input_head];
+            app_input_head = (app_input_head + 1) % APP_INPUT_CAPACITY;
+            app_input_count--;
+            return true;
+        }
+        app_input_readers++;
+        (void)scheduler_block_current_until_locked(
+            &app_input_readers, timer_ticks() + APP_WAIT_RECHECK_TICKS);
+        app_input_readers--;
+    }
+}
+
+/*
+ * App jobs: each started program gets a scheduler task that loads it,
+ * runs it to the end and records how it went. The desktop's pass reports
+ * the result where the program was started from.
+ */
+#define APP_JOB_CAPACITY 8
+#define APP_ARGUMENTS_CAPACITY 512
+
+struct app_job {
+    bool used;
+    volatile bool finished;
+    enum app_origin origin;
+    bool builtin;
+    enum user_program program;
+    char path[256];
+    size_t path_length;
+    char arguments[APP_ARGUMENTS_CAPACITY];
+    size_t arguments_length;
+    /* Files: the file opened; Notepad: the file to edit. */
+    char document[FILES_PATH_CAPACITY];
+    size_t document_length;
+    struct permission_identity identity;
+    uint64_t task_id;
+    uint64_t process_id;
+    uint64_t exit_status;
+    enum user_run_result result;
+};
+
+static struct app_job app_jobs[APP_JOB_CAPACITY];
+/* Set while logging out: ending programs then opens nothing. */
+static bool apps_stopping;
+
+static void app_job_worker(void *argument) {
+    struct app_job *job = argument;
+    uint64_t process_id = 0;
+    uint64_t exit_status = 1;
+    enum user_run_result result;
+    if (job->builtin) {
+        result = user_process_run(job->program, &process_id, &exit_status)
+            ? USER_RUN_STARTED : USER_RUN_FAILED;
+    } else {
+        result = user_process_run_file(job->path, job->path_length,
+                                       job->arguments, job->arguments_length,
+                                       &job->identity, &process_id,
+                                       &exit_status);
+    }
+    job->process_id = process_id;
+    job->exit_status = exit_status;
+    job->result = result;
+    __atomic_store_n(&job->finished, true, __ATOMIC_RELEASE);
+}
+
+static struct app_job *app_job_new(enum app_origin origin) {
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        if (!app_jobs[i].used) {
+            app_jobs[i] = (struct app_job){0};
+            app_jobs[i].used = true;
+            app_jobs[i].origin = origin;
+            app_jobs[i].identity = permission_session_identity();
+            return &app_jobs[i];
+        }
+    }
+    return NULL;
+}
+
+static enum run_result app_job_start(struct app_job *job) {
+    if (!scheduler_spawn(app_job_worker, job, &job->task_id)) {
+        job->used = false;
+        return RUN_BUSY;
+    }
+    return RUN_STARTED;
+}
+
+/*
+ * Starts an ELF program from the initramfs (/bin, /lib) or a disk
+ * (/disk...) as the logged-in account, after the same permission check
+ * Files uses. RUN_STARTED means it is on its way: whether the file was
+ * a program at all is known when its job ends.
+ */
+static enum run_result app_launch(enum app_origin origin, const char *typed,
+                                  size_t typed_length, const char *arguments,
+                                  size_t arguments_length,
+                                  const char *document,
+                                  size_t document_length) {
+    char path[256];
+    size_t length = permission_canonicalize(typed, typed_length, path,
+                                            sizeof(path));
+    if (length < 2) {
+        return RUN_NOT_FOUND;
+    }
+    if (!permission_ui_allows(path, length, PERMISSION_READ)) {
+        return RUN_DENIED;
+    }
+    if (arguments_length > APP_ARGUMENTS_CAPACITY
+        || document_length > FILES_PATH_CAPACITY) {
+        return RUN_FAILED;
+    }
+    struct app_job *job = app_job_new(origin);
+    if (job == NULL) {
+        return RUN_BUSY;
+    }
+    for (size_t i = 0; i < length; i++) {
+        job->path[i] = path[i];
+    }
+    job->path_length = length;
+    for (size_t i = 0; i < arguments_length; i++) {
+        job->arguments[i] = arguments[i];
+    }
+    job->arguments_length = arguments_length;
+    for (size_t i = 0; i < document_length; i++) {
+        job->document[i] = document[i];
+    }
+    job->document_length = document_length;
+    return app_job_start(job);
+}
+
+/* The Terminal's built-in test programs (elf, demo). */
+static enum run_result app_launch_builtin(enum user_program program,
+                                          const char *name) {
+    struct app_job *job = app_job_new(APP_FROM_TERMINAL);
+    if (job == NULL) {
+        return RUN_BUSY;
+    }
+    job->builtin = true;
+    job->program = program;
+    job->path_length = append_text(job->path, sizeof(job->path), 0, name);
+    return app_job_start(job);
+}
+
+static uint64_t app_job_process(const struct app_job *job) {
+    return job->used && !job->finished ? user_task_process_id(job->task_id)
+                                       : 0;
+}
+
+/* Ctrl+C in the Terminal: ends the newest program started there. */
+static bool app_kill_terminal_job(void) {
+    const struct app_job *newest = NULL;
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        const struct app_job *job = &app_jobs[i];
+        if (job->used && !job->finished && job->origin == APP_FROM_TERMINAL
+            && (newest == NULL || job->task_id > newest->task_id)) {
+            newest = job;
+        }
+    }
+    return newest != NULL && user_process_kill(app_job_process(newest));
+}
+
+/* The Terminal's ps. */
+static void apps_list(void) {
+    bool any = false;
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        const struct app_job *job = &app_jobs[i];
+        if (!job->used || job->finished) {
+            continue;
+        }
+        char line[TERMINAL_COLUMNS] = "PID ";
+        uint64_t process_id = app_job_process(job);
+        size_t length = process_id != 0
+            ? append_decimal(line, sizeof(line), 4, process_id)
+            : append_text(line, sizeof(line), 4, "-");
+        length = append_text(line, sizeof(line), length, "  ");
+        char path[sizeof(job->path) + 1];
+        for (size_t j = 0; j < job->path_length; j++) {
+            path[j] = job->path[j];
+        }
+        path[job->path_length] = '\0';
+        append_text(line, sizeof(line), length, path);
+        terminal_print(line);
+        any = true;
+    }
+    if (!any) {
+        terminal_print("NO PROGRAMS RUNNING");
+    }
+}
+
+static enum run_result app_run_result(enum user_run_result result) {
+    switch (result) {
+    case USER_RUN_STARTED: return RUN_STARTED;
+    case USER_RUN_NOT_FOUND: return RUN_NOT_FOUND;
+    case USER_RUN_TOO_LARGE: return RUN_TOO_LARGE;
+    case USER_RUN_NOT_PROGRAM: return RUN_NOT_PROGRAM;
+    default: return RUN_FAILED;
+    }
+}
+
+/* A job ended: say so where the program was started. */
+static void app_job_report(struct app_job *job) {
+    enum run_result result = app_run_result(job->result);
+    bool started = result == RUN_STARTED;
+    switch (job->origin) {
+    case APP_FROM_TERMINAL:
+        terminal_output_flush();
+        if (started) {
+            terminal_report_exit(true, job->exit_status);
+        } else {
+            terminal_print(run_result_text(result));
+        }
+        break;
+    case APP_FROM_FILES:
+        if (result == RUN_NOT_PROGRAM && !apps_stopping) {
+            files_open_text(job->document, job->document_length);
+        } else if (!started) {
+            set_status(run_result_text(result));
+        } else {
+            set_status(job->exit_status == 0 ? "PROGRAM EXITED WITH STATUS 0"
+                       : job->exit_status == 128 + 9 ? "PROGRAM WAS ENDED"
+                                                     : "PROGRAM EXITED WITH ERROR");
+        }
+        break;
+    case APP_FROM_NOTEPAD:
+        if (!started && !apps_stopping) {
+            if (job->document_length != 0) {
+                (void)editor_open(job->document, job->document_length);
+            } else {
+                editor_new();
+            }
+        } else if (started && job->exit_status != 0
+                   && job->exit_status != 128 + 9) {
+            set_status("NOTEPAD EXITED WITH ERROR");
+        }
+        break;
+    }
+    if (windows[WINDOW_FILES].open) {
+        files_refresh(); /* the program may have changed files */
+    }
+}
+
+/*
+ * The desktop's side of programs, once per pass: opens and frees windows,
+ * ends programs that ignore a close, shows output, reports ended jobs.
+ * Returns true when the screen needs drawing.
+ */
+static bool apps_poll(void) {
+    bool redraw = false;
+    uint64_t now = timer_ticks();
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        struct app_window *window = &app_windows[slot];
+        if (window->owner == 0) {
+            continue;
+        }
+        if (window->owner_exited) {
+            app_window_release(slot);
+            redraw = true;
+            continue;
+        }
+        if (window->open_pending) {
+            app_window_open(slot);
+            redraw = true;
+        }
+        if (window->closed && now - window->close_tick
+                                  > APP_CLOSE_GRACE_TICKS) {
+            (void)user_process_kill(window->owner);
+        }
+        if (window->dirty) {
+            window->dirty = false;
+            redraw = true;
+        }
+    }
+    if (app_output_count != 0) {
+        if (app_output_windowless && !windows[WINDOW_TERMINAL].open
+            && !apps_stopping) {
+            window_open(WINDOW_TERMINAL);
+        }
+        app_output_windowless = false;
+        while (app_output_count != 0) {
+            terminal_output_put(app_output[app_output_head]);
+            app_output_head = (app_output_head + 1) % APP_OUTPUT_CAPACITY;
+            app_output_count--;
+        }
+        redraw = true;
+    }
+    if (app_input_readers != app_input_readers_drawn) {
+        app_input_readers_drawn = app_input_readers;
+        redraw = true;
+    }
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        struct app_job *job = &app_jobs[i];
+        if (job->used && __atomic_load_n(&job->finished, __ATOMIC_ACQUIRE)) {
+            app_job_report(job);
+            job->used = false;
+            redraw = true;
+        }
+    }
+    return redraw;
+}
+
+/*
+ * Log out, the shell: every program ends first (they run as the account
+ * that is leaving). Programs get up to 3 seconds; one stuck waiting
+ * outside the desktop (a pipe, a thread) is left behind after that.
+ */
+static void apps_stop_all(void) {
+    apps_stopping = true;
+    uint64_t deadline = timer_ticks() + APP_CLOSE_GRACE_TICKS;
+    for (;;) {
+        bool running = user_process_kill_all() != 0;
+        for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+            if (app_jobs[i].used && !app_jobs[i].finished) {
+                running = true;
+            }
+        }
+        if (!running || timer_ticks() >= deadline) {
+            break;
+        }
+        (void)scheduler_sleep_until(timer_ticks() + 1);
+    }
+    (void)apps_poll();
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        if (app_windows[slot].owner != 0 && app_windows[slot].owner_exited) {
+            app_window_release(slot);
+        }
+    }
+    app_input_count = 0;
+    apps_stopping = false;
+}
+
+/*
+ * One pass of the desktop: programs' requests, input, host resize, mouse,
+ * clock. Returns true when the desktop should end (shell, log out to the
+ * shell). Between passes the desktop sleeps, which is when programs run.
  */
 static struct mouse_state loop_mouse;
 static uint8_t loop_previous_buttons;
 static struct drag_state loop_drag;
 static uint64_t loop_drawn_tick;
 
-static bool desktop_step(bool in_program) {
-    bool redraw = false;
+static bool desktop_step(void) {
+    bool redraw = apps_poll();
     char character;
     bool super_pending = false;
     while (keyboard_read_character(&character)) {
@@ -6717,9 +7143,9 @@ static bool desktop_step(bool in_program) {
             redraw = true;
         }
         loop_previous_buttons = mouse.buttons;
-        app_mouse_update(mouse.x, mouse.y, mouse.buttons);
+        apps_mouse_update(mouse.x, mouse.y, mouse.buttons);
     }
-    app_check_resize();
+    apps_check_resize();
     if (exit_to_shell) {
         return true;
     }
@@ -6734,11 +7160,7 @@ static bool desktop_step(bool in_program) {
         draw_scene();
     } else {
         console_cursor_refresh();
-        if (in_program) {
-            (void)scheduler_sleep_until(timer_ticks() + 1);
-        } else {
-            __asm__ volatile ("hlt" : : : "memory");
-        }
+        (void)scheduler_sleep_until(timer_ticks() + 1);
     }
     return false;
 }
@@ -6789,16 +7211,20 @@ void desktop_run(void) {
         ? loop_mouse.buttons : 0;
     loop_drag = (struct drag_state){0};
     loop_drawn_tick = timer_ticks() / 50;
+    /* From here the desktop gives up the processor only between passes,
+       and programs' output and input go through the Terminal. */
+    scheduler_set_kernel_preemption(false);
+    user_set_console_sink(app_output_sink);
+    user_set_console_input(app_console_input);
     desktop_active = true;
-    desktop_exit_pending = false;
     draw_scene();
 
-    for (;;) {
-        if (desktop_step(false) || desktop_exit_pending) {
-            desktop_active = false;
-            desktop_exit_pending = false;
-            console_clear();
-            return;
-        }
+    while (!desktop_step()) {
     }
+    apps_stop_all();
+    desktop_active = false;
+    user_set_console_input(NULL);
+    user_set_console_sink(NULL);
+    scheduler_set_kernel_preemption(true);
+    console_clear();
 }

@@ -32,6 +32,38 @@ bool user_process_run_elf_args(const uint8_t *image, size_t image_size,
                                const char *exec_path, size_t exec_path_length,
                                const char *arguments, size_t arguments_length,
                                uint64_t *process_id, uint64_t *exit_status);
+struct permission_identity;
+
+/* Reads an ELF program file (initramfs or disk, at most 1 MiB) into this
+   task's buffer and runs it as identity until it ends. */
+enum user_run_result {
+    USER_RUN_STARTED,
+    USER_RUN_NOT_FOUND,
+    USER_RUN_TOO_LARGE,
+    USER_RUN_NOT_PROGRAM,
+    USER_RUN_FAILED,
+};
+enum user_run_result user_process_run_file(
+    const char *path, size_t path_length, const char *arguments,
+    size_t arguments_length, const struct permission_identity *identity,
+    uint64_t *process_id, uint64_t *exit_status);
+
+/*
+ * Ends a running process (as if by SIGKILL, status 137): at its next
+ * system call return or timer tick in user mode, and from waits that
+ * check user_current_killed. Returns false if no such process runs.
+ */
+bool user_process_kill(uint64_t process_id);
+/* Asks every running process to end; returns how many still run. */
+size_t user_process_kill_all(void);
+/* For code running inside a system call of the current process. */
+bool user_current_killed(void);
+uint64_t user_current_process_id(void);
+/* The process a scheduler task runs, or 0. */
+uint64_t user_task_process_id(uint64_t task_id);
+/* Timer interrupt return path: sends a killed process to its exit. */
+void *user_preempt_check(void *interrupt_frame);
+
 bool user_process_self_test(void);
 bool user_process_concurrent_self_test(void);
 bool user_process_input_wait_self_test(void);
@@ -47,5 +79,11 @@ bool user_linux_return_check(void *saved_registers, bool exiting);
 typedef void (*user_console_sink)(const char *data, size_t length,
                                   bool error);
 void user_set_console_sink(user_console_sink sink);
+
+/* Where programs' standard input comes from while set (the desktop
+   Terminal); NULL means the keyboard. Waits for one character; false
+   ends the read with an error. Called with interrupts off. */
+typedef bool (*user_console_input)(char *character);
+void user_set_console_input(user_console_input input);
 
 #endif

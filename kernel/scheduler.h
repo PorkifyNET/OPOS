@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SCHEDULER_TASK_CAPACITY 8
+#define SCHEDULER_TASK_CAPACITY 16
 #define SCHEDULER_FPU_STATE_SIZE 512
 
 typedef void (*scheduler_task_entry)(void *argument);
@@ -34,6 +34,17 @@ void scheduler_restore_current_fpu(
     const uint8_t state[SCHEDULER_FPU_STATE_SIZE]);
 bool scheduler_sleep_until(uint64_t wake_tick);
 bool scheduler_block_current_locked(const void *event);
+/* Like scheduler_block_current_locked, but also wakes at wake_tick. */
+bool scheduler_block_current_until_locked(const void *event,
+                                          uint64_t wake_tick);
+/*
+ * Kernel code of a task that has no program context can be preempted by
+ * the timer only while this is enabled (the boot task starts with it on,
+ * spawned tasks with it off). With it off the task gives up the processor
+ * only when it sleeps or blocks, so it never stops halfway through
+ * changing shared kernel state.
+ */
+void scheduler_set_kernel_preemption(bool enabled);
 void scheduler_wake_event(const void *event);
 size_t scheduler_wake_event_count(const void *event, size_t maximum);
 

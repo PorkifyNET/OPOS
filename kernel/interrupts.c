@@ -8,6 +8,7 @@
 #include "paging.h"
 #include "scheduler.h"
 #include "timer.h"
+#include "user.h"
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -347,7 +348,7 @@ void *irq_handler(uint64_t vector, void *interrupt_frame) {
     io_out8(PIC1_COMMAND, 0x20);
 
     if (vector == PIC1_OFFSET) {
-        return scheduler_timer_tick(interrupt_frame);
+        return user_preempt_check(scheduler_timer_tick(interrupt_frame));
     }
     return interrupt_frame;
 }

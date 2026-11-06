@@ -28,13 +28,16 @@ int64_t desktop_app_window_create(uint64_t owner, const char *title,
 int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
                                    uint32_t width, uint32_t height,
                                    uint32_t stride);
-/* Waits up to timeout_ms (negative: forever; 0: just check) while the
-   desktop keeps running. Returns 1 with an event, 0 without. Sets
+/* Waits up to timeout_ms (negative: forever; 0: just check); the
+   desktop and other programs run meanwhile. Returns 1 with an event, 0
+   without (also when the program is being ended). Sets
    *terminate when the program ignored a close and must end. */
 int64_t desktop_app_window_event(uint64_t owner,
                                  struct desktop_app_event *event,
                                  int64_t timeout_ms, bool *terminate);
 /* Content size as width << 32 | height, or 0 without a window. */
 uint64_t desktop_app_window_size(uint64_t owner);
+/* Every process end: its window goes away. */
+void desktop_app_process_exited(uint64_t process_id);
 
 #endif

@@ -55,9 +55,11 @@ Arguments follow the path: `run /disk/hello one "two words"` gives
 double quotes too. Up to 15 arguments fit. Files starts programs without
 arguments.
 
-One program runs at a time. While it waits for window events, the desktop
-keeps working; starting a second program shows "ANOTHER PROGRAM IS
-RUNNING".
+Programs run side by side, each on its own task, and the desktop stays
+responsive while they compute. A program reading standard input gets the
+lines typed into the Terminal. In the Terminal, `ps` lists running programs,
+and `kill PID` or Ctrl+C (the newest program started there) ends one, with
+status 137. Logging out ends every program.
 
 ## Windows
 
@@ -155,7 +157,10 @@ See `docs/security-model.md`.
 
 ## Limits
 
-- Each program gets one window, and only one program runs at a time.
+- Each program gets one window. Up to four program windows can be open at
+  once, and up to eight programs can be started from the desktop at a time.
+- A program blocked waiting on a pipe, a child or another thread is only
+  ended when it wakes up.
 - There are no widgets: programs draw their own pixels and text.
 - The C library is small. It has no floating-point formatting, no
   `FILE` streams and no `qsort`, `time` or `locale`.

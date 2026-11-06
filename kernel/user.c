@@ -287,6 +287,7 @@ struct user_process {
     enum user_process_state state;
     uint64_t fault_status;
     bool faulted;
+    volatile bool kill_requested;
     bool elf_image;
     uintptr_t initial_break;
     uintptr_t current_break;
@@ -938,6 +939,12 @@ static user_console_sink console_sink;
 
 void user_set_console_sink(user_console_sink sink) {
     console_sink = sink;
+}
+
+static user_console_input console_input;
+
+void user_set_console_input(user_console_input input) {
+    console_input = input;
 }
 
 static void user_console_write(uint64_t file_descriptor, const char *data,
@@ -3125,7 +3132,9 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             size_t bytes_read = 0;
             while (bytes_read < length) {
                 char character;
-                if (!keyboard_wait_character(&character)) {
+                if (!(console_input != NULL
+                          ? console_input(&character)
+                          : keyboard_wait_character(&character))) {
                     frame->rax = (uint64_t)(int64_t)-5;
                     return false;
                 }
@@ -4161,6 +4170,10 @@ bool user_linux_signal_deliver(void *saved_registers) {
     if (frame == NULL || process == NULL || thread == NULL) {
         return false;
     }
+    if (process->kill_requested) {
+        frame->rax = 128 + LINUX_SIGKILL;
+        return true;
+    }
 
     for (;;) {
         uint64_t deliverable = __atomic_load_n(&thread->pending_signals,
@@ -4256,6 +4269,8 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
     user_close_all_files(process);
     scheduler_set_current_context(NULL);
     process->state = USER_PROCESS_EXITED;
+    process->kill_requested = false;
+    desktop_app_process_exited(process->id);
     user_orphan_children(process->id);
     if (process->faulted) {
         status = process->fault_status;
@@ -4719,6 +4734,101 @@ bool user_process_run_elf_args(const uint8_t *image, size_t image_size,
                                   NULL, 0, exec_path, exec_path_length,
                                   NULL, arguments, arguments_length,
                                   process_id, exit_status);
+}
+
+enum user_run_result user_process_run_file(
+    const char *path, size_t path_length, const char *arguments,
+    size_t arguments_length, const struct permission_identity *identity,
+    uint64_t *process_id, uint64_t *exit_status) {
+    uint8_t *image = user_exec_image_buffer(scheduler_current_slot());
+    if (path == NULL || path_length == 0
+        || path_length >= USER_FILE_PATH_CAPACITY) {
+        return USER_RUN_NOT_FOUND;
+    }
+    if (image == NULL) {
+        return USER_RUN_FAILED;
+    }
+    size_t size = 0;
+    if (!vfs_read_file(path, path_length, image, USER_EXEC_IMAGE_MAX,
+                       &size)) {
+        return size > USER_EXEC_IMAGE_MAX ? USER_RUN_TOO_LARGE
+                                          : USER_RUN_NOT_FOUND;
+    }
+    if (size < 4 || image[0] != 0x7f || image[1] != 'E' || image[2] != 'L'
+        || image[3] != 'F') {
+        return USER_RUN_NOT_PROGRAM;
+    }
+    return user_process_run_image(USER_PROGRAM_MODULE_ELF, image, size,
+                                  NULL, 0, path, path_length, identity,
+                                  arguments, arguments_length, process_id,
+                                  exit_status)
+        ? USER_RUN_STARTED : USER_RUN_FAILED;
+}
+
+bool user_process_kill(uint64_t process_id) {
+    if (process_id == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        if (process_slots[i].state == USER_PROCESS_RUNNING
+            && process_slots[i].id == process_id) {
+            process_slots[i].kill_requested = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t user_process_kill_all(void) {
+    size_t running = 0;
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        if (process_slots[i].state == USER_PROCESS_RUNNING) {
+            process_slots[i].kill_requested = true;
+            running++;
+        }
+    }
+    return running;
+}
+
+bool user_current_killed(void) {
+    const struct user_process *process = scheduler_current_context();
+    return process != NULL && process->kill_requested;
+}
+
+uint64_t user_current_process_id(void) {
+    const struct user_process *process = scheduler_current_context();
+    return process != NULL ? process->id : 0;
+}
+
+uint64_t user_task_process_id(uint64_t task_id) {
+    size_t slot;
+    if (!scheduler_task_slot(task_id, &slot)
+        || process_slots[slot].state != USER_PROCESS_RUNNING) {
+        return 0;
+    }
+    return process_slots[slot].id;
+}
+
+void *user_preempt_check(void *interrupt_frame) {
+    struct user_process *process = scheduler_current_context();
+    if (interrupt_frame == NULL || process == NULL
+        || !process->kill_requested) {
+        return interrupt_frame;
+    }
+    /* The timer stub saves 15 registers below the exception frame. */
+    struct exception_frame *frame = (struct exception_frame *)
+        ((uint8_t *)interrupt_frame + 15 * sizeof(uint64_t));
+    if ((frame->code_segment & 3) != 3) {
+        return interrupt_frame;
+    }
+    process->fault_status = 128 + LINUX_SIGKILL;
+    process->faulted = true;
+    frame->instruction_pointer = (uintptr_t)user_exit_trampoline;
+    frame->code_segment = KERNEL_CODE_SELECTOR;
+    frame->flags = 0x202;
+    frame->stack_pointer = (uintptr_t)(frame + 1);
+    frame->stack_segment = KERNEL_DATA_SELECTOR;
+    return interrupt_frame;
 }
 
 static void user_child_worker(void *argument) {

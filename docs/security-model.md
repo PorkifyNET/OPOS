@@ -73,6 +73,12 @@ in, a computer without accounts belongs to whoever is at the keyboard
 (administrator); a computer with accounts gives a standard identity with
 no home folder (for example the live session started from the ISO).
 
+Programs run side by side with the desktop. Logging out, or leaving the
+desktop for the kernel shell, first ends every running program, so none
+keeps running as the account that left. A program blocked on a pipe, a
+child or another thread ends only when it wakes. The desktop waits 3
+seconds for it, then goes on without it.
+
 Denied calls return `EACCES` (13). Files shows "ACCESS DENIED".
 
 `sdk/examples/permtest.c` checks the program side of this table.

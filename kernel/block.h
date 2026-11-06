@@ -11,6 +11,7 @@ enum block_device {
     BLOCK_DEVICE_AHCI,
     BLOCK_DEVICE_NVME,
     BLOCK_DEVICE_SCSI,
+    BLOCK_DEVICE_SD,
 };
 
 #define BLOCK_MAX_DISKS 16
@@ -34,7 +35,8 @@ struct block_disk_info {
    block_initialize. */
 void block_set_boot_identity(uint32_t mbr_disk_id, const uint8_t gpt_guid[16]);
 
-/* Lists every IDE, SATA (AHCI), NVMe and SCSI (PVSCSI, LSI, BusLogic) disk
+/* Lists every IDE, SATA (AHCI), NVMe, SCSI (PVSCSI, LSI, BusLogic) and
+   SD/eMMC disk
    with 512-byte sectors, then makes the boot disk active, or the first disk
    when the boot disk is not among them (for example a live CD). Initialize
    AHCI, NVMe and the SCSI host drivers first. */

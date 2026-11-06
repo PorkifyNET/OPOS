@@ -251,6 +251,7 @@ size_t storage_list(struct storage_volume *volumes, size_t capacity) {
                     .sectors = entry->sectors,
                     .partition_type = entry->type,
                     .removable = info.removable,
+                    .sd_card = info.device == BLOCK_DEVICE_SD,
                 };
                 detect(volume);
                 find_mount(volume);
@@ -265,6 +266,7 @@ size_t storage_list(struct storage_volume *volumes, size_t capacity) {
             .disk = disk,
             .sectors = info.sectors,
             .removable = info.removable,
+            .sd_card = info.device == BLOCK_DEVICE_SD,
         };
         if (!readable) {
             volume->filesystem = STORAGE_FS_READ_ERROR;

@@ -1893,7 +1893,8 @@ static void files_drive_name(const struct storage_volume *drive, char *name,
     }
     size_t used;
     if (drive->removable) {
-        used = append_text(name, capacity, 0, "USB DRIVE");
+        used = append_text(name, capacity, 0,
+                           drive->sd_card ? "SD CARD" : "USB DRIVE");
     } else {
         used = append_text(name, capacity, 0, "DISK ");
         used = append_decimal(name, capacity, used, drive->disk + 1);

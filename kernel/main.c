@@ -37,6 +37,7 @@
 #include "xhci.h"
 #include "optical.h"
 #include "boot_display.h"
+#include "sdhci.h"
 
 #define COM1 0x3f8
 #define GLYPH_SCALE 2
@@ -1198,6 +1199,11 @@ void kmain(void) {
         console_write_hex(buslogic_disk_count());
         console_write_string("\n");
     }
+    if (sdhci_initialize()) {
+        console_write_string("OPOS: SD/eMMC cards found: ");
+        console_write_hex(sdhci_disk_count());
+        console_write_string("\n");
+    }
 
     /* Limine reports the disk it loaded the kernel from; that disk is
        mounted at /disk even when other disks come first. */
@@ -1313,7 +1319,7 @@ void kmain(void) {
     for (size_t i = 0; i < block_disk_count(); i++) {
         struct block_disk_info info;
         if (block_disk_info(i, &info) && info.removable) {
-            serial_write_string("OPOS: USB disk ");
+            serial_write_string("OPOS: removable disk ");
             serial_write_string(info.location);
             serial_write_string(" \"");
             serial_write_string(info.model);

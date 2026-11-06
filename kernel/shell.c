@@ -564,7 +564,7 @@ static void execute_command(void) {
                 write_decimal(drives[i].partition);
             }
             if (drives[i].removable) {
-                console_write_string(" (usb)");
+                console_write_string(drives[i].sd_card ? " (sd card)" : " (usb)");
             }
             console_write_string(": ");
             console_write_string(storage_filesystem_name(drives[i].filesystem));

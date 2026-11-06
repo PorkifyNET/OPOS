@@ -3,6 +3,7 @@
 #include "block.h"
 #include "nvme.h"
 #include "scsi.h"
+#include "sdhci.h"
 
 struct block_disk {
     enum block_device device;
@@ -38,6 +39,8 @@ static uint64_t disk_sectors(const struct block_disk *disk) {
         return nvme_sector_count(disk->unit);
     case BLOCK_DEVICE_SCSI:
         return scsi_sector_count(disk->unit);
+    case BLOCK_DEVICE_SD:
+        return sdhci_sector_count(disk->unit);
     default:
         return 0;
     }
@@ -58,6 +61,9 @@ static bool disk_read(const struct block_disk *disk, uint32_t first_sector,
     case BLOCK_DEVICE_SCSI:
         return scsi_read_sectors(disk->unit, first_sector, sector_count,
                                  buffer);
+    case BLOCK_DEVICE_SD:
+        return sdhci_read_sectors(disk->unit, first_sector, sector_count,
+                                  buffer);
     default:
         return false;
     }
@@ -78,6 +84,9 @@ static bool disk_write(const struct block_disk *disk, uint32_t first_sector,
     case BLOCK_DEVICE_SCSI:
         return scsi_write_sectors(disk->unit, first_sector, sector_count,
                                   buffer);
+    case BLOCK_DEVICE_SD:
+        return sdhci_write_sectors(disk->unit, first_sector, sector_count,
+                                   buffer);
     default:
         return false;
     }
@@ -135,6 +144,9 @@ enum block_device block_initialize(void) {
     }
     for (size_t unit = 0; unit < scsi_disk_count(); unit++) {
         add_disk(BLOCK_DEVICE_SCSI, unit);
+    }
+    for (size_t unit = 0; unit < sdhci_disk_count(); unit++) {
+        add_disk(BLOCK_DEVICE_SD, unit);
     }
     for (size_t i = 0; i < disk_count; i++) {
         disks[i].boot_disk = is_boot_disk(&disks[i]);
@@ -218,8 +230,9 @@ bool block_disk_info(size_t index, struct block_disk_info *info) {
     info->device = disk->device;
     info->sectors = disk_sectors(disk);
     info->boot_disk = disk->boot_disk;
-    info->removable = disk->device == BLOCK_DEVICE_SCSI
-        && scsi_removable(disk->unit);
+    info->removable = (disk->device == BLOCK_DEVICE_SCSI
+                       && scsi_removable(disk->unit))
+        || (disk->device == BLOCK_DEVICE_SD && sdhci_removable(disk->unit));
     char *location = info->location;
     size_t capacity = sizeof(info->location);
     location[0] = '\0';
@@ -248,6 +261,10 @@ bool block_disk_info(size_t index, struct block_disk_info *info) {
     case BLOCK_DEVICE_SCSI:
         info->model = scsi_model(disk->unit);
         scsi_location(disk->unit, location, capacity);
+        break;
+    case BLOCK_DEVICE_SD:
+        info->model = sdhci_model(disk->unit);
+        sdhci_location(disk->unit, location, capacity);
         break;
     default:
         info->model = "";
@@ -293,6 +310,8 @@ const char *block_device_name(enum block_device device) {
         return "NVMe disk";
     case BLOCK_DEVICE_SCSI:
         return "SCSI disk";
+    case BLOCK_DEVICE_SD:
+        return "SD/eMMC disk";
     default:
         return "none";
     }

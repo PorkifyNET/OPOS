@@ -261,3 +261,11 @@ bool pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
     }
     return false;
 }
+
+uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset) {
+    if (device == NULL) {
+        return 0xffffffffu;
+    }
+    return pci_read_config32(device->bus, device->device, device->function,
+                             offset);
+}

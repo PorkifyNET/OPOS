@@ -43,6 +43,8 @@ uint64_t pci_bar_address(const struct pci_device *device, uint8_t bar,
                          bool *io_space);
 /* Sets I/O space, memory space and bus master in the command register. */
 void pci_enable_device(const struct pci_device *device);
+/* Reads a 32-bit configuration register (offset is rounded down to 4). */
+uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset);
 
 void pci_initialize(void);
 void pci_get_storage_controllers(struct pci_storage_controllers *controllers);

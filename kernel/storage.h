@@ -44,6 +44,8 @@ struct storage_volume {
     bool optical;
     /* A USB stick or other removable disk. */
     bool removable;
+    /* Removable and in an SD card slot (else a USB stick). */
+    bool sd_card;
     size_t disk;            /* block disk index */
     uint32_t partition;     /* 1-based table position; 0 = whole disk */
     uint64_t first;         /* first sector */

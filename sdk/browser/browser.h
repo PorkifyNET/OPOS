@@ -35,7 +35,10 @@ enum display {
 
 enum align { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
 
+struct var_scope;
+
 struct style {
+    const struct var_scope *vars; /* custom properties (css.c) */
     enum display display;
     int font_size;           /* pixels */
     bool bold, italic, mono;
@@ -154,6 +157,9 @@ struct css_sheet *css_parse(const char *text, size_t length);
 struct css_sheet *css_append(struct css_sheet *chain, struct css_sheet *sheet);
 void css_free(struct css_sheet *chain);
 void css_reset_variables(void);
+/* True when a media query ("print", "(max-width: 600px)", ...) applies to
+   the browser window. */
+bool css_media_matches(const char *query);
 void css_apply(const struct css_sheet *chain,
                const struct opos_html_node *element, struct style *style,
                const struct style *parent);

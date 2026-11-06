@@ -683,20 +683,43 @@ static void append(char **out, size_t *used, size_t *capacity, const char *s,
     (*out)[*used] = '\0';
 }
 
+/* Style sheets of one page load: each address once, at most MAX_SHEETS
+   of them and MAX_CSS_BYTES in all (big sites link 20+ sheets). */
+#define MAX_SHEETS 32
+#define MAX_SHEET_BYTES (2u << 20)
+#define MAX_CSS_BYTES (6u << 20)
+
+struct sheet_loads {
+    int count;
+    size_t bytes;
+    char urls[MAX_SHEETS][OPOS_HTTP_URL_MAX];
+};
+
 static __attribute__((noinline)) void fetch_sheet(const char *base,
                                                       const char *href,
-                                                      struct css_sheet **chain) {
+                                                      struct css_sheet **chain,
+                                                      struct sheet_loads *loads) {
     char url[OPOS_HTTP_URL_MAX];
     if (!opos_url_resolve(base, href, url, sizeof(url))) {
         return;
     }
-    char text[OPOS_HTTP_URL_MAX + 16];
-    snprintf(text, sizeof(text), "Style %s", url);
+    for (int i = 0; i < loads->count; i++) {
+        if (strcmp(loads->urls[i], url) == 0) {
+            return;
+        }
+    }
+    if (loads->count == MAX_SHEETS || loads->bytes >= MAX_CSS_BYTES) {
+        return;
+    }
+    snprintf(loads->urls[loads->count++], OPOS_HTTP_URL_MAX, "%s", url);
+    char text[OPOS_HTTP_URL_MAX + 32];
+    snprintf(text, sizeof(text), "Style %d: %s", loads->count, url);
     set_status(text);
     paint();
     struct opos_http_response response;
-    if (opos_http_get(url, 1u << 20, &response) == 0) {
+    if (opos_http_get(url, MAX_SHEET_BYTES, &response) == 0) {
         if (response.status == 200) {
+            loads->bytes += response.length;
             *chain = css_append(*chain, css_parse((const char *)response.body,
                                                   response.length));
         }
@@ -705,14 +728,14 @@ static __attribute__((noinline)) void fetch_sheet(const char *base,
 }
 
 static void collect_sheets(struct opos_html_node *node, struct css_sheet **chain,
-                           const char *base, int *fetched) {
+                           const char *base, struct sheet_loads *loads) {
     for (; node != NULL; node = node->next_sibling) {
         if (node->type != HTML_NODE_ELEMENT) {
             continue;
         }
         if (node->tag == HTML_TAG_STYLE) {
             const char *media = opos_html_attribute(node, "media");
-            if (media != NULL && strstr(media, "print") != NULL) {
+            if (media != NULL && !css_media_matches(media)) {
                 continue;
             }
             for (struct opos_html_node *t = node->first_child; t != NULL;
@@ -727,13 +750,12 @@ static void collect_sheets(struct opos_html_node *node, struct css_sheet **chain
             const char *href = opos_html_attribute(node, "href");
             const char *media = opos_html_attribute(node, "media");
             if (rel != NULL && href != NULL && strstr(rel, "stylesheet") != NULL
-                && strstr(rel, "alternate") == NULL && *fetched < 8
-                && (media == NULL || strstr(media, "print") == NULL)) {
-                (*fetched)++;
-                fetch_sheet(base, href, chain);
+                && strstr(rel, "alternate") == NULL
+                && (media == NULL || css_media_matches(media))) {
+                fetch_sheet(base, href, chain, loads);
             }
         }
-        collect_sheets(node->first_child, chain, base, fetched);
+        collect_sheets(node->first_child, chain, base, loads);
     }
 }
 
@@ -772,8 +794,13 @@ static void install_document(const char *html, size_t length,
     memset(&b.page, 0, sizeof(b.page));
     b.page.doc = doc;
     css_reset_variables();
-    int fetched = 0;
-    collect_sheets(doc->root, &b.page.sheets, url, &fetched);
+    /* @media rules are decided while the sheets are parsed. */
+    viewport_width_px = viewport_width();
+    viewport_height_px = viewport_height();
+    static struct sheet_loads loads;
+    loads.count = 0;
+    loads.bytes = 0;
+    collect_sheets(doc->root, &b.page.sheets, url, &loads);
     snprintf(b.page.url, sizeof(b.page.url), "%s", url);
     b.have_page = true;
     b.scroll = 0;

@@ -754,6 +754,7 @@ const struct css_sheet *style_sheets;
 void style_compute(const struct opos_html_node *element,
                    const struct style *parent, struct style *style) {
     memset(style, 0, sizeof(*style));
+    style->vars = parent->vars;
     style->font_size = parent->font_size;
     style->bold = parent->bold;
     style->italic = parent->italic;

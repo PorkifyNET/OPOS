@@ -147,6 +147,49 @@ void *realloc(void *memory, size_t size) {
     return bigger;
 }
 
+static void swap_bytes(unsigned char *a, unsigned char *b, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        unsigned char t = a[i];
+        a[i] = b[i];
+        b[i] = t;
+    }
+}
+
+/* Moves element `root` down the heap of `count` elements. */
+static void sift_down(unsigned char *base, size_t root, size_t count,
+                      size_t size, int (*compare)(const void *, const void *)) {
+    for (;;) {
+        size_t child = root * 2 + 1;
+        if (child >= count) {
+            return;
+        }
+        if (child + 1 < count
+            && compare(base + child * size, base + (child + 1) * size) < 0) {
+            child++;
+        }
+        if (compare(base + root * size, base + child * size) >= 0) {
+            return;
+        }
+        swap_bytes(base + root * size, base + child * size, size);
+        root = child;
+    }
+}
+
+void qsort(void *base, size_t count, size_t size,
+           int (*compare)(const void *, const void *)) {
+    unsigned char *bytes = base;
+    if (count < 2 || size == 0) {
+        return;
+    }
+    for (size_t i = count / 2; i > 0; i--) {
+        sift_down(bytes, i - 1, count, size, compare);
+    }
+    for (size_t end = count - 1; end > 0; end--) {
+        swap_bytes(bytes, bytes + end * size, size);
+        sift_down(bytes, 0, end, size, compare);
+    }
+}
+
 int abs(int value) {
     return value < 0 ? -value : value;
 }

@@ -17,8 +17,8 @@
 #define MAX_PARTS 12
 #define MAX_CLASSES 4
 #define MAX_ATTRS 3
-#define MAX_VARIABLES 400
-#define VIEWPORT_WIDTH 900
+#define MAX_MATCHES 1024
+#define MAX_LISTS 96
 
 enum attr_op { OP_EXISTS, OP_EQUALS, OP_WORD, OP_PREFIX, OP_SUFFIX, OP_SUBSTR,
                OP_DASH };
@@ -54,21 +54,34 @@ struct rule {
     const char *important;
 };
 
+struct css_index;
+
 struct css_sheet {
     char *text;                    /* owns the selector/declaration text */
     struct rule *rules;
     size_t count, capacity;
     uint32_t next_order;
     struct css_sheet *next;
+    /* Only on the first sheet of a chain: rules of the whole chain by the
+       id, class or tag their last compound needs (see build_index). */
+    struct css_index *index;
 };
 
-struct variable {
-    char name[40];
-    char *value;
+/* Custom properties: each element that declares any gets a scope (a hash
+   table of its own declarations) linked to the scope it inherits. */
+struct var_entry {
+    const char *name;              /* NULL: empty slot */
+    size_t length;
+    uint32_t hash;
+    char *value;                   /* malloc'd */
 };
 
-static struct variable variables[MAX_VARIABLES];
-static int variable_count;
+struct var_scope {
+    const struct var_scope *parent;
+    struct var_entry *entries;
+    size_t size, used;             /* size is a power of two */
+    struct var_scope *next_owned;  /* every scope of an index, for freeing */
+};
 
 /* -------------------------------------------------------------- tokenising */
 
@@ -305,26 +318,6 @@ static bool add_rule(struct css_sheet *sheet, struct rule *rule) {
     return true;
 }
 
-static void store_variable(const char *name, size_t name_length,
-                           const char *value) {
-    if (name_length >= sizeof(variables[0].name)) {
-        return;
-    }
-    for (int i = 0; i < variable_count; i++) {
-        if (strlen(variables[i].name) == name_length
-            && strncmp(variables[i].name, name, name_length) == 0) {
-            return; /* the first definition wins (the light theme) */
-        }
-    }
-    if (variable_count == MAX_VARIABLES) {
-        return;
-    }
-    memcpy(variables[variable_count].name, name, name_length);
-    variables[variable_count].name[name_length] = '\0';
-    variables[variable_count].value = strdup(value);
-    variable_count++;
-}
-
 /* Splits a declaration block (modified in place) into the normal and the
    !important parts; custom properties are recorded. The two outputs point
    into freshly allocated space inside `sheet->text`-independent heap, so
@@ -363,9 +356,9 @@ static void split_block(char *block, char **normal, char **important) {
                 name_length--;
             }
             char *value = skip_blank(colon + 1);
-            if (name_length > 2 && name[0] == '-' && name[1] == '-') {
-                store_variable(name, name_length, value);
-            } else if (n != NULL && im != NULL) {
+            /* Custom properties stay in the block: they cascade per element
+               (see element_scope). */
+            if (n != NULL && im != NULL) {
                 char *bang = strstr(value, "!important");
                 size_t span = strlen(p);
                 if (bang != NULL) {
@@ -430,7 +423,7 @@ static bool media_matches(const char *query) {
                     && strstr(colon, "em") < strchr(colon, ')')) {
                     v *= 16;
                 }
-                ok = v <= VIEWPORT_WIDTH;
+                ok = v <= viewport_width_px;
             }
         }
         if (ok && (f = strstr(alternative, "max-width")) != NULL) {
@@ -441,7 +434,7 @@ static bool media_matches(const char *query) {
                     && strstr(colon, "em") < strchr(colon, ')')) {
                     v *= 16;
                 }
-                ok = v >= VIEWPORT_WIDTH;
+                ok = v >= viewport_width_px;
             }
         }
         if (ok) {
@@ -452,6 +445,10 @@ static bool media_matches(const char *query) {
         }
         alternative = comma + 1;
     }
+}
+
+bool css_media_matches(const char *query) {
+    return media_matches(query);
 }
 
 static void parse_rules(struct css_sheet *sheet, char *p, char *limit);
@@ -597,7 +594,13 @@ struct css_sheet *css_parse(const char *text, size_t length) {
     return sheet;
 }
 
+static void index_free(struct css_index *index);
+
 void css_free(struct css_sheet *sheet) {
+    if (sheet != NULL) {
+        index_free(sheet->index);
+        sheet->index = NULL;
+    }
     while (sheet != NULL) {
         struct css_sheet *next = sheet->next;
         const char *last_normal = NULL;
@@ -833,21 +836,266 @@ static bool match_from(const struct opos_html_node *node,
     }
 }
 
+/* ----------------------------------------------------------------- index */
+
+/*
+ * Every rule is filed under one key taken from the last compound of its
+ * selector: its id, else its first class, else its tag name; rules with
+ * none of these go to a universal list. An element then only has to test
+ * the rules filed under its own id, classes and tag, plus the universal
+ * ones, instead of every rule of every sheet.
+ */
+struct bucket {
+    char type;                     /* '#' id, '.' class, 't' tag,
+                                      '@' attribute name; 0 empty */
+    const char *name;
+    size_t length;
+    uint32_t hash;
+    const struct rule **rules;
+    size_t count, capacity;
+};
+
+/* Matched rules per element, kept with the index: matching depends only on
+   the document and the sheets, not on the layout. */
+struct cached {
+    const struct opos_html_node *node;
+    const struct rule **rules;     /* in cascade order */
+    size_t count;
+    bool scope_ready;
+    const struct var_scope *scope; /* custom properties seen by the node */
+};
+
+struct css_index {
+    struct bucket *buckets;
+    size_t size;                   /* a power of two */
+    size_t used;
+    const struct rule **universal;
+    size_t universal_count, universal_capacity;
+    size_t rule_total;             /* rules of the chain when built */
+    struct cached *cache;          /* matched rules per element */
+    size_t cache_size, cache_used;
+    struct var_scope *scopes;      /* every scope built for this index */
+};
+
+static uint32_t key_hash(char type, const char *name, size_t length) {
+    uint32_t hash = 2166136261u ^ (uint8_t)type;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (type == 't' || type == '@') {
+            c = (unsigned char)tolower(c);
+        }
+        hash = (hash ^ c) * 16777619u;
+    }
+    return hash;
+}
+
+static bool key_equal(const struct bucket *bucket, char type, const char *name,
+                      size_t length, uint32_t hash) {
+    if (bucket->type != type || bucket->hash != hash
+        || bucket->length != length) {
+        return false;
+    }
+    if (type == 't' || type == '@') {
+        for (size_t i = 0; i < length; i++) {
+            if (tolower((unsigned char)bucket->name[i])
+                != tolower((unsigned char)name[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return strncmp(bucket->name, name, length) == 0;
+}
+
+static bool push_rule(const struct rule ***list, size_t *count,
+                      size_t *capacity, const struct rule *rule) {
+    if (*count == *capacity) {
+        size_t grown = *capacity == 0 ? 4 : *capacity * 2;
+        const struct rule **bigger = realloc(*list, grown * sizeof(**list));
+        if (bigger == NULL) {
+            return false;
+        }
+        *list = bigger;
+        *capacity = grown;
+    }
+    (*list)[(*count)++] = rule;
+    return true;
+}
+
+static struct bucket *index_find(const struct css_index *index, char type,
+                                 const char *name, size_t length) {
+    if (index->size == 0) {
+        return NULL;
+    }
+    uint32_t hash = key_hash(type, name, length);
+    size_t mask = index->size - 1;
+    for (size_t at = hash & mask;; at = (at + 1) & mask) {
+        struct bucket *bucket = &index->buckets[at];
+        if (bucket->type == 0) {
+            return NULL;
+        }
+        if (key_equal(bucket, type, name, length, hash)) {
+            return bucket;
+        }
+    }
+}
+
+static bool index_grow(struct css_index *index) {
+    size_t size = index->size == 0 ? 256 : index->size * 2;
+    struct bucket *buckets = calloc(size, sizeof(*buckets));
+    if (buckets == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < index->size; i++) {
+        struct bucket *old = &index->buckets[i];
+        if (old->type == 0) {
+            continue;
+        }
+        size_t at = old->hash & (size - 1);
+        while (buckets[at].type != 0) {
+            at = (at + 1) & (size - 1);
+        }
+        buckets[at] = *old;
+    }
+    free(index->buckets);
+    index->buckets = buckets;
+    index->size = size;
+    return true;
+}
+
+static bool index_add(struct css_index *index, char type, const char *name,
+                      size_t length, const struct rule *rule) {
+    struct bucket *bucket = index_find(index, type, name, length);
+    if (bucket == NULL) {
+        if ((index->used + 1) * 2 > index->size && !index_grow(index)) {
+            return false;
+        }
+        uint32_t hash = key_hash(type, name, length);
+        size_t mask = index->size - 1;
+        size_t at = hash & mask;
+        while (index->buckets[at].type != 0) {
+            at = (at + 1) & mask;
+        }
+        bucket = &index->buckets[at];
+        bucket->type = type;
+        bucket->name = name;
+        bucket->length = length;
+        bucket->hash = hash;
+        index->used++;
+    }
+    return push_rule(&bucket->rules, &bucket->count, &bucket->capacity, rule);
+}
+
+static void index_free(struct css_index *index) {
+    if (index == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < index->size; i++) {
+        free(index->buckets[i].rules);
+    }
+    free(index->buckets);
+    free(index->universal);
+    for (size_t i = 0; i < index->cache_size; i++) {
+        free(index->cache[i].rules);
+    }
+    free(index->cache);
+    while (index->scopes != NULL) {
+        struct var_scope *next = index->scopes->next_owned;
+        for (size_t i = 0; i < index->scopes->size; i++) {
+            free(index->scopes->entries[i].value);
+        }
+        free(index->scopes->entries);
+        free(index->scopes);
+        index->scopes = next;
+    }
+    free(index);
+}
+
+static size_t chain_rules(const struct css_sheet *chain) {
+    size_t total = 0;
+    for (; chain != NULL; chain = chain->next) {
+        total += chain->count;
+    }
+    return total;
+}
+
+/* The chain's index, (re)built when sheets were added since. */
+static struct css_index *chain_index(struct css_sheet *chain) {
+    size_t total = chain_rules(chain);
+    if (chain->index != NULL && chain->index->rule_total == total) {
+        return chain->index;
+    }
+    index_free(chain->index);
+    chain->index = NULL;
+    struct css_index *index = calloc(1, sizeof(*index));
+    if (index == NULL) {
+        return NULL;
+    }
+    for (const struct css_sheet *sheet = chain; sheet != NULL;
+         sheet = sheet->next) {
+        for (size_t i = 0; i < sheet->count; i++) {
+            const struct rule *rule = &sheet->rules[i];
+            const struct part *last = &rule->parts[rule->part_count - 1];
+            bool ok;
+            if (last->id != NULL) {
+                ok = index_add(index, '#', last->id, last->id_length, rule);
+            } else if (last->class_count > 0) {
+                ok = index_add(index, '.', last->classes[0],
+                               last->class_lengths[0], rule);
+            } else if (last->tag != NULL) {
+                ok = index_add(index, 't', last->tag, last->tag_length, rule);
+            } else if (last->root) {
+                ok = index_add(index, 't', "html", 4, rule);
+            } else if (last->attr_count > 0) {
+                ok = index_add(index, '@', last->attrs[0].name,
+                               last->attrs[0].name_length, rule);
+            } else {
+                ok = push_rule(&index->universal, &index->universal_count,
+                               &index->universal_capacity, rule);
+            }
+            if (!ok) {
+                index_free(index);
+                return NULL;
+            }
+        }
+    }
+    index->rule_total = total;
+    chain->index = index;
+    return index;
+}
+
 /* ---------------------------------------------------------------- applying */
 
-static const char *variable_value(const char *name, size_t length) {
-    for (int i = variable_count - 1; i >= 0; i--) {
-        if (strlen(variables[i].name) == length
-            && strncmp(variables[i].name, name, length) == 0) {
-            return variables[i].value;
+static uint32_t name_hash(const char *name, size_t length) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++) {
+        hash = (hash ^ (unsigned char)name[i]) * 16777619u;
+    }
+    return hash;
+}
+
+static const char *variable_value(const struct var_scope *scope,
+                                  const char *name, size_t length) {
+    uint32_t hash = name_hash(name, length);
+    for (; scope != NULL; scope = scope->parent) {
+        size_t mask = scope->size - 1;
+        for (size_t at = hash & mask;; at = (at + 1) & mask) {
+            const struct var_entry *e = &scope->entries[at];
+            if (e->name == NULL) {
+                break;
+            }
+            if (e->hash == hash && e->length == length
+                && strncmp(e->name, name, length) == 0) {
+                return e->value;
+            }
         }
     }
     return NULL;
 }
 
 /* Replaces var(--x, fallback) and light-dark(a, b) in a value. */
-static void substitute(const char *value, char *out, size_t capacity,
-                       int depth) {
+static void substitute(const struct var_scope *scope, const char *value,
+                       char *out, size_t capacity, int depth) {
     size_t used = 0;
     while (*value != '\0' && used + 1 < capacity) {
         bool is_var = strncmp(value, "var(", 4) == 0;
@@ -869,7 +1117,7 @@ static void substitute(const char *value, char *out, size_t capacity,
             }
             const char *argument_end = paren == 0 ? p - 1 : p;
             const char *first_end = comma != NULL ? comma : argument_end;
-            char piece[160];
+            char piece[400];
             size_t n = (size_t)(first_end - start);
             if (n >= sizeof(piece)) {
                 n = sizeof(piece) - 1;
@@ -877,7 +1125,7 @@ static void substitute(const char *value, char *out, size_t capacity,
             memcpy(piece, start, n);
             piece[n] = '\0';
             const char *replacement = NULL;
-            char fallback[160];
+            char fallback[400];
             if (is_var) {
                 char *trim = piece;
                 while (*trim == ' ') {
@@ -887,7 +1135,7 @@ static void substitute(const char *value, char *out, size_t capacity,
                 while (tl > 0 && trim[tl - 1] == ' ') {
                     tl--;
                 }
-                replacement = variable_value(trim, tl);
+                replacement = variable_value(scope, trim, tl);
                 if (replacement == NULL && comma != NULL) {
                     size_t f = (size_t)(argument_end - comma - 1);
                     if (f >= sizeof(fallback)) {
@@ -901,8 +1149,9 @@ static void substitute(const char *value, char *out, size_t capacity,
                 replacement = piece;
             }
             if (replacement != NULL) {
-                char inner[200];
-                substitute(replacement, inner, sizeof(inner), depth + 1);
+                char inner[400];
+                substitute(scope, replacement, inner, sizeof(inner),
+                           depth + 1);
                 for (size_t i = 0; inner[i] != '\0' && used + 1 < capacity; i++) {
                     out[used++] = inner[i];
                 }
@@ -954,7 +1203,7 @@ void css_apply_block(struct style *style, const char *text,
         while (name_length > 0 && text[name_length - 1] == ' ') {
             name_length--;
         }
-        char raw[300];
+        char raw[400];
         size_t n = (size_t)(end - colon - 1);
         if (n >= sizeof(raw)) {
             n = sizeof(raw) - 1;
@@ -965,8 +1214,8 @@ void css_apply_block(struct style *style, const char *text,
                                  && text[1] == '-')) {
             if (strstr(raw, "var(") != NULL || strstr(raw, "light-dark(")
                                                     != NULL) {
-                char value[300];
-                substitute(raw, value, sizeof(value), 0);
+                char value[400];
+                substitute(style->vars, raw, value, sizeof(value), 0);
                 apply_declaration(style, text, name_length, value, parent);
             } else {
                 apply_declaration(style, text, name_length, raw, parent);
@@ -979,20 +1228,296 @@ void css_apply_block(struct style *style, const char *text,
     }
 }
 
-struct match {
-    const struct rule *rule;
-    uint32_t key;
-};
-
-static int compare_match(const void *a, const void *b) {
-    const struct match *x = a, *y = b;
-    if (x->rule->specificity != y->rule->specificity) {
-        return x->rule->specificity < y->rule->specificity ? -1 : 1;
+static int compare_rule(const void *a, const void *b) {
+    const struct rule *x = *(const struct rule *const *)a;
+    const struct rule *y = *(const struct rule *const *)b;
+    if (x->specificity != y->specificity) {
+        return x->specificity < y->specificity ? -1 : 1;
     }
-    if (x->rule->order != y->rule->order) {
-        return x->rule->order < y->rule->order ? -1 : 1;
+    if (x->order != y->order) {
+        return x->order < y->order ? -1 : 1;
     }
     return 0;
+}
+
+static struct cached *cache_slot(struct css_index *index,
+                                 const struct opos_html_node *node,
+                                 bool *found) {
+    if ((index->cache_used + 1) * 2 > index->cache_size) {
+        size_t size = index->cache_size == 0 ? 1024 : index->cache_size * 2;
+        struct cached *table = calloc(size, sizeof(*table));
+        if (table == NULL) {
+            return NULL;
+        }
+        for (size_t i = 0; i < index->cache_size; i++) {
+            struct cached *old = &index->cache[i];
+            if (old->node == NULL) {
+                continue;
+            }
+            size_t at = ((uintptr_t)old->node >> 4) & (size - 1);
+            while (table[at].node != NULL) {
+                at = (at + 1) & (size - 1);
+            }
+            table[at] = *old;
+        }
+        free(index->cache);
+        index->cache = table;
+        index->cache_size = size;
+    }
+    size_t mask = index->cache_size - 1;
+    for (size_t at = ((uintptr_t)node >> 4) & mask;; at = (at + 1) & mask) {
+        struct cached *slot = &index->cache[at];
+        if (slot->node == node) {
+            *found = true;
+            return slot;
+        }
+        if (slot->node == NULL) {
+            *found = false;
+            return slot;
+        }
+    }
+}
+
+static void add_list(const struct rule *const **lists, size_t *lengths,
+                     size_t *list_count, const struct bucket *bucket) {
+    if (bucket != NULL && *list_count < MAX_LISTS) {
+        lists[*list_count] = bucket->rules;
+        lengths[(*list_count)++] = bucket->count;
+    }
+}
+
+/* The rules that match element, sorted by specificity and order. */
+static struct cached *matched_rules(struct css_index *index,
+                                          const struct opos_html_node *element) {
+    bool found;
+    struct cached *slot = cache_slot(index, element, &found);
+    if (slot == NULL) {
+        return NULL;
+    }
+    if (found) {
+        return slot;
+    }
+    /* Candidate lists: universal, tag, id, each class, each attribute. */
+    const struct rule *const *lists[MAX_LISTS];
+    size_t lengths[MAX_LISTS];
+    size_t list_count = 0;
+    lists[list_count] = index->universal;
+    lengths[list_count++] = index->universal_count;
+    add_list(lists, lengths, &list_count,
+             index_find(index, 't', element->name, strlen(element->name)));
+    const char *id = opos_html_attribute(element, "id");
+    if (id != NULL && id[0] != '\0') {
+        add_list(lists, lengths, &list_count,
+                 index_find(index, '#', id, strlen(id)));
+    }
+    for (const struct opos_html_attr *attr = element->attributes;
+         attr != NULL; attr = attr->next) {
+        add_list(lists, lengths, &list_count,
+                 index_find(index, '@', attr->name, strlen(attr->name)));
+    }
+    const char *classes = opos_html_attribute(element, "class");
+    const char *seen[64];
+    size_t seen_length[64];
+    size_t seen_count = 0;
+    while (classes != NULL && *classes != '\0') {
+        while (*classes == ' ' || *classes == '\t' || *classes == '\n'
+               || *classes == '\r' || *classes == '\f') {
+            classes++;
+        }
+        const char *start = classes;
+        while (*classes != '\0' && *classes != ' ' && *classes != '\t'
+               && *classes != '\n' && *classes != '\r' && *classes != '\f') {
+            classes++;
+        }
+        size_t length = (size_t)(classes - start);
+        if (length == 0) {
+            break;
+        }
+        bool duplicate = false;
+        for (size_t i = 0; i < seen_count; i++) {
+            if (seen_length[i] == length
+                && strncmp(seen[i], start, length) == 0) {
+                duplicate = true;
+            }
+        }
+        if (duplicate || seen_count == 64) {
+            continue;
+        }
+        seen[seen_count] = start;
+        seen_length[seen_count++] = length;
+        add_list(lists, lengths, &list_count,
+                 index_find(index, '.', start, length));
+    }
+    static const struct rule *found_rules[MAX_MATCHES];
+    size_t count = 0;
+    for (size_t l = 0; l < list_count; l++) {
+        for (size_t i = 0; i < lengths[l] && count < MAX_MATCHES; i++) {
+            const struct rule *rule = lists[l][i];
+            if (match_from(element, rule->parts, rule->part_count - 1)) {
+                found_rules[count++] = rule;
+            }
+        }
+    }
+    qsort(found_rules, count, sizeof(found_rules[0]), compare_rule);
+    slot->rules = NULL;
+    if (count > 0) {
+        slot->rules = malloc(count * sizeof(found_rules[0]));
+        if (slot->rules == NULL) {
+            return NULL;
+        }
+        memcpy(slot->rules, found_rules, count * sizeof(found_rules[0]));
+    }
+    slot->count = count;
+    slot->scope_ready = false;
+    slot->scope = NULL;
+    slot->node = element;
+    index->cache_used++;
+    return slot;
+}
+
+static bool scope_put(struct var_scope *scope, const char *name,
+                      size_t length, const char *value, size_t value_length) {
+    if ((scope->used + 1) * 2 > scope->size) {
+        size_t size = scope->size == 0 ? 16 : scope->size * 2;
+        struct var_entry *entries = calloc(size, sizeof(*entries));
+        if (entries == NULL) {
+            return false;
+        }
+        for (size_t i = 0; i < scope->size; i++) {
+            struct var_entry *old = &scope->entries[i];
+            if (old->name == NULL) {
+                continue;
+            }
+            size_t at = old->hash & (size - 1);
+            while (entries[at].name != NULL) {
+                at = (at + 1) & (size - 1);
+            }
+            entries[at] = *old;
+        }
+        free(scope->entries);
+        scope->entries = entries;
+        scope->size = size;
+    }
+    uint32_t hash = name_hash(name, length);
+    size_t mask = scope->size - 1;
+    size_t at = hash & mask;
+    while (scope->entries[at].name != NULL
+           && !(scope->entries[at].hash == hash
+                && scope->entries[at].length == length
+                && strncmp(scope->entries[at].name, name, length) == 0)) {
+        at = (at + 1) & mask;
+    }
+    char *copy = malloc(value_length + 1);
+    if (copy == NULL) {
+        return false;
+    }
+    memcpy(copy, value, value_length);
+    copy[value_length] = '\0';
+    struct var_entry *e = &scope->entries[at];
+    if (e->name == NULL) {
+        scope->used++;
+    }
+    free(e->value);
+    e->name = name;
+    e->length = length;
+    e->hash = hash;
+    e->value = copy;
+    return true;
+}
+
+/* Adds the custom properties declared in a block to *scope (created on
+   first use). Later declarations replace earlier ones. */
+static void collect_vars(struct css_index *index, struct var_scope **scope,
+                         const struct var_scope *parent, const char *text) {
+    while (text != NULL && *text != '\0') {
+        while (*text == ' ' || *text == '\n' || *text == '\t' || *text == '\r'
+               || *text == ';') {
+            text++;
+        }
+        const char *end = text;
+        char quote = 0;
+        int paren = 0;
+        while (*end != '\0' && (quote != 0 || paren > 0 || *end != ';')) {
+            if (quote != 0) {
+                if (*end == quote) {
+                    quote = 0;
+                }
+            } else if (*end == '"' || *end == '\'') {
+                quote = *end;
+            } else if (*end == '(' || *end == '{' || *end == '[') {
+                paren++;
+            } else if ((*end == ')' || *end == '}' || *end == ']')
+                       && paren > 0) {
+                paren--;
+            }
+            end++;
+        }
+        if (text[0] == '-' && text[1] == '-') {
+            const char *colon = text;
+            while (colon < end && *colon != ':') {
+                colon++;
+            }
+            if (colon < end) {
+                size_t name_length = (size_t)(colon - text);
+                while (name_length > 0 && text[name_length - 1] == ' ') {
+                    name_length--;
+                }
+                const char *value = colon + 1;
+                while (value < end && (*value == ' ' || *value == '\t'
+                                       || *value == '\n')) {
+                    value++;
+                }
+                size_t value_length = (size_t)(end - value);
+                while (value_length > 0
+                       && (value[value_length - 1] == ' '
+                           || value[value_length - 1] == '\n')) {
+                    value_length--;
+                }
+                /* "!important" is not part of the value. */
+                if (value_length >= 10
+                    && strncmp(value + value_length - 10, "!important", 10)
+                           == 0) {
+                    value_length -= 10;
+                    while (value_length > 0 && value[value_length - 1] == ' ') {
+                        value_length--;
+                    }
+                }
+                if (*scope == NULL) {
+                    *scope = calloc(1, sizeof(**scope));
+                    if (*scope == NULL) {
+                        return;
+                    }
+                    (*scope)->parent = parent;
+                    (*scope)->next_owned = index->scopes;
+                    index->scopes = *scope;
+                }
+                scope_put(*scope, text, name_length, value, value_length);
+            }
+        }
+        text = *end == '\0' ? end : end + 1;
+    }
+}
+
+/* The custom properties the element sees: its own declarations (rules in
+   cascade order, then its style attribute, then !important ones) over the
+   parent's. Cached with the element's rules. */
+static const struct var_scope *element_scope(
+    struct css_index *index, struct cached *matched,
+    const struct opos_html_node *element, const struct var_scope *parent) {
+    if (matched->scope_ready) {
+        return matched->scope;
+    }
+    struct var_scope *scope = NULL;
+    for (size_t i = 0; i < matched->count; i++) {
+        collect_vars(index, &scope, parent, matched->rules[i]->normal);
+    }
+    collect_vars(index, &scope, parent, opos_html_attribute(element, "style"));
+    for (size_t i = 0; i < matched->count; i++) {
+        collect_vars(index, &scope, parent, matched->rules[i]->important);
+    }
+    matched->scope = scope != NULL ? scope : parent;
+    matched->scope_ready = true;
+    return matched->scope;
 }
 
 void css_apply(const struct css_sheet *chain,
@@ -1001,47 +1526,29 @@ void css_apply(const struct css_sheet *chain,
     if (chain == NULL) {
         return;
     }
-    struct match matches[512];
-    size_t count = 0;
-    for (const struct css_sheet *sheet = chain; sheet != NULL;
-         sheet = sheet->next) {
-        for (size_t i = 0; i < sheet->count && count < 512; i++) {
-            const struct rule *rule = &sheet->rules[i];
-            if (match_from(element, rule->parts, rule->part_count - 1)) {
-                matches[count].rule = rule;
-                matches[count].key = rule->order;
-                count++;
-            }
-        }
-    }
-    if (count == 0) {
+    struct css_index *index = chain_index((struct css_sheet *)chain);
+    if (index == NULL) {
         return;
     }
-    for (size_t i = 1; i < count; i++) {
-        struct match held = matches[i];
-        size_t j = i;
-        while (j > 0 && compare_match(&matches[j - 1], &held) > 0) {
-            matches[j] = matches[j - 1];
-            j--;
-        }
-        matches[j] = held;
+    struct cached *matched = matched_rules(index, element);
+    if (matched == NULL) {
+        return;
     }
-    for (size_t i = 0; i < count; i++) {
-        if (matches[i].rule->normal != NULL) {
-            css_apply_block(style, matches[i].rule->normal, parent);
+    style->vars = element_scope(index, matched, element, parent->vars);
+    for (size_t i = 0; i < matched->count; i++) {
+        if (matched->rules[i]->normal != NULL) {
+            css_apply_block(style, matched->rules[i]->normal, parent);
         }
     }
-    for (size_t i = 0; i < count; i++) {
-        if (matches[i].rule->important != NULL
-            && matches[i].rule->important[0] != '\0') {
-            css_apply_block(style, matches[i].rule->important, parent);
+    for (size_t i = 0; i < matched->count; i++) {
+        const char *important = matched->rules[i]->important;
+        if (important != NULL && important[0] != '\0') {
+            css_apply_block(style, important, parent);
         }
     }
 }
 
 void css_reset_variables(void) {
-    for (int i = 0; i < variable_count; i++) {
-        free(variables[i].value);
-    }
-    variable_count = 0;
+    /* Custom properties live in per-element scopes (freed with the
+       sheets); nothing global is left to reset. */
 }

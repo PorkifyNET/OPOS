@@ -25,6 +25,10 @@ long atol(const char *text);
 long strtol(const char *text, char **end, int base);
 unsigned long strtoul(const char *text, char **end, int base);
 
+/* Sorts count elements of size bytes (heap sort: not stable). */
+void qsort(void *base, size_t count, size_t size,
+           int (*compare)(const void *, const void *));
+
 __attribute__((noreturn)) void exit(int status);
 
 #endif

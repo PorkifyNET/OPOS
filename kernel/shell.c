@@ -534,7 +534,7 @@ static void execute_command(void) {
                              "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
                              "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest, "
-                             "net, dhcp, ping HOST, lookup NAME\n");
+                             "net, dhcp, ping HOST, lookup NAME, http HOST[/PATH]\n");
     } else if (command_matches(command, command_length, "echo")) {
         console_write_string(arguments);
         console_write_string("\n");
@@ -640,6 +640,8 @@ static void execute_command(void) {
     } else if (command_matches(command, command_length, "dhcp")) {
         net_dhcp_restart();
         console_write_string("Asking the DHCP server for an address...\n");
+    } else if (command_matches(command, command_length, "http")) {
+        shell_net_wait(net_http_start(arguments, arguments_length));
     } else if (command_matches(command, command_length, "ping")
                || command_matches(command, command_length, "lookup")) {
         bool started = command_length == 4

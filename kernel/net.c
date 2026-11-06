@@ -442,6 +442,8 @@ static void icmp_receive(const uint8_t *ip, const uint8_t *icmp,
                          size_t length);
 static void udp_receive(const uint8_t *ip, const uint8_t *udp,
                         size_t length);
+static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
+                        size_t length);
 
 static void ip_receive(const uint8_t *ip, size_t length) {
     if (length < IP_HEADER || (ip[0] >> 4) != 4) {
@@ -478,6 +480,8 @@ static void ip_receive(const uint8_t *ip, size_t length) {
         icmp_receive(ip, ip + header, total - header);
     } else if (ip[9] == IP_PROTOCOL_UDP) {
         udp_receive(ip, ip + header, total - header);
+    } else if (ip[9] == 6) {
+        tcp_receive(ip, ip + header, total - header);
     }
 }
 
@@ -881,6 +885,553 @@ static void dns_poll(void) {
     dns_send();
 }
 
+/* ---------------------------------------------------------------- TCP */
+
+/*
+ * TCP client connections. Sending is go-back-N: unacknowledged bytes stay
+ * in the send buffer and a timeout resends from the oldest one. Received
+ * segments are taken only in order; anything else gets a duplicate ACK.
+ * No listening sockets yet.
+ */
+#define IP_PROTOCOL_TCP 6
+#define TCP_CONNECTIONS 4
+#define TCP_SEND_CAPACITY 16384
+#define TCP_RECEIVE_CAPACITY 32768
+#define TCP_MSS 1460
+#define TCP_HEADER 20
+#define TCP_RTO_START TICKS_PER_SECOND
+#define TCP_RTO_MAX (16 * TICKS_PER_SECOND)
+#define TCP_RETRIES 7
+#define TCP_TIME_WAIT_TICKS (2 * TICKS_PER_SECOND)
+
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_PSH 0x08
+#define TCP_ACK 0x10
+
+enum tcp_state {
+    TCP_CLOSED,
+    TCP_SYN_SENT,
+    TCP_ESTABLISHED,
+    TCP_FIN_WAIT_1,
+    TCP_FIN_WAIT_2,
+    TCP_CLOSE_WAIT,
+    TCP_LAST_ACK,
+    TCP_TIME_WAIT,
+};
+
+struct tcp_connection {
+    bool used;
+    bool detached; /* the owner closed it; free the slot when done */
+    bool failed;   /* reset by the peer or timed out */
+    enum tcp_state state;
+    uint8_t remote_ip[4];
+    uint16_t remote_port;
+    uint16_t local_port;
+    uint32_t iss;
+    uint32_t snd_una;
+    uint32_t snd_nxt;
+    uint32_t snd_wnd;
+    uint32_t mss;
+    uint32_t rcv_nxt;
+    bool fin_queued;
+    bool fin_sent;
+    bool remote_closed;
+    uint32_t advertised; /* window in the last segment we sent */
+    uint64_t retransmit_at; /* 0: no timer */
+    uint64_t rto;
+    int retries;
+    uint64_t time_wait_until;
+    size_t send_length; /* bytes from snd_una on */
+    size_t receive_start;
+    size_t receive_length;
+    uint8_t send_buffer[TCP_SEND_CAPACITY];
+    uint8_t receive_buffer[TCP_RECEIVE_CAPACITY];
+};
+
+static struct tcp_connection tcp_table[TCP_CONNECTIONS];
+static uint16_t tcp_next_port;
+
+/* Sequence comparisons that survive wrap-around. */
+static bool seq_lt(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) < 0;
+}
+
+static bool seq_le(uint32_t a, uint32_t b) {
+    return (int32_t)(a - b) <= 0;
+}
+
+static uint32_t tcp_window(const struct tcp_connection *c) {
+    size_t free = TCP_RECEIVE_CAPACITY - c->receive_length;
+    return free > 65535 ? 65535 : (uint32_t)free;
+}
+
+/* Sends one segment; data may be NULL when length is 0. */
+static void tcp_segment(struct tcp_connection *c, uint32_t seq, uint8_t flags,
+                        const uint8_t *data, size_t length) {
+    uint8_t *tcp = frame_out + ETHERNET_HEADER + IP_HEADER;
+    size_t header = TCP_HEADER + ((flags & TCP_SYN) != 0 ? 4 : 0);
+    put16(tcp, c->local_port);
+    put16(tcp + 2, c->remote_port);
+    put32(tcp + 4, seq);
+    put32(tcp + 8, (flags & TCP_ACK) != 0 ? c->rcv_nxt : 0);
+    tcp[12] = (uint8_t)(header / 4 << 4);
+    tcp[13] = flags;
+    c->advertised = tcp_window(c);
+    put16(tcp + 14, (uint16_t)c->advertised);
+    put16(tcp + 16, 0);
+    put16(tcp + 18, 0);
+    if ((flags & TCP_SYN) != 0) {
+        tcp[20] = 2; /* maximum segment size */
+        tcp[21] = 4;
+        put16(tcp + 22, TCP_MSS);
+    }
+    if (length != 0) {
+        copy(tcp + header, data, length);
+    }
+    size_t total = header + length;
+    uint8_t pseudo[12];
+    copy(pseudo, our_ip, 4);
+    copy(pseudo + 4, c->remote_ip, 4);
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTOCOL_TCP;
+    put16(pseudo + 10, (uint16_t)total);
+    put16(tcp + 16, checksum_finish(
+        checksum_add(checksum_add(0, pseudo, 12), tcp, total)));
+    (void)ip_send(c->remote_ip, IP_PROTOCOL_TCP, total);
+}
+
+static void tcp_arm(struct tcp_connection *c) {
+    if (c->retransmit_at == 0) {
+        c->retransmit_at = timer_ticks() + c->rto;
+    }
+}
+
+static void tcp_free(struct tcp_connection *c) {
+    c->used = false;
+    c->state = TCP_CLOSED;
+}
+
+/* Sends whatever the window allows, then the FIN once all data is out.
+   force sends at least one byte into a closed window (a probe). */
+static void tcp_push(struct tcp_connection *c, bool force) {
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT
+        && c->state != TCP_FIN_WAIT_1 && c->state != TCP_LAST_ACK) {
+        return;
+    }
+    while (!c->fin_sent) {
+        size_t in_flight = c->snd_nxt - c->snd_una;
+        if (in_flight >= c->send_length) {
+            break;
+        }
+        uint32_t window = c->snd_wnd;
+        if (force && window <= in_flight) {
+            window = (uint32_t)in_flight + 1;
+        }
+        if (in_flight >= window) {
+            if (c->snd_wnd == 0) {
+                tcp_arm(c); /* probe the closed window later */
+            }
+            break;
+        }
+        size_t length = c->send_length - in_flight;
+        if (length > window - in_flight) {
+            length = window - in_flight;
+        }
+        if (length > c->mss) {
+            length = c->mss;
+        }
+        tcp_segment(c, c->snd_nxt, TCP_ACK | TCP_PSH,
+                    c->send_buffer + in_flight, length);
+        c->snd_nxt += (uint32_t)length;
+        tcp_arm(c);
+        force = false;
+    }
+    if (c->fin_queued && !c->fin_sent
+        && c->snd_nxt - c->snd_una == c->send_length) {
+        tcp_segment(c, c->snd_nxt, TCP_FIN | TCP_ACK, NULL, 0);
+        c->snd_nxt++;
+        c->fin_sent = true;
+        if (c->state == TCP_ESTABLISHED) {
+            c->state = TCP_FIN_WAIT_1;
+        } else if (c->state == TCP_CLOSE_WAIT) {
+            c->state = TCP_LAST_ACK;
+        }
+        tcp_arm(c);
+    }
+}
+
+static void tcp_send_reset(const uint8_t *ip, const uint8_t *tcp,
+                           size_t payload, uint8_t flags) {
+    /* Static: the buffers make the structure far too big for the stack. */
+    static struct tcp_connection temporary;
+    zero(&temporary, sizeof(temporary) - TCP_SEND_CAPACITY
+                         - TCP_RECEIVE_CAPACITY);
+    copy(temporary.remote_ip, ip + 12, 4);
+    temporary.remote_port = get16(tcp);
+    temporary.local_port = get16(tcp + 2);
+    temporary.receive_length = TCP_RECEIVE_CAPACITY;
+    if ((flags & TCP_ACK) != 0) {
+        tcp_segment(&temporary, get32(tcp + 8), TCP_RST, NULL, 0);
+    } else {
+        uint32_t length = (uint32_t)payload + ((flags & TCP_SYN) ? 1 : 0)
+                        + ((flags & TCP_FIN) ? 1 : 0);
+        temporary.rcv_nxt = get32(tcp + 4) + length;
+        tcp_segment(&temporary, 0, TCP_RST | TCP_ACK, NULL, 0);
+    }
+}
+
+static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
+                        size_t length) {
+    if (length < TCP_HEADER || !configured) {
+        return;
+    }
+    size_t header = (size_t)(tcp[12] >> 4) * 4;
+    if (header < TCP_HEADER || header > length) {
+        return;
+    }
+    uint8_t pseudo[12];
+    copy(pseudo, ip + 12, 4);
+    copy(pseudo + 4, ip + 16, 4);
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTOCOL_TCP;
+    put16(pseudo + 10, (uint16_t)length);
+    if (checksum_finish(checksum_add(checksum_add(0, pseudo, 12), tcp,
+                                     length)) != 0) {
+        return;
+    }
+    uint16_t remote_port = get16(tcp);
+    uint16_t local_port = get16(tcp + 2);
+    uint32_t seq = get32(tcp + 4);
+    uint32_t ack = get32(tcp + 8);
+    uint8_t flags = tcp[13];
+    uint32_t window = get16(tcp + 14);
+    const uint8_t *data = tcp + header;
+    size_t data_length = length - header;
+
+    struct tcp_connection *c = NULL;
+    for (size_t i = 0; i < TCP_CONNECTIONS; i++) {
+        struct tcp_connection *candidate = &tcp_table[i];
+        if (candidate->used && candidate->state != TCP_CLOSED
+            && candidate->local_port == local_port
+            && candidate->remote_port == remote_port
+            && same(candidate->remote_ip, ip + 12, 4)) {
+            c = candidate;
+            break;
+        }
+    }
+    if (c == NULL) {
+        if ((flags & TCP_RST) == 0) {
+            tcp_send_reset(ip, tcp, data_length, flags);
+        }
+        return;
+    }
+
+    if (c->state == TCP_SYN_SENT) {
+        if ((flags & TCP_ACK) != 0 && ack != c->iss + 1) {
+            if ((flags & TCP_RST) == 0) {
+                tcp_send_reset(ip, tcp, data_length, flags);
+            }
+            return;
+        }
+        if ((flags & TCP_RST) != 0) {
+            if ((flags & TCP_ACK) != 0) {
+                c->failed = true; /* connection refused */
+                c->state = TCP_CLOSED;
+            }
+            return;
+        }
+        if ((flags & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK)) {
+            return;
+        }
+        c->rcv_nxt = seq + 1;
+        c->snd_una = ack;
+        c->snd_wnd = window;
+        c->mss = 536;
+        for (size_t i = TCP_HEADER; i + 1 < header;) {
+            uint8_t kind = tcp[i];
+            if (kind == 0) {
+                break;
+            }
+            if (kind == 1) {
+                i++;
+                continue;
+            }
+            uint8_t size = tcp[i + 1];
+            if (size < 2 || i + size > header) {
+                break;
+            }
+            if (kind == 2 && size == 4) {
+                c->mss = get16(tcp + i + 2);
+            }
+            i += size;
+        }
+        if (c->mss > TCP_MSS) {
+            c->mss = TCP_MSS;
+        }
+        if (c->mss < 64) {
+            c->mss = 64;
+        }
+        c->state = TCP_ESTABLISHED;
+        c->retransmit_at = 0;
+        c->retries = 0;
+        c->rto = TCP_RTO_START;
+        tcp_segment(c, c->snd_nxt, TCP_ACK, NULL, 0);
+        tcp_push(c, false);
+        return;
+    }
+
+    if ((flags & TCP_RST) != 0) {
+        /* Accept a reset only inside the window we offered. */
+        if (seq_le(c->rcv_nxt, seq)
+            && seq_lt(seq, c->rcv_nxt + (c->advertised ? c->advertised : 1))) {
+            c->failed = c->state != TCP_TIME_WAIT && !c->remote_closed;
+            c->state = TCP_CLOSED;
+            if (c->detached) {
+                tcp_free(c);
+            }
+        }
+        return;
+    }
+    if ((flags & TCP_SYN) != 0) {
+        /* A retransmitted SYN+ACK: our ACK was lost. */
+        tcp_segment(c, c->snd_nxt, TCP_ACK, NULL, 0);
+        return;
+    }
+    if ((flags & TCP_ACK) == 0) {
+        return;
+    }
+
+    /* Acknowledgement. */
+    if (seq_lt(c->snd_una, ack) && seq_le(ack, c->snd_nxt)) {
+        uint32_t acked = ack - c->snd_una;
+        bool fin_acked = c->fin_sent && ack == c->snd_nxt;
+        size_t data_acked = acked - (fin_acked ? 1 : 0);
+        if (data_acked > c->send_length) {
+            data_acked = c->send_length;
+        }
+        for (size_t i = data_acked; i < c->send_length; i++) {
+            c->send_buffer[i - data_acked] = c->send_buffer[i];
+        }
+        c->send_length -= data_acked;
+        c->snd_una = ack;
+        c->retries = 0;
+        c->rto = TCP_RTO_START;
+        c->retransmit_at = 0;
+        if (c->snd_una != c->snd_nxt) {
+            tcp_arm(c);
+        }
+        if (fin_acked) {
+            if (c->state == TCP_FIN_WAIT_1) {
+                c->state = TCP_FIN_WAIT_2;
+                /* Give up on a peer that never closes its side. */
+                c->time_wait_until = timer_ticks() + 30 * TICKS_PER_SECOND;
+            } else if (c->state == TCP_LAST_ACK) {
+                c->state = TCP_CLOSED;
+                if (c->detached) {
+                    tcp_free(c);
+                }
+                return;
+            }
+        }
+    }
+    if (seq_le(c->snd_una, ack)) {
+        c->snd_wnd = window;
+    }
+
+    /* Data, in order only. */
+    bool send_ack = false;
+    bool in_order = seq == c->rcv_nxt;
+    if (data_length != 0) {
+        send_ack = true;
+        if (in_order && !c->remote_closed && c->detached) {
+            /* Nobody reads any more: accept and drop. */
+            c->rcv_nxt += (uint32_t)data_length;
+        } else if (in_order && !c->remote_closed) {
+            size_t room = TCP_RECEIVE_CAPACITY - c->receive_length;
+            size_t take = data_length < room ? data_length : room;
+            for (size_t i = 0; i < take; i++) {
+                size_t at = (c->receive_start + c->receive_length + i)
+                          % TCP_RECEIVE_CAPACITY;
+                c->receive_buffer[at] = data[i];
+            }
+            c->receive_length += take;
+            c->rcv_nxt += (uint32_t)take;
+            in_order = take == data_length;
+        }
+    }
+    if ((flags & TCP_FIN) != 0 && in_order
+        && seq + (uint32_t)data_length == c->rcv_nxt && !c->remote_closed) {
+        c->rcv_nxt++;
+        c->remote_closed = true;
+        send_ack = true;
+        if (c->state == TCP_ESTABLISHED) {
+            c->state = TCP_CLOSE_WAIT;
+        } else if (c->state == TCP_FIN_WAIT_1 || c->state == TCP_FIN_WAIT_2) {
+            c->state = TCP_TIME_WAIT;
+            c->time_wait_until = timer_ticks() + TCP_TIME_WAIT_TICKS;
+            c->retransmit_at = 0;
+        }
+    }
+    if (send_ack) {
+        tcp_segment(c, c->snd_nxt, TCP_ACK, NULL, 0);
+    }
+    tcp_push(c, false);
+}
+
+static void tcp_poll(void) {
+    uint64_t now = timer_ticks();
+    for (size_t i = 0; i < TCP_CONNECTIONS; i++) {
+        struct tcp_connection *c = &tcp_table[i];
+        if (!c->used) {
+            continue;
+        }
+        if ((c->state == TCP_TIME_WAIT
+             || (c->state == TCP_FIN_WAIT_2 && c->detached))
+            && now >= c->time_wait_until) {
+            c->state = TCP_CLOSED;
+            if (c->detached) {
+                tcp_free(c);
+            }
+            continue;
+        }
+        if (c->retransmit_at == 0 || now < c->retransmit_at) {
+            continue;
+        }
+        c->retransmit_at = 0;
+        if (++c->retries > TCP_RETRIES) {
+            c->failed = true;
+            c->state = TCP_CLOSED;
+            if (c->detached) {
+                tcp_free(c);
+            }
+            continue;
+        }
+        c->rto = c->rto * 2 > TCP_RTO_MAX ? TCP_RTO_MAX : c->rto * 2;
+        if (c->state == TCP_SYN_SENT) {
+            tcp_segment(c, c->iss, TCP_SYN, NULL, 0);
+            tcp_arm(c);
+            continue;
+        }
+        /* Go back to the oldest unacknowledged byte. */
+        c->snd_nxt = c->snd_una;
+        c->fin_sent = false;
+        tcp_push(c, true);
+        tcp_arm(c);
+    }
+}
+
+int net_tcp_connect(const uint8_t ip[4], uint16_t port) {
+    if (!configured) {
+        return -1;
+    }
+    for (int i = 0; i < TCP_CONNECTIONS; i++) {
+        struct tcp_connection *c = &tcp_table[i];
+        if (c->used) {
+            continue;
+        }
+        zero(c, sizeof(*c) - TCP_SEND_CAPACITY - TCP_RECEIVE_CAPACITY);
+        c->used = true;
+        copy(c->remote_ip, ip, 4);
+        c->remote_port = port;
+        if (tcp_next_port < 49152) {
+            tcp_next_port = (uint16_t)(49152 + random32() % 8192);
+        }
+        c->local_port = tcp_next_port++;
+        c->iss = random32();
+        c->snd_una = c->iss;
+        c->snd_nxt = c->iss + 1;
+        c->mss = 536;
+        c->rto = TCP_RTO_START;
+        c->state = TCP_SYN_SENT;
+        tcp_segment(c, c->iss, TCP_SYN, NULL, 0);
+        tcp_arm(c);
+        return i;
+    }
+    return -1;
+}
+
+static struct tcp_connection *tcp_handle(int handle) {
+    if (handle < 0 || handle >= TCP_CONNECTIONS || !tcp_table[handle].used
+        || tcp_table[handle].detached) {
+        return NULL;
+    }
+    return &tcp_table[handle];
+}
+
+enum net_tcp_status net_tcp_status(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL || c->failed) {
+        return NET_TCP_FAILED;
+    }
+    if (c->state == TCP_SYN_SENT) {
+        return NET_TCP_CONNECTING;
+    }
+    if (c->receive_length == 0 && (c->remote_closed || c->state == TCP_CLOSED)) {
+        return NET_TCP_FINISHED;
+    }
+    return NET_TCP_OPEN;
+}
+
+size_t net_tcp_send(int handle, const void *data, size_t length) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL || c->fin_queued || c->failed
+        || (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT
+            && c->state != TCP_SYN_SENT)) {
+        return 0;
+    }
+    size_t room = TCP_SEND_CAPACITY - c->send_length;
+    if (length > room) {
+        length = room;
+    }
+    copy(c->send_buffer + c->send_length, data, length);
+    c->send_length += length;
+    tcp_push(c, false);
+    return length;
+}
+
+size_t net_tcp_receive(int handle, void *buffer, size_t capacity) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL) {
+        return 0;
+    }
+    size_t length = c->receive_length < capacity ? c->receive_length
+                                                 : capacity;
+    uint8_t *out = buffer;
+    for (size_t i = 0; i < length; i++) {
+        out[i] = c->receive_buffer[(c->receive_start + i)
+                                   % TCP_RECEIVE_CAPACITY];
+    }
+    c->receive_start = (c->receive_start + length) % TCP_RECEIVE_CAPACITY;
+    c->receive_length -= length;
+    /* Tell the peer when a nearly closed window has opened again. */
+    if (length != 0 && c->advertised < c->mss
+        && tcp_window(c) >= c->mss && !c->remote_closed
+        && c->state != TCP_CLOSED) {
+        tcp_segment(c, c->snd_nxt, TCP_ACK, NULL, 0);
+    }
+    return length;
+}
+
+void net_tcp_close(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL) {
+        return;
+    }
+    c->detached = true;
+    c->receive_length = 0;
+    if (c->state == TCP_SYN_SENT || c->state == TCP_CLOSED || c->failed) {
+        if (c->state == TCP_SYN_SENT) {
+            tcp_segment(c, c->snd_nxt, TCP_RST, NULL, 0);
+        }
+        tcp_free(c);
+        return;
+    }
+    c->fin_queued = true;
+    tcp_push(c, false);
+}
+
 /* --------------------------------------------------------------- ICMP */
 
 #define PING_ID 0x4f50
@@ -896,6 +1447,7 @@ enum session_kind {
     SESSION_NONE,
     SESSION_PING,
     SESSION_LOOKUP,
+    SESSION_HTTP,
 };
 
 static enum session_kind session;
@@ -909,7 +1461,30 @@ static bool ping_waiting;
 static unsigned ping_received;
 static uint64_t ping_total_us;
 
+/* HTTP test fetch (SESSION_HTTP). */
+#define HTTP_PATH_CAPACITY 128
+#define HTTP_BODY_LINES 12
+#define HTTP_TIMEOUT_TICKS (20 * TICKS_PER_SECOND)
+
+static char http_path[HTTP_PATH_CAPACITY];
+static int http_handle = -1;
+static bool http_requested;
+static bool http_in_body;
+static char http_line[LINE_CAPACITY];
+static size_t http_line_length;
+static bool http_line_cut;
+static uint8_t http_chunk[512];
+static size_t http_chunk_at;
+static size_t http_chunk_length;
+static unsigned http_body_lines;
+static uint64_t http_body_bytes;
+static uint64_t http_started;
+
 static void session_end(void) {
+    if (http_handle >= 0) {
+        net_tcp_close(http_handle);
+        http_handle = -1;
+    }
     session = SESSION_NONE;
     dns_active = false;
 }
@@ -1039,6 +1614,43 @@ bool net_lookup_start(const char *host, size_t length) {
     return session_begin(SESSION_LOOKUP, host, length);
 }
 
+bool net_http_start(const char *text, size_t length) {
+    /* [http://]host[/path] */
+    if (length >= 7 && same(text, "http://", 7)) {
+        text += 7;
+        length -= 7;
+    }
+    size_t host_length = 0;
+    while (host_length < length && text[host_length] != '/'
+           && text[host_length] != ' ') {
+        host_length++;
+    }
+    size_t path_length = length - host_length;
+    const char *path = text + host_length;
+    while (path_length != 0 && *path == ' ') {
+        path++;
+        path_length--;
+    }
+    if (path_length >= HTTP_PATH_CAPACITY || (path_length != 0 && *path != '/')) {
+        output("Usage: http HOST[/PATH]");
+        return false;
+    }
+    http_path[0] = '/';
+    http_path[1] = '\0';
+    if (path_length != 0) {
+        copy(http_path, path, path_length);
+        http_path[path_length] = '\0';
+    }
+    http_requested = false;
+    http_in_body = false;
+    http_line_length = 0;
+    http_chunk_at = 0;
+    http_chunk_length = 0;
+    http_body_lines = 0;
+    http_body_bytes = 0;
+    return session_begin(SESSION_HTTP, text, host_length);
+}
+
 bool net_session_active(void) {
     return session != SESSION_NONE;
 }
@@ -1048,6 +1660,110 @@ void net_session_stop(void) {
         ping_summary();
     }
     session_end();
+}
+
+/* Ends the current header or body line. */
+static void http_line_end(void) {
+    if (http_line_length != 0 && http_line[http_line_length - 1] == '\r') {
+        http_line_length--;
+    }
+    http_line[http_line_length] = '\0';
+    if (!http_in_body) {
+        if (http_line_length == 0) {
+            http_in_body = true;
+        } else {
+            output(http_line);
+        }
+    } else {
+        if (http_body_lines == 0) {
+            output("--- body ---");
+        }
+        if (http_body_lines < HTTP_BODY_LINES) {
+            output(http_line);
+        }
+        http_body_lines++;
+    }
+    http_line_length = 0;
+    http_line_cut = false;
+}
+
+static void http_poll(void) {
+    char line[LINE_CAPACITY];
+    if (http_handle < 0) {
+        size_t used = append(line, sizeof(line), 0, "Connecting to ");
+        used = net_format_ipv4(line, sizeof(line), used, ping_target);
+        append(line, sizeof(line), used, " port 80...");
+        output(line);
+        http_handle = net_tcp_connect(ping_target, 80);
+        http_started = timer_ticks();
+        if (http_handle < 0) {
+            output("No free connection.");
+            session_end();
+        }
+        return;
+    }
+    enum net_tcp_status status = net_tcp_status(http_handle);
+    if (status == NET_TCP_FAILED) {
+        output(http_requested ? "Connection lost." : "Cannot connect.");
+        session_end();
+        return;
+    }
+    if (status == NET_TCP_CONNECTING) {
+        if (timer_ticks() - http_started > HTTP_TIMEOUT_TICKS) {
+            output("Connection timed out.");
+            session_end();
+        }
+        return;
+    }
+    if (!http_requested) {
+        char request[2 * DNS_NAME_CAPACITY + HTTP_PATH_CAPACITY + 64];
+        size_t used = append(request, sizeof(request), 0, "GET ");
+        used = append(request, sizeof(request), used, http_path);
+        used = append(request, sizeof(request), used,
+                      " HTTP/1.0\r\nHost: ");
+        used = append(request, sizeof(request), used, session_host);
+        used = append(request, sizeof(request), used,
+                      "\r\nUser-Agent: OPOS\r\nConnection: close\r\n\r\n");
+        (void)net_tcp_send(http_handle, request, used);
+        http_requested = true;
+        output("Connected; request sent.");
+        return;
+    }
+    /* Stop while the output queue is nearly full; the rest of the chunk
+       waits for the next tick. */
+    while (line_count < LINE_COUNT - 1) {
+        if (http_chunk_at == http_chunk_length) {
+            http_chunk_at = 0;
+            http_chunk_length = net_tcp_receive(http_handle, http_chunk,
+                                                sizeof(http_chunk));
+            if (http_chunk_length == 0) {
+                break;
+            }
+        }
+        char c = (char)http_chunk[http_chunk_at++];
+        if (http_in_body) {
+            http_body_bytes++;
+        }
+        if (c == '\n') {
+            http_line_end();
+        } else if (http_line_length + 1 < sizeof(http_line)) {
+            http_line[http_line_length++] = c >= ' ' || c == '\r' ? c : '?';
+        } else {
+            http_line_cut = true;
+        }
+    }
+    if (status == NET_TCP_FINISHED && http_chunk_at == http_chunk_length) {
+        if (http_line_length != 0) {
+            http_line_end();
+        }
+        size_t used = append(line, sizeof(line), 0, "Done: ");
+        used = append_number(line, sizeof(line), used, http_body_bytes);
+        used = append(line, sizeof(line), used, " bytes of body, ");
+        used = append_number(line, sizeof(line), used, http_body_lines);
+        append(line, sizeof(line), used, " lines.");
+        output(line);
+        session_end();
+    }
 }
 
 static void session_poll(void) {
@@ -1084,6 +1800,10 @@ static void session_poll(void) {
         net_format_ipv4(line, sizeof(line), used, ping_target);
         output(line);
         session_end();
+        return;
+    }
+    if (session == SESSION_HTTP) {
+        http_poll();
         return;
     }
     uint64_t now = timer_ticks();
@@ -1139,6 +1859,7 @@ void net_poll(void) {
         }
     }
     arp_poll();
+    tcp_poll();
     dhcp_poll();
     dns_poll();
     session_poll();

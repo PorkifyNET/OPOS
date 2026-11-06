@@ -534,7 +534,7 @@ static bool terminal_execute(void) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
         terminal_print("PS KILL PID  SHELL REBOOT SHUTDOWN EXIT");
         terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
-        terminal_print("NET  DHCP  PING HOST  LOOKUP NAME");
+        terminal_print("NET  DHCP  PING HOST  LOOKUP NAME  HTTP HOST[/PATH]");
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
     } else if (text_equals(terminal_line, terminal_length, "clear")) {
@@ -597,6 +597,9 @@ static bool terminal_execute(void) {
         terminal_print("Asking the DHCP server for an address...");
     } else if (terminal_length > 5 && text_equals(terminal_line, 5, "ping ")) {
         terminal_net_session = net_ping_start(terminal_line + 5,
+                                              terminal_length - 5);
+    } else if (terminal_length > 5 && text_equals(terminal_line, 5, "http ")) {
+        terminal_net_session = net_http_start(terminal_line + 5,
                                               terminal_length - 5);
     } else if (terminal_length > 7
                && text_equals(terminal_line, 7, "lookup ")) {

@@ -51,9 +51,29 @@ size_t net_format_mac(char *text, size_t capacity, size_t length,
  */
 bool net_ping_start(const char *host, size_t length);
 bool net_lookup_start(const char *host, size_t length);
+/* Fetches http://HOST/PATH (text is "[http://]host[/path]") and prints the
+   headers and the start of the body. */
+bool net_http_start(const char *text, size_t length);
 bool net_session_active(void);
 void net_session_stop(void);
 /* Takes the next output line (without newline); false when none. */
 bool net_take_line(char *line, size_t capacity);
+
+/*
+ * TCP client connections (up to 4). Handles are small integers. Send and
+ * receive never block: they copy what fits / what has arrived.
+ */
+enum net_tcp_status {
+    NET_TCP_CONNECTING,
+    NET_TCP_OPEN,
+    NET_TCP_FINISHED, /* the peer closed and every byte has been read */
+    NET_TCP_FAILED,   /* refused, reset or timed out */
+};
+int net_tcp_connect(const uint8_t ip[4], uint16_t port);
+enum net_tcp_status net_tcp_status(int handle);
+size_t net_tcp_send(int handle, const void *data, size_t length);
+size_t net_tcp_receive(int handle, void *buffer, size_t capacity);
+/* Closes our side; the handle is invalid afterwards. */
+void net_tcp_close(int handle);
 
 #endif

@@ -737,6 +737,28 @@ static void collect_sheets(struct opos_html_node *node, struct css_sheet **chain
     }
 }
 
+/* The first enabled control with the autofocus attribute, or NULL. */
+static const struct opos_html_node *find_autofocus(
+    const struct opos_html_node *node) {
+    for (const struct opos_html_node *child = node->first_child; child != NULL;
+         child = child->next_sibling) {
+        if (child->type != HTML_NODE_ELEMENT) {
+            continue;
+        }
+        enum field_kind kind = form_kind(child);
+        if (kind != FIELD_NONE && kind != FIELD_HIDDEN
+            && opos_html_attribute(child, "autofocus") != NULL
+            && opos_html_attribute(child, "disabled") == NULL) {
+            return child;
+        }
+        const struct opos_html_node *found = find_autofocus(child);
+        if (found != NULL) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
 static void install_document(const char *html, size_t length,
                              const char *charset, const char *url) {
     struct opos_html_doc *doc = opos_html_parse(html, length, charset);
@@ -756,6 +778,7 @@ static void install_document(const char *html, size_t length,
     b.have_page = true;
     b.scroll = 0;
     clear_selection();
+    b.page.focus = find_autofocus(doc->body);
     relayout();
 }
 
@@ -816,7 +839,7 @@ static void progress(void *context, size_t received, size_t total) {
 }
 
 /* Fetches and shows a URL. */
-static void load(const char *url) {
+static void load_request(const char *url, const char *post, size_t post_length) {
     char text[OPOS_HTTP_URL_MAX + 16];
     set_address(url);
     snprintf(text, sizeof(text), "Loading %s", url);
@@ -825,7 +848,10 @@ static void load(const char *url) {
 
     struct opos_http_response response;
     opos_http_set_progress(progress, NULL);
-    long error = opos_http_get(url, MAX_PAGE_BYTES, &response);
+    long error = post != NULL
+        ? opos_http_post(url, "application/x-www-form-urlencoded", post,
+                         post_length, MAX_PAGE_BYTES, &response)
+        : opos_http_get(url, MAX_PAGE_BYTES, &response);
     opos_http_set_progress(NULL, NULL);
     if (error != 0) {
         char detail[320];
@@ -905,7 +931,8 @@ static void load(const char *url) {
     opos_http_free(&response);
 }
 
-static void navigate(const char *url, bool record) {
+static void navigate_request(const char *url, bool record, const char *post,
+                             size_t post_length) {
     if (record) {
         if (b.history_position + 1 < b.history_count) {
             b.history_count = b.history_position + 1;
@@ -918,13 +945,288 @@ static void navigate(const char *url, bool record) {
         snprintf(b.history[b.history_count], sizeof(b.history[0]), "%s", url);
         b.history_position = b.history_count++;
     }
-    load(url);
+    load_request(url, post, post_length);
     if (record && b.history_position >= 0) {
         /* Remember where redirects ended up. */
         snprintf(b.history[b.history_position], sizeof(b.history[0]), "%s",
                  b.url);
     }
     b.dirty = true;
+}
+
+static void load(const char *url) { load_request(url, NULL, 0); }
+
+static void navigate(const char *url, bool record) {
+    navigate_request(url, record, NULL, 0);
+}
+
+/* ----------------------------------------------------------------- forms */
+
+/* Lays the page out again after a form control changed, keeping the
+   scroll position. */
+static void refresh_controls(void) {
+    int keep = b.scroll;
+    relayout();
+    b.scroll = keep;
+    clamp_scroll();
+    b.dirty = true;
+}
+
+static void set_focus(const struct opos_html_node *node) {
+    if (b.have_page && b.page.focus != node) {
+        b.page.focus = node;
+        refresh_controls();
+    }
+}
+
+/* Submits the form that holds control; submitter is the button pressed
+   (or NULL when Enter was pressed in a text field). */
+static void submit_form(const struct opos_html_node *control,
+                        const struct opos_html_node *submitter) {
+    const struct opos_html_node *form = form_of(control);
+    if (form == NULL) {
+        return;
+    }
+    size_t length = 0;
+    char *data = form_encode(&b.page, form, submitter, &length);
+    if (data == NULL) {
+        set_status("Out of memory");
+        return;
+    }
+    const char *action = opos_html_attribute(form, "action");
+    const char *method = opos_html_attribute(form, "method");
+    if (submitter != NULL) {
+        /* <button formaction=...> and formmethod override the form's. */
+        const char *override = opos_html_attribute(submitter, "formaction");
+        if (override != NULL) {
+            action = override;
+        }
+        override = opos_html_attribute(submitter, "formmethod");
+        if (override != NULL) {
+            method = override;
+        }
+    }
+    char url[OPOS_HTTP_URL_MAX];
+    if (action == NULL || action[0] == '\0') {
+        snprintf(url, sizeof(url), "%s", b.page.url);
+    } else if (!opos_url_resolve(b.page.url, action, url, sizeof(url))) {
+        free(data);
+        set_status("The form's address is not valid");
+        return;
+    }
+    if (starts_with_ci(url, "javascript:")) {
+        free(data);
+        set_status("This form needs JavaScript");
+        return;
+    }
+    bool post = method != NULL && starts_with_ci(method, "post");
+    if (post) {
+        navigate_request(url, true, data, length);
+    } else {
+        /* GET: the data replaces the query of the action address. */
+        url[strcspn(url, "?#")] = '\0';
+        size_t base = strlen(url);
+        if (base + 1 + length >= sizeof(url)) {
+            set_status("The form's data is too long for an address");
+        } else {
+            url[base] = '?';
+            memcpy(url + base + 1, data, length + 1);
+            navigate(url, true);
+        }
+    }
+    free(data);
+}
+
+/* A click on a form control. */
+static void click_control(const struct opos_html_node *node) {
+    if (opos_html_attribute(node, "disabled") != NULL) {
+        return;
+    }
+    struct form_field *field = form_field(&b.page, node);
+    if (field == NULL) {
+        return;
+    }
+    switch (field->kind) {
+    case FIELD_TEXT: case FIELD_PASSWORD: case FIELD_TEXTAREA:
+        if (opos_html_attribute(node, "readonly") == NULL) {
+            set_focus(node);
+        }
+        return;
+    case FIELD_CHECKBOX:
+        field->checked = !field->checked;
+        break;
+    case FIELD_RADIO:
+        form_check_radio(&b.page, node);
+        break;
+    case FIELD_SELECT: {
+        /* No drop-down list yet: each click picks the next option. */
+        int count = form_option_count(node);
+        if (count > 0) {
+            field->option = (field->option + 1) % count;
+        }
+        break;
+    }
+    case FIELD_SUBMIT:
+        b.page.focus = NULL;
+        submit_form(node, node);
+        return;
+    default:
+        set_focus(node);
+        return;
+    }
+    b.page.focus = node;
+    refresh_controls();
+}
+
+/* Moves the focus to the next (step 1) or previous (-1) control shown on
+   the page, in layout order. */
+static void focus_step(int step) {
+    const struct opos_html_node *order[512];
+    size_t count = 0;
+    for (size_t i = 0; i < b.page.item_count && count < 512; i++) {
+        const struct opos_html_node *node = b.page.items[i].control;
+        if (node != NULL && opos_html_attribute(node, "disabled") == NULL) {
+            order[count++] = node;
+        }
+    }
+    if (count == 0) {
+        return;
+    }
+    size_t at = count;
+    for (size_t i = 0; i < count; i++) {
+        if (order[i] == b.page.focus) {
+            at = i;
+            break;
+        }
+    }
+    size_t next;
+    if (at == count) {
+        next = step > 0 ? 0 : count - 1;
+    } else {
+        next = (at + count + (size_t)(step > 0 ? 1 : count - 1)) % count;
+    }
+    set_focus(order[next]);
+    /* Bring it into view. */
+    for (size_t i = 0; i < b.page.item_count; i++) {
+        const struct display_item *item = &b.page.items[i];
+        if (item->control == order[next]) {
+            int top = item->y + MARGIN;
+            if (top < b.scroll
+                || top + item->height > b.scroll + viewport_height()) {
+                b.scroll = top - viewport_height() / 3;
+                clamp_scroll();
+            }
+            break;
+        }
+    }
+}
+
+/* Keys while a text field has the focus. Returns false for keys the page
+   should handle instead (scrolling). */
+static bool field_key(uint32_t key, bool ctrl, bool shift) {
+    const struct opos_html_node *node = b.page.focus;
+    struct form_field *field = form_field(&b.page, node);
+    if (field == NULL) {
+        return false;
+    }
+    if (key == OPOS_KEY_ESCAPE) {
+        set_focus(NULL);
+        return true;
+    }
+    if (key == '\t') {
+        focus_step(shift ? -1 : 1);
+        return true;
+    }
+    if (field->kind != FIELD_TEXT && field->kind != FIELD_PASSWORD
+        && field->kind != FIELD_TEXTAREA) {
+        /* Buttons, boxes and lists: Space presses, Enter submits. */
+        if (key == ' ' || (key == '\n' && field->kind == FIELD_SUBMIT)) {
+            click_control(node);
+            return true;
+        }
+        if (key == '\n') {
+            submit_form(node, NULL);
+            return true;
+        }
+        return false;
+    }
+    if (key == '\n' && field->kind != FIELD_TEXTAREA) {
+        /* Enter in a text field submits its form. */
+        submit_form(node, NULL);
+        return true;
+    }
+    char *value = field->value;
+    size_t length = field->length;
+    char *grown = NULL;
+    if (key == '\b') {
+        if (length == 0) {
+            return true;
+        }
+        do {
+            length--;
+        } while (length > 0 && (value[length] & 0xc0) == 0x80);
+        field->length = length;
+        value[length] = '\0';
+    } else if (ctrl && (key == 'v' || key == 'V')) {
+        char pasted[4096];
+        long got = opos_clipboard_get(pasted, sizeof(pasted));
+        if (got <= 0) {
+            return true;
+        }
+        if (got > (long)sizeof(pasted)) {
+            got = sizeof(pasted);
+        }
+        grown = malloc(length + (size_t)got + 1);
+        if (grown == NULL) {
+            return true;
+        }
+        memcpy(grown, value, length);
+        size_t used = length;
+        for (long i = 0; i < got; i++) {
+            char ch = pasted[i];
+            if (ch == '\r') {
+                continue;
+            }
+            if (ch == '\n' && field->kind != FIELD_TEXTAREA) {
+                ch = ' ';
+            }
+            if ((unsigned char)ch >= 32 || ch == '\n') {
+                grown[used++] = ch;
+            }
+        }
+        if (!field_set(field, grown, used)) {
+            free(grown);
+            return true;
+        }
+        free(grown);
+    } else if (ctrl && (key == 'c' || key == 'C')) {
+        if (field->kind != FIELD_PASSWORD) {
+            opos_clipboard_set(field->value, field->length);
+        }
+        return true;
+    } else if ((key >= 32 && key < 127 && !ctrl) || key == '\n') {
+        const char *max = opos_html_attribute(node, "maxlength");
+        if (max != NULL && (long)field->length >= strtol(max, NULL, 10)
+            && strtol(max, NULL, 10) >= 0) {
+            return true;
+        }
+        char ch = (char)key;
+        grown = malloc(length + 2);
+        if (grown == NULL) {
+            return true;
+        }
+        memcpy(grown, value, length);
+        grown[length] = ch;
+        if (!field_set(field, grown, length + 1)) {
+            free(grown);
+            return true;
+        }
+        free(grown);
+    } else {
+        return false;
+    }
+    refresh_controls();
+    return true;
 }
 
 static void go_history(int step) {
@@ -1064,6 +1366,13 @@ static void on_click(int x, int y) {
     if (!b.have_page || y >= TOOLBAR_HEIGHT + viewport_height()) {
         return;
     }
+    const struct opos_html_node *control = page_control_at(
+        &b.page, x - MARGIN, y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+    if (control != NULL) {
+        click_control(control);
+        return;
+    }
+    set_focus(NULL);
     /* Start a selection; a release without a drag follows a link. */
     b.selecting = true;
     b.pressed_moved = false;
@@ -1155,6 +1464,14 @@ static void on_key(uint32_t key, uint32_t modifiers) {
             find_from(selection_start(), 1);
         }
         b.dirty = true;
+        return;
+    }
+    if (b.have_page && b.page.focus != NULL && !b.editing && !b.finding
+        && field_key(key, ctrl, (modifiers & OPOS_MOD_SHIFT) != 0)) {
+        return;
+    }
+    if (key == '\t' && b.have_page && !b.editing && !b.finding) {
+        focus_step((modifiers & OPOS_MOD_SHIFT) != 0 ? -1 : 1);
         return;
     }
     if (ctrl && (key == 'c' || key == 'C') && !b.editing) {

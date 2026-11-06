@@ -444,8 +444,13 @@ void opos_http_free(struct opos_http_response *response) {
     response->length = 0;
 }
 
-long opos_http_get(const char *address, size_t max_body,
-                   struct opos_http_response *response) {
+/* One request, following redirects. post_type != NULL sends a POST with
+   post_body; a 301, 302 or 303 redirect turns it into a GET, a 307 or 308
+   redirect repeats the POST. */
+static long http_request(const char *address, const char *post_type,
+                         const void *post_body, size_t post_length,
+                         size_t max_body,
+                         struct opos_http_response *response) {
     memset(response, 0, sizeof(*response));
     if (strlen(address) >= OPOS_HTTP_URL_MAX) {
         return -OPOS_ENAMETOOLONG;
@@ -484,15 +489,26 @@ long opos_http_get(const char *address, size_t max_body,
             snprintf(host_header, sizeof(host_header), "%s:%u", url->host,
                      url->port);
         }
+        char post_headers[200] = "";
+        if (post_type != NULL) {
+            snprintf(post_headers, sizeof(post_headers),
+                     "Content-Type: %s\r\nContent-Length: %lu\r\n",
+                     post_type, (unsigned long)post_length);
+        }
         int length = snprintf(request, OPOS_HTTP_URL_MAX + 512,
-                              "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                              "%s %s HTTP/1.1\r\nHost: %s\r\n"
                               "User-Agent: " USER_AGENT "\r\n"
                               "Accept: text/html,*/*;q=0.8\r\n"
                               "Accept-Encoding: gzip\r\n"
+                              "%s"
                               "Connection: close\r\n\r\n",
-                              url->path, host_header);
+                              post_type != NULL ? "POST" : "GET", url->path,
+                              host_header, post_headers);
         if (length <= 0 || length >= OPOS_HTTP_URL_MAX + 512
-            || raw_write(c, request, (size_t)length) != length) {
+            || raw_write(c, request, (size_t)length) != length
+            || (post_type != NULL && post_length > 0
+                && raw_write(c, post_body, post_length)
+                       != (long)post_length)) {
             connection_close(c);
             result = -OPOS_EIO;
             goto done;
@@ -548,6 +564,9 @@ long opos_http_get(const char *address, size_t max_body,
             && redirects < OPOS_HTTP_MAX_REDIRECTS) {
             connection_close(c);
             strcpy(location, next);
+            if (status != 307 && status != 308) {
+                post_type = NULL;
+            }
             continue;
         }
         if (content_length > 0 && (unsigned long long)content_length > max_body
@@ -597,4 +616,15 @@ done:
     free(request);
     free(url);
     return result;
+}
+
+long opos_http_get(const char *url, size_t max_body,
+                   struct opos_http_response *response) {
+    return http_request(url, NULL, NULL, 0, max_body, response);
+}
+
+long opos_http_post(const char *url, const char *content_type,
+                    const void *body, size_t length, size_t max_body,
+                    struct opos_http_response *response) {
+    return http_request(url, content_type, body, length, max_body, response);
 }

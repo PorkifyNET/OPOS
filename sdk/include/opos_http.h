@@ -41,6 +41,13 @@ struct opos_http_response {
 long opos_http_get(const char *url, size_t max_body,
                    struct opos_http_response *response);
 
+/* Sends body with a POST request (content_type such as
+   "application/x-www-form-urlencoded") and reads the response like
+   opos_http_get. A 301, 302 or 303 redirect is followed with a GET. */
+long opos_http_post(const char *url, const char *content_type,
+                    const void *body, size_t length, size_t max_body,
+                    struct opos_http_response *response);
+
 void opos_http_free(struct opos_http_response *response);
 
 /* Optional progress report while the body arrives: bytes so far and the

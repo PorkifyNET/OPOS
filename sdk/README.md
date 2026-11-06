@@ -137,6 +137,12 @@ into programs that use it; about 120 KiB). Certificates are checked
 against `/etc/ssl/certs/ca-certificates.crt`, the host name and the clock.
 The full BearSSL API is available through `<bearssl.h>` too.
 
+HTTP: `opos_http.h` has `opos_http_get(url, max_body, &response)` and
+`opos_http_post(url, content_type, body, length, max_body, &response)`.
+They speak HTTP/1.1 over plain TCP or TLS, follow redirects (a POST
+redirected with 301, 302 or 303 continues as a GET), and decode chunked and
+gzip bodies. `opos_url_resolve` resolves relative links.
+
 Images: `opos_image.h` decodes PNG (every colour type and bit depth,
 interlaced too), JPEG (baseline and progressive) and BMP. It is the same
 decoder the desktop uses (`lib/image.c` is generated from

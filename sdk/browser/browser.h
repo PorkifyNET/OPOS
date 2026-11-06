@@ -116,6 +116,24 @@ struct display_item {
     struct opos_html_node *link;
     /* image */
     struct image_ref *image;
+    /* the form control a control's background rectangle belongs to */
+    const struct opos_html_node *control;
+};
+
+enum field_kind {
+    FIELD_NONE, FIELD_TEXT, FIELD_PASSWORD, FIELD_CHECKBOX, FIELD_RADIO,
+    FIELD_SUBMIT, FIELD_BUTTON, FIELD_RESET, FIELD_HIDDEN, FIELD_TEXTAREA,
+    FIELD_SELECT
+};
+
+/* The current state of one form control. */
+struct form_field {
+    const struct opos_html_node *node;
+    enum field_kind kind;
+    char *value;               /* text fields; malloc'd, NUL-terminated */
+    size_t length;
+    bool checked;              /* checkboxes and radio buttons */
+    int option;                /* select: index of the chosen option */
 };
 
 /* An <img> of the page, loaded after the page is laid out. */
@@ -161,7 +179,28 @@ struct page {
     size_t image_capacity;
     void *arena;               /* layout scratch (styles) */
     struct css_sheet *sheets;  /* author style sheets, in order */
+    struct form_field *fields; /* form controls touched so far */
+    size_t field_count;
+    size_t field_capacity;
+    const struct opos_html_node *focus; /* the text field being typed in */
 };
+
+/* form.c */
+enum field_kind form_kind(const struct opos_html_node *node);
+/* The control's state, created from its attributes on first use; NULL for
+   elements that are not form controls (or without memory). */
+struct form_field *form_field(struct page *page,
+                              const struct opos_html_node *node);
+bool field_set(struct form_field *field, const char *text, size_t length);
+void form_fields_free(struct page *page);
+const struct opos_html_node *form_option(const struct opos_html_node *select,
+                                         int index);
+int form_option_count(const struct opos_html_node *select);
+const struct opos_html_node *form_of(const struct opos_html_node *node);
+void form_check_radio(struct page *page, const struct opos_html_node *radio);
+/* The form's data as application/x-www-form-urlencoded (malloc'd). */
+char *form_encode(struct page *page, const struct opos_html_node *form,
+                  const struct opos_html_node *submitter, size_t *length);
 
 /* Lays the document out for a viewport width. Rebuilds the display list. */
 void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
@@ -174,5 +213,9 @@ void page_destroy(struct page *page);
 
 /* The item (link or not) under a point in page coordinates, or NULL. */
 const struct display_item *page_item_at(const struct page *page, int x, int y);
+
+/* The form control under a point in page coordinates, or NULL. */
+const struct opos_html_node *page_control_at(const struct page *page, int x,
+                                             int y);
 
 #endif

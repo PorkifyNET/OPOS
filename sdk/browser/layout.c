@@ -66,6 +66,8 @@ struct inline_item {
     enum box_kind box;
     bool checked;
     bool placeholder;
+    bool focused;
+    const struct opos_html_node *node;
 };
 
 struct placed {
@@ -446,99 +448,123 @@ static void append_text(const struct opos_html_node *node, char *out,
     out[*used] = '\0';
 }
 
+/* Number of UTF-8 characters in text. */
+static size_t utf8_count(const char *text, size_t length) {
+    size_t count = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (((unsigned char)text[i] & 0xc0) != 0x80) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static void add_control(struct ctx *c, const struct opos_html_node *node,
                         const struct style *style) {
-    struct inline_item *item = NULL;
-    char *label = NULL;
-    size_t length = 0;
-    int line = 0;
+    enum field_kind kind = form_kind(node);
+    if (kind == FIELD_NONE || kind == FIELD_HIDDEN) {
+        return;
+    }
+    struct form_field *field = form_field(c->page, node);
+    bool focused = c->page->focus == node;
     int ascent, descent;
     line_metrics(c, style, &ascent, &descent);
-    line = ascent + descent;
+    int line = ascent + descent;
     enum box_kind box = BOX_TEXT;
     int width = 0;
     int height = line + 8;
-    bool checked = opos_html_attribute(node, "checked") != NULL;
+    bool checked = field != NULL ? field->checked
+                 : opos_html_attribute(node, "checked") != NULL;
     bool placeholder = false;
     const char *text = "";
+    char *owned = NULL;   /* text when it had to be built (malloc'd) */
     char buffer[200];
     buffer[0] = '\0';
 
-    switch (node->tag) {
-    case HTML_TAG_INPUT: {
-        const char *type = opos_html_attribute(node, "type");
-        const char *value = opos_html_attribute(node, "value");
-        char kind[16] = "text";
-        if (type != NULL) {
-            size_t i = 0;
-            for (; type[i] != '\0' && i + 1 < sizeof(kind); i++) {
-                kind[i] = (char)tolower((unsigned char)type[i]);
-            }
-            kind[i] = '\0';
-        }
-        if (strcmp(kind, "hidden") == 0) {
-            return;
-        }
-        if (strcmp(kind, "checkbox") == 0 || strcmp(kind, "radio") == 0) {
-            box = kind[0] == 'c' ? BOX_CHECKBOX : BOX_RADIO;
-            width = height = 14;
-        } else if (strcmp(kind, "submit") == 0 || strcmp(kind, "button") == 0
-                   || strcmp(kind, "reset") == 0 || strcmp(kind, "image") == 0) {
-            box = BOX_BUTTON;
+    switch (kind) {
+    case FIELD_CHECKBOX:
+    case FIELD_RADIO:
+        box = kind == FIELD_CHECKBOX ? BOX_CHECKBOX : BOX_RADIO;
+        width = height = 14;
+        break;
+    case FIELD_SUBMIT:
+    case FIELD_BUTTON:
+    case FIELD_RESET:
+        box = BOX_BUTTON;
+        if (node->tag == HTML_TAG_BUTTON) {
+            size_t used = 0;
+            append_text(node, buffer, sizeof(buffer), &used);
+            text = buffer;
+        } else {
+            const char *value = opos_html_attribute(node, "value");
+            const char *type = opos_html_attribute(node, "type");
             text = value != NULL && value[0] != '\0' ? value
-                 : strcmp(kind, "reset") == 0 ? "Reset"
-                 : strcmp(kind, "submit") == 0 ? "Submit" : "Button";
+                 : kind == FIELD_RESET ? "Reset"
+                 : kind == FIELD_SUBMIT ? "Submit"
+                 : type != NULL && strcmp(type, "file") == 0 ? "Choose file"
+                 : "Button";
+        }
+        break;
+    case FIELD_TEXT:
+    case FIELD_PASSWORD:
+    case FIELD_TEXTAREA: {
+        if (kind == FIELD_TEXTAREA) {
+            box = BOX_TEXTAREA;
+            int cols = attribute_size(node, "cols", 0);
+            int rows = attribute_size(node, "rows", 0);
+            width = (cols > 0 ? cols : 20) * (style->font_size / 2 + 1) + 12;
+            height = (rows > 0 ? rows : 2) * line + 8;
+            if (width > 600) {
+                width = 600;
+            }
+            if (height > 400) {
+                height = 400;
+            }
         } else {
             int size = attribute_size(node, "size", 0);
             width = (size > 0 ? size : 20) * (style->font_size / 2 + 1) + 12;
             if (width > 480) {
                 width = 480;
             }
-            text = value != NULL ? value : "";
-            if (text[0] == '\0') {
-                const char *hint = opos_html_attribute(node, "placeholder");
-                if (hint != NULL) {
-                    text = hint;
-                    placeholder = true;
-                }
+        }
+        if (style->width > 0) {
+            width = style->width;
+        } else if (style->width_pct > 0 && !c->measuring) {
+            width = c->bwidth * style->width_pct / 100;
+        }
+        if (width < 40) {
+            width = 40;
+        }
+        if (width > c->bwidth && c->bwidth > 40 && !c->measuring) {
+            width = c->bwidth;
+        }
+        text = field != NULL ? field->value
+             : opos_html_attribute(node, "value") != NULL
+                 ? opos_html_attribute(node, "value") : "";
+        if (text[0] == '\0') {
+            const char *hint = opos_html_attribute(node, "placeholder");
+            if (hint != NULL) {
+                text = hint;
+                placeholder = true;
             }
-            if (strcmp(kind, "password") == 0 && !placeholder) {
-                size_t n = strlen(text);
-                if (n >= sizeof(buffer)) {
-                    n = sizeof(buffer) - 1;
-                }
-                memset(buffer, '*', n);
-                buffer[n] = '\0';
-                text = buffer;
+        }
+        if (kind == FIELD_PASSWORD && !placeholder) {
+            size_t n = utf8_count(text, strlen(text));
+            owned = malloc(n + 1);
+            if (owned == NULL) {
+                c->failed = true;
+                return;
             }
+            memset(owned, '*', n);
+            owned[n] = '\0';
+            text = owned;
         }
         break;
     }
-    case HTML_TAG_BUTTON: {
-        box = BOX_BUTTON;
-        size_t used = 0;
-        append_text(node, buffer, sizeof(buffer), &used);
-        text = buffer;
-        break;
-    }
-    case HTML_TAG_TEXTAREA: {
-        box = BOX_TEXTAREA;
-        int cols = attribute_size(node, "cols", 0);
-        int rows = attribute_size(node, "rows", 0);
-        width = (cols > 0 ? cols : 20) * (style->font_size / 2 + 1) + 12;
-        height = (rows > 0 ? rows : 2) * line + 8;
-        if (width > 600) {
-            width = 600;
-        }
-        if (height > 400) {
-            height = 400;
-        }
-        break;
-    }
-    case HTML_TAG_SELECT: {
+    case FIELD_SELECT: {
         box = BOX_SELECT;
-        const struct opos_html_node *option = opos_html_find(
-            (struct opos_html_node *)node, HTML_TAG_OPTION);
+        const struct opos_html_node *option = form_option(
+            node, field != NULL ? field->option : 0);
         if (option != NULL) {
             size_t used = 0;
             append_text(option, buffer, sizeof(buffer), &used);
@@ -549,29 +575,39 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
     default:
         return;
     }
-    if (box == BOX_TEXT || box == BOX_BUTTON || box == BOX_SELECT) {
-        /* Collapse white space in the label. */
+    size_t length = 0;
+    char *label = NULL;
+    if (box != BOX_CHECKBOX && box != BOX_RADIO) {
         length = strlen(text);
         label = arena_alloc(c->page, length + 1);
         if (label == NULL) {
+            free(owned);
             c->failed = true;
             return;
         }
         size_t used = 0;
-        bool space = true;
-        for (size_t i = 0; i < length; i++) {
-            if (is_ws(text[i])) {
-                if (!space) {
-                    label[used++] = ' ';
-                }
-                space = true;
-            } else {
-                label[used++] = text[i];
-                space = false;
+        if (box == BOX_TEXT || box == BOX_TEXTAREA) {
+            /* Typed text keeps its spaces; line breaks show as spaces. */
+            for (size_t i = 0; i < length; i++) {
+                label[used++] = is_ws(text[i]) ? ' ' : text[i];
             }
-        }
-        while (used > 0 && label[used - 1] == ' ') {
-            used--;
+        } else {
+            /* Collapse white space in button and option labels. */
+            bool space = true;
+            for (size_t i = 0; i < length; i++) {
+                if (is_ws(text[i])) {
+                    if (!space) {
+                        label[used++] = ' ';
+                    }
+                    space = true;
+                } else {
+                    label[used++] = text[i];
+                    space = false;
+                }
+            }
+            while (used > 0 && label[used - 1] == ' ') {
+                used--;
+            }
         }
         label[used] = '\0';
         length = used;
@@ -582,9 +618,28 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
             if (width < 60) {
                 width = 60;
             }
+        } else if (!c->measuring) {
+            /* Fit the text in the box: the end of it while typing,
+               otherwise the start. */
+            int room = width - 14;
+            while (length > 0 && text_width(c, style, label, length) > room) {
+                if (focused && !placeholder) {
+                    size_t skip = 1;
+                    while (skip < length && (label[skip] & 0xc0) == 0x80) {
+                        skip++;
+                    }
+                    label += skip;
+                    length -= skip;
+                } else {
+                    do {
+                        length--;
+                    } while (length > 0 && (label[length] & 0xc0) == 0x80);
+                }
+            }
         }
     }
-    item = inline_push(c);
+    free(owned);
+    struct inline_item *item = inline_push(c);
     if (item == NULL) {
         return;
     }
@@ -597,6 +652,8 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
     item->box = box;
     item->checked = checked;
     item->placeholder = placeholder;
+    item->focused = focused;
+    item->node = node;
 }
 
 /* -------------------------------------------------------------- line flush */
@@ -802,12 +859,22 @@ static void emit_line(struct ctx *c, size_t count, int used,
                                                  item->width, item->height);
             if (fill != NULL) {
                 fill->colour = field ? 0x00ffffff : 0x00e9e9ed;
+                fill->control = item->node;
             }
             struct display_item *outline = add_item(c, ITEM_OUTLINE, x,
                                                     box_top, item->width,
                                                     item->height);
             if (outline != NULL) {
-                outline->colour = 0x00767676;
+                outline->colour = item->focused ? 0x000645ad : 0x00767676;
+            }
+            if (item->focused) {
+                struct display_item *ring = add_item(c, ITEM_OUTLINE, x - 1,
+                                                     box_top - 1,
+                                                     item->width + 2,
+                                                     item->height + 2);
+                if (ring != NULL) {
+                    ring->colour = 0x000645ad;
+                }
             }
             if (item->box == BOX_CHECKBOX || item->box == BOX_RADIO) {
                 if (item->checked) {
@@ -839,6 +906,23 @@ static void emit_line(struct ctx *c, size_t count, int used,
                     label->baseline = ascent;
                     label->colour = item->placeholder ? 0x00757575
                                                       : style->colour;
+                }
+            }
+            if (item->focused
+                && (item->box == BOX_TEXT || item->box == BOX_TEXTAREA)) {
+                /* The caret, after the text (before a placeholder). */
+                int ascent, descent;
+                line_metrics(c, style, &ascent, &descent);
+                int caret_x = x + 6;
+                if (!item->placeholder && item->length > 0) {
+                    caret_x += text_width(c, style, item->text, item->length);
+                }
+                struct display_item *caret = add_item(
+                    c, ITEM_RECT, caret_x,
+                    box_top + (item->height - ascent - descent) / 2, 1,
+                    ascent + descent);
+                if (caret != NULL) {
+                    caret->colour = style->colour;
                 }
             }
             break;
@@ -2333,6 +2417,7 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
 }
 
 void page_destroy(struct page *page) {
+    form_fields_free(page);
     css_free(page->sheets);
     style_sheets = NULL;
     free_arena(page);
@@ -2354,6 +2439,19 @@ const struct display_item *page_item_at(const struct page *page, int x, int y) {
             && x >= item->x && x < item->x + item->width && y >= item->y
             && y < item->y + item->height) {
             return item;
+        }
+    }
+    return NULL;
+}
+
+const struct opos_html_node *page_control_at(const struct page *page, int x,
+                                             int y) {
+    for (size_t i = page->item_count; i > 0; i--) {
+        const struct display_item *item = &page->items[i - 1];
+        if (item->control != NULL && x >= item->x
+            && x < item->x + item->width && y >= item->y
+            && y < item->y + item->height) {
+            return item->control;
         }
     }
     return NULL;

@@ -1906,7 +1906,7 @@ void net_describe(void (*print)(const char *line)) {
     net_get_status(&status);
     char line[LINE_CAPACITY];
     if (!status.card) {
-        print("No supported network card (Intel e1000/e1000e or VMware vmxnet3).");
+        print("No supported network card (Intel e1000/e1000e, VMware vmxnet3 or AMD PCnet).");
         return;
     }
     static const char hex[] = "0123456789abcdef";

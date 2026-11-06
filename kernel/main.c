@@ -185,7 +185,31 @@ static void serial_write_character(char character) {
     }
 }
 
+/*
+ * The console's copy on serial is kept one line at a time and written at
+ * the newline, so Backspace edits the buffered line instead of sending
+ * "\b \b": a serial log read as a text file then shows the command as it
+ * was finally typed. Direct serial writes flush the pending line first.
+ */
+static char serial_line[256];
+static size_t serial_line_length;
+
+static void serial_line_flush(void) {
+    for (size_t i = 0; i < serial_line_length; i++) {
+        serial_write_character(serial_line[i]);
+    }
+    serial_line_length = 0;
+}
+
+static void serial_line_put(char character) {
+    if (serial_line_length == sizeof(serial_line)) {
+        serial_line_flush();
+    }
+    serial_line[serial_line_length++] = character;
+}
+
 static void serial_write_string(const char *string) {
+    serial_line_flush();
     while (*string != '\0') {
         if (*string == '\n') {
             serial_write_character('\r');
@@ -731,6 +755,7 @@ void console_write_string(const char *string) {
     while (*string != '\0') {
         char character = *string++;
         if (character == '\n') {
+            serial_line_flush();
             serial_write_character('\r');
             serial_write_character('\n');
             text_x = TEXT_MARGIN;
@@ -742,8 +767,9 @@ void console_write_string(const char *string) {
         uint64_t character_width = (FONT_WIDTH + 1) * GLYPH_SCALE;
         if (character == '\b') {
             if (text_x > TEXT_MARGIN) {
-                static const char erase_sequence[] = "\b \b";
-                serial_write_string(erase_sequence);
+                if (serial_line_length != 0) {
+                    serial_line_length--;
+                }
                 text_x -= character_width;
                 if (active_framebuffer != NULL
                     && text_y <= active_framebuffer->height - TEXT_LINE_HEIGHT) {
@@ -761,7 +787,7 @@ void console_write_string(const char *string) {
             continue;
         }
 
-        serial_write_character(character);
+        serial_line_put(character);
         if (active_framebuffer == NULL) {
             continue;
         }

@@ -11,6 +11,7 @@
 #include "permissions.h"
 #include "accounts.h"
 #include "scheduler.h"
+#include "net.h"
 #include "timer.h"
 #include "user.h"
 #include "vfs.h"
@@ -20,6 +21,12 @@
 #define USER_PIE_BASE 0x04000000ULL
 #define USER_STACK_ADDRESS 0x7ffff000ULL
 #define USER_STACK_TOP (USER_STACK_ADDRESS + PAGE_SIZE)
+/* The main thread's stack: USER_STACK_PAGES pages ending at
+   USER_STACK_TOP. The top page (at USER_STACK_ADDRESS) holds argv,
+   envp and the auxiliary vector. musl's resolver alone needs over 4 KiB. */
+#define USER_STACK_PAGES 32
+#define USER_STACK_BASE (USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE)
+#define USER_STACK_ARGUMENT_PAGE (USER_STACK_PAGES - 1)
 #define USER_AT_NULL 0
 #define USER_AT_PHDR 3
 #define USER_AT_PHENT 4
@@ -119,6 +126,9 @@
 #define LINUX_O_APPEND 1024
 #define LINUX_O_DIRECTORY 65536
 #define LINUX_O_CLOEXEC 524288
+#define LINUX_O_NOCTTY 0x100
+#define LINUX_O_NONBLOCK 0x800
+#define LINUX_O_LARGEFILE 0x8000 /* always on for 64-bit files */
 #define LINUX_MODE_DIRECTORY 0040000
 #define LINUX_MODE_CHARACTER 0020000
 #define LINUX_MODE_FIFO 0010000
@@ -210,6 +220,7 @@ enum user_open_file_kind {
     USER_OPEN_FILE_VFS,
     USER_OPEN_FILE_PIPE_READ,
     USER_OPEN_FILE_PIPE_WRITE,
+    USER_OPEN_FILE_SOCKET,
 };
 
 struct user_file_descriptor {
@@ -223,6 +234,18 @@ struct user_file_descriptor {
     size_t offset;
     vfs_object_handle object;
     uint8_t pipe_slot;
+    bool nonblocking;
+    /* Sockets: SOCK_STREAM or SOCK_DGRAM, enum user_socket_state, the
+       net.c handle (TCP connection, listener or UDP socket; -1 = none). */
+    uint8_t socket_type;
+    uint8_t socket_state;
+    bool socket_read_shut;
+    bool socket_write_shut;
+    int socket_handle;
+    uint16_t socket_port; /* bound TCP port before connect/listen */
+    int socket_error;     /* pending SO_ERROR (negative errno) */
+    uint8_t socket_peer_ip[4];
+    uint16_t socket_peer_port;
 };
 
 struct user_pipe {
@@ -306,7 +329,7 @@ struct user_process {
     size_t image_segment_count;
     uint64_t image_pages[ELF_MAX_SEGMENT_PAGES];
     size_t image_page_count;
-    uint64_t stack_page;
+    uint64_t stack_pages[USER_STACK_PAGES];
     size_t cwd_length;
     char cwd[USER_FILE_PATH_CAPACITY];
     struct user_descriptor descriptors[USER_DESCRIPTOR_CAPACITY];
@@ -709,7 +732,7 @@ static bool process_mmap_state_clean(const struct user_process *process) {
 
 static bool process_resource_state_clean(const struct user_process *process) {
     if (process == NULL || process->state == USER_PROCESS_RUNNING
-        || process->address_space != 0 || process->stack_page != 0
+        || process->address_space != 0 || process->stack_pages[USER_STACK_ARGUMENT_PAGE] != 0
         || process->heap_page_count != 0 || process->image_segment_count != 0
         || process->image_page_count != 0
         || !process_mmap_state_clean(process)) {
@@ -1004,6 +1027,18 @@ static void user_console_write(uint64_t file_descriptor, const char *data,
     }
 }
 
+static int64_t user_socket_send(struct user_process *process,
+                                uint64_t descriptor, uintptr_t buffer,
+                                size_t length, uint64_t flags,
+                                const uint8_t *to_ip, uint16_t to_port,
+                                bool kernel_buffer);
+static int64_t user_socket_receive(struct user_process *process,
+                                   uint64_t descriptor, uintptr_t buffer,
+                                   size_t length, uint64_t flags,
+                                   uint8_t from_ip[4], uint16_t *from_port,
+                                   bool kernel_buffer);
+static void user_socket_release(struct user_file_descriptor *file);
+
 static bool user_linux_writev(struct user_process *process,
                               struct linux_syscall_frame *frame) {
     if (process == NULL || frame->rdi >= USER_DESCRIPTOR_CAPACITY) {
@@ -1064,6 +1099,10 @@ static bool user_linux_writev(struct user_process *process,
     } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
         frame->rax = (uint64_t)user_pipe_write(file, buffer, total_length,
                                                false);
+    } else if (file->kind == USER_OPEN_FILE_SOCKET) {
+        frame->rax = (uint64_t)user_socket_send(
+            process, frame->rdi, (uintptr_t)buffer, total_length, 0, NULL, 0,
+            true);
     } else {
         if (file->append) {
             struct vfs_metadata metadata;
@@ -1246,6 +1285,10 @@ static bool user_close_open_file(struct user_file_descriptor *file) {
     if (file->kind == USER_OPEN_FILE_VFS) {
         return vfs_close_object(file->object);
     }
+    if (file->kind == USER_OPEN_FILE_SOCKET) {
+        user_socket_release(file);
+        return true;
+    }
     struct user_pipe *pipe = user_file_pipe(file);
     if (pipe == NULL) {
         return false;
@@ -1404,7 +1447,8 @@ static int64_t user_linux_open_file(struct user_process *process,
                                     uintptr_t path_address, uint64_t flags) {
     const uint64_t supported_flags = LINUX_O_ACCMODE | LINUX_O_CREAT
         | LINUX_O_EXCL | LINUX_O_TRUNC | LINUX_O_APPEND | LINUX_O_DIRECTORY
-        | LINUX_O_CLOEXEC;
+        | LINUX_O_CLOEXEC | LINUX_O_NOCTTY | LINUX_O_NONBLOCK
+        | LINUX_O_LARGEFILE;
     uint64_t access = flags & LINUX_O_ACCMODE;
     if (process == NULL || (flags & ~supported_flags) != 0
         || access == LINUX_O_ACCMODE
@@ -2027,6 +2071,17 @@ static int64_t user_linux_fstat(struct user_process *process,
         stat->block_size = USER_PIPE_BUFFER_CAPACITY;
         return 0;
     }
+    if (file->kind == USER_OPEN_FILE_SOCKET) {
+        for (size_t i = 0; i < sizeof(*stat); i++) {
+            ((uint8_t *)stat)[i] = 0;
+        }
+        stat->device = 3;
+        stat->inode = 300 + (uint64_t)(file - open_files);
+        stat->link_count = 1;
+        stat->mode = 0140000 | 0777; /* S_IFSOCK */
+        stat->block_size = 4096;
+        return 0;
+    }
     struct vfs_metadata metadata;
     if (!vfs_object_metadata(file->object, &metadata)) {
         return -5;
@@ -2338,7 +2393,7 @@ static void user_discard_cloned_process(struct user_process *process) {
                              process->image_page_count, 0);
     process->image_page_count = 0;
     process->image_segment_count = 0;
-    (void)release_user_pages(0, &process->stack_page, 1, 0);
+    (void)release_user_pages(0, process->stack_pages, USER_STACK_PAGES, 0);
     (void)release_user_pages(0, process->heap_pages,
                              process->heap_page_count, 0);
     process->heap_page_count = 0;
@@ -2358,8 +2413,10 @@ static bool user_map_cloned_process(struct user_process *process) {
                               user_segment_paging_flags(segment->flags))
                 != segment->page_count) return false;
     }
-    if (!paging_map_page(USER_STACK_ADDRESS, process->stack_page,
-                            PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE)
+    if (map_user_pages(USER_STACK_BASE, process->stack_pages,
+                       USER_STACK_PAGES,
+                       PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE)
+            != USER_STACK_PAGES
         || map_user_pages(process->heap_base, process->heap_pages,
                           process->heap_page_count,
                           PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE)
@@ -2611,7 +2668,8 @@ static int64_t user_linux_fork(struct user_process *parent,
     bool cloned = user_clone_page_array(parent->image_pages,
                                          parent->image_page_count,
                                          child->image_pages)
-        && user_clone_page_array(&parent->stack_page, 1, &child->stack_page)
+        && user_clone_page_array(parent->stack_pages, USER_STACK_PAGES,
+                                 child->stack_pages)
         && user_clone_page_array(parent->heap_pages,
                                  parent->heap_page_count,
                                  child->heap_pages);
@@ -2765,22 +2823,23 @@ static int64_t user_linux_execve(struct user_process *process,
     uint8_t **image_buffers = load->image_buffers;
     uint64_t *interpreter_physical = load->interpreter_physical;
     uint8_t **interpreter_buffers = load->interpreter_buffers;
-    uint64_t stack_physical[1] = {0};
-    uint8_t *stack_buffers[1] = {0};
+    uint64_t stack_physical[USER_STACK_PAGES] = {0};
+    uint8_t *stack_buffers[USER_STACK_PAGES] = {0};
     if (!allocate_user_pages(plan.total_page_count, image_physical,
                              image_buffers)
         || !allocate_user_pages(interpreter_plan.total_page_count,
                                 interpreter_physical, interpreter_buffers)
-        || !allocate_user_pages(1, stack_physical, stack_buffers)) {
+        || !allocate_user_pages(USER_STACK_PAGES, stack_physical,
+                                stack_buffers)) {
         release_user_pages(0, image_physical, plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return -12;
     }
     zero_user_pages(plan.total_page_count, image_buffers);
     zero_user_pages(interpreter_plan.total_page_count, interpreter_buffers);
-    zero_user_pages(1, stack_buffers);
+    zero_user_pages(USER_STACK_PAGES, stack_buffers);
     if (!elf_load_user_image(exec_image, image_size, &plan,
                              image_buffers, plan.total_page_count, PAGE_SIZE)
         || (plan.has_interpreter
@@ -2791,10 +2850,10 @@ static int64_t user_linux_execve(struct user_process *process,
         release_user_pages(0, image_physical, plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return -8;
     }
-    uintptr_t initial_stack = user_prepare_exec_stack(stack_buffers[0], &plan,
+    uintptr_t initial_stack = user_prepare_exec_stack(stack_buffers[USER_STACK_ARGUMENT_PAGE], &plan,
                                                        &vectors,
                                                        plan.has_interpreter
                                                            ? USER_MMAP_BASE : 0,
@@ -2803,7 +2862,7 @@ static int64_t user_linux_execve(struct user_process *process,
         release_user_pages(0, image_physical, plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return -7;
     }
 
@@ -2824,7 +2883,7 @@ static int64_t user_linux_execve(struct user_process *process,
         release_user_pages(0, image_physical, plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return -12;
     }
     size_t image_mapped[ELF_MAX_LOAD_SEGMENTS] = {0};
@@ -2835,21 +2894,24 @@ static int64_t user_linux_execve(struct user_process *process,
             || map_elf_plan(&interpreter_plan, interpreter_physical,
                             interpreter_mapped));
     bool stack_mapped = interpreter_mapped_all
-        && paging_map_page(USER_STACK_ADDRESS, stack_physical[0],
-                           PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE);
+        && map_user_pages(USER_STACK_BASE, stack_physical, USER_STACK_PAGES,
+                          PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE)
+               == USER_STACK_PAGES;
     bool image_valid = stack_mapped
         && elf_plan_permissions_valid(&plan)
         && (!plan.has_interpreter
             || elf_plan_permissions_valid(&interpreter_plan))
-        && paging_user_range_valid(USER_STACK_ADDRESS, PAGE_SIZE, true, false)
-        && !paging_user_range_valid(USER_STACK_ADDRESS, PAGE_SIZE, false, true);
+        && paging_user_range_valid(USER_STACK_BASE,
+                                   USER_STACK_PAGES * PAGE_SIZE, true, false)
+        && !paging_user_range_valid(USER_STACK_BASE,
+                                    USER_STACK_PAGES * PAGE_SIZE, false, true);
     if (!image_valid) {
         (void)scheduler_activate_current_address_space(old_address_space);
         (void)paging_address_space_destroy(new_address_space);
         release_user_pages(0, image_physical, plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return -12;
     }
 
@@ -2858,7 +2920,8 @@ static int64_t user_linux_execve(struct user_process *process,
     }
     bool old_image_freed = release_user_pages(
         0, process->image_pages, process->image_page_count, 0);
-    bool old_stack_freed = release_user_pages(0, &process->stack_page, 1, 0);
+    bool old_stack_freed = release_user_pages(0, process->stack_pages,
+                                              USER_STACK_PAGES, 0);
     bool old_heap_freed = release_user_pages(
         0, process->heap_pages, process->heap_page_count, 0);
     bool old_mmap_freed = user_free_mmap_physical(process);
@@ -2906,7 +2969,9 @@ static int64_t user_linux_execve(struct user_process *process,
             }
         }
     }
-    process->stack_page = stack_physical[0];
+    for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+        process->stack_pages[i] = stack_physical[i];
+    }
     for (size_t i = 0; i < USER_DESCRIPTOR_CAPACITY; i++) {
         if (process->descriptors[i].used
             && process->descriptors[i].close_on_exec) {
@@ -3083,6 +3148,1261 @@ static bool user_opos_window(const struct user_process *process,
     return false;
 }
 
+/* ------------------------------------------------------------- sockets */
+
+/*
+ * Linux socket calls for AF_INET stream (TCP) and datagram (UDP) sockets
+ * on top of net.c. Kernel code is not preempted, so the net.c calls here
+ * cannot interleave with the desktop's net_poll. Blocking calls poll the
+ * network themselves and sleep a tick at a time; a kill (scheduler
+ * interrupt) ends them with EINTR.
+ */
+#define LINUX_AF_UNSPEC 0
+#define LINUX_AF_INET 2
+#define LINUX_SOCK_STREAM 1
+#define LINUX_SOCK_DGRAM 2
+#define LINUX_SOCK_NONBLOCK 0x800
+#define LINUX_SOCK_CLOEXEC 0x80000
+#define LINUX_MSG_PEEK 0x2
+#define LINUX_MSG_DONTWAIT 0x40
+#define LINUX_SOL_SOCKET 1
+#define LINUX_SO_TYPE 3
+#define LINUX_SO_ERROR 4
+#define LINUX_POLLIN 0x001
+#define LINUX_POLLPRI 0x002
+#define LINUX_POLLOUT 0x004
+#define LINUX_POLLERR 0x008
+#define LINUX_POLLHUP 0x010
+#define LINUX_POLLNVAL 0x020
+#define USER_POLL_MAX 64
+#define USER_UDP_MAX 1472
+
+enum user_socket_state {
+    USER_SOCKET_NEW,
+    USER_SOCKET_CONNECTING,
+    USER_SOCKET_CONNECTED,
+    USER_SOCKET_LISTENING,
+};
+
+/* One tick of waiting; false when the process is being killed. */
+static uint8_t user_socket_event;
+
+static bool user_socket_wait(void) {
+    net_poll();
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    bool woke = scheduler_block_current_until_locked(&user_socket_event,
+                                                     timer_ticks() + 1);
+    if ((flags & (1u << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+    return woke;
+}
+
+static int64_t user_read_sockaddr(uintptr_t address, uint64_t length,
+                                  uint8_t ip[4], uint16_t *port,
+                                  uint16_t *family) {
+    if (address == 0) {
+        return -14;
+    }
+    if (length < 2 || !paging_user_range_valid(address, 2, false, false)) {
+        return length < 2 ? -22 : -14;
+    }
+    const uint8_t *bytes = (const uint8_t *)address;
+    *family = (uint16_t)(bytes[0] | bytes[1] << 8);
+    if (*family == LINUX_AF_UNSPEC) {
+        return 0;
+    }
+    if (*family != LINUX_AF_INET) {
+        return -97;
+    }
+    if (length < 16) {
+        return -22;
+    }
+    if (!paging_user_range_valid(address, 16, false, false)) {
+        return -14;
+    }
+    *port = (uint16_t)(bytes[2] << 8 | bytes[3]);
+    for (int i = 0; i < 4; i++) {
+        ip[i] = bytes[4 + i];
+    }
+    return 0;
+}
+
+/* Fills a sockaddr_in and its length (both may be 0 = not wanted). */
+static int64_t user_write_sockaddr(uintptr_t address, uintptr_t length_address,
+                                   const uint8_t ip[4], uint16_t port) {
+    if (address == 0 || length_address == 0) {
+        return 0;
+    }
+    if (!paging_user_range_valid(length_address, 4, true, false)) {
+        return -14;
+    }
+    uint32_t capacity = *(uint32_t *)length_address;
+    uint8_t bytes[16] = {LINUX_AF_INET, 0, (uint8_t)(port >> 8),
+                         (uint8_t)port, ip[0], ip[1], ip[2], ip[3]};
+    uint32_t length = capacity < 16 ? capacity : 16;
+    if (length != 0 && !paging_user_range_valid(address, length, true, false)) {
+        return -14;
+    }
+    for (uint32_t i = 0; i < length; i++) {
+        ((uint8_t *)address)[i] = bytes[i];
+    }
+    *(uint32_t *)length_address = 16;
+    return 0;
+}
+
+static struct user_file_descriptor *user_socket_file(
+    struct user_process *process, uint64_t descriptor, int64_t *error) {
+    struct user_file_descriptor *file = user_file_descriptor(process,
+                                                             descriptor);
+    if (file == NULL) {
+        *error = -9;
+        return NULL;
+    }
+    if (file->kind != USER_OPEN_FILE_SOCKET) {
+        *error = -88; /* ENOTSOCK */
+        return NULL;
+    }
+    return file;
+}
+
+/* Gives a new open file a descriptor; -24 when either table is full. */
+static int64_t user_install_file(struct user_process *process,
+                                 const struct user_file_descriptor *file,
+                                 bool close_on_exec) {
+    size_t descriptor = USER_FIRST_FILE_DESCRIPTOR;
+    while (descriptor < USER_DESCRIPTOR_CAPACITY
+           && process->descriptors[descriptor].used) {
+        descriptor++;
+    }
+    size_t slot = 0;
+    while (slot < USER_OPEN_FILE_CAPACITY && open_files[slot].used) {
+        slot++;
+    }
+    if (descriptor == USER_DESCRIPTOR_CAPACITY
+        || slot == USER_OPEN_FILE_CAPACITY) {
+        return -24;
+    }
+    open_files[slot] = *file;
+    open_files[slot].used = true;
+    open_files[slot].references = 1;
+    process->descriptors[descriptor] = (struct user_descriptor){
+        .used = true,
+        .close_on_exec = close_on_exec,
+        .file_slot = (uint8_t)slot,
+    };
+    return (int64_t)descriptor;
+}
+
+static void user_socket_release(struct user_file_descriptor *file) {
+    if (file->socket_handle < 0) {
+        return;
+    }
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        net_udp_close(file->socket_handle);
+    } else if (file->socket_state == USER_SOCKET_LISTENING) {
+        net_tcp_unlisten(file->socket_handle);
+    } else {
+        net_tcp_close(file->socket_handle);
+    }
+    file->socket_handle = -1;
+}
+
+/* A UDP socket gets its port on first use when it was never bound. */
+static int64_t user_udp_ready(struct user_file_descriptor *file) {
+    if (file->socket_handle >= 0) {
+        return 0;
+    }
+    int id = net_udp_open(0);
+    if (id < 0) {
+        return id;
+    }
+    file->socket_handle = id;
+    return 0;
+}
+
+/* Settles a pending connect: 0 connected, -115 still going, or the
+   error (the socket is then unconnected again). */
+static int64_t user_tcp_settle(struct user_file_descriptor *file) {
+    if (file->socket_state != USER_SOCKET_CONNECTING) {
+        return 0;
+    }
+    enum net_tcp_status status = net_tcp_status(file->socket_handle);
+    if (status == NET_TCP_CONNECTING) {
+        return -115;
+    }
+    if (status == NET_TCP_FAILED) {
+        int error = net_tcp_error(file->socket_handle);
+        net_tcp_close(file->socket_handle);
+        file->socket_handle = -1;
+        file->socket_state = USER_SOCKET_NEW;
+        file->socket_error = error != 0 ? error : -111;
+        return file->socket_error;
+    }
+    file->socket_state = USER_SOCKET_CONNECTED;
+    return 0;
+}
+
+static int64_t user_linux_socket(struct user_process *process,
+                                 uint64_t domain, uint64_t type,
+                                 uint64_t protocol) {
+    if (domain != LINUX_AF_INET) {
+        return -97; /* EAFNOSUPPORT */
+    }
+    uint64_t kind = type & 0xff;
+    if ((kind != LINUX_SOCK_STREAM && kind != LINUX_SOCK_DGRAM)
+        || (type & ~(0xffull | LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC))
+               != 0) {
+        return -94; /* ESOCKTNOSUPPORT */
+    }
+    if (protocol != 0
+        && protocol != (kind == LINUX_SOCK_STREAM ? 6u : 17u)) {
+        return -93; /* EPROTONOSUPPORT */
+    }
+    struct user_file_descriptor file = {
+        .kind = USER_OPEN_FILE_SOCKET,
+        .readable = true,
+        .writable = true,
+        .nonblocking = (type & LINUX_SOCK_NONBLOCK) != 0,
+        .socket_type = (uint8_t)kind,
+        .socket_state = USER_SOCKET_NEW,
+        .socket_handle = -1,
+    };
+    return user_install_file(process, &file,
+                             (type & LINUX_SOCK_CLOEXEC) != 0);
+}
+
+static int64_t user_linux_bind(struct user_process *process,
+                               uint64_t descriptor, uintptr_t address,
+                               uint64_t length) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    uint16_t family = 0;
+    error = user_read_sockaddr(address, length, ip, &port, &family);
+    if (error != 0) {
+        return error;
+    }
+    if (family != LINUX_AF_INET) {
+        return -97;
+    }
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        if (file->socket_handle >= 0) {
+            return -22;
+        }
+        int id = net_udp_open(port);
+        if (id < 0) {
+            return id;
+        }
+        file->socket_handle = id;
+        return 0;
+    }
+    if (file->socket_state != USER_SOCKET_NEW || file->socket_port != 0) {
+        return -22;
+    }
+    if (port == 0) {
+        port = net_tcp_pick_port();
+    } else if (!net_tcp_port_free(port)) {
+        return -98; /* EADDRINUSE */
+    }
+    file->socket_port = port;
+    return 0;
+}
+
+static int64_t user_linux_listen(struct user_process *process,
+                                 uint64_t descriptor, uint64_t backlog) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    if (file->socket_type != LINUX_SOCK_STREAM) {
+        return -95; /* EOPNOTSUPP */
+    }
+    if (file->socket_state == USER_SOCKET_LISTENING) {
+        return 0;
+    }
+    if (file->socket_state != USER_SOCKET_NEW) {
+        return -22;
+    }
+    if (file->socket_port == 0) {
+        file->socket_port = net_tcp_pick_port();
+    }
+    int listener = net_tcp_listen(file->socket_port,
+                                  (int)(backlog > 64 ? 64 : backlog));
+    if (listener < 0) {
+        return listener;
+    }
+    file->socket_handle = listener;
+    file->socket_state = USER_SOCKET_LISTENING;
+    return 0;
+}
+
+static int64_t user_linux_accept(struct user_process *process,
+                                 uint64_t descriptor, uintptr_t address,
+                                 uintptr_t length_address, uint64_t flags) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    if (file->socket_state != USER_SOCKET_LISTENING
+        || (flags & ~(uint64_t)(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC))
+               != 0) {
+        return -22;
+    }
+    int handle;
+    for (;;) {
+        handle = net_tcp_accept(file->socket_handle);
+        if (handle != -11) {
+            break;
+        }
+        if (file->nonblocking) {
+            return -11;
+        }
+        if (!user_socket_wait()) {
+            return -4;
+        }
+        /* The descriptor may have been closed by another thread. */
+        file = user_socket_file(process, descriptor, &error);
+        if (file == NULL || file->socket_state != USER_SOCKET_LISTENING) {
+            return file == NULL ? error : -22;
+        }
+    }
+    if (handle < 0) {
+        return handle;
+    }
+    struct user_file_descriptor accepted = {
+        .kind = USER_OPEN_FILE_SOCKET,
+        .readable = true,
+        .writable = true,
+        .nonblocking = (flags & LINUX_SOCK_NONBLOCK) != 0,
+        .socket_type = LINUX_SOCK_STREAM,
+        .socket_state = USER_SOCKET_CONNECTED,
+        .socket_handle = handle,
+    };
+    int64_t new_descriptor = user_install_file(
+        process, &accepted, (flags & LINUX_SOCK_CLOEXEC) != 0);
+    if (new_descriptor < 0) {
+        net_tcp_close(handle);
+        return new_descriptor;
+    }
+    uint8_t local_ip[4];
+    uint8_t remote_ip[4];
+    uint16_t local_port;
+    uint16_t remote_port;
+    net_tcp_endpoints(handle, local_ip, &local_port, remote_ip, &remote_port);
+    (void)user_write_sockaddr(address, length_address, remote_ip,
+                              remote_port);
+    return new_descriptor;
+}
+
+static int64_t user_linux_connect(struct user_process *process,
+                                  uint64_t descriptor, uintptr_t address,
+                                  uint64_t length) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    uint16_t family = 0;
+    error = user_read_sockaddr(address, length, ip, &port, &family);
+    if (error != 0) {
+        return error;
+    }
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        if (family == LINUX_AF_UNSPEC) {
+            file->socket_state = USER_SOCKET_NEW;
+            return 0;
+        }
+        error = user_udp_ready(file);
+        if (error != 0) {
+            return error;
+        }
+        for (int i = 0; i < 4; i++) {
+            file->socket_peer_ip[i] = ip[i];
+        }
+        file->socket_peer_port = port;
+        file->socket_state = USER_SOCKET_CONNECTED;
+        return 0;
+    }
+    if (family != LINUX_AF_INET) {
+        return -97;
+    }
+    if (file->socket_state == USER_SOCKET_CONNECTED) {
+        return -106; /* EISCONN */
+    }
+    if (file->socket_state == USER_SOCKET_LISTENING) {
+        return -22;
+    }
+    if (file->socket_state == USER_SOCKET_NEW) {
+        if (ip[0] == 127) {
+            return -111; /* nothing listens on loopback */
+        }
+        if (port == 0) {
+            return -22;
+        }
+        int handle = net_tcp_connect_from(ip, port, file->socket_port);
+        if (handle < 0) {
+            uint8_t local[4];
+            net_local_address(local);
+            return local[0] == 0 && local[1] == 0 ? -101 : -105;
+        }
+        file->socket_handle = handle;
+        file->socket_state = USER_SOCKET_CONNECTING;
+        file->socket_error = 0;
+        if (file->nonblocking) {
+            return -115; /* EINPROGRESS */
+        }
+    } else if (file->nonblocking) {
+        error = user_tcp_settle(file);
+        return error == -115 ? -114 : error; /* EALREADY */
+    }
+    for (;;) {
+        error = user_tcp_settle(file);
+        if (error != -115) {
+            if (error != 0) {
+                file->socket_error = 0; /* reported here instead */
+            }
+            return error;
+        }
+        if (!user_socket_wait()) {
+            return -4;
+        }
+        file = user_socket_file(process, descriptor, &error);
+        if (file == NULL) {
+            return error;
+        }
+    }
+}
+
+/* Sends from user memory (or kernel memory when kernel_buffer). */
+static int64_t user_socket_send(struct user_process *process,
+                                uint64_t descriptor, uintptr_t buffer,
+                                size_t length, uint64_t flags,
+                                const uint8_t *to_ip, uint16_t to_port,
+                                bool kernel_buffer) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    if (!kernel_buffer && length != 0
+        && !paging_user_range_valid(buffer, length, false, false)) {
+        return -14;
+    }
+    bool nonblocking = file->nonblocking || (flags & LINUX_MSG_DONTWAIT);
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        uint8_t ip[4];
+        uint16_t port;
+        if (to_ip != NULL) {
+            for (int i = 0; i < 4; i++) {
+                ip[i] = to_ip[i];
+            }
+            port = to_port;
+        } else if (file->socket_state == USER_SOCKET_CONNECTED) {
+            for (int i = 0; i < 4; i++) {
+                ip[i] = file->socket_peer_ip[i];
+            }
+            port = file->socket_peer_port;
+        } else {
+            return -89; /* EDESTADDRREQ */
+        }
+        error = user_udp_ready(file);
+        if (error != 0) {
+            return error;
+        }
+        return net_udp_send(file->socket_handle, ip, port,
+                            (const void *)buffer, length);
+    }
+    if (file->socket_state == USER_SOCKET_CONNECTING) {
+        while ((error = user_tcp_settle(file)) == -115) {
+            if (nonblocking) {
+                return -11;
+            }
+            if (!user_socket_wait()) {
+                return -4;
+            }
+            file = user_socket_file(process, descriptor, &error);
+            if (file == NULL) {
+                return error;
+            }
+        }
+        if (error != 0) {
+            return error;
+        }
+    }
+    if (file->socket_state != USER_SOCKET_CONNECTED) {
+        return -107; /* ENOTCONN */
+    }
+    size_t sent = 0;
+    while (sent < length || length == 0) {
+        if (file->socket_write_shut || !net_tcp_can_send(file->socket_handle)) {
+            int tcp_error = net_tcp_error(file->socket_handle);
+            error = tcp_error != 0 ? tcp_error : -32; /* EPIPE */
+            return sent != 0 ? (int64_t)sent : error;
+        }
+        if (length == 0) {
+            return 0;
+        }
+        size_t queued = net_tcp_send(file->socket_handle,
+                                     (const uint8_t *)buffer + sent,
+                                     length - sent);
+        sent += queued;
+        if (sent == length) {
+            break;
+        }
+        if (queued == 0) {
+            if (nonblocking) {
+                return sent != 0 ? (int64_t)sent : -11;
+            }
+            if (!user_socket_wait()) {
+                return sent != 0 ? (int64_t)sent : -4;
+            }
+            file = user_socket_file(process, descriptor, &error);
+            if (file == NULL) {
+                return sent != 0 ? (int64_t)sent : error;
+            }
+            if (!kernel_buffer
+                && !paging_user_range_valid(buffer + sent, length - sent,
+                                            false, false)) {
+                return sent != 0 ? (int64_t)sent : -14;
+            }
+        }
+    }
+    return (int64_t)sent;
+}
+
+/* Receives into user memory (or kernel memory when kernel_buffer). */
+static int64_t user_socket_receive(struct user_process *process,
+                                   uint64_t descriptor, uintptr_t buffer,
+                                   size_t length, uint64_t flags,
+                                   uint8_t from_ip[4], uint16_t *from_port,
+                                   bool kernel_buffer) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    if ((flags & LINUX_MSG_PEEK) != 0) {
+        return -95;
+    }
+    bool nonblocking = file->nonblocking || (flags & LINUX_MSG_DONTWAIT);
+    for (;;) {
+        if (!kernel_buffer && length != 0
+            && !paging_user_range_valid(buffer, length, true, false)) {
+            return -14;
+        }
+        if (file->socket_type == LINUX_SOCK_DGRAM) {
+            error = user_udp_ready(file);
+            if (error != 0) {
+                return error;
+            }
+            uint8_t ip[4];
+            uint16_t port;
+            long got = net_udp_receive(file->socket_handle, (void *)buffer,
+                                       length, ip, &port);
+            if (got != -11) {
+                if (got >= 0 && from_ip != NULL) {
+                    for (int i = 0; i < 4; i++) {
+                        from_ip[i] = ip[i];
+                    }
+                    *from_port = port;
+                }
+                return got;
+            }
+        } else {
+            if (file->socket_state == USER_SOCKET_CONNECTING) {
+                error = user_tcp_settle(file);
+                if (error != 0 && error != -115) {
+                    return error;
+                }
+            }
+            if (file->socket_state == USER_SOCKET_CONNECTED) {
+                size_t got = net_tcp_receive(file->socket_handle,
+                                             (void *)buffer, length);
+                if (got != 0 || length == 0) {
+                    if (from_ip != NULL) {
+                        uint8_t local[4];
+                        uint16_t local_port;
+                        net_tcp_endpoints(file->socket_handle, local,
+                                          &local_port, from_ip, from_port);
+                    }
+                    return (int64_t)got;
+                }
+                enum net_tcp_status status =
+                    net_tcp_status(file->socket_handle);
+                if (status == NET_TCP_FINISHED || file->socket_read_shut) {
+                    return 0;
+                }
+                if (status == NET_TCP_FAILED) {
+                    int tcp_error = net_tcp_error(file->socket_handle);
+                    return tcp_error != 0 ? tcp_error : 0;
+                }
+            } else if (file->socket_state != USER_SOCKET_CONNECTING) {
+                return -107;
+            }
+        }
+        if (nonblocking) {
+            return -11;
+        }
+        if (!user_socket_wait()) {
+            return -4;
+        }
+        file = user_socket_file(process, descriptor, &error);
+        if (file == NULL) {
+            return error;
+        }
+    }
+}
+
+static int64_t user_linux_sendto(struct user_process *process,
+                                 struct linux_syscall_frame *frame) {
+    uint8_t ip[4];
+    uint16_t port = 0;
+    uint16_t family = 0;
+    const uint8_t *to = NULL;
+    if (frame->r8 != 0) {
+        int64_t error = user_read_sockaddr((uintptr_t)frame->r8, frame->r9,
+                                           ip, &port, &family);
+        if (error != 0) {
+            return error;
+        }
+        if (family != LINUX_AF_INET) {
+            return -97;
+        }
+        to = ip;
+    }
+    if (frame->rdx > USER_FILE_IO_MAX) {
+        return -22;
+    }
+    return user_socket_send(process, frame->rdi, (uintptr_t)frame->rsi,
+                            (size_t)frame->rdx, frame->r10, to, port, false);
+}
+
+static int64_t user_linux_recvfrom(struct user_process *process,
+                                   struct linux_syscall_frame *frame) {
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    if (frame->rdx > USER_FILE_IO_MAX) {
+        return -22;
+    }
+    int64_t result = user_socket_receive(
+        process, frame->rdi, (uintptr_t)frame->rsi, (size_t)frame->rdx,
+        frame->r10, ip, &port, false);
+    if (result >= 0 && frame->r8 != 0) {
+        int64_t error = user_write_sockaddr((uintptr_t)frame->r8,
+                                            (uintptr_t)frame->r9, ip, port);
+        if (error != 0) {
+            return error;
+        }
+    }
+    return result;
+}
+
+/* struct msghdr: name 0, namelen 8, iov 16, iovlen 24, control 32,
+   controllen 40, flags 48. */
+static int64_t user_linux_message(struct user_process *process,
+                                  struct linux_syscall_frame *frame,
+                                  bool send) {
+    uintptr_t message = (uintptr_t)frame->rsi;
+    if (!paging_user_range_valid(message, 56, !send, false)) {
+        return -14;
+    }
+    uintptr_t name = *(uint64_t *)message;
+    uint32_t name_length = *(uint32_t *)(message + 8);
+    uintptr_t iovecs = *(uint64_t *)(message + 16);
+    uint64_t count = *(uint64_t *)(message + 24);
+    if (count > USER_IOV_MAX
+        || (count != 0
+            && !paging_user_range_valid(
+                iovecs, count * sizeof(struct linux_iovec), false, false))) {
+        return count > USER_IOV_MAX ? -22 : -14;
+    }
+    const struct linux_iovec *vector = (const struct linux_iovec *)iovecs;
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, frame->rdi,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    bool datagram = file->socket_type == LINUX_SOCK_DGRAM;
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    if (send) {
+        const uint8_t *to = NULL;
+        if (name != 0) {
+            uint16_t family = 0;
+            error = user_read_sockaddr(name, name_length, ip, &port, &family);
+            if (error != 0) {
+                return error;
+            }
+            to = ip;
+        }
+        if (datagram) {
+            /* One datagram: gather the pieces first. */
+            uint8_t gathered[USER_UDP_MAX];
+            size_t total = 0;
+            for (uint64_t i = 0; i < count; i++) {
+                if (vector[i].length > sizeof(gathered) - total) {
+                    return -90; /* EMSGSIZE */
+                }
+                if (vector[i].length != 0
+                    && !paging_user_range_valid(vector[i].base,
+                                                vector[i].length, false,
+                                                false)) {
+                    return -14;
+                }
+                for (uint64_t j = 0; j < vector[i].length; j++) {
+                    gathered[total++] = ((const uint8_t *)vector[i].base)[j];
+                }
+            }
+            return user_socket_send(process, frame->rdi,
+                                    (uintptr_t)gathered, total, frame->rdx,
+                                    to, port, true);
+        }
+        int64_t total = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            if (vector[i].length == 0) {
+                continue;
+            }
+            int64_t sent = user_socket_send(process, frame->rdi,
+                                            vector[i].base, vector[i].length,
+                                            frame->rdx, NULL, 0, false);
+            if (sent < 0) {
+                return total != 0 ? total : sent;
+            }
+            total += sent;
+            if ((uint64_t)sent < vector[i].length) {
+                break;
+            }
+        }
+        return total;
+    }
+    int64_t result;
+    if (datagram) {
+        uint8_t received[USER_UDP_MAX];
+        result = user_socket_receive(process, frame->rdi,
+                                     (uintptr_t)received, sizeof(received),
+                                     frame->rdx, ip, &port, true);
+        if (result >= 0) {
+            size_t offset = 0;
+            for (uint64_t i = 0; i < count && offset < (size_t)result; i++) {
+                size_t piece = vector[i].length;
+                if (piece > (size_t)result - offset) {
+                    piece = (size_t)result - offset;
+                }
+                if (piece != 0
+                    && !paging_user_range_valid(vector[i].base, piece, true,
+                                                false)) {
+                    return -14;
+                }
+                for (size_t j = 0; j < piece; j++) {
+                    ((uint8_t *)vector[i].base)[j] = received[offset + j];
+                }
+                offset += piece;
+            }
+            result = (int64_t)offset;
+        }
+    } else {
+        /* A stream read fills the first non-empty piece (short reads are
+           allowed). */
+        uint64_t i = 0;
+        while (i < count && vector[i].length == 0) {
+            i++;
+        }
+        result = user_socket_receive(
+            process, frame->rdi, i < count ? vector[i].base : 0,
+            i < count ? vector[i].length : 0, frame->rdx, ip, &port, false);
+    }
+    if (result >= 0) {
+        if (name != 0) {
+            error = user_write_sockaddr(name, message + 8, ip, port);
+            if (error != 0) {
+                return error;
+            }
+        }
+        *(uint64_t *)(message + 40) = 0;          /* no control data */
+        *(uint32_t *)(message + 48) = 0;          /* flags */
+    }
+    return result;
+}
+
+static int64_t user_linux_shutdown(struct user_process *process,
+                                   uint64_t descriptor, uint64_t how) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    if (how > 2) {
+        return -22;
+    }
+    if (file->socket_state != USER_SOCKET_CONNECTED) {
+        return -107;
+    }
+    if (how != 1) {
+        file->socket_read_shut = true;
+    }
+    if (how != 0 && file->socket_type == LINUX_SOCK_STREAM) {
+        file->socket_write_shut = true;
+        net_tcp_shutdown(file->socket_handle);
+    }
+    return 0;
+}
+
+static int64_t user_linux_socket_name(struct user_process *process,
+                                      uint64_t descriptor, uintptr_t address,
+                                      uintptr_t length_address, bool peer) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, descriptor,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    uint8_t ip[4] = {0, 0, 0, 0};
+    uint16_t port = 0;
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        if (peer) {
+            if (file->socket_state != USER_SOCKET_CONNECTED) {
+                return -107;
+            }
+            for (int i = 0; i < 4; i++) {
+                ip[i] = file->socket_peer_ip[i];
+            }
+            port = file->socket_peer_port;
+        } else {
+            net_local_address(ip);
+            port = file->socket_handle >= 0
+                       ? net_udp_port(file->socket_handle) : 0;
+        }
+    } else if (file->socket_state == USER_SOCKET_CONNECTED
+               || file->socket_state == USER_SOCKET_CONNECTING) {
+        uint8_t local_ip[4];
+        uint8_t remote_ip[4];
+        uint16_t local_port;
+        uint16_t remote_port;
+        net_tcp_endpoints(file->socket_handle, local_ip, &local_port,
+                          remote_ip, &remote_port);
+        for (int i = 0; i < 4; i++) {
+            ip[i] = peer ? remote_ip[i] : local_ip[i];
+        }
+        port = peer ? remote_port : local_port;
+    } else if (peer) {
+        return -107;
+    } else {
+        port = file->socket_port;
+    }
+    return user_write_sockaddr(address, length_address, ip, port);
+}
+
+static int64_t user_linux_getsockopt(struct user_process *process,
+                                     struct linux_syscall_frame *frame) {
+    int64_t error = 0;
+    struct user_file_descriptor *file = user_socket_file(process, frame->rdi,
+                                                         &error);
+    if (file == NULL) {
+        return error;
+    }
+    uintptr_t value = (uintptr_t)frame->r10;
+    uintptr_t length = (uintptr_t)frame->r8;
+    if (!paging_user_range_valid(length, 4, true, false)
+        || *(uint32_t *)length < 4
+        || !paging_user_range_valid(value, 4, true, false)) {
+        return -14;
+    }
+    int32_t result = 0;
+    if (frame->rsi == LINUX_SOL_SOCKET && frame->rdx == LINUX_SO_ERROR) {
+        if (file->socket_type == LINUX_SOCK_STREAM) {
+            (void)user_tcp_settle(file);
+        }
+        result = -file->socket_error;
+        file->socket_error = 0;
+    } else if (frame->rsi == LINUX_SOL_SOCKET
+               && frame->rdx == LINUX_SO_TYPE) {
+        result = file->socket_type;
+    }
+    *(int32_t *)value = result;
+    *(uint32_t *)length = 4;
+    return 0;
+}
+
+/* Ready events of one descriptor, for poll and select. */
+static uint32_t user_descriptor_events(struct user_process *process,
+                                       uint64_t descriptor) {
+    if (descriptor < USER_FIRST_FILE_DESCRIPTOR
+        && descriptor < USER_DESCRIPTOR_CAPACITY
+        && !process->descriptors[descriptor].used) {
+        if (process->descriptors[descriptor].closed) {
+            return LINUX_POLLNVAL;
+        }
+        /* The console: output always fits; input readiness is unknown,
+           so stdin only reports when polled with a timeout of 0 too. */
+        return descriptor == 0 ? 0 : LINUX_POLLOUT;
+    }
+    struct user_file_descriptor *file = user_file_descriptor(process,
+                                                             descriptor);
+    if (file == NULL) {
+        return LINUX_POLLNVAL;
+    }
+    if (file->kind == USER_OPEN_FILE_PIPE_READ
+        || file->kind == USER_OPEN_FILE_PIPE_WRITE) {
+        struct user_pipe *pipe = user_file_pipe(file);
+        if (pipe == NULL) {
+            return LINUX_POLLNVAL;
+        }
+        if (file->kind == USER_OPEN_FILE_PIPE_READ) {
+            return (pipe->size != 0 ? LINUX_POLLIN : 0)
+                 | (pipe->writers == 0 ? LINUX_POLLHUP : 0);
+        }
+        return pipe->readers == 0 ? LINUX_POLLERR
+             : pipe->size < USER_PIPE_BUFFER_CAPACITY ? LINUX_POLLOUT : 0;
+    }
+    if (file->kind != USER_OPEN_FILE_SOCKET) {
+        return LINUX_POLLIN | LINUX_POLLOUT;
+    }
+    if (file->socket_type == LINUX_SOCK_DGRAM) {
+        return LINUX_POLLOUT
+             | (file->socket_handle >= 0
+                    && net_udp_readable(file->socket_handle)
+                ? LINUX_POLLIN : 0);
+    }
+    switch (file->socket_state) {
+    case USER_SOCKET_LISTENING:
+        return net_tcp_accept_ready(file->socket_handle) ? LINUX_POLLIN : 0;
+    case USER_SOCKET_CONNECTING: {
+        int64_t error = user_tcp_settle(file);
+        if (error == -115) {
+            return 0;
+        }
+        if (error != 0) {
+            return LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP;
+        }
+        break;
+    }
+    case USER_SOCKET_CONNECTED:
+        break;
+    default:
+        return LINUX_POLLOUT | LINUX_POLLHUP;
+    }
+    uint32_t events = 0;
+    if (net_tcp_readable(file->socket_handle) || file->socket_read_shut) {
+        events |= LINUX_POLLIN;
+    }
+    if (net_tcp_status(file->socket_handle) == NET_TCP_FAILED) {
+        events |= LINUX_POLLERR | LINUX_POLLHUP;
+    } else if (net_tcp_can_send(file->socket_handle)
+               && net_tcp_send_space(file->socket_handle) != 0) {
+        events |= LINUX_POLLOUT;
+    }
+    return events;
+}
+
+/* Milliseconds to an absolute tick; UINT64_MAX means forever. */
+static uint64_t user_poll_deadline(int64_t milliseconds) {
+    if (milliseconds < 0) {
+        return UINT64_MAX;
+    }
+    return timer_ticks() + ((uint64_t)milliseconds + 9) / 10;
+}
+
+static int64_t user_poll(struct user_process *process, uintptr_t address,
+                         uint64_t count, uint64_t deadline) {
+    if (count > USER_POLL_MAX) {
+        return -22;
+    }
+    if (count != 0
+        && !paging_user_range_valid(address, count * 8, true, false)) {
+        return -14;
+    }
+    for (;;) {
+        net_poll();
+        if (count != 0
+            && !paging_user_range_valid(address, count * 8, true, false)) {
+            return -14;
+        }
+        int64_t ready = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            uint8_t *entry = (uint8_t *)address + i * 8;
+            int32_t descriptor = *(int32_t *)entry;
+            uint16_t wanted = *(uint16_t *)(entry + 4);
+            uint16_t events = 0;
+            if (descriptor >= 0) {
+                events = (uint16_t)user_descriptor_events(process,
+                                                          (uint64_t)descriptor);
+                events &= wanted | LINUX_POLLERR | LINUX_POLLHUP
+                        | LINUX_POLLNVAL;
+            }
+            *(uint16_t *)(entry + 6) = events;
+            ready += events != 0 ? 1 : 0;
+        }
+        if (ready != 0 || timer_ticks() >= deadline) {
+            return ready;
+        }
+        if (!user_socket_wait()) {
+            return -4;
+        }
+    }
+}
+
+/* select/pselect6: fd_set bitmaps of 64-bit words. */
+static int64_t user_select(struct user_process *process, uint64_t count,
+                           uintptr_t read_set, uintptr_t write_set,
+                           uintptr_t except_set, uint64_t deadline) {
+    if (count > 1024) {
+        return -22;
+    }
+    size_t bytes = (size_t)((count + 63) / 64) * 8;
+    uint64_t wanted_read[16] = {0};
+    uint64_t wanted_write[16] = {0};
+    uintptr_t sets[3] = {read_set, write_set, except_set};
+    for (int s = 0; s < 3; s++) {
+        if (sets[s] != 0 && bytes != 0
+            && !paging_user_range_valid(sets[s], bytes, true, false)) {
+            return -14;
+        }
+    }
+    for (size_t w = 0; w < bytes / 8; w++) {
+        wanted_read[w] = read_set != 0 ? ((uint64_t *)read_set)[w] : 0;
+        wanted_write[w] = write_set != 0 ? ((uint64_t *)write_set)[w] : 0;
+    }
+    for (;;) {
+        net_poll();
+        int64_t ready = 0;
+        uint64_t out_read[16] = {0};
+        uint64_t out_write[16] = {0};
+        for (uint64_t fd = 0; fd < count; fd++) {
+            uint64_t bit = 1ull << (fd % 64);
+            bool want_read = (wanted_read[fd / 64] & bit) != 0;
+            bool want_write = (wanted_write[fd / 64] & bit) != 0;
+            if (!want_read && !want_write) {
+                continue;
+            }
+            uint32_t events = user_descriptor_events(process, fd);
+            if ((events & LINUX_POLLNVAL) != 0) {
+                return -9;
+            }
+            if (want_read
+                && (events & (LINUX_POLLIN | LINUX_POLLHUP | LINUX_POLLERR))) {
+                out_read[fd / 64] |= bit;
+                ready++;
+            }
+            if (want_write && (events & (LINUX_POLLOUT | LINUX_POLLERR))) {
+                out_write[fd / 64] |= bit;
+                ready++;
+            }
+        }
+        if (ready != 0 || timer_ticks() >= deadline) {
+            for (size_t w = 0; w < bytes / 8; w++) {
+                if (read_set != 0) {
+                    ((uint64_t *)read_set)[w] = out_read[w];
+                }
+                if (write_set != 0) {
+                    ((uint64_t *)write_set)[w] = out_write[w];
+                }
+                if (except_set != 0) {
+                    ((uint64_t *)except_set)[w] = 0;
+                }
+            }
+            return ready;
+        }
+        if (!user_socket_wait()) {
+            return -4;
+        }
+    }
+}
+
+/* Reads a struct timespec (or timeval when micro) into a deadline. */
+static int64_t user_time_deadline(uintptr_t address, bool micro,
+                                  uint64_t *deadline) {
+    if (address == 0) {
+        *deadline = UINT64_MAX;
+        return 0;
+    }
+    if (!paging_user_range_valid(address, 16, false, false)) {
+        return -14;
+    }
+    int64_t seconds = *(int64_t *)address;
+    int64_t fraction = *(int64_t *)(address + 8);
+    if (seconds < 0 || fraction < 0
+        || fraction >= (micro ? 1000000 : 1000000000)) {
+        return -22;
+    }
+    uint64_t milliseconds = (uint64_t)seconds * 1000
+                          + (uint64_t)fraction / (micro ? 1000 : 1000000);
+    if (seconds > 100000000) {
+        *deadline = UINT64_MAX;
+        return 0;
+    }
+    *deadline = user_poll_deadline((int64_t)milliseconds);
+    return 0;
+}
+
+static int64_t user_linux_fcntl(struct user_process *process,
+                                uint64_t descriptor, uint64_t command,
+                                uint64_t argument) {
+    if (descriptor >= USER_DESCRIPTOR_CAPACITY) {
+        return -9;
+    }
+    struct user_descriptor *entry = &process->descriptors[descriptor];
+    struct user_file_descriptor *file = user_file_descriptor(process,
+                                                             descriptor);
+    bool console = descriptor < USER_FIRST_FILE_DESCRIPTOR && !entry->used
+                && !entry->closed;
+    if (file == NULL && !console) {
+        return -9;
+    }
+    switch (command) {
+    case 0:    /* F_DUPFD */
+    case 1030: /* F_DUPFD_CLOEXEC */
+        if (file == NULL) {
+            return -22;
+        }
+        return user_duplicate_descriptor(process, descriptor, argument, false,
+                                         command == 1030, false);
+    case 1: /* F_GETFD */
+        return entry->close_on_exec ? 1 : 0;
+    case 2: /* F_SETFD */
+        if (file != NULL) {
+            entry->close_on_exec = (argument & 1) != 0;
+        }
+        return 0;
+    case 3: { /* F_GETFL */
+        if (file == NULL) {
+            return descriptor == 0 ? 0 : 1;
+        }
+        int64_t flags = file->readable && file->writable ? 2
+                      : file->writable ? 1 : 0;
+        flags |= file->nonblocking ? LINUX_O_NONBLOCK : 0;
+        flags |= file->append ? LINUX_O_APPEND : 0;
+        return flags;
+    }
+    case 4: /* F_SETFL */
+        if (file != NULL) {
+            file->nonblocking = (argument & LINUX_O_NONBLOCK) != 0;
+            if (file->kind == USER_OPEN_FILE_VFS) {
+                file->append = (argument & LINUX_O_APPEND) != 0;
+            }
+        }
+        return 0;
+    default:
+        return -22;
+    }
+}
+
+/* Socket, poll, select and fcntl calls. Returns false when number is not
+   one of them. */
+static bool user_linux_socket_syscall(struct user_process *process,
+                                      struct linux_syscall_frame *frame,
+                                      uint64_t number) {
+    int64_t result;
+    switch (number) {
+    case 41:
+        result = user_linux_socket(process, frame->rdi, frame->rsi,
+                                   frame->rdx);
+        break;
+    case 42:
+        result = user_linux_connect(process, frame->rdi,
+                                    (uintptr_t)frame->rsi, frame->rdx);
+        break;
+    case 43:
+        result = user_linux_accept(process, frame->rdi, (uintptr_t)frame->rsi,
+                                   (uintptr_t)frame->rdx, 0);
+        break;
+    case 288:
+        result = user_linux_accept(process, frame->rdi, (uintptr_t)frame->rsi,
+                                   (uintptr_t)frame->rdx, frame->r10);
+        break;
+    case 44:
+        result = user_linux_sendto(process, frame);
+        break;
+    case 45:
+        result = user_linux_recvfrom(process, frame);
+        break;
+    case 46:
+        result = user_linux_message(process, frame, true);
+        break;
+    case 47:
+        result = user_linux_message(process, frame, false);
+        break;
+    case 48:
+        result = user_linux_shutdown(process, frame->rdi, frame->rsi);
+        break;
+    case 49:
+        result = user_linux_bind(process, frame->rdi, (uintptr_t)frame->rsi,
+                                 frame->rdx);
+        break;
+    case 50:
+        result = user_linux_listen(process, frame->rdi, frame->rsi);
+        break;
+    case 51:
+    case 52:
+        result = user_linux_socket_name(process, frame->rdi,
+                                        (uintptr_t)frame->rsi,
+                                        (uintptr_t)frame->rdx, number == 52);
+        break;
+    case 53: /* socketpair: AF_UNIX only */
+        result = -97;
+        break;
+    case 54: { /* setsockopt: accepted and ignored */
+        int64_t error = 0;
+        result = user_socket_file(process, frame->rdi, &error) != NULL
+                     ? 0 : error;
+        break;
+    }
+    case 55:
+        result = user_linux_getsockopt(process, frame);
+        break;
+    case 7:
+        result = user_poll(process, (uintptr_t)frame->rdi, frame->rsi,
+                           user_poll_deadline((int32_t)frame->rdx));
+        break;
+    case 271: {
+        uint64_t deadline;
+        result = user_time_deadline((uintptr_t)frame->rdx, false, &deadline);
+        if (result == 0) {
+            result = user_poll(process, (uintptr_t)frame->rdi, frame->rsi,
+                               deadline);
+        }
+        break;
+    }
+    case 23:
+    case 270: {
+        uint64_t deadline;
+        result = user_time_deadline((uintptr_t)frame->r8, number == 23,
+                                    &deadline);
+        if (result == 0) {
+            result = user_select(process, frame->rdi, (uintptr_t)frame->rsi,
+                                 (uintptr_t)frame->rdx,
+                                 (uintptr_t)frame->r10, deadline);
+        }
+        break;
+    }
+    case 72:
+        result = user_linux_fcntl(process, frame->rdi, frame->rsi,
+                                  frame->rdx);
+        break;
+    default:
+        return false;
+    }
+    frame->rax = (uint64_t)result;
+    return true;
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -3103,6 +4423,9 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
         && number <= OPOS_SYSCALL_WINDOW_SIZE) {
         return user_opos_window(process, frame);
+    }
+    if (user_linux_socket_syscall(process, frame, number)) {
+        return false;
     }
     uint64_t file_descriptor = frame->rdi;
     uintptr_t buffer_address = (uintptr_t)frame->rsi;
@@ -3141,6 +4464,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
             frame->rax = (uint64_t)user_pipe_write(
                 file, (const uint8_t *)buffer_address, length, true);
+        } else if (file->kind == USER_OPEN_FILE_SOCKET) {
+            frame->rax = (uint64_t)user_socket_send(
+                process, file_descriptor, buffer_address, length, 0, NULL, 0,
+                false);
         } else {
             if (file->append) {
                 struct vfs_metadata metadata;
@@ -3227,6 +4554,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         } else if (file->kind == USER_OPEN_FILE_PIPE_READ) {
             frame->rax = (uint64_t)user_pipe_read(
                 file, (uint8_t *)buffer_address, length);
+        } else if (file->kind == USER_OPEN_FILE_SOCKET) {
+            frame->rax = (uint64_t)user_socket_receive(
+                process, file_descriptor, buffer_address, length, 0, NULL,
+                NULL, false);
         } else {
             size_t bytes_read = 0;
             if (!vfs_object_read_at(file->object, file->offset,
@@ -4353,8 +5684,9 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
         process->image_segment_count = 0;
         process->image_page_count = 0;
     }
-    bool stack_freed = release_user_pages(USER_STACK_ADDRESS,
-                                           &process->stack_page, 1, 1);
+    bool stack_freed = release_user_pages(USER_STACK_BASE,
+                                           process->stack_pages,
+                                           USER_STACK_PAGES, USER_STACK_PAGES);
     bool heap_freed = release_user_pages(process->heap_base, process->heap_pages,
                                           process->heap_page_count,
                                           process->heap_page_count);
@@ -4580,24 +5912,25 @@ static bool user_process_run_image(enum user_program program,
     uint8_t **image_buffers = load->image_buffers;
     uint64_t *interpreter_physical = load->interpreter_physical;
     uint8_t **interpreter_buffers = load->interpreter_buffers;
-    uint64_t stack_physical[1] = {0};
-    uint8_t *stack_buffers[1] = {0};
+    uint64_t stack_physical[USER_STACK_PAGES] = {0};
+    uint8_t *stack_buffers[USER_STACK_PAGES] = {0};
     if (!allocate_user_pages(elf_plan.total_page_count,
                              image_physical, image_buffers)
         || !allocate_user_pages(interpreter_plan.total_page_count,
                                 interpreter_physical, interpreter_buffers)
-        || !allocate_user_pages(1, stack_physical, stack_buffers)) {
+        || !allocate_user_pages(USER_STACK_PAGES, stack_physical,
+                                stack_buffers)) {
         release_user_pages(0, image_physical,
                            elf_plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return false;
     }
 
     zero_user_pages(elf_plan.total_page_count, image_buffers);
     zero_user_pages(interpreter_plan.total_page_count, interpreter_buffers);
-    zero_user_pages(1, stack_buffers);
+    zero_user_pages(USER_STACK_PAGES, stack_buffers);
     if (is_elf_image) {
         if (!elf_load_user_image(program_start, program_size, &elf_plan,
                                  image_buffers, elf_plan.total_page_count,
@@ -4611,7 +5944,7 @@ static bool user_process_run_image(enum user_program program,
                                elf_plan.total_page_count, 0);
             release_user_pages(0, interpreter_physical,
                                interpreter_plan.total_page_count, 0);
-            release_user_pages(0, stack_physical, 1, 0);
+            release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
             return false;
         }
     } else {
@@ -4626,7 +5959,7 @@ static bool user_process_run_image(enum user_program program,
                            elf_plan.total_page_count, 0);
         release_user_pages(0, interpreter_physical,
                            interpreter_plan.total_page_count, 0);
-        release_user_pages(0, stack_physical, 1, 0);
+        release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         return false;
     }
     if (!scheduler_activate_current_address_space(process->address_space)) {
@@ -4640,7 +5973,7 @@ static bool user_process_run_image(enum user_program program,
         image_freed = release_user_pages(
             0, interpreter_physical, interpreter_plan.total_page_count, 0)
             && image_freed;
-        bool stack_freed = release_user_pages(0, stack_physical, 1, 0);
+        bool stack_freed = release_user_pages(0, stack_physical, USER_STACK_PAGES, 0);
         if (!address_space_freed || !image_freed || !stack_freed) {
             console_write_string("OPOS: failed to clean up process address space\n");
         }
@@ -4655,22 +5988,27 @@ static bool user_process_run_image(enum user_program program,
             || map_elf_plan(&interpreter_plan, interpreter_physical,
                             interpreter_mapped));
     bool stack_mapped = all_image_mapped
-        && paging_map_page(USER_STACK_ADDRESS, stack_physical[0],
-                           PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE);
+        && map_user_pages(USER_STACK_BASE, stack_physical, USER_STACK_PAGES,
+                          PAGING_USER | PAGING_WRITABLE | PAGING_NO_EXECUTE)
+               == USER_STACK_PAGES;
     bool permissions_valid = stack_mapped
         && elf_plan_permissions_valid(&elf_plan)
         && (!elf_plan.has_interpreter
             || elf_plan_permissions_valid(&interpreter_plan))
-        && paging_user_range_valid(USER_STACK_ADDRESS, PAGE_SIZE, true, false)
-        && !paging_user_range_valid(USER_STACK_ADDRESS, PAGE_SIZE, false, true);
+        && paging_user_range_valid(USER_STACK_BASE,
+                                   USER_STACK_PAGES * PAGE_SIZE, true, false)
+        && !paging_user_range_valid(USER_STACK_BASE,
+                                    USER_STACK_PAGES * PAGE_SIZE, false, true);
     if (!permissions_valid) {
         bool image_freed = release_elf_plan_pages(
             &elf_plan, image_physical, image_mapped);
         image_freed = release_elf_plan_pages(
             &interpreter_plan, interpreter_physical, interpreter_mapped)
             && image_freed;
-        bool stack_freed = release_user_pages(USER_STACK_ADDRESS, stack_physical,
-                                              1, stack_mapped ? 1 : 0);
+        bool stack_freed = release_user_pages(USER_STACK_BASE, stack_physical,
+                                              USER_STACK_PAGES,
+                                              stack_mapped ? USER_STACK_PAGES
+                                                           : 0);
         bool address_space_freed =
             restore_kernel_address_space(kernel_address_space,
                                          process->address_space);
@@ -4692,7 +6030,7 @@ static bool user_process_run_image(enum user_program program,
         initial_stack = user_build_start_vectors(
                 vectors, initial_execfn, initial_execfn_length, arguments,
                 arguments_length)
-            ? user_prepare_exec_stack(stack_buffers[0], &elf_plan, vectors,
+            ? user_prepare_exec_stack(stack_buffers[USER_STACK_ARGUMENT_PAGE], &elf_plan, vectors,
                                       USER_MMAP_BASE, NULL, 0)
             : 0;
     }
@@ -4702,8 +6040,9 @@ static bool user_process_run_image(enum user_program program,
         image_freed = release_elf_plan_pages(
             &interpreter_plan, interpreter_physical, interpreter_mapped)
             && image_freed;
-        bool stack_freed = release_user_pages(USER_STACK_ADDRESS, stack_physical,
-                                              1, 1);
+        bool stack_freed = release_user_pages(USER_STACK_BASE, stack_physical,
+                                              USER_STACK_PAGES,
+                                              USER_STACK_PAGES);
         bool address_space_freed = restore_kernel_address_space(
             kernel_address_space, process->address_space);
         if (address_space_freed) {
@@ -4749,7 +6088,9 @@ static bool user_process_run_image(enum user_program program,
                 user_segment_paging_flags(segment->flags);
         }
     }
-    process->stack_page = stack_physical[0];
+    for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+        process->stack_pages[i] = stack_physical[i];
+    }
     user_threads[task_slot] = (struct user_thread) {
         .active = true,
         .id = process->id,

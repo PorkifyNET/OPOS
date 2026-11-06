@@ -970,6 +970,8 @@ static void execute_command(void) {
         enum user_program program;
         struct initramfs_file file;
         bool run_file = false;
+        const char *program_arguments = "";
+        size_t program_arguments_length = 0;
         char path[256];
         size_t path_length = 0;
         if (command_matches(arguments, arguments_length, "demo")) {
@@ -994,7 +996,18 @@ static void execute_command(void) {
             program = USER_PROGRAM_SPAWN_TEST;
         } else if (arguments_length != 0) {
             size_t path_start = arguments[0] == '/' ? 1 : 0;
-            path_length = arguments_length - path_start;
+            /* "run PATH ARGS...": the rest of the line is argv[1...]. */
+            size_t path_end = path_start;
+            while (path_end < arguments_length && arguments[path_end] != ' ') {
+                path_end++;
+            }
+            program_arguments = arguments + path_end;
+            program_arguments_length = arguments_length - path_end;
+            while (program_arguments_length != 0 && *program_arguments == ' ') {
+                program_arguments++;
+                program_arguments_length--;
+            }
+            path_length = path_end - path_start;
             if (path_length == 0) {
                 console_write_warning("Usage: run PATH\n");
                 return;
@@ -1025,8 +1038,10 @@ static void execute_command(void) {
         uint64_t exit_status;
         console_write_string("Starting user process...\n");
         bool started = run_file
-            ? user_process_run_elf_path(file.data, file.size,
+            ? user_process_run_elf_args(file.data, file.size,
                                         path, path_length + 1,
+                                        program_arguments,
+                                        program_arguments_length,
                                         &process_id, &exit_status)
             : user_process_run(program, &process_id, &exit_status);
         if (!started) {

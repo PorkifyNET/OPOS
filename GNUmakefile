@@ -21,11 +21,13 @@ DYNAMIC_BASE_LIBRARY_ELF := $(BUILD)/libopos-base.so
 MUSL_TEST_ELF := $(BUILD)/musl-test.elf
 MUSL_PTHREAD_TEST_ELF := $(BUILD)/musl-pthread-test.elf
 MUSL_SIGNAL_TEST_ELF := $(BUILD)/musl-signal-test.elf
+MUSL_NET_TEST_ELF := $(BUILD)/musl-net-test.elf
 INITRAMFS := $(BUILD)/initramfs.tar
 # Notepad is an ordinary SDK program (sdk/examples/notepad.c) shipped in
 # the initramfs as /bin/notepad.
 SDK_NOTEPAD := sdk/build/notepad
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/lib/image.c sdk/include/opos_image.h
+SDK_FETCH := sdk/build/fetch
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/lib/image.c sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -150,8 +152,15 @@ $(MUSL_SIGNAL_TEST_ELF): kernel/musl_signal_test.c
 	mkdir -p $(BUILD)
 	$(MUSL_CC) -static -Os -s -fno-stack-protector -Wl,--build-id=none $< -o $@
 
+$(MUSL_NET_TEST_ELF): kernel/musl_net_test.c
+	mkdir -p $(BUILD)
+	$(MUSL_CC) -static -Os -s -fno-stack-protector -Wl,--build-id=none $< -o $@
+
 $(SDK_NOTEPAD): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/notepad
+
+$(SDK_FETCH): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/fetch
 
 # The SDK is self-contained, so it carries copies of the kernel's image
 # decoder; these rules keep them identical.
@@ -161,7 +170,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(SDK_NOTEPAD) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF)
+$(INITRAMFS): $(WALLPAPERS) $(SDK_NOTEPAD) $(SDK_FETCH) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -173,8 +182,10 @@ $(INITRAMFS): $(WALLPAPERS) $(SDK_NOTEPAD) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMI
 	cp $(DYNAMIC_BASE_LIBRARY_ELF) $(BUILD)/initramfs_root/lib/libopos-base.so
 	cp $(MUSL_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-test
 	cp $(MUSL_PTHREAD_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-pthread-test
+	cp $(MUSL_NET_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-net-test
 	cp $(MUSL_SIGNAL_TEST_ELF) $(BUILD)/initramfs_root/tests/musl-signal-test
 	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
+	cp $(SDK_FETCH) $(BUILD)/initramfs_root/bin/fetch
 	mkdir -p $(BUILD)/initramfs_root/share/wallpapers
 	cp $(WALLPAPERS) $(BUILD)/initramfs_root/share/wallpapers/
 	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin lib share tests

@@ -75,5 +75,44 @@ size_t net_tcp_send(int handle, const void *data, size_t length);
 size_t net_tcp_receive(int handle, void *buffer, size_t capacity);
 /* Closes our side; the handle is invalid afterwards. */
 void net_tcp_close(int handle);
+/* local_port 0 picks a free one. */
+int net_tcp_connect_from(const uint8_t ip[4], uint16_t port,
+                         uint16_t local_port);
+/* With NET_TCP_FAILED: -111 refused, -104 reset, -110 timed out. */
+int net_tcp_error(int handle);
+size_t net_tcp_send_space(int handle);
+/* Data waiting, or the peer closed / reset (a read will not block). */
+bool net_tcp_readable(int handle);
+bool net_tcp_can_send(int handle);
+/* Sends our FIN but keeps receiving. */
+void net_tcp_shutdown(int handle);
+void net_tcp_endpoints(int handle, uint8_t local_ip[4], uint16_t *local_port,
+                       uint8_t remote_ip[4], uint16_t *remote_port);
+bool net_tcp_port_free(uint16_t port);
+uint16_t net_tcp_pick_port(void);
+/* Listening ports: up to 4, each with up to 8 waiting connections.
+   Returns a listener id or a negative errno. */
+int net_tcp_listen(uint16_t port, int backlog);
+bool net_tcp_accept_ready(int listener);
+/* A connection handle, or -11 (EAGAIN) when none is waiting. */
+int net_tcp_accept(int listener);
+void net_tcp_unlisten(int listener);
+
+/*
+ * UDP sockets (up to 8, 8 queued datagrams each). Sending to 127.0.0.1:53
+ * goes to the DHCP-given DNS server and the answers come back as if from
+ * 127.0.0.1, which is where musl's resolver asks without /etc/resolv.conf.
+ * Results are byte counts or negative errnos (-11 = nothing waiting).
+ */
+int net_udp_open(uint16_t port);
+void net_udp_close(int id);
+uint16_t net_udp_port(int id);
+long net_udp_send(int id, const uint8_t ip[4], uint16_t port,
+                  const void *data, size_t length);
+bool net_udp_readable(int id);
+long net_udp_receive(int id, void *buffer, size_t capacity, uint8_t ip[4],
+                     uint16_t *port);
+/* Our address (0.0.0.0 before DHCP). */
+void net_local_address(uint8_t ip[4]);
 
 #endif

@@ -118,6 +118,13 @@ Examples built on these calls:
   (for text files) open it. It shows text drawing, keyboard shortcuts
   with modifiers, mouse selection, and loading and saving files.
 
+Networking: `opos_net.h` has IPv4 TCP and UDP sockets (the Linux socket
+calls: `opos_socket`, `opos_connect`, `opos_bind`, `opos_listen`,
+`opos_accept`, `opos_send`, `opos_recv`, `opos_sendto`, `opos_recvfrom`,
+`opos_poll`, closed with `opos_close`) and `opos_net_resolve` for DNS.
+`examples/fetch.c` prints a web page over HTTP; it ships as `/bin/fetch`:
+`run /bin/fetch example.com`.
+
 Images: `opos_image.h` decodes PNG (every colour type and bit depth,
 interlaced too), JPEG (baseline and progressive) and BMP. It is the same
 decoder the desktop uses (`lib/image.c` is generated from

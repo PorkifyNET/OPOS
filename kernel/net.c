@@ -510,9 +510,11 @@ static bool udp_send(const uint8_t destination[4], uint16_t source_port,
 static void dhcp_receive(const uint8_t *data, size_t length);
 static void dns_receive(const uint8_t *data, size_t length);
 
+static void udp_deliver(const uint8_t *ip, const uint8_t *udp,
+                        const uint8_t *data, size_t length);
+
 static void udp_receive(const uint8_t *ip, const uint8_t *udp,
                         size_t length) {
-    (void)ip;
     if (length < UDP_HEADER) {
         return;
     }
@@ -525,6 +527,8 @@ static void udp_receive(const uint8_t *ip, const uint8_t *udp,
         dhcp_receive(udp + UDP_HEADER, udp_length - UDP_HEADER);
     } else if (port == DNS_CLIENT_PORT && get16(udp) == DNS_PORT) {
         dns_receive(udp + UDP_HEADER, udp_length - UDP_HEADER);
+    } else if (configured) {
+        udp_deliver(ip, udp, udp + UDP_HEADER, udp_length - UDP_HEADER);
     }
 }
 
@@ -891,10 +895,10 @@ static void dns_poll(void) {
  * TCP client connections. Sending is go-back-N: unacknowledged bytes stay
  * in the send buffer and a timeout resends from the oldest one. Received
  * segments are taken only in order; anything else gets a duplicate ACK.
- * No listening sockets yet.
+ * Listening ports keep a short queue of established connections.
  */
 #define IP_PROTOCOL_TCP 6
-#define TCP_CONNECTIONS 4
+#define TCP_CONNECTIONS 8
 #define TCP_SEND_CAPACITY 16384
 #define TCP_RECEIVE_CAPACITY 32768
 #define TCP_MSS 1460
@@ -913,6 +917,7 @@ static void dns_poll(void) {
 enum tcp_state {
     TCP_CLOSED,
     TCP_SYN_SENT,
+    TCP_SYN_RECEIVED,
     TCP_ESTABLISHED,
     TCP_FIN_WAIT_1,
     TCP_FIN_WAIT_2,
@@ -925,6 +930,9 @@ struct tcp_connection {
     bool used;
     bool detached; /* the owner closed it; free the slot when done */
     bool failed;   /* reset by the peer or timed out */
+    int error;     /* with failed: -111 refused, -104 reset, -110 timeout */
+    int listener;  /* SYN_RECEIVED/queued: the listening slot, else -1 */
+    bool queued;   /* waiting in that listener's accept queue */
     enum tcp_state state;
     uint8_t remote_ip[4];
     uint16_t remote_port;
@@ -952,6 +960,45 @@ struct tcp_connection {
 
 static struct tcp_connection tcp_table[TCP_CONNECTIONS];
 static uint16_t tcp_next_port;
+
+#define TCP_LISTENERS 4
+#define TCP_BACKLOG 8
+
+struct tcp_listener {
+    bool used;
+    uint16_t port;
+    size_t backlog;
+    size_t count;
+    int queue[TCP_BACKLOG];
+};
+
+static struct tcp_listener tcp_listeners[TCP_LISTENERS];
+
+static struct tcp_listener *tcp_find_listener(uint16_t port) {
+    for (size_t i = 0; i < TCP_LISTENERS; i++) {
+        if (tcp_listeners[i].used && tcp_listeners[i].port == port) {
+            return &tcp_listeners[i];
+        }
+    }
+    return NULL;
+}
+
+static uint16_t tcp_ephemeral_port(void) {
+    for (int tries = 0; tries < 16384; tries++) {
+        if (tcp_next_port < 49152) {
+            tcp_next_port = (uint16_t)(49152 + random32() % 8192);
+        }
+        uint16_t port = tcp_next_port++;
+        bool taken = tcp_find_listener(port) != NULL;
+        for (size_t i = 0; i < TCP_CONNECTIONS && !taken; i++) {
+            taken = tcp_table[i].used && tcp_table[i].local_port == port;
+        }
+        if (!taken) {
+            return port;
+        }
+    }
+    return 0;
+}
 
 /* Sequence comparisons that survive wrap-around. */
 static bool seq_lt(uint32_t a, uint32_t b) {
@@ -1082,6 +1129,61 @@ static void tcp_send_reset(const uint8_t *ip, const uint8_t *tcp,
     }
 }
 
+/* Reads the MSS option of a SYN. */
+static uint32_t tcp_option_mss(const uint8_t *tcp, size_t header) {
+    uint32_t mss = 536;
+    for (size_t i = TCP_HEADER; i + 1 < header;) {
+        uint8_t kind = tcp[i];
+        if (kind == 0) {
+            break;
+        }
+        if (kind == 1) {
+            i++;
+            continue;
+        }
+        uint8_t size = tcp[i + 1];
+        if (size < 2 || i + size > header) {
+            break;
+        }
+        if (kind == 2 && size == 4) {
+            mss = get16(tcp + i + 2);
+        }
+        i += size;
+    }
+    return mss > TCP_MSS ? TCP_MSS : mss < 64 ? 64 : mss;
+}
+
+/* Starts an incoming connection: answers the SYN with SYN+ACK. */
+static bool tcp_accept_syn(struct tcp_listener *listener, const uint8_t *ip,
+                           const uint8_t *tcp, size_t header, uint32_t seq,
+                           uint32_t window) {
+    for (int i = 0; i < TCP_CONNECTIONS; i++) {
+        struct tcp_connection *c = &tcp_table[i];
+        if (c->used) {
+            continue;
+        }
+        zero(c, sizeof(*c) - TCP_SEND_CAPACITY - TCP_RECEIVE_CAPACITY);
+        c->used = true;
+        c->detached = true; /* nobody owns it until accept() */
+        c->listener = (int)(listener - tcp_listeners);
+        copy(c->remote_ip, ip + 12, 4);
+        c->remote_port = get16(tcp);
+        c->local_port = get16(tcp + 2);
+        c->iss = random32();
+        c->snd_una = c->iss;
+        c->snd_nxt = c->iss + 1;
+        c->rcv_nxt = seq + 1;
+        c->snd_wnd = window;
+        c->mss = tcp_option_mss(tcp, header);
+        c->rto = TCP_RTO_START;
+        c->state = TCP_SYN_RECEIVED;
+        tcp_segment(c, c->iss, TCP_SYN | TCP_ACK, NULL, 0);
+        tcp_arm(c);
+        return true;
+    }
+    return false;
+}
+
 static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
                         size_t length) {
     if (length < TCP_HEADER || !configured) {
@@ -1122,10 +1224,53 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
         }
     }
     if (c == NULL) {
+        struct tcp_listener *listener = tcp_find_listener(local_port);
+        if ((flags & (TCP_SYN | TCP_ACK | TCP_RST)) == TCP_SYN
+            && listener != NULL && same(ip + 16, our_ip, 4)
+            && listener->count < listener->backlog
+            && tcp_accept_syn(listener, ip, tcp, header, seq, window)) {
+            return;
+        }
         if ((flags & TCP_RST) == 0) {
             tcp_send_reset(ip, tcp, data_length, flags);
         }
         return;
+    }
+
+    if (c->state == TCP_SYN_RECEIVED) {
+        if ((flags & TCP_RST) != 0) {
+            tcp_free(c);
+            return;
+        }
+        if ((flags & TCP_SYN) != 0) {
+            /* Our SYN+ACK got lost: send it again. */
+            tcp_segment(c, c->iss, TCP_SYN | TCP_ACK, NULL, 0);
+            return;
+        }
+        if ((flags & TCP_ACK) == 0) {
+            return;
+        }
+        if (ack != c->iss + 1) {
+            tcp_send_reset(ip, tcp, data_length, flags);
+            return;
+        }
+        struct tcp_listener *listener =
+            c->listener >= 0 ? &tcp_listeners[c->listener] : NULL;
+        if (listener == NULL || !listener->used
+            || listener->count >= TCP_BACKLOG) {
+            tcp_segment(c, ack, TCP_RST, NULL, 0);
+            tcp_free(c);
+            return;
+        }
+        c->snd_una = ack;
+        c->snd_wnd = window;
+        c->state = TCP_ESTABLISHED;
+        c->retransmit_at = 0;
+        c->retries = 0;
+        c->rto = TCP_RTO_START;
+        c->queued = true;
+        listener->queue[listener->count++] = (int)(c - tcp_table);
+        /* Data in the same segment is handled below. */
     }
 
     if (c->state == TCP_SYN_SENT) {
@@ -1138,6 +1283,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
         if ((flags & TCP_RST) != 0) {
             if ((flags & TCP_ACK) != 0) {
                 c->failed = true; /* connection refused */
+                c->error = -111;
                 c->state = TCP_CLOSED;
             }
             return;
@@ -1187,6 +1333,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
         if (seq_le(c->rcv_nxt, seq)
             && seq_lt(seq, c->rcv_nxt + (c->advertised ? c->advertised : 1))) {
             c->failed = c->state != TCP_TIME_WAIT && !c->remote_closed;
+            c->error = -104;
             c->state = TCP_CLOSED;
             if (c->detached) {
                 tcp_free(c);
@@ -1245,7 +1392,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
     bool in_order = seq == c->rcv_nxt;
     if (data_length != 0) {
         send_ack = true;
-        if (in_order && !c->remote_closed && c->detached) {
+        if (in_order && !c->remote_closed && c->detached && !c->queued) {
             /* Nobody reads any more: accept and drop. */
             c->rcv_nxt += (uint32_t)data_length;
         } else if (in_order && !c->remote_closed) {
@@ -1302,6 +1449,7 @@ static void tcp_poll(void) {
         c->retransmit_at = 0;
         if (++c->retries > TCP_RETRIES) {
             c->failed = true;
+            c->error = -110;
             c->state = TCP_CLOSED;
             if (c->detached) {
                 tcp_free(c);
@@ -1309,8 +1457,11 @@ static void tcp_poll(void) {
             continue;
         }
         c->rto = c->rto * 2 > TCP_RTO_MAX ? TCP_RTO_MAX : c->rto * 2;
-        if (c->state == TCP_SYN_SENT) {
-            tcp_segment(c, c->iss, TCP_SYN, NULL, 0);
+        if (c->state == TCP_SYN_SENT || c->state == TCP_SYN_RECEIVED) {
+            tcp_segment(c, c->iss,
+                        c->state == TCP_SYN_SENT ? TCP_SYN
+                                                 : TCP_SYN | TCP_ACK,
+                        NULL, 0);
             tcp_arm(c);
             continue;
         }
@@ -1323,6 +1474,11 @@ static void tcp_poll(void) {
 }
 
 int net_tcp_connect(const uint8_t ip[4], uint16_t port) {
+    return net_tcp_connect_from(ip, port, 0);
+}
+
+int net_tcp_connect_from(const uint8_t ip[4], uint16_t port,
+                         uint16_t local_port) {
     if (!configured) {
         return -1;
     }
@@ -1335,10 +1491,8 @@ int net_tcp_connect(const uint8_t ip[4], uint16_t port) {
         c->used = true;
         copy(c->remote_ip, ip, 4);
         c->remote_port = port;
-        if (tcp_next_port < 49152) {
-            tcp_next_port = (uint16_t)(49152 + random32() % 8192);
-        }
-        c->local_port = tcp_next_port++;
+        c->listener = -1;
+        c->local_port = local_port != 0 ? local_port : tcp_ephemeral_port();
         c->iss = random32();
         c->snd_una = c->iss;
         c->snd_nxt = c->iss + 1;
@@ -1430,6 +1584,324 @@ void net_tcp_close(int handle) {
     }
     c->fin_queued = true;
     tcp_push(c, false);
+}
+
+int net_tcp_error(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    return c == NULL ? -9 : c->failed ? (c->error != 0 ? c->error : -104) : 0;
+}
+
+bool net_tcp_readable(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    return c != NULL && (c->receive_length != 0 || c->remote_closed
+                         || c->failed || c->state == TCP_CLOSED);
+}
+
+size_t net_tcp_send_space(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL || c->failed || c->fin_queued) {
+        return 0;
+    }
+    return TCP_SEND_CAPACITY - c->send_length;
+}
+
+bool net_tcp_can_send(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    return c != NULL && !c->failed && !c->fin_queued
+        && (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT);
+}
+
+void net_tcp_shutdown(int handle) {
+    struct tcp_connection *c = tcp_handle(handle);
+    if (c == NULL || c->fin_queued || c->failed) {
+        return;
+    }
+    c->fin_queued = true;
+    tcp_push(c, false);
+}
+
+void net_tcp_endpoints(int handle, uint8_t local_ip[4], uint16_t *local_port,
+                       uint8_t remote_ip[4], uint16_t *remote_port) {
+    struct tcp_connection *c = tcp_handle(handle);
+    copy(local_ip, configured ? our_ip : zero_ip, 4);
+    copy(remote_ip, c != NULL ? c->remote_ip : zero_ip, 4);
+    *local_port = c != NULL ? c->local_port : 0;
+    *remote_port = c != NULL ? c->remote_port : 0;
+}
+
+bool net_tcp_port_free(uint16_t port) {
+    if (tcp_find_listener(port) != NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < TCP_CONNECTIONS; i++) {
+        if (tcp_table[i].used && tcp_table[i].local_port == port) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint16_t net_tcp_pick_port(void) {
+    return tcp_ephemeral_port();
+}
+
+int net_tcp_listen(uint16_t port, int backlog) {
+    if (port == 0 || tcp_find_listener(port) != NULL) {
+        return -98;
+    }
+    for (int i = 0; i < TCP_LISTENERS; i++) {
+        struct tcp_listener *listener = &tcp_listeners[i];
+        if (listener->used) {
+            continue;
+        }
+        zero(listener, sizeof(*listener));
+        listener->used = true;
+        listener->port = port;
+        listener->backlog = backlog < 1 ? 1
+                          : backlog > TCP_BACKLOG ? TCP_BACKLOG
+                                                  : (size_t)backlog;
+        return i;
+    }
+    return -105;
+}
+
+static struct tcp_connection *tcp_queued(struct tcp_listener *listener,
+                                         size_t index) {
+    int handle = listener->queue[index];
+    struct tcp_connection *c = &tcp_table[handle];
+    if (!c->used || !c->queued
+        || c->listener != (int)(listener - tcp_listeners)) {
+        return NULL;
+    }
+    return c;
+}
+
+static void tcp_listener_drop_stale(struct tcp_listener *listener) {
+    size_t out = 0;
+    for (size_t i = 0; i < listener->count; i++) {
+        if (tcp_queued(listener, i) != NULL) {
+            listener->queue[out++] = listener->queue[i];
+        }
+    }
+    listener->count = out;
+}
+
+bool net_tcp_accept_ready(int id) {
+    if (id < 0 || id >= TCP_LISTENERS || !tcp_listeners[id].used) {
+        return false;
+    }
+    tcp_listener_drop_stale(&tcp_listeners[id]);
+    return tcp_listeners[id].count != 0;
+}
+
+int net_tcp_accept(int id) {
+    if (id < 0 || id >= TCP_LISTENERS || !tcp_listeners[id].used) {
+        return -22;
+    }
+    struct tcp_listener *listener = &tcp_listeners[id];
+    tcp_listener_drop_stale(listener);
+    if (listener->count == 0) {
+        return -11;
+    }
+    int handle = listener->queue[0];
+    for (size_t i = 1; i < listener->count; i++) {
+        listener->queue[i - 1] = listener->queue[i];
+    }
+    listener->count--;
+    struct tcp_connection *c = &tcp_table[handle];
+    c->queued = false;
+    c->detached = false;
+    c->listener = -1;
+    return handle;
+}
+
+void net_tcp_unlisten(int id) {
+    if (id < 0 || id >= TCP_LISTENERS || !tcp_listeners[id].used) {
+        return;
+    }
+    struct tcp_listener *listener = &tcp_listeners[id];
+    /* Connections nobody accepted are reset. */
+    for (size_t i = 0; i < TCP_CONNECTIONS; i++) {
+        struct tcp_connection *c = &tcp_table[i];
+        if (c->used && c->listener == id) {
+            tcp_segment(c, c->snd_nxt, TCP_RST | TCP_ACK, NULL, 0);
+            tcp_free(c);
+        }
+    }
+    listener->used = false;
+}
+
+/* ------------------------------------------------------- UDP sockets */
+
+#define UDP_SOCKETS 8
+#define UDP_QUEUE 8
+#define UDP_PAYLOAD_MAX (FRAME_CAPACITY - ETHERNET_HEADER - IP_HEADER \
+                         - UDP_HEADER)
+
+struct udp_datagram {
+    uint16_t length;
+    uint8_t ip[4];
+    uint16_t port;
+    uint8_t data[UDP_PAYLOAD_MAX];
+};
+
+struct udp_socket {
+    bool used;
+    bool dns_proxy; /* sent to 127.0.0.1:53, which we forward */
+    uint16_t port;
+    size_t head;
+    size_t count;
+    struct udp_datagram queue[UDP_QUEUE];
+};
+
+static struct udp_socket udp_sockets[UDP_SOCKETS];
+static uint16_t udp_next_port;
+static const uint8_t loopback_ip[4] = {127, 0, 0, 1};
+
+static struct udp_socket *udp_socket(int id) {
+    if (id < 0 || id >= UDP_SOCKETS || !udp_sockets[id].used) {
+        return NULL;
+    }
+    return &udp_sockets[id];
+}
+
+static bool udp_port_taken(uint16_t port) {
+    if (port == DHCP_CLIENT_PORT || port == DNS_CLIENT_PORT) {
+        return true;
+    }
+    for (size_t i = 0; i < UDP_SOCKETS; i++) {
+        if (udp_sockets[i].used && udp_sockets[i].port == port) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int net_udp_open(uint16_t port) {
+    if (port == 0) {
+        for (int tries = 0; tries < 16384 && port == 0; tries++) {
+            if (udp_next_port < 50000) {
+                udp_next_port = (uint16_t)(50000 + random32() % 8192);
+            }
+            uint16_t candidate = udp_next_port++;
+            if (!udp_port_taken(candidate)) {
+                port = candidate;
+            }
+        }
+        if (port == 0) {
+            return -98;
+        }
+    } else if (udp_port_taken(port)) {
+        return -98;
+    }
+    for (int i = 0; i < UDP_SOCKETS; i++) {
+        struct udp_socket *s = &udp_sockets[i];
+        if (s->used) {
+            continue;
+        }
+        s->used = true;
+        s->dns_proxy = false;
+        s->port = port;
+        s->head = 0;
+        s->count = 0;
+        return i;
+    }
+    return -105;
+}
+
+void net_udp_close(int id) {
+    struct udp_socket *s = udp_socket(id);
+    if (s != NULL) {
+        s->used = false;
+    }
+}
+
+uint16_t net_udp_port(int id) {
+    struct udp_socket *s = udp_socket(id);
+    return s != NULL ? s->port : 0;
+}
+
+long net_udp_send(int id, const uint8_t ip[4], uint16_t port,
+                  const void *data, size_t length) {
+    struct udp_socket *s = udp_socket(id);
+    if (s == NULL) {
+        return -9;
+    }
+    if (length > UDP_PAYLOAD_MAX) {
+        return -90;
+    }
+    const uint8_t *destination = ip;
+    if (ip[0] == 127) {
+        /* Only the DNS forwarder lives on the loopback address. */
+        if (!same(ip, loopback_ip, 4) || port != DNS_PORT || !configured
+            || same(our_dns, zero_ip, 4)) {
+            return -101;
+        }
+        s->dns_proxy = true;
+        destination = our_dns;
+    } else if (!configured && !same(ip, broadcast_ip, 4)) {
+        return -101;
+    }
+    copy(frame_out + ETHERNET_HEADER + IP_HEADER + UDP_HEADER, data, length);
+    if (!udp_send(destination, s->port, port, length)) {
+        return -105;
+    }
+    return (long)length;
+}
+
+bool net_udp_readable(int id) {
+    struct udp_socket *s = udp_socket(id);
+    return s != NULL && s->count != 0;
+}
+
+long net_udp_receive(int id, void *buffer, size_t capacity, uint8_t ip[4],
+                     uint16_t *port) {
+    struct udp_socket *s = udp_socket(id);
+    if (s == NULL) {
+        return -9;
+    }
+    if (s->count == 0) {
+        return -11;
+    }
+    struct udp_datagram *datagram = &s->queue[s->head];
+    size_t length = datagram->length < capacity ? datagram->length
+                                                : capacity;
+    copy(buffer, datagram->data, length);
+    if (ip != NULL) {
+        copy(ip, datagram->ip, 4);
+    }
+    if (port != NULL) {
+        *port = datagram->port;
+    }
+    s->head = (s->head + 1) % UDP_QUEUE;
+    s->count--;
+    return (long)length;
+}
+
+static void udp_deliver(const uint8_t *ip, const uint8_t *udp,
+                        const uint8_t *data, size_t length) {
+    uint16_t port = get16(udp + 2);
+    for (size_t i = 0; i < UDP_SOCKETS; i++) {
+        struct udp_socket *s = &udp_sockets[i];
+        if (!s->used || s->port != port) {
+            continue;
+        }
+        if (s->count == UDP_QUEUE || length > UDP_PAYLOAD_MAX) {
+            return; /* dropped, as UDP may */
+        }
+        struct udp_datagram *datagram =
+            &s->queue[(s->head + s->count) % UDP_QUEUE];
+        datagram->length = (uint16_t)length;
+        copy(datagram->ip, ip + 12, 4);
+        datagram->port = get16(udp);
+        if (s->dns_proxy && same(ip + 12, our_dns, 4)
+            && datagram->port == DNS_PORT) {
+            copy(datagram->ip, loopback_ip, 4);
+        }
+        copy(datagram->data, data, length);
+        s->count++;
+        return;
+    }
 }
 
 /* --------------------------------------------------------------- ICMP */
@@ -1875,6 +2347,10 @@ void net_poll(void) {
     dhcp_poll();
     dns_poll();
     session_poll();
+}
+
+void net_local_address(uint8_t ip[4]) {
+    copy(ip, configured ? our_ip : zero_ip, 4);
 }
 
 void net_get_status(struct net_status *status) {

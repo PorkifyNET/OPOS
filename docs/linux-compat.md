@@ -129,6 +129,39 @@ stdout through `dup2`, sends a two-vector `writev`, wakes a blocked parent read,
 checks EOF and exit status, fills a pipe to force and wake a blocked writer,
 then verifies `EPIPE` and resource reuse.
 
+## Sockets, poll and select
+
+`socket`, `connect`, `bind`, `listen`, `accept`/`accept4`, `sendto`/`send`,
+`recvfrom`/`recv`, `sendmsg`, `recvmsg`, `shutdown`, `getsockname`,
+`getpeername`, `setsockopt` (accepted, ignored) and `getsockopt`
+(`SO_ERROR`, `SO_TYPE`) work for `AF_INET` `SOCK_STREAM` (TCP) and
+`SOCK_DGRAM` (UDP) sockets on top of `kernel/net.c`. `read`, `write`,
+`writev`, `close`, `fstat` (`S_IFSOCK`) and `fork` sharing work on socket
+descriptors. `SOCK_NONBLOCK`, `MSG_DONTWAIT` and `fcntl(F_SETFL, O_NONBLOCK)`
+give `EAGAIN`/`EINPROGRESS`; `MSG_PEEK`, IPv6, `AF_UNIX` and `socketpair`
+are not supported. Blocking calls poll the network card and wait one timer
+tick at a time, so a killed process leaves them with `EINTR`.
+
+Limits are system-wide: 8 TCP connections, 4 listening ports with up to 8
+queued connections each, and 8 UDP sockets with 8 queued datagrams each.
+There is no loopback interface, with one exception: UDP to `127.0.0.1:53` is
+forwarded to the DHCP-provided DNS server and the answers come back from
+`127.0.0.1`. That is where musl's resolver asks when `/etc/resolv.conf` is
+missing, so `getaddrinfo` works unchanged.
+
+`poll`, `ppoll`, `select` and `pselect6` report readiness for sockets and
+pipes (regular files are always ready; console input is never reported
+ready). `fcntl` handles `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD`,
+`F_GETFL` and `F_SETFL`. `open` accepts and ignores `O_LARGEFILE` and
+`O_NOCTTY`, which musl adds on its own.
+
+`/tests/musl-net-test [host [port]]` resolves a name with `getaddrinfo`
+and fetches `/` over HTTP; `/tests/musl-net-test serve [port]` answers one
+HTTP request (test it in QEMU with `hostfwd=tcp::8080-:8080` and `curl`).
+
+The main thread's stack is 32 pages (128 KiB) below `0x80000000`; the top
+page holds argv, envp and the auxiliary vector.
+
 ## execve and the dynamic interpreter
 
 `execve` atomically replaces the current process image from either initramfs or

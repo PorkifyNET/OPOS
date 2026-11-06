@@ -25,6 +25,7 @@
 #include "svga.h"
 #include "boot_display.h"
 #include "vmware.h"
+#include "net.h"
 #include "timer.h"
 #include "user.h"
 #include "vfs.h"
@@ -509,6 +510,21 @@ static void terminal_list_files(void) {
 }
 
 /* Executes the typed line. Returns false when the terminal should close. */
+static bool terminal_net_session;
+/* Lines from a ping or lookup typed in the Terminal. */
+static bool terminal_net_output(void) {
+    char line[TERMINAL_COLUMNS];
+    bool any = false;
+    while (net_take_line(line, sizeof(line))) {
+        terminal_print(line);
+        any = true;
+    }
+    if (!net_session_active()) {
+        terminal_net_session = false;
+    }
+    return any;
+}
+
 static bool terminal_execute(void) {
     char echo[TERMINAL_COLUMNS] = "OPOS> ";
     append_text(echo, sizeof(echo), 6, terminal_line);
@@ -518,6 +534,7 @@ static bool terminal_execute(void) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
         terminal_print("PS KILL PID  SHELL REBOOT SHUTDOWN EXIT");
         terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
+        terminal_print("NET  DHCP  PING HOST  LOOKUP NAME");
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
     } else if (text_equals(terminal_line, terminal_length, "clear")) {
@@ -573,6 +590,18 @@ static bool terminal_execute(void) {
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
         }
+    } else if (text_equals(terminal_line, terminal_length, "net")) {
+        net_describe(terminal_print);
+    } else if (text_equals(terminal_line, terminal_length, "dhcp")) {
+        net_dhcp_restart();
+        terminal_print("Asking the DHCP server for an address...");
+    } else if (terminal_length > 5 && text_equals(terminal_line, 5, "ping ")) {
+        terminal_net_session = net_ping_start(terminal_line + 5,
+                                              terminal_length - 5);
+    } else if (terminal_length > 7
+               && text_equals(terminal_line, 7, "lookup ")) {
+        terminal_net_session = net_lookup_start(terminal_line + 7,
+                                                terminal_length - 7);
     } else if (text_equals(terminal_line, terminal_length, "ps")) {
         apps_list();
     } else if (terminal_length > 5 && text_equals(terminal_line, 5, "kill ")) {
@@ -8450,6 +8479,12 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
 /* Returns true when the focused terminal consumed the character. */
 static bool terminal_key(char character) {
     if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
+        && terminal_net_session && net_session_active()) {
+        net_session_stop();
+        terminal_print("^C");
+        return true;
+    }
+    if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
         && app_kill_terminal_job()) {
         terminal_output_flush();
         terminal_print("^C");
@@ -9994,6 +10029,8 @@ static bool desktop_step(void) {
     int64_t height_before = screen_height();
     vmware_tools_poll();
     i2c_hid_poll();
+    net_poll();
+    redraw |= terminal_net_output();
     if (screen_width() != width_before || screen_height() != height_before) {
         windows_fit_screen();
         redraw = true;

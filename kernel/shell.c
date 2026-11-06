@@ -22,6 +22,8 @@
 #include "timer.h"
 #include "user.h"
 #include "vfs.h"
+#include "keyboard.h"
+#include "net.h"
 
 #define SHELL_LINE_CAPACITY 2048
 #define FAT16_DISPLAY_CAPACITY 1024
@@ -473,6 +475,36 @@ static void shell_install(const char *arguments, size_t length) {
     console_write_string("OPOS is installed. Remove the installation media and reboot.\n");
 }
 
+static void shell_print_line(const char *line) {
+    console_write_string(line);
+    console_write_string("\n");
+}
+
+/* Prints a ping or lookup as it runs; Ctrl+C or Esc stops it. */
+static void shell_net_wait(bool started) {
+    char line[128];
+    while (started && net_session_active()) {
+        while (net_take_line(line, sizeof(line))) {
+            shell_print_line(line);
+        }
+        char character;
+        while (keyboard_read_character(&character)) {
+            if (character == KEY_ESCAPE
+                || (keyboard_last_ctrl()
+                    && (character == 'c' || character == 'C'))) {
+                console_write_string("^C\n");
+                net_session_stop();
+            }
+        }
+        console_cursor_refresh();
+        __asm__ volatile ("hlt" : : : "memory");
+        net_poll();
+    }
+    while (net_take_line(line, sizeof(line))) {
+        shell_print_line(line);
+    }
+}
+
 static void execute_command(void) {
     /* USB sticks may have come or gone since the last command. */
     (void)storage_poll();
@@ -501,7 +533,8 @@ static void execute_command(void) {
                              "storage, drives, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
                              "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
-                             "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest\n");
+                             "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest, "
+                             "net, dhcp, ping HOST, lookup NAME\n");
     } else if (command_matches(command, command_length, "echo")) {
         console_write_string(arguments);
         console_write_string("\n");
@@ -602,6 +635,17 @@ static void execute_command(void) {
         } else {
             console_write_warning("Usage: touchpad [mouse|multitouch]\n");
         }
+    } else if (command_matches(command, command_length, "net")) {
+        net_describe(shell_print_line);
+    } else if (command_matches(command, command_length, "dhcp")) {
+        net_dhcp_restart();
+        console_write_string("Asking the DHCP server for an address...\n");
+    } else if (command_matches(command, command_length, "ping")
+               || command_matches(command, command_length, "lookup")) {
+        bool started = command_length == 4
+                           ? net_ping_start(arguments, arguments_length)
+                           : net_lookup_start(arguments, arguments_length);
+        shell_net_wait(started);
     } else if (command_matches(command, command_length, "pci")) {
         acpi_dump_pci();
     } else if (command_matches(command, command_length, "desktop")) {

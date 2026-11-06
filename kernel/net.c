@@ -1843,6 +1843,18 @@ void net_poll(void) {
     if (!e1000_ready()) {
         return;
     }
+    /* A link that comes back may lead to another network: ask DHCP again
+       (checked twice a second). */
+    static bool link_was_up = true;
+    static uint64_t link_checked;
+    if (timer_ticks() - link_checked >= TICKS_PER_SECOND / 2) {
+        link_checked = timer_ticks();
+        bool link = e1000_link_up();
+        if (link && !link_was_up) {
+            net_dhcp_restart();
+        }
+        link_was_up = link;
+    }
     for (int frames = 0; frames < 32; frames++) {
         size_t length = e1000_receive(frame_in, sizeof(frame_in));
         if (length == 0) {

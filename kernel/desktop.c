@@ -6193,11 +6193,34 @@ static struct rect clock_rect(void) {
                          CLOCK_WIDTH - 10, bar.height};
 }
 
-/* False when the button would run into the clock. */
-static bool task_button_fits(struct rect button) {
+/* Network status icon, next to the clock; only with a network card. */
+#define NET_ICON_WIDTH 26
+#define NET_ICON_HEIGHT 22
+
+static bool net_icon_visible(void) {
+    struct net_status status;
+    net_get_status(&status);
+    return status.card;
+}
+
+static struct rect net_icon_rect(void) {
+    struct rect bar = taskbar_rect();
     struct rect clock = clock_rect();
-    return taskbar_vertical() ? button.y + button.height <= clock.y - 10
-                              : button.x + button.width <= clock.x - 10;
+    if (taskbar_vertical()) {
+        return (struct rect){bar.x + (bar.width - NET_ICON_WIDTH) / 2,
+                             clock.y - NET_ICON_HEIGHT - 8, NET_ICON_WIDTH,
+                             NET_ICON_HEIGHT};
+    }
+    return (struct rect){clock.x - NET_ICON_WIDTH - 12,
+                         bar.y + (bar.height - NET_ICON_HEIGHT) / 2,
+                         NET_ICON_WIDTH, NET_ICON_HEIGHT};
+}
+
+/* False when the button would run into the clock or the status icons. */
+static bool task_button_fits(struct rect button) {
+    struct rect limit = net_icon_visible() ? net_icon_rect() : clock_rect();
+    return taskbar_vertical() ? button.y + button.height <= limit.y - 10
+                              : button.x + button.width <= limit.x - 10;
 }
 
 /* INSTALL OPOS is listed only on installation media, LOG OUT only while
@@ -6312,10 +6335,12 @@ static int64_t taskbar_menu_y;
  * dragged).
  */
 static bool taskbar_pointer_reveal;
+/* The network popup (click on the network icon). */
+static bool net_popup_open;
 
 static bool taskbar_shown(void) {
     return !appearance_taskbar_autohide() || start_menu_open
-        || taskbar_menu_open || taskbar_pointer_reveal
+        || taskbar_menu_open || net_popup_open || taskbar_pointer_reveal
         || keyboard_super_held();
 }
 
@@ -6389,6 +6414,8 @@ static void draw_button(struct rect area, const char *label, bool active) {
                       area.width - 20, label, 240, 245, 255);
 }
 
+static void draw_net_icon(void);
+
 static void draw_taskbar(void) {
     struct rect bar = taskbar_rect();
     fill(bar, 20, 26, 40);
@@ -6435,6 +6462,7 @@ static void draw_taskbar(void) {
         length = append_text(time, sizeof(time), length, ":");
         append_two_digits(time, sizeof(time), length, seconds % 60);
     }
+    draw_net_icon();
     struct rect clock = clock_rect();
     if (taskbar_vertical()) {
         draw_text_clipped(clock.x + 4, clock.y + 4, clock.width - 8, date,
@@ -6450,6 +6478,84 @@ static void draw_taskbar(void) {
         append_text(line, sizeof(line), length, time);
         draw_text_clipped(clock.x, clock.y + (clock.height - CHAR_HEIGHT) / 2,
                           clock.width, line, 230, 238, 255);
+    }
+}
+
+/*
+ * Three rising bars: bright when connected, dim while DHCP is still
+ * asking, with a red cross when the link (cable) is down.
+ */
+static void draw_net_icon(void) {
+    struct net_status status;
+    net_get_status(&status);
+    if (!status.card) {
+        return;
+    }
+    struct rect icon = net_icon_rect();
+    if (net_popup_open) {
+        fill(icon, 70, 100, 160);
+    }
+    for (int i = 0; i < 3; i++) {
+        int64_t height = 6 + 5 * i;
+        struct rect bar = {icon.x + 4 + 7 * i,
+                           icon.y + icon.height - 3 - height, 4, height};
+        if (status.configured) {
+            fill(bar, 230, 238, 255);
+        } else {
+            fill(bar, 110, 120, 140);
+        }
+    }
+    if (!status.link) {
+        for (int i = 0; i < 9; i++) {
+            fill((struct rect){icon.x + icon.width - 11 + i, icon.y + 2 + i,
+                               2, 2}, 240, 90, 90);
+            fill((struct rect){icon.x + icon.width - 3 - i, icon.y + 2 + i,
+                               2, 2}, 240, 90, 90);
+        }
+    }
+}
+
+#define NET_POPUP_LINES 6
+static char net_popup_text[NET_POPUP_LINES][72];
+static size_t net_popup_count;
+
+static void net_popup_add(const char *line) {
+    if (net_popup_count < NET_POPUP_LINES) {
+        net_popup_text[net_popup_count][0] = '\0';
+        append_text(net_popup_text[net_popup_count],
+                    sizeof(net_popup_text[0]), 0, line);
+        net_popup_count++;
+    }
+}
+
+/* Sized to the current text (net_describe), so it fills the lines too. */
+static struct rect net_popup_rect(void) {
+    net_popup_count = 0;
+    net_describe(net_popup_add);
+    size_t columns = 20;
+    for (size_t i = 0; i < net_popup_count; i++) {
+        size_t length = text_length(net_popup_text[i]);
+        columns = length > columns ? length : columns;
+    }
+    struct rect icon = net_icon_rect();
+    int64_t width = (int64_t)columns * CHAR_WIDTH + 26;
+    int64_t height = (int64_t)net_popup_count * (CHAR_HEIGHT + 6) + 16;
+    return taskbar_popup_rect(icon.x + icon.width - width, icon.y, width,
+                              height);
+}
+
+static void draw_net_popup(void) {
+    if (!net_popup_open) {
+        return;
+    }
+    struct rect popup = net_popup_rect();
+    fill(popup, 110, 160, 255);
+    fill((struct rect){popup.x + 2, popup.y + 2, popup.width - 4,
+                       popup.height - 4}, 26, 34, 54);
+    for (size_t i = 0; i < net_popup_count; i++) {
+        draw_text_clipped(popup.x + 12,
+                          popup.y + 10 + (int64_t)i * (CHAR_HEIGHT + 6),
+                          popup.width - 24, net_popup_text[i], 230, 238, 255);
     }
 }
 
@@ -6815,6 +6921,7 @@ static void draw_scene(void) {
         draw_start_menu();
     }
     draw_taskbar_menu();
+    draw_net_popup();
     if (buffered) {
         console_frame_present();
     } else {
@@ -8344,6 +8451,12 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     if (files_menu_press(x, y)) {
         return DESKTOP_CONTINUE;
     }
+    bool net_popup_was_open = net_popup_open;
+    net_popup_open = false;
+    if (net_popup_was_open && rect_contains(net_popup_rect(), x, y)) {
+        net_popup_open = true;
+        return DESKTOP_CONTINUE;
+    }
     if (taskbar_menu_open) {
         taskbar_menu_open = false;
         for (size_t i = 0; i < TASKBAR_MENU_COUNT; i++) {
@@ -8391,6 +8504,11 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     }
 
     if (taskbar_shown() && rect_contains(taskbar_rect(), x, y)) {
+        if (net_icon_visible() && rect_contains(net_icon_rect(), x, y)) {
+            net_popup_open = !net_popup_was_open;
+            start_menu_open = false;
+            return DESKTOP_CONTINUE;
+        }
         if (rect_contains(start_button_rect(), x, y)) {
             start_menu_open = true;
             menu_selection = 0;

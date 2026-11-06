@@ -19,6 +19,14 @@ bool mouse_read_state(struct mouse_state *state);
    (screen pixels, y down) and the button bits (1 left, 2 right, 4 middle). */
 void mouse_external_attach(void);
 void mouse_external_report(int32_t dx, int32_t dy, uint8_t buttons);
+/* Scroll wheel: drivers add notches (positive = scroll up, away from the
+   user); the desktop takes the sum once per pass. */
+void mouse_external_scroll(int32_t notches);
+int32_t mouse_take_wheel(void);
+/* Width of the area the pointer moves in (the screen). */
+int32_t mouse_screen_width(void);
+/* True when the PS/2 mouse reports a wheel (IntelliMouse). */
+bool mouse_has_wheel(void);
 /* Why mouse_initialize failed, or NULL when the mouse is ready. */
 const char *mouse_failure_reason(void);
 /* True when the device answered a reset; *id is its PS/2 device ID. */

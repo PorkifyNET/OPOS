@@ -863,6 +863,9 @@ static size_t editor_goal_column;
 static size_t editor_top_line;
 static size_t editor_left_column;
 static size_t editor_page_lines = 1;
+/* Set by the scroll wheel: the view stays where it was scrolled to
+   instead of following the cursor, until the next key or click. */
+static bool editor_view_free;
 static char editor_path[EDITOR_PATH_CAPACITY];
 static size_t editor_path_length; /* 0: untitled */
 static bool editor_modified;
@@ -882,6 +885,7 @@ static void editor_reset(void) {
     editor_selecting = false;
     editor_goal_column = 0;
     editor_top_line = 0;
+    editor_view_free = false;
     editor_left_column = 0;
     editor_path_length = 0;
     editor_path[0] = '\0';
@@ -1381,6 +1385,7 @@ static void editor_ctrl_key(char character, bool shift) {
 }
 
 static void editor_key(char character) {
+    editor_view_free = false;
     if (editor_prompt_active) {
         editor_prompt_key(character);
         return;
@@ -1553,7 +1558,14 @@ static void draw_editor(struct rect area, bool focused) {
                       position_width, position, 151, 190, 235);
 
     struct rect text = editor_text_rect(area);
-    editor_scroll_to_cursor(text);
+    if (editor_view_free) {
+        size_t last = editor_line_of(editor_length);
+        if (editor_top_line > last) {
+            editor_top_line = last;
+        }
+    } else {
+        editor_scroll_to_cursor(text);
+    }
     size_t rows = text.height > 0 ? (size_t)(text.height / LINE_HEIGHT) : 0;
     size_t columns = text.width > 0 ? (size_t)(text.width / CHAR_WIDTH) : 0;
     size_t cursor_line = editor_line_of(editor_cursor);
@@ -1656,6 +1668,7 @@ static void draw_editor(struct rect area, bool focused) {
 }
 
 static void editor_click(struct rect area, int32_t x, int32_t y) {
+    editor_view_free = false;
     if (editor_prompt_active) {
         return;
     }
@@ -3116,6 +3129,9 @@ enum setting_row_kind {
     ROW_WALLPAPER,
     ROW_WALLPAPER_STYLE,
     ROW_WALLPAPER_BROWSE,
+    ROW_TAP_TO_CLICK,
+    ROW_SCROLL_DIRECTION,
+    ROW_POINTER_SPEED,
 };
 
 struct setting_row {
@@ -3140,6 +3156,9 @@ static const struct setting_row setting_rows[] = {
     {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0},
     {"USE YOUR OWN PICTURE (RIGHT-CLICK IT IN FILES)",
      ROW_WALLPAPER_BROWSE, 0},
+    {"TOUCHPAD: TAP TO CLICK", ROW_TAP_TO_CLICK, 0},
+    {"TOUCHPAD: TWO-FINGER SCROLLING", ROW_SCROLL_DIRECTION, 0},
+    {"TOUCHPAD: POINTER SPEED", ROW_POINTER_SPEED, 0},
 };
 #define SETTING_ROW_COUNT (sizeof(setting_rows) / sizeof(setting_rows[0]))
 #define SETTING_VALUE_WIDTH (18 * CHAR_WIDTH + 12)
@@ -3240,7 +3259,22 @@ static void setting_value_text(const struct setting_row *row,
         return;
     }
     size_t length = append_text(text, capacity, 0, "< ");
+    struct tp_options touchpad;
+    appearance_touchpad(&touchpad);
     switch (row->kind) {
+    case ROW_TAP_TO_CLICK:
+        length = append_text(text, capacity, length,
+                             touchpad.tap_to_click ? "ON" : "OFF");
+        break;
+    case ROW_SCROLL_DIRECTION:
+        length = append_text(text, capacity, length,
+                             touchpad.natural_scroll ? "NATURAL"
+                                                     : "TRADITIONAL");
+        break;
+    case ROW_POINTER_SPEED:
+        length = append_decimal(text, capacity, length, touchpad.speed);
+        length = append_text(text, capacity, length, " OF 10");
+        break;
     case ROW_THEME:
         length = append_text(text, capacity, length,
                              appearance_theme_name(appearance_theme()));
@@ -3467,6 +3501,26 @@ static void settings_change(size_t index, int delta) {
     }
     if (row->kind == ROW_RESOLUTION) {
         settings_change_resolution(delta);
+        return;
+    }
+    if (row->kind == ROW_TAP_TO_CLICK || row->kind == ROW_SCROLL_DIRECTION
+        || row->kind == ROW_POINTER_SPEED) {
+        struct tp_options touchpad;
+        appearance_touchpad(&touchpad);
+        if (row->kind == ROW_TAP_TO_CLICK) {
+            touchpad.tap_to_click = !touchpad.tap_to_click;
+        } else if (row->kind == ROW_SCROLL_DIRECTION) {
+            touchpad.natural_scroll = !touchpad.natural_scroll;
+        } else {
+            int speed = touchpad.speed + (delta < 0 ? -1 : 1);
+            touchpad.speed = (uint8_t)(speed < TP_SPEED_MIN ? TP_SPEED_MIN
+                                       : speed > TP_SPEED_MAX ? TP_SPEED_MAX
+                                                              : speed);
+        }
+        appearance_set_touchpad(&touchpad);
+        if (!i2c_hid_multitouch()) {
+            set_status("NO MULTI-TOUCH TOUCHPAD FOUND; SAVED FOR LATER");
+        }
         return;
     }
     if (row->kind == ROW_THEME) {
@@ -7168,6 +7222,7 @@ static void handle_right_press(int32_t x, int32_t y) {
 #define APP_EVENT_MOUSE_MOVE 4
 #define APP_EVENT_RESIZE 5
 #define APP_EVENT_CLOSE 6
+#define APP_EVENT_WHEEL 7 /* x, y; key = signed notches, positive = up */
 /* After its window closes a program has this long to exit (3 s). */
 #define APP_CLOSE_GRACE_TICKS 300
 /* Waiting programs look at least this often whether they were ended. */
@@ -7315,6 +7370,20 @@ static void app_mouse_update(size_t slot, int32_t x, int32_t y,
         };
         app_push(slot, &event);
     }
+}
+
+static void app_wheel(size_t slot, int32_t x, int32_t y, int32_t notches) {
+    struct app_window *window = &app_windows[slot];
+    struct rect area = app_content(slot);
+    if (!app_window_live(slot) || !rect_contains(area, x, y)) {
+        return;
+    }
+    struct desktop_app_event event = {
+        .type = APP_EVENT_WHEEL, .key = (uint32_t)notches,
+        .x = x - (int32_t)area.x, .y = y - (int32_t)area.y,
+        .buttons = window->buttons_down,
+    };
+    app_push(slot, &event);
 }
 
 static void apps_mouse_update(int32_t x, int32_t y, uint8_t buttons) {
@@ -8295,6 +8364,82 @@ static void desktop_storage_poll(void) {
                                 : "USB DRIVES CHANGED");
 }
 
+/* Rows a list moves per wheel notch. */
+#define WHEEL_ROWS 3
+
+/* Moves a first-visible-row value by -notches * rows, within
+   0..count-visible. */
+static size_t wheel_scrolled(size_t first, int32_t notches, size_t rows,
+                             size_t count, size_t visible) {
+    int64_t next = (int64_t)first - (int64_t)notches * (int64_t)rows;
+    int64_t last = count > visible ? (int64_t)(count - visible) : 0;
+    if (next > last) {
+        next = last;
+    }
+    return next < 0 ? 0 : (size_t)next;
+}
+
+/* Mouse wheel or two-finger scroll (positive notches scroll up). It goes
+   to the window under the pointer, focused or not. */
+static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
+    if (notches == 0 || login_active || start_menu_open) {
+        return false;
+    }
+    enum window_kind kind = window_at(x, y);
+    if (kind == WINDOW_COUNT) {
+        return false;
+    }
+    struct rect area = content_rect(window_rect(kind));
+    if (window_is_app(kind)) {
+        app_wheel(kind - WINDOW_APP, x, y, notches);
+        return false;
+    }
+    if (kind == WINDOW_FILES && !files_menu_open) {
+        /* Selection-driven list: the selection moves along so the
+           clamp keeps the new position. */
+        struct rect list = files_list_area(area);
+        files_clamp(list);
+        size_t count = files_row_count();
+        size_t visible = files_visible_rows(list);
+        if (count == 0 || visible == 0) {
+            return false;
+        }
+        files_scroll = wheel_scrolled(files_scroll, notches, WHEEL_ROWS,
+                                      count, visible);
+        if (files_selection < files_scroll) {
+            files_selection = files_scroll;
+        } else if (files_selection >= files_scroll + visible) {
+            files_selection = files_scroll + visible - 1;
+        }
+        return true;
+    }
+    if (kind == WINDOW_EDITOR && !editor_prompt_active) {
+        struct rect text = editor_text_rect(area);
+        size_t visible = text.height > 0 ? (size_t)(text.height / LINE_HEIGHT)
+                                         : 1;
+        size_t lines = editor_line_of(editor_length) + 1;
+        editor_top_line = wheel_scrolled(editor_top_line, notches, WHEEL_ROWS,
+                                         lines, visible);
+        editor_view_free = true;
+        return true;
+    }
+    if (kind == WINDOW_SETTINGS) {
+        /* Same row count as settings_fit. */
+        size_t visible = area.height >= 76
+                       ? (size_t)(area.height - 76) / 36 + 1 : 1;
+        settings_fit(area);
+        settings_scroll = wheel_scrolled(settings_scroll, notches, 1,
+                                         SETTING_ROW_COUNT, visible);
+        if (settings_selection < settings_scroll) {
+            settings_selection = settings_scroll;
+        } else if (settings_selection >= settings_scroll + visible) {
+            settings_selection = settings_scroll + visible - 1;
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool desktop_step(void) {
     bool redraw = apps_poll();
     char character;
@@ -8348,6 +8493,7 @@ static bool desktop_step(void) {
         }
         loop_previous_buttons = mouse.buttons;
         apps_mouse_update(mouse.x, mouse.y, mouse.buttons);
+        redraw |= handle_wheel(mouse.x, mouse.y, mouse_take_wheel());
     }
     apps_check_resize();
     if (exit_to_shell) {

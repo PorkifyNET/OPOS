@@ -497,7 +497,7 @@ static void execute_command(void) {
         return;
     }
     if (command_matches(command, command_length, "help")) {
-        console_write_string("Commands: help, echo, uptime, clear, mouse, touchpad, pci, desktop, disk, "
+        console_write_string("Commands: help, echo, uptime, clear, mouse, touchpad, touchpad mouse, touchpad multitouch, pci, desktop, disk, "
                              "storage, drives, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
                              "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
@@ -583,8 +583,25 @@ static void execute_command(void) {
         }
         console_write_string("\n");
     } else if (command_matches(command, command_length, "touchpad")) {
-        acpi_dump_touchpad();
-        i2c_hid_write_status();
+        if (arguments_length == 0) {
+            acpi_dump_touchpad();
+            i2c_hid_write_status();
+        } else if (command_matches(arguments, arguments_length, "mouse")
+                   || command_matches(arguments, arguments_length,
+                                      "multitouch")) {
+            /* Until the next boot: plain mouse mode, or multi-touch. */
+            bool multitouch = arguments_length == sizeof("multitouch") - 1;
+            if (i2c_hid_set_multitouch(multitouch)) {
+                console_write_string(multitouch
+                                     ? "Touchpad: multi-touch mode.\n"
+                                     : "Touchpad: mouse mode.\n");
+            } else {
+                console_write_warning(
+                    "The touchpad cannot switch to that mode.\n");
+            }
+        } else {
+            console_write_warning("Usage: touchpad [mouse|multitouch]\n");
+        }
     } else if (command_matches(command, command_length, "pci")) {
         acpi_dump_pci();
     } else if (command_matches(command, command_length, "desktop")) {

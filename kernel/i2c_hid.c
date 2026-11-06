@@ -3,11 +3,13 @@
 
    The ACPI tables give the touchpad's I2C address, its HID descriptor
    register (_DSM) and the controller's PCI address (_ADR). The touchpad
-   starts in mouse mode (relative motion and buttons), which is all this
-   driver reads: it parses the report descriptor for the mouse
-   collection. OPOS routes no IOAPIC interrupts yet, so the touchpad is
-   polled every timer tick; HID over I2C devices answer a read without
-   pending data with a zero length. */
+   starts in mouse mode (relative motion and buttons). When its report
+   descriptor has a Precision Touchpad collection, the driver switches it
+   to multi-touch reports (feature Input Mode = 3) and turns contacts into
+   gestures (touchpad_gesture.c); otherwise, or if that fails, it keeps
+   reading the mouse collection. Reports are read when the touchpad's
+   interrupt (routed through the IOAPIC) says one is waiting, or polled
+   every timer tick when that interrupt does not work. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -22,6 +24,7 @@
 #include "paging.h"
 #include "pci.h"
 #include "timer.h"
+#include "touchpad_gesture.h"
 
 #define I2C_MMIO_BASE 0xffffc00000180000ULL
 #define I2C_MAX_CONTROLLERS 12
@@ -79,6 +82,48 @@ struct field {
     bool relative;
 };
 
+/* A field of a feature report (Precision Touchpad configuration). */
+struct feature_field {
+    bool present;
+    uint8_t report_id;
+    uint16_t offset;    /* bits after the report ID */
+    uint8_t size;
+    uint16_t report_bits; /* the whole report after its ID */
+};
+
+/* One contact slot of the Precision Touchpad input report. */
+struct finger {
+    struct field tip;
+    struct field confidence;
+    struct field id;
+    struct field x;
+    struct field y;
+};
+
+/* HID usages (page << 16 | id). */
+#define USAGE_MOUSE 0x00010002u
+#define USAGE_X 0x00010030u
+#define USAGE_Y 0x00010031u
+#define USAGE_BUTTON_1 0x00090001u
+#define USAGE_TOUCH_PAD 0x000d0005u
+#define USAGE_DEVICE_CONFIGURATION 0x000d000eu
+#define USAGE_FINGER 0x000d0022u
+#define USAGE_TIP_SWITCH 0x000d0042u
+#define USAGE_CONFIDENCE 0x000d0047u
+#define USAGE_CONTACT_ID 0x000d0051u
+#define USAGE_INPUT_MODE 0x000d0052u
+#define USAGE_CONTACT_COUNT 0x000d0054u
+#define USAGE_SURFACE_SWITCH 0x000d0057u
+#define USAGE_BUTTON_SWITCH 0x000d0058u
+/* Windows certification blob; some pads only switch mode once it was
+   read (Linux hid-multitouch does the same). */
+#define USAGE_CERTIFICATE_BLOB 0xff0000c5u
+#define INPUT_MODE_TOUCHPAD 3
+#define HID_OPCODE_GET_REPORT 0x02
+#define HID_OPCODE_SET_REPORT 0x03
+#define HID_REPORT_TYPE_FEATURE 3
+#define PTP_MAX_FINGERS TP_MAX_CONTACTS
+
 static struct {
     const char *stage;
     struct acpi_i2c_hid acpi;
@@ -97,6 +142,7 @@ static struct {
     uint16_t input_register;
     uint16_t max_input;
     uint16_t command_register;
+    uint16_t data_register;
     uint16_t vendor;
     uint16_t product;
     bool report_ids;
@@ -105,6 +151,24 @@ static struct {
     struct field buttons[3];
     struct field x;
     struct field y;
+    /* Precision Touchpad (multi-touch) collection. */
+    bool ptp_found;
+    uint8_t ptp_report_id;
+    struct finger fingers[PTP_MAX_FINGERS];
+    uint8_t finger_count;
+    struct field contact_count;
+    struct field ptp_button;
+    int32_t x_max, y_max;           /* logical maxima of contact X/Y */
+    int32_t x_physical, y_physical; /* physical maxima, 0 if absent */
+    struct feature_field input_mode;
+    struct feature_field surface_switch;
+    struct feature_field button_switch;
+    struct feature_field blob;
+    bool ptp_mode;                 /* input mode switched to touchpad */
+    const char *ptp_error;
+    uint64_t ptp_frames;
+    uint8_t frame_expected;         /* hybrid reports: contacts still due */
+    uint8_t frame_collected;
     bool active;
     uint64_t reports;
     uint64_t empty_reads;
@@ -405,17 +469,39 @@ static void set_field(struct field *f, uint32_t offset, uint32_t size,
     f->relative = (flags & 0x04) != 0;
 }
 
-/* Finds the first Generic Desktop / Mouse application collection and
-   the bit positions of its buttons and X/Y in its input report. */
+static void set_feature(struct feature_field *f, uint8_t report_id,
+                        uint32_t offset, uint32_t size) {
+    if (f->present || size == 0 || size > 32 || offset > 0xffff) {
+        return;
+    }
+    f->present = true;
+    f->report_id = report_id;
+    f->offset = (uint16_t)offset;
+    f->size = (uint8_t)size;
+}
+
+/*
+ * Walks the report descriptor once and records:
+ * - the first Generic Desktop / Mouse application collection: the bit
+ *   positions of its buttons and X/Y (the mode the touchpad starts in);
+ * - a Digitizer / Touch Pad collection (Precision Touchpad): its finger
+ *   slots (tip, confidence, contact ID, X, Y), contact count and button;
+ * - the feature fields that switch the input mode, and the certificate
+ *   blob some pads want read first.
+ */
 static bool parse_report_descriptor(const uint8_t *d, size_t length) {
     static uint32_t bit_offset[256];
+    static uint32_t feature_offset[256];
     for (int i = 0; i < 256; i++) {
         bit_offset[i] = 0;
+        feature_offset[i] = 0;
     }
     uint32_t usage_page = 0;
     uint32_t report_size = 0;
     uint32_t report_count = 0;
     int32_t logical_minimum = 0;
+    int32_t logical_maximum = 0;
+    int32_t physical_maximum = 0;
     uint8_t report_id = 0;
     uint32_t usages[16];
     size_t usage_count = 0;
@@ -424,15 +510,18 @@ static bool parse_report_descriptor(const uint8_t *d, size_t length) {
     bool have_range = false;
     int depth = 0;
     int mouse_depth = -1;
-    bool done = false;
+    bool mouse_done = false;
+    uint32_t application = 0; /* usage of the enclosing top-level collection */
+    int finger_depth = -1;
+    int finger = -1;          /* slot being filled, or -1 */
     struct {
         uint32_t usage_page, report_size, report_count;
-        int32_t logical_minimum;
+        int32_t logical_minimum, logical_maximum, physical_maximum;
         uint8_t report_id;
     } stack[4];
     int stack_depth = 0;
 
-    for (size_t i = 0; i < length && !done;) {
+    for (size_t i = 0; i < length;) {
         uint8_t prefix = d[i++];
         if (prefix == 0xfe) { /* long item */
             if (i + 1 >= length) {
@@ -466,6 +555,15 @@ static bool parse_report_descriptor(const uint8_t *d, size_t length) {
             switch (tag) {
             case 0x0: usage_page = value; break;
             case 0x1: logical_minimum = signed_value; break;
+            case 0x2:
+                /* An unsigned maximum may look negative in a short item. */
+                logical_maximum = signed_value < 0 && logical_minimum >= 0
+                                ? (int32_t)value : signed_value;
+                break;
+            case 0x4:
+                physical_maximum = signed_value < 0 ? (int32_t)value
+                                                    : signed_value;
+                break;
             case 0x7: report_size = value; break;
             case 0x8:
                 report_id = (uint8_t)value;
@@ -478,6 +576,8 @@ static bool parse_report_descriptor(const uint8_t *d, size_t length) {
                     stack[stack_depth].report_size = report_size;
                     stack[stack_depth].report_count = report_count;
                     stack[stack_depth].logical_minimum = logical_minimum;
+                    stack[stack_depth].logical_maximum = logical_maximum;
+                    stack[stack_depth].physical_maximum = physical_maximum;
                     stack[stack_depth].report_id = report_id;
                     stack_depth++;
                 }
@@ -489,6 +589,8 @@ static bool parse_report_descriptor(const uint8_t *d, size_t length) {
                     report_size = stack[stack_depth].report_size;
                     report_count = stack[stack_depth].report_count;
                     logical_minimum = stack[stack_depth].logical_minimum;
+                    logical_maximum = stack[stack_depth].logical_maximum;
+                    physical_maximum = stack[stack_depth].physical_maximum;
                     report_id = stack[stack_depth].report_id;
                 }
                 break;
@@ -513,57 +615,147 @@ static bool parse_report_descriptor(const uint8_t *d, size_t length) {
             continue;
         }
         /* main */
+        uint32_t last_usage = usage_count > 0 ? usages[usage_count - 1] : 0;
         if (tag == 0xa) { /* collection */
-            if (value == 1 && mouse_depth < 0 && usage_count > 0
-                && usages[usage_count - 1] == 0x00010002) {
+            if (depth == 0) {
+                application = last_usage;
+            }
+            if (value == 1 && mouse_depth < 0 && last_usage == USAGE_MOUSE) {
                 mouse_depth = depth;
                 touchpad.mouse_report_id = report_id;
+            }
+            if (application == USAGE_TOUCH_PAD && finger_depth < 0
+                && last_usage == USAGE_FINGER) {
+                finger_depth = depth;
+                finger = touchpad.finger_count < PTP_MAX_FINGERS
+                       ? touchpad.finger_count++ : -1;
             }
             depth++;
         } else if (tag == 0xc) { /* end collection */
             depth--;
             if (mouse_depth >= 0 && depth == mouse_depth) {
-                done = true;
+                mouse_done = true;
             }
-        } else if (tag == 0x8) { /* input */
-            uint32_t bits = report_size * report_count;
-            if (mouse_depth >= 0 && (value & 1) == 0) {
+            if (depth == finger_depth) {
+                finger_depth = -1;
+                finger = -1;
+            }
+            if (depth <= 0) {
+                depth = 0;
+                application = 0;
+            }
+        } else if (tag == 0x8 || tag == 0xb) { /* input or feature */
+            bool input = tag == 0x8;
+            uint32_t *offsets = input ? bit_offset : feature_offset;
+            bool variable = (value & 1) == 0; /* not a constant (padding) */
+            bool in_mouse = input && mouse_depth >= 0 && !mouse_done;
+            bool in_touchpad = input && application == USAGE_TOUCH_PAD;
+            if (in_mouse && variable) {
                 touchpad.mouse_report_id = report_id;
-                for (uint32_t n = 0; n < report_count; n++) {
-                    uint32_t usage;
-                    if (have_range) {
-                        usage = usage_minimum + n;
-                        if (usage > usage_maximum) {
-                            break;
-                        }
-                    } else if (usage_count > 0) {
-                        usage = usages[n < usage_count ? n : usage_count - 1];
-                    } else {
+            }
+            if (in_touchpad && variable) {
+                touchpad.ptp_report_id = report_id;
+            }
+            uint32_t count = report_count < 64 ? report_count : 64;
+            for (uint32_t n = 0; variable && n < count; n++) {
+                uint32_t usage;
+                if (have_range) {
+                    usage = usage_minimum + n;
+                    if (usage > usage_maximum) {
                         break;
                     }
-                    uint32_t at = bit_offset[report_id] + n * report_size;
-                    if (usage >= 0x00090001 && usage <= 0x00090003) {
-                        set_field(&touchpad.buttons[usage - 0x00090001], at,
+                } else if (usage_count > 0) {
+                    usage = usages[n < usage_count ? n : usage_count - 1];
+                } else {
+                    break;
+                }
+                uint32_t at = offsets[report_id] + n * report_size;
+                if (!input) {
+                    if (usage == USAGE_INPUT_MODE) {
+                        set_feature(&touchpad.input_mode, report_id, at,
+                                    report_size);
+                    } else if (usage == USAGE_SURFACE_SWITCH) {
+                        set_feature(&touchpad.surface_switch, report_id, at,
+                                    report_size);
+                    } else if (usage == USAGE_BUTTON_SWITCH) {
+                        set_feature(&touchpad.button_switch, report_id, at,
+                                    report_size);
+                    } else if (usage == USAGE_CERTIFICATE_BLOB && n == 0) {
+                        set_feature(&touchpad.blob, report_id, at,
+                                    report_size);
+                    }
+                    continue;
+                }
+                if (in_mouse) {
+                    if (usage >= USAGE_BUTTON_1 && usage <= USAGE_BUTTON_1 + 2) {
+                        set_field(&touchpad.buttons[usage - USAGE_BUTTON_1], at,
                                   report_size, 0, value);
-                    } else if (usage == 0x00010030) {
+                    } else if (usage == USAGE_X) {
                         set_field(&touchpad.x, at, report_size,
                                   logical_minimum, value);
-                    } else if (usage == 0x00010031) {
+                    } else if (usage == USAGE_Y) {
                         set_field(&touchpad.y, at, report_size,
                                   logical_minimum, value);
                     }
                 }
+                if (!in_touchpad) {
+                    continue;
+                }
+                if (finger_depth >= 0) {
+                    if (finger < 0) {
+                        continue;
+                    }
+                    struct finger *f = &touchpad.fingers[finger];
+                    if (usage == USAGE_TIP_SWITCH) {
+                        set_field(&f->tip, at, report_size, 0, value);
+                    } else if (usage == USAGE_CONFIDENCE) {
+                        set_field(&f->confidence, at, report_size, 0, value);
+                    } else if (usage == USAGE_CONTACT_ID) {
+                        set_field(&f->id, at, report_size, 0, value);
+                    } else if (usage == USAGE_X) {
+                        set_field(&f->x, at, report_size, logical_minimum,
+                                  value);
+                        if (finger == 0) {
+                            touchpad.x_max = logical_maximum;
+                            touchpad.x_physical = physical_maximum;
+                        }
+                    } else if (usage == USAGE_Y) {
+                        set_field(&f->y, at, report_size, logical_minimum,
+                                  value);
+                        if (finger == 0) {
+                            touchpad.y_max = logical_maximum;
+                            touchpad.y_physical = physical_maximum;
+                        }
+                    }
+                } else if (usage == USAGE_CONTACT_COUNT) {
+                    set_field(&touchpad.contact_count, at, report_size, 0,
+                              value);
+                } else if (usage == USAGE_BUTTON_1) {
+                    set_field(&touchpad.ptp_button, at, report_size, 0, value);
+                }
             }
-            bit_offset[report_id] += bits;
-        } else if (tag == 0x9 || tag == 0xb) {
-            /* output / feature: separate reports, no input bits */
+            offsets[report_id] += report_size * report_count;
         }
         usage_count = 0;
         have_range = false;
     }
+
+    struct feature_field *features[4] = {
+        &touchpad.input_mode, &touchpad.surface_switch,
+        &touchpad.button_switch, &touchpad.blob,
+    };
+    for (int k = 0; k < 4; k++) {
+        uint32_t bits = feature_offset[features[k]->report_id];
+        features[k]->report_bits = (uint16_t)(bits < 0xffff ? bits : 0xffff);
+    }
+    const struct finger *first = &touchpad.fingers[0];
+    touchpad.ptp_found = touchpad.report_ids && touchpad.finger_count > 0
+        && first->tip.present && first->x.present && first->y.present
+        && !first->x.relative && touchpad.x_max > 0 && touchpad.y_max > 0
+        && touchpad.input_mode.present;
     touchpad.mouse_found = mouse_depth >= 0 && touchpad.x.present
         && touchpad.y.present;
-    return touchpad.mouse_found;
+    return touchpad.mouse_found || touchpad.ptp_found;
 }
 
 static int32_t read_field(const struct field *f, const uint8_t *data,
@@ -592,6 +784,106 @@ static bool hid_command(uint8_t opcode, uint8_t argument) {
         (uint8_t)(touchpad.command_register >> 8), argument, opcode,
     };
     return dw_transfer(touchpad.acpi.address, command, 4, NULL, 0);
+}
+
+/* Command register, then the GET/SET_REPORT opcode for a feature report
+   (IDs from 15 up take an extra byte), then the data register. */
+static size_t report_command(uint8_t *out, uint8_t opcode, uint8_t id) {
+    size_t n = 0;
+    out[n++] = (uint8_t)touchpad.command_register;
+    out[n++] = (uint8_t)(touchpad.command_register >> 8);
+    out[n++] = (uint8_t)(HID_REPORT_TYPE_FEATURE << 4 | (id < 15 ? id : 15));
+    out[n++] = opcode;
+    if (id >= 15) {
+        out[n++] = id;
+    }
+    out[n++] = (uint8_t)touchpad.data_register;
+    out[n++] = (uint8_t)(touchpad.data_register >> 8);
+    return n;
+}
+
+static uint8_t feature_buffer[HID_MAX_INPUT];
+
+/* Reads feature report id into feature_buffer: a 2-byte length, the ID,
+   then the data. */
+static bool get_feature_report(uint8_t id, size_t data_bytes) {
+    uint8_t command[8];
+    size_t n = report_command(command, HID_OPCODE_GET_REPORT, id);
+    size_t want = data_bytes + 3;
+    if (want > sizeof(feature_buffer)) {
+        want = sizeof(feature_buffer);
+    }
+    return dw_transfer(touchpad.acpi.address, command, n, feature_buffer, want);
+}
+
+/* Writes feature report id with data_bytes of data (ID not included). */
+static bool set_feature_report(uint8_t id, const uint8_t *data,
+                               size_t data_bytes) {
+    static uint8_t command[8 + 3 + 64];
+    if (data_bytes > 64) {
+        return false;
+    }
+    size_t n = report_command(command, HID_OPCODE_SET_REPORT, id);
+    size_t total = 2 + 1 + data_bytes;
+    command[n++] = (uint8_t)total;
+    command[n++] = (uint8_t)(total >> 8);
+    command[n++] = id;
+    for (size_t i = 0; i < data_bytes; i++) {
+        command[n++] = data[i];
+    }
+    return dw_transfer(touchpad.acpi.address, command, n, NULL, 0);
+}
+
+static void put_bits(uint8_t *data, const struct feature_field *f,
+                     uint32_t value) {
+    for (uint32_t b = 0; b < f->size; b++) {
+        uint32_t bit = f->offset + b;
+        if ((value >> b) & 1) {
+            data[bit / 8] |= (uint8_t)(1u << (bit % 8));
+        } else {
+            data[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+        }
+    }
+}
+
+/* Writes value into one or two fields of the same feature report. */
+static bool write_features(const struct feature_field *a,
+                           const struct feature_field *b, uint32_t value) {
+    uint8_t data[64] = {0};
+    size_t bytes = ((size_t)a->report_bits + 7) / 8;
+    if (bytes == 0 || bytes > sizeof(data)) {
+        return false;
+    }
+    put_bits(data, a, value);
+    if (b != NULL && b->present && b->report_id == a->report_id) {
+        put_bits(data, b, value);
+    }
+    return set_feature_report(a->report_id, data, bytes);
+}
+
+/* Switches the pad from mouse mode to Precision Touchpad reports: reads
+   the certificate blob (some pads need it), sets Input Mode = touchpad,
+   then turns on surface and button reporting. */
+static bool enable_touchpad_mode(void) {
+    if (touchpad.blob.present) {
+        (void)get_feature_report(touchpad.blob.report_id,
+                          ((size_t)touchpad.blob.report_bits + 7) / 8);
+    }
+    if (!write_features(&touchpad.input_mode, NULL, INPUT_MODE_TOUCHPAD)) {
+        touchpad.ptp_error = "setting the input mode failed";
+        return false;
+    }
+    if (touchpad.surface_switch.present) {
+        (void)write_features(&touchpad.surface_switch,
+                             &touchpad.button_switch, 1);
+    }
+    if (touchpad.button_switch.present
+        && (!touchpad.surface_switch.present
+            || touchpad.button_switch.report_id
+                   != touchpad.surface_switch.report_id)) {
+        (void)write_features(&touchpad.button_switch, NULL, 1);
+    }
+    return true;
 }
 
 static void read_input(size_t *length) {
@@ -631,6 +923,7 @@ bool i2c_hid_initialize(void) {
     touchpad.input_register = le16(desc + 8);
     touchpad.max_input = le16(desc + 10);
     touchpad.command_register = le16(desc + 16);
+    touchpad.data_register = le16(desc + 18);
     touchpad.vendor = le16(desc + 20);
     touchpad.product = le16(desc + 22);
 
@@ -689,19 +982,102 @@ bool i2c_hid_initialize(void) {
                      length)) {
         return false;
     }
-    touchpad.stage = "no mouse collection in the report descriptor";
+    touchpad.stage = "no mouse or touchpad collection in the report descriptor";
     if (!parse_report_descriptor(report_descriptor, length)) {
         return false;
     }
-    if (!touchpad.x.relative) {
-        touchpad.stage = "mouse collection reports absolute X/Y";
+    if (touchpad.mouse_found && !touchpad.x.relative) {
+        touchpad.mouse_found = false; /* absolute X/Y: not usable as one */
+    }
+    /* Multi-touch when the pad offers it; the mouse collection stays as
+       the fallback (and its reports are still read). */
+    touchpad.ptp_error = "no Precision Touchpad collection";
+    if (touchpad.ptp_found) {
+        touchpad.ptp_error = NULL;
+        touchpad.ptp_mode = enable_touchpad_mode();
+    }
+    if (!touchpad.mouse_found && !touchpad.ptp_mode) {
+        touchpad.stage = touchpad.ptp_found
+                       ? "touchpad mode failed and no mouse collection"
+                       : "mouse collection reports absolute X/Y";
         return false;
     }
-    touchpad.stage = touchpad.irq_mode ? "ready (interrupt)"
-                                       : "ready (polled, repeats dropped)";
+    if (touchpad.ptp_mode) {
+        struct tp_geometry geometry = {
+            .x_max = touchpad.x_max, .y_max = touchpad.y_max,
+            .x_physical = touchpad.x_physical,
+            .y_physical = touchpad.y_physical,
+            .screen_width = mouse_screen_width(),
+        };
+        tp_reset(&geometry);
+        touchpad.stage = touchpad.irq_mode ? "ready, multi-touch (interrupt)"
+                                           : "ready, multi-touch (polled)";
+    } else {
+        touchpad.stage = touchpad.irq_mode ? "ready (interrupt)"
+                                           : "ready (polled, repeats dropped)";
+    }
     touchpad.active = true;
     mouse_external_attach();
     return true;
+}
+
+static uint32_t now_ms(void) {
+    return (uint32_t)(timer_ticks() * 10); /* 100 Hz timer */
+}
+
+static void apply_gesture(const struct tp_output *out) {
+    mouse_external_report(out->dx, out->dy, out->buttons);
+    if (out->scroll != 0) {
+        mouse_external_scroll(out->scroll);
+    }
+}
+
+/* One Precision Touchpad input report (after its ID). In hybrid mode a
+   frame of N contacts spans several reports: the first carries the
+   contact count, the others a count of 0. */
+static struct tp_contact frame[TP_MAX_CONTACTS];
+
+static void handle_touchpad_report(const uint8_t *data, size_t length) {
+    touchpad.reports++;
+    uint32_t count = touchpad.contact_count.present
+        ? (uint32_t)read_field(&touchpad.contact_count, data, length)
+        : touchpad.finger_count;
+    if (count > 0 || touchpad.frame_expected == 0) {
+        /* A new frame. More contacts than slots arrive in several
+           reports; a count of 0 with no frame open is an empty frame. */
+        touchpad.frame_collected = 0;
+        touchpad.frame_expected = (uint8_t)(count < 32 ? count : 32);
+    }
+    /* Slots for contacts this report carries; lifted ones (tip clear)
+       and palms (confidence clear) count but are not touching. */
+    static size_t touching;
+    if (touchpad.frame_collected == 0) {
+        touching = 0;
+    }
+    for (size_t slot = 0; slot < touchpad.finger_count
+         && touchpad.frame_collected < touchpad.frame_expected; slot++) {
+        const struct finger *f = &touchpad.fingers[slot];
+        touchpad.frame_collected++;
+        bool tip = read_field(&f->tip, data, length) != 0;
+        bool confident = !f->confidence.present
+                      || read_field(&f->confidence, data, length) != 0;
+        if (tip && confident && touching < TP_MAX_CONTACTS) {
+            frame[touching].id = f->id.present
+                ? (uint32_t)read_field(&f->id, data, length) : (uint32_t)slot;
+            frame[touching].x = read_field(&f->x, data, length);
+            frame[touching].y = read_field(&f->y, data, length);
+            touching++;
+        }
+    }
+    if (touchpad.frame_collected < touchpad.frame_expected) {
+        return; /* more reports for this frame follow */
+    }
+    touchpad.frame_expected = 0;
+    touchpad.ptp_frames++;
+    bool button = read_field(&touchpad.ptp_button, data, length) != 0;
+    struct tp_output out;
+    tp_frame(frame, touching, button, now_ms(), &out);
+    apply_gesture(&out);
 }
 
 /* Applies one input report from input_buffer. */
@@ -729,11 +1105,16 @@ static void handle_report(size_t length) {
         touchpad.last_report[i] = input_buffer[i];
     }
     if (touchpad.report_ids) {
-        if (data[0] != touchpad.mouse_report_id) {
-            return;
-        }
+        uint8_t id = data[0];
         data++;
         data_length--;
+        if (touchpad.ptp_mode && id == touchpad.ptp_report_id) {
+            handle_touchpad_report(data, data_length);
+            return;
+        }
+        if (!touchpad.mouse_found || id != touchpad.mouse_report_id) {
+            return;
+        }
     }
     touchpad.reports++;
     uint8_t buttons = 0;
@@ -750,6 +1131,12 @@ static void handle_report(size_t length) {
 void i2c_hid_poll(void) {
     if (!touchpad.active) {
         return;
+    }
+    if (touchpad.ptp_mode) {
+        struct tp_output out;
+        if (tp_tick(now_ms(), &out)) {
+            apply_gesture(&out);
+        }
     }
     if (touchpad.irq_mode) {
         /* One read per interrupt. The handler masked the line; unmasking
@@ -883,6 +1270,35 @@ void i2c_hid_write_status(void) {
     write_field("x", &touchpad.x);
     console_write_string(" ");
     write_field("y", &touchpad.y);
+    console_write_string("\n  multi-touch ");
+    console_write_string(touchpad.ptp_mode ? "on"
+                         : touchpad.ptp_error != NULL ? touchpad.ptp_error
+                                                      : "off");
+    if (touchpad.ptp_found) {
+        console_write_string(": id ");
+        write_decimal(touchpad.ptp_report_id);
+        console_write_string(" fingers ");
+        write_decimal(touchpad.finger_count);
+        console_write_string(" max ");
+        write_decimal((uint64_t)touchpad.x_max);
+        console_write_string("x");
+        write_decimal((uint64_t)touchpad.y_max);
+        console_write_string(" phys ");
+        write_decimal((uint64_t)touchpad.x_physical);
+        console_write_string("x");
+        write_decimal((uint64_t)touchpad.y_physical);
+        console_write_string(" mode id ");
+        write_decimal(touchpad.input_mode.report_id);
+        console_write_string(" @");
+        write_decimal(touchpad.input_mode.offset);
+        console_write_string("/");
+        write_decimal(touchpad.input_mode.report_bits);
+        console_write_string(touchpad.contact_count.present ? " count" : "");
+        console_write_string(touchpad.ptp_button.present ? " button" : "");
+        console_write_string(touchpad.blob.present ? " blob" : "");
+        console_write_string(" frames ");
+        write_decimal(touchpad.ptp_frames);
+    }
     console_write_string("\n  irq ");
     if (touchpad.acpi.gsi_valid) {
         write_decimal(touchpad.acpi.gsi);
@@ -934,6 +1350,36 @@ void i2c_hid_test_report(const uint8_t *data, size_t length, int32_t *dx,
     *dy = read_field(&touchpad.y, data, length);
 }
 #endif
+
+bool i2c_hid_multitouch(void) {
+    return touchpad.active && touchpad.ptp_mode;
+}
+
+bool i2c_hid_set_multitouch(bool multitouch) {
+    if (!touchpad.active || !touchpad.ptp_found) {
+        return false;
+    }
+    if (multitouch) {
+        if (!touchpad.ptp_mode) {
+            touchpad.ptp_mode = enable_touchpad_mode();
+            struct tp_geometry geometry = {
+                .x_max = touchpad.x_max, .y_max = touchpad.y_max,
+                .x_physical = touchpad.x_physical,
+                .y_physical = touchpad.y_physical,
+                .screen_width = mouse_screen_width(),
+            };
+            tp_reset(&geometry);
+        }
+        return touchpad.ptp_mode;
+    }
+    if (!touchpad.mouse_found
+        || !write_features(&touchpad.input_mode, NULL, 0)) {
+        return false;
+    }
+    touchpad.ptp_mode = false;
+    mouse_external_report(0, 0, 0);
+    return true;
+}
 
 bool i2c_hid_present(void) {
     return touchpad.acpi_found && touchpad.acpi.address_valid;

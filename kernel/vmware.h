@@ -21,8 +21,10 @@ bool vmware_backdoor_present(void);
 bool vmware_mouse_active(void);
 
 /* Drains queued absolute pointer events (from the PS/2 IRQ). Coordinates
-   are 0..65535 across the screen. Returns true if any event was read. */
-bool vmware_mouse_read(uint32_t *x, uint32_t *y, uint8_t *buttons);
+   are 0..65535 across the screen. Wheel notches (positive = up) are added
+   to *wheel. Returns true if any event was read. */
+bool vmware_mouse_read(uint32_t *x, uint32_t *y, uint8_t *buttons,
+                       int32_t *wheel);
 
 /* Polls the GuestRPC channel; call from the main loops. Rate-limited
    internally. Not for interrupt context. */

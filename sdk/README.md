@@ -101,6 +101,7 @@ for (;;) {
   | `OPOS_EVENT_MOUSE_MOVE` | `x`, `y`, `buttons`. Sent while the pointer is over the focused window, or while a button pressed in it is held (then `x`, `y` can be outside) |
   | `OPOS_EVENT_RESIZE` | `width`, `height` of the content area |
   | `OPOS_EVENT_CLOSE` | The user closed the window or logged out. Save and exit: waiting again ends the program |
+  | `OPOS_EVENT_WHEEL` | `x`, `y`, `buttons`; `OPOS_WHEEL_NOTCHES(event)` is the signed number of wheel notches, positive = scroll up. Sent for the mouse wheel and two-finger touchpad scrolling while the pointer is over the window, even when the window is not focused |
 
 - `opos_window_size(&width, &height)` reads the current content size.
 - The desktop keeps the Super shortcuts; every other key goes to the

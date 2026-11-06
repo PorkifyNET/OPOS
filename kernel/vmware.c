@@ -111,7 +111,8 @@ static bool mouse_enable(void) {
     return true;
 }
 
-bool vmware_mouse_read(uint32_t *x, uint32_t *y, uint8_t *buttons) {
+bool vmware_mouse_read(uint32_t *x, uint32_t *y, uint8_t *buttons,
+                       int32_t *wheel) {
     if (!mouse_active) {
         return false;
     }
@@ -132,6 +133,8 @@ bool vmware_mouse_read(uint32_t *x, uint32_t *y, uint8_t *buttons) {
         if ((flags & VMMOUSE_RELATIVE_PACKET) != 0) {
             continue;
         }
+        /* edx: signed wheel motion, positive toward the user. */
+        *wheel -= (int8_t)(uint8_t)r.edx;
         *x = r.ebx & 0xffffu;
         *y = r.ecx & 0xffffu;
         *buttons = (uint8_t)(((flags & VMMOUSE_LEFT_BUTTON) ? 1 : 0)

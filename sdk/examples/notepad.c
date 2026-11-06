@@ -727,6 +727,17 @@ int main(int argc, char **argv, char **envp) {
         case OPOS_EVENT_MOUSE_UP:
             dragging = false;
             break;
+        case OPOS_EVENT_WHEEL: {
+            /* Three lines per notch; the caret stays where it is. */
+            int lines = OPOS_WHEEL_NOTCHES(event) * 3;
+            for (; lines > 0 && scroll_pos > 0; lines--) {
+                scroll_pos = line_start(scroll_pos - 1);
+            }
+            for (; lines < 0 && line_end(scroll_pos) < length; lines++) {
+                scroll_pos = line_end(scroll_pos) + 1;
+            }
+            break;
+        }
         case OPOS_EVENT_CLOSE:
             return 0;
         default:

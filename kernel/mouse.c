@@ -30,8 +30,13 @@ static int32_t pointer_x;
 static int32_t pointer_y;
 static int32_t maximum_x;
 static int32_t maximum_y;
-static uint8_t packet[3];
+static uint8_t packet[4];
 static uint8_t packet_index;
+/* 3 for a plain PS/2 mouse, 4 with an IntelliMouse wheel (ID 3). */
+static uint8_t packet_size = 3;
+/* Wheel notches not yet taken by the desktop; positive = away from the
+   user (scroll up). */
+static int32_t wheel_pending;
 static uint8_t pointer_buttons;
 static bool available;
 static const char *failure = "not initialized";
@@ -130,6 +135,29 @@ static bool write_configuration(uint8_t configuration) {
     return true;
 }
 
+/* IntelliMouse: the sample rates 200, 100, 80 in a row switch a wheel
+   mouse to device ID 3 and 4-byte packets. Other mice ignore them. */
+static void enable_wheel(void) {
+    packet_size = 3;
+    static const uint8_t rates[3] = {200, 100, 80};
+    for (int i = 0; i < 3; i++) {
+        if (!mouse_send_command(0xf3) || !mouse_send_command(rates[i])) {
+            return;
+        }
+    }
+    uint8_t id;
+    if (mouse_send_command(0xf2) && read_mouse_byte(PS2_WAIT_LIMIT, &id)) {
+        device_id = id;
+        if (id == 3 || id == 4) {
+            packet_size = 4;
+        }
+    }
+    /* Back to the default rate. */
+    if (mouse_send_command(0xf3)) {
+        (void)mouse_send_command(100);
+    }
+}
+
 /* Laptop touchpads (Synaptics, ELAN, ALPS, ...) start in a basic PS/2
    mouse mode and send the standard 3-byte packets this driver reads.
    Real controllers need more care than emulated ones: stale bytes, slow
@@ -179,7 +207,7 @@ static bool setup_device(void) {
             ready = false;
             failure = reset_ok ? "no ACK to set defaults (0xF6)"
                                : "no PS/2 mouse or touchpad answered";
-        } else if (!mouse_send_command(0xf4)) {
+        } else if (enable_wheel(), !mouse_send_command(0xf4)) {
             ready = false;
             failure = "no ACK to enable (0xF4)";
         }
@@ -247,7 +275,9 @@ void mouse_irq_handler(void) {
         packet_index = 0;
         uint32_t x, y;
         uint8_t buttons;
-        if (vmware_mouse_read(&x, &y, &buttons)) {
+        int32_t wheel = 0;
+        if (vmware_mouse_read(&x, &y, &buttons, &wheel)) {
+            wheel_pending += wheel;
             pointer_x = (int32_t)(((uint64_t)x * (uint64_t)(maximum_x + 1)) >> 16);
             pointer_y = (int32_t)(((uint64_t)y * (uint64_t)(maximum_y + 1)) >> 16);
             pointer_buttons = buttons;
@@ -258,7 +288,7 @@ void mouse_irq_handler(void) {
         return;
     }
     packet[packet_index++] = value;
-    if (packet_index != sizeof(packet)) {
+    if (packet_index != packet_size) {
         return;
     }
     packet_index = 0;
@@ -280,6 +310,15 @@ void mouse_irq_handler(void) {
         pointer_y = maximum_y;
     }
     pointer_buttons = packet[0] & 0x07;
+    if (packet_size == 4) {
+        /* ID 3: a signed byte; ID 4 keeps it in the low 4 bits. Positive
+           means the wheel turned toward the user. */
+        int8_t z = (int8_t)packet[3];
+        if (device_id == 4) {
+            z = (int8_t)((packet[3] & 0x0f) << 4) >> 4;
+        }
+        wheel_pending -= z;
+    }
 }
 
 void mouse_set_bounds(uint64_t screen_width, uint64_t screen_height) {
@@ -315,6 +354,34 @@ bool mouse_read_state(struct mouse_state *state) {
 /* Other pointer drivers (the I2C touchpad) feed relative motion here. */
 void mouse_external_attach(void) {
     external_available = true;
+}
+
+int32_t mouse_take_wheel(void) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    int32_t notches = wheel_pending;
+    wheel_pending = 0;
+    if ((flags & (1u << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+    return notches;
+}
+
+void mouse_external_scroll(int32_t notches) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    wheel_pending += notches;
+    if ((flags & (1u << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+}
+
+int32_t mouse_screen_width(void) {
+    return maximum_x + 1;
+}
+
+bool mouse_has_wheel(void) {
+    return packet_size == 4;
 }
 
 void mouse_external_report(int32_t dx, int32_t dy, uint8_t buttons) {

@@ -332,7 +332,14 @@ static size_t config_path(char *path, size_t capacity, bool for_writing) {
     return length + 1 < capacity ? length : 0;
 }
 
+/* Touchpad gestures, kept with the rest of the account's desktop choices. */
+static struct tp_options touchpad_options;
+
 static void config_defaults(void) {
+    touchpad_options = (struct tp_options){
+        .tap_to_click = true, .natural_scroll = true,
+        .speed = TP_SPEED_DEFAULT,
+    };
     current_theme = THEME_OCEAN;
     current_style = WALLPAPER_FILL;
     append(wallpaper_path, sizeof(wallpaper_path), 0, DEFAULT_WALLPAPER);
@@ -380,6 +387,25 @@ static void config_parse(const char *text, size_t size) {
                        && parse_name(value, value_length, style_names,
                                      WALLPAPER_STYLE_COUNT, &index)) {
                 current_style = (enum wallpaper_style)index;
+            } else if (same_ignoring_case(key, key_length, "tap")) {
+                touchpad_options.tap_to_click =
+                    !same_ignoring_case(value, value_length, "off");
+            } else if (same_ignoring_case(key, key_length, "scroll")) {
+                touchpad_options.natural_scroll =
+                    !same_ignoring_case(value, value_length, "traditional");
+            } else if (same_ignoring_case(key, key_length, "pointer")
+                       && value_length > 0 && value_length <= 2) {
+                uint32_t speed = 0;
+                for (size_t i = 0; i < value_length; i++) {
+                    speed = speed * 10 + (uint32_t)(value[i] - '0');
+                    if (value[i] < '0' || value[i] > '9') {
+                        speed = 0;
+                        break;
+                    }
+                }
+                if (speed >= TP_SPEED_MIN && speed <= TP_SPEED_MAX) {
+                    touchpad_options.speed = (uint8_t)speed;
+                }
             } else if (same_ignoring_case(key, key_length, "wallpaper")
                        && value_length < WALLPAPER_PATH_MAX) {
                 bool printable = true;
@@ -425,6 +451,7 @@ void appearance_load(void) {
     }
     wallpaper_generation++;
     picture_cache_clear();
+    tp_set_options(&touchpad_options);
 }
 
 static bool ensure_directory(const char *path, size_t length) {
@@ -456,6 +483,17 @@ static void config_save(void) {
     used = append(text, sizeof(text), used, wallpaper_path);
     used = append(text, sizeof(text), used, "\nstyle=");
     used = append(text, sizeof(text), used, style_names[current_style]);
+    used = append(text, sizeof(text), used, "\ntap=");
+    used = append(text, sizeof(text), used,
+                  touchpad_options.tap_to_click ? "on" : "off");
+    used = append(text, sizeof(text), used, "\nscroll=");
+    used = append(text, sizeof(text), used,
+                  touchpad_options.natural_scroll ? "natural" : "traditional");
+    char speed[3] = {(char)('0' + touchpad_options.speed / 10),
+                     (char)('0' + touchpad_options.speed % 10), '\0'};
+    used = append(text, sizeof(text), used, "\npointer=");
+    used = append(text, sizeof(text), used,
+                  touchpad_options.speed >= 10 ? speed : speed + 1);
     used = append(text, sizeof(text), used, "\n");
     (void)vfs_write_file(path, length, (const uint8_t *)text, used);
 }
@@ -481,6 +519,20 @@ enum wallpaper_style appearance_wallpaper_style(void) {
 
 const char *appearance_wallpaper_style_name(enum wallpaper_style style) {
     return style < WALLPAPER_STYLE_COUNT ? style_names[style] : "?";
+}
+
+void appearance_touchpad(struct tp_options *options) {
+    *options = touchpad_options;
+}
+
+void appearance_set_touchpad(const struct tp_options *options) {
+    touchpad_options = *options;
+    if (touchpad_options.speed < TP_SPEED_MIN
+        || touchpad_options.speed > TP_SPEED_MAX) {
+        touchpad_options.speed = TP_SPEED_DEFAULT;
+    }
+    tp_set_options(&touchpad_options);
+    config_save();
 }
 
 void appearance_set_wallpaper_style(enum wallpaper_style style) {

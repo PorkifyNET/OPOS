@@ -10,6 +10,12 @@ bool i2c_hid_initialize(void);
    desktop and shell loops (not from interrupt handlers). */
 void i2c_hid_poll(void);
 bool i2c_hid_active(void);
+/* True when the touchpad runs in Precision Touchpad (multi-touch) mode:
+   tap-to-click, two-finger scrolling (options: touchpad_gesture.h). */
+bool i2c_hid_multitouch(void);
+/* Switches between multi-touch and plain mouse mode (shell fallback).
+   False when the touchpad lacks that mode or the switch failed. */
+bool i2c_hid_set_multitouch(bool multitouch);
 /* True when ACPI declares a HID-over-I2C device. */
 bool i2c_hid_present(void);
 /* Where initialisation got to, for the boot log. */

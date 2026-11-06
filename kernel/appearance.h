@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "image.h"
+#include "touchpad_gesture.h"
 
 /*
  * Desktop appearance: colour theme, background picture and account
@@ -65,6 +66,11 @@ void appearance_cycle_wallpaper(int delta);
 enum wallpaper_style appearance_wallpaper_style(void);
 const char *appearance_wallpaper_style_name(enum wallpaper_style style);
 void appearance_set_wallpaper_style(enum wallpaper_style style);
+
+/* Touchpad gestures (tap-to-click, scroll direction, pointer speed),
+   saved with the other choices; applied to the touchpad on load. */
+void appearance_touchpad(struct tp_options *options);
+void appearance_set_touchpad(const struct tp_options *options);
 
 /* The background at screen size (0x00RRGGBB), or NULL for the gradient
    (also when the picture cannot be loaded any more). */

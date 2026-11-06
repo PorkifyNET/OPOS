@@ -159,6 +159,10 @@ static inline long opos_user_info(struct opos_user_info *info) {
 #define OPOS_EVENT_MOUSE_MOVE 4 /* x, y, buttons */
 #define OPOS_EVENT_RESIZE 5     /* width, height of the content area */
 #define OPOS_EVENT_CLOSE 6      /* the user closed the window */
+/* Mouse wheel or two-finger scroll over the window: x, y, buttons, and
+   key = notches as a signed number, positive = scroll up. */
+#define OPOS_EVENT_WHEEL 7
+#define OPOS_WHEEL_NOTCHES(event) ((int32_t)(event).key)
 
 /* Modifiers held with a key. Letters typed with Shift already arrive in
    upper case; Ctrl+S arrives as 's' with OPOS_MOD_CTRL. */

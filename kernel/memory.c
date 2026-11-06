@@ -161,3 +161,27 @@ uint64_t physical_pages_alloc_contiguous(uint64_t count) {
     }
     return 0;
 }
+
+/*
+ * GCC may call these for large structure copies and clears even in a
+ * freestanding kernel. The attribute stops it from turning the loops back
+ * into calls to themselves.
+ */
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *memset(void *destination, int value, size_t length) {
+    uint8_t *bytes = destination;
+    for (size_t i = 0; i < length; i++) {
+        bytes[i] = (uint8_t)value;
+    }
+    return destination;
+}
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void *memcpy(void *destination, const void *source, size_t length) {
+    uint8_t *to = destination;
+    const uint8_t *from = source;
+    for (size_t i = 0; i < length; i++) {
+        to[i] = from[i];
+    }
+    return destination;
+}

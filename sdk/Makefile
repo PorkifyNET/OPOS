@@ -1,7 +1,7 @@
 # Builds OPOS applications with any x86-64 GCC or Clang on Linux (or WSL).
 # No OPOS source tree is needed: copy this sdk/ folder anywhere.
 #
-#   make                 builds build/hello and build/permtest
+#   make                 builds build/hello, build/permtest and build/sketch
 #   make APP=myapp       builds build/myapp from myapp.c in this folder
 #
 # Copy the result to an OPOS disk (for example with mtools: mcopy) and run
@@ -16,7 +16,7 @@ CFLAGS := -std=c11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
-EXAMPLES := hello permtest
+EXAMPLES := hello permtest sketch
 
 .PHONY: all clean
 all: $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))

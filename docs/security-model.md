@@ -33,6 +33,14 @@ Check `kernel/permissions.c`, `kernel/user.c`, `kernel/paging.c` and
   which is why this check matters.
 - The FPU state restored by `rt_sigreturn` has MXCSR masked to the bits
   the CPU supports; otherwise FXRSTOR would fault in ring 0.
+- Program windows: only the process that opened the window can draw in it
+  or read its events. Presented pixels are checked and copied into a
+  kernel buffer with interrupts off. While a program waits for an event,
+  the desktop runs inside that system call with interrupts on; the event
+  buffer is checked again before the kernel writes it. Keyboard input goes
+  to a program only while its window has focus; the Super shortcuts
+  always stay with the desktop. A program that ignores a close request is
+  ended (status 137) the next time it waits.
 - CPU exceptions in ring 3 end only that process. A fault in ring 0 still
   halts the machine (see "Not done yet").
 

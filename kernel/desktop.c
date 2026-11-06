@@ -6,6 +6,7 @@
 #include "block.h"
 #include "cmos.h"
 #include "console.h"
+#include "desktop.h"
 #include "fat16.h"
 #include "font.h"
 #include "initramfs.h"
@@ -15,6 +16,7 @@
 #include "memory.h"
 #include "mouse.h"
 #include "power.h"
+#include "scheduler.h"
 #include "svga.h"
 #include "vmware.h"
 #include "timer.h"
@@ -60,13 +62,21 @@ enum window_kind {
     WINDOW_EDITOR,
     WINDOW_INSTALLER,
     WINDOW_ACCOUNTS,
+    WINDOW_APP,
     WINDOW_COUNT
 };
 
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "SYSTEM INFO", "WELCOME", "SETTINGS", "TEXT EDITOR",
-    "INSTALL OPOS", "ACCOUNTS"
+    "INSTALL OPOS", "ACCOUNTS", "PROGRAM"
 };
+
+static char app_title[32];
+
+/* A program's window shows the title the program chose. */
+static const char *window_title(enum window_kind kind) {
+    return kind == WINDOW_APP ? app_title : window_titles[kind];
+}
 
 struct window {
     bool open;
@@ -110,7 +120,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "SYSTEM INFO", "TOGGLE TILING", "SETTINGS", "ACCOUNTS", "INSTALL OPOS", "LOG OUT", "REBOOT (CTRL: SHELL)", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "SYSTEM INFO", "TOGGLE TILING", "SETTINGS", "ACCOUNTS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -359,6 +369,17 @@ static size_t terminal_output_length;
 static void draw_scene(void);
 static void window_open(enum window_kind kind);
 static void window_raise(enum window_kind kind);
+static bool program_running;
+static bool desktop_active;
+static bool desktop_exit_pending;
+static bool terminal_output_shown;
+static bool app_window_live(void);
+static void app_program_finished(void);
+static void app_window_closed(void);
+static void app_key(char character);
+static void app_mouse_press(int32_t x, int32_t y, uint32_t button);
+static void draw_app(struct rect area);
+static const char *window_title(enum window_kind kind);
 
 static void terminal_output_flush(void) {
     if (terminal_output_length != 0) {
@@ -371,6 +392,10 @@ static void terminal_output_flush(void) {
 static void terminal_output_sink(const char *data, size_t length,
                                  bool error) {
     (void)error;
+    if (!terminal_output_shown && !app_window_live()) {
+        terminal_output_shown = true;
+        window_open(WINDOW_TERMINAL);
+    }
     for (size_t i = 0; i < length; i++) {
         char c = data[i];
         if (c == '\n') {
@@ -391,15 +416,19 @@ static void terminal_output_sink(const char *data, size_t length,
     draw_scene();
 }
 
+/* The Terminal opens when the program first writes something. */
 static void terminal_capture_begin(void) {
-    window_open(WINDOW_TERMINAL);
     terminal_output_length = 0;
+    terminal_output_shown = false;
+    program_running = true;
     user_set_console_sink(terminal_output_sink);
 }
 
 static void terminal_capture_end(void) {
     user_set_console_sink(NULL);
     terminal_output_flush();
+    program_running = false;
+    app_program_finished();
 }
 
 static void terminal_report_exit(bool started, uint64_t exit_status) {
@@ -411,6 +440,10 @@ static void terminal_report_exit(bool started, uint64_t exit_status) {
 static void terminal_launch(enum user_program program) {
     uint64_t process_id;
     uint64_t exit_status = 1;
+    if (program_running) {
+        terminal_print("ANOTHER PROGRAM IS RUNNING");
+        return;
+    }
     terminal_capture_begin();
     bool started = user_process_run(program, &process_id, &exit_status);
     terminal_capture_end();
@@ -425,6 +458,7 @@ enum run_result {
     RUN_TOO_LARGE,
     RUN_NOT_PROGRAM,
     RUN_FAILED,
+    RUN_BUSY,
 };
 
 /* Program images are loaded here first (the loader copies them). Same
@@ -437,6 +471,8 @@ static uint8_t program_image[64 * 1024];
  */
 static enum run_result run_program_file(const char *typed,
                                         size_t typed_length,
+                                        const char *arguments,
+                                        size_t arguments_length,
                                         uint64_t *exit_status) {
     char path[256];
     size_t length = permission_canonicalize(typed, typed_length, path,
@@ -465,7 +501,8 @@ static enum run_result run_program_file(const char *typed,
         return RUN_NOT_PROGRAM;
     }
     uint64_t process_id;
-    return user_process_run_elf_path(image, size, path, length, &process_id,
+    return user_process_run_elf_args(image, size, path, length, arguments,
+                                     arguments_length, &process_id,
                                      exit_status)
         ? RUN_STARTED : RUN_FAILED;
 }
@@ -477,6 +514,7 @@ static const char *run_result_text(enum run_result result) {
     case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (64 KIB LIMIT)";
     case RUN_NOT_PROGRAM: return "NOT A PROGRAM (NO ELF HEADER)";
     case RUN_FAILED: return "PROGRAM COULD NOT START";
+    case RUN_BUSY: return "ANOTHER PROGRAM IS RUNNING";
     default: return "";
     }
 }
@@ -510,7 +548,7 @@ static bool terminal_execute(void) {
     terminal_print(echo);
 
     if (text_equals(terminal_line, terminal_length, "help")) {
-        terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN [/]PATH");
+        terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
         terminal_print("SHELL REBOOT SHUTDOWN EXIT");
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
@@ -527,20 +565,47 @@ static bool terminal_execute(void) {
     } else if (text_equals(terminal_line, terminal_length, "demo")) {
         terminal_launch(USER_PROGRAM_DEMO);
     } else if (terminal_length > 4 && text_equals(terminal_line, 4, "run ")) {
-        /* A name without a leading '/' is looked up from the root, so
-           "run bin/elf-test" still works. */
+        /* run PATH [ARGUMENTS]. A path with spaces goes in double
+           quotes. A name without a leading '/' is looked up from the
+           root, so "run bin/elf-test" still works. */
         char path[sizeof(terminal_line) + 1];
         size_t length = 0;
-        if (terminal_line[4] != '/') {
+        size_t i = 4;
+        while (i < terminal_length && terminal_line[i] == ' ') {
+            i++;
+        }
+        bool quoted = i < terminal_length && terminal_line[i] == '"';
+        if (quoted) {
+            i++;
+        }
+        if (i < terminal_length && terminal_line[i] != '/') {
             path[length++] = '/';
         }
-        for (size_t i = 4; i < terminal_length; i++) {
-            path[length++] = terminal_line[i];
+        for (; i < terminal_length; i++) {
+            char c = terminal_line[i];
+            if (quoted ? c == '"' : c == ' ') {
+                i++;
+                break;
+            }
+            path[length++] = c;
         }
         uint64_t exit_status = 1;
-        terminal_capture_begin();
-        enum run_result result = run_program_file(path, length, &exit_status);
-        terminal_capture_end();
+        enum run_result result = RUN_BUSY;
+        if (!program_running) {
+            /* The prompt empties while the program runs, so the Terminal
+               stays usable (other commands work meanwhile). */
+            char arguments[sizeof(terminal_line)];
+            size_t arguments_length = terminal_length - i;
+            for (size_t j = 0; j < arguments_length; j++) {
+                arguments[j] = terminal_line[i + j];
+            }
+            terminal_length = 0;
+            terminal_line[0] = '\0';
+            terminal_capture_begin();
+            result = run_program_file(path, length, arguments,
+                                      arguments_length, &exit_status);
+            terminal_capture_end();
+        }
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
         } else {
@@ -713,6 +778,9 @@ static void window_open(enum window_kind kind) {
 }
 
 static void window_close(enum window_kind kind) {
+    if (kind == WINDOW_APP) {
+        app_window_closed();
+    }
     if (kind == WINDOW_EDITOR) {
         if (!editor_may_discard()) {
             return;
@@ -2140,9 +2208,12 @@ static void files_run_program(const char *path, size_t length) {
     /* Output goes to the Terminal, which comes up if it was closed. */
     enum window_kind previous = z_count != 0 ? z_order[z_count - 1]
                                              : WINDOW_COUNT;
-    terminal_capture_begin();
-    enum run_result result = run_program_file(path, length, &exit_status);
-    terminal_capture_end();
+    enum run_result result = RUN_BUSY;
+    if (!program_running) {
+        terminal_capture_begin();
+        result = run_program_file(path, length, NULL, 0, &exit_status);
+        terminal_capture_end();
+    }
     if (result == RUN_STARTED) {
         terminal_report_exit(true, exit_status);
     }
@@ -4750,7 +4821,7 @@ static void draw_window(enum window_kind kind) {
     struct rect title = title_rect(frame);
     fill(title, focused ? 36 : 30, focused ? 52 : 36, focused ? 86 : 52);
     draw_text_clipped(title.x + 10, title.y + 5,
-                      title.width - TITLE_HEIGHT - 20, window_titles[kind],
+                      title.width - TITLE_HEIGHT - 20, window_title(kind),
                       245, 248, 255);
     struct rect close = close_rect(frame);
     fill(close, focused ? 190 : 80, focused ? 70 : 60, focused ? 80 : 70);
@@ -4779,6 +4850,9 @@ static void draw_window(enum window_kind kind) {
         break;
     case WINDOW_ACCOUNTS:
         draw_accounts(content, focused);
+        break;
+    case WINDOW_APP:
+        draw_app(content);
         break;
     default:
         draw_welcome(content);
@@ -4877,7 +4951,7 @@ static void draw_taskbar(void) {
         if (button.x + button.width > bar.width - CLOCK_WIDTH - 10) {
             break;
         }
-        draw_button(button, window_titles[tile_order[i]],
+        draw_button(button, window_title(tile_order[i]),
                     window_focused(tile_order[i]));
     }
 
@@ -5899,6 +5973,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         installer_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_ACCOUNTS) {
         accounts_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_APP) {
+        app_mouse_press(x, y, 1);
     } else if (kind == WINDOW_SETTINGS) {
         struct rect area = content_rect(frame);
         for (size_t i = 0; i < SETTING_ROW_COUNT; i++) {
@@ -6132,6 +6208,8 @@ static enum desktop_result handle_key(char character, bool super) {
         installer_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_ACCOUNTS) {
         accounts_key(character);
+    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_APP) {
+        app_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
         if (character == KEY_UP) {
             settings_selection = (settings_selection + SETTING_ROW_COUNT - 1)
@@ -6164,7 +6242,448 @@ static void handle_right_press(int32_t x, int32_t y) {
     struct rect content = content_rect(frame);
     if (kind == WINDOW_FILES && rect_contains(content, x, y)) {
         files_context(content, x, y);
+    } else if (kind == WINDOW_APP) {
+        app_mouse_press(x, y, 2);
     }
+}
+
+
+/* ------------------------------------------------------- program windows */
+
+/*
+ * One window for a running program (sdk/include/opos.h). Programs run on
+ * the desktop's own kernel task, so while a program waits for an event the
+ * desktop keeps running from inside that system call (desktop_step): the
+ * user can still move windows, type in the Terminal or browse Files. Only
+ * one program runs at a time.
+ *
+ * The program draws into its own memory and presents it; the kernel copies
+ * the pixels into app_surface, which the window shows at its top left.
+ */
+#define APP_SURFACE_WIDTH 1024
+#define APP_SURFACE_HEIGHT 768
+#define APP_EVENT_CAPACITY 64
+#define APP_EVENT_KEY 1
+#define APP_EVENT_MOUSE_DOWN 2
+#define APP_EVENT_MOUSE_UP 3
+#define APP_EVENT_MOUSE_MOVE 4
+#define APP_EVENT_RESIZE 5
+#define APP_EVENT_CLOSE 6
+
+static uint32_t *app_surface;
+static uint32_t app_width;
+static uint32_t app_height;
+static uint64_t app_owner;
+static bool app_closed;
+static bool app_close_sent;
+static bool app_pumping;
+static char app_title[32] = "PROGRAM";
+static struct desktop_app_event app_events[APP_EVENT_CAPACITY];
+static size_t app_event_head;
+static size_t app_event_count;
+static uint32_t app_buttons_down;
+static int32_t app_mouse_x;
+static int32_t app_mouse_y;
+static int64_t app_reported_width;
+static int64_t app_reported_height;
+
+static bool app_window_live(void) {
+    return app_owner != 0 && !app_closed && windows[WINDOW_APP].open;
+}
+
+static void app_push(const struct desktop_app_event *event) {
+    if (!app_window_live()) {
+        return;
+    }
+    if (event->type == APP_EVENT_MOUSE_MOVE && app_event_count != 0) {
+        struct desktop_app_event *last = &app_events[
+            (app_event_head + app_event_count - 1) % APP_EVENT_CAPACITY];
+        if (last->type == APP_EVENT_MOUSE_MOVE) {
+            *last = *event;
+            return;
+        }
+    }
+    if (app_event_count == APP_EVENT_CAPACITY) {
+        return; /* the program is not keeping up; drop the newest */
+    }
+    app_events[(app_event_head + app_event_count) % APP_EVENT_CAPACITY] =
+        *event;
+    app_event_count++;
+}
+
+static struct rect app_content(void) {
+    return content_rect(window_rect(WINDOW_APP));
+}
+
+static void app_key(char character) {
+    struct desktop_app_event event = {
+        .type = APP_EVENT_KEY, .key = (uint8_t)character,
+    };
+    app_push(&event);
+}
+
+static void app_mouse_press(int32_t x, int32_t y, uint32_t button) {
+    struct rect area = app_content();
+    if (!app_window_live() || !rect_contains(area, x, y)) {
+        return;
+    }
+    app_buttons_down |= button;
+    app_mouse_x = x - (int32_t)area.x;
+    app_mouse_y = y - (int32_t)area.y;
+    struct desktop_app_event event = {
+        .type = APP_EVENT_MOUSE_DOWN, .x = app_mouse_x, .y = app_mouse_y,
+        .button = button, .buttons = app_buttons_down,
+    };
+    app_push(&event);
+}
+
+/* Releases and movement; presses come from handle_press. */
+static void app_mouse_update(int32_t x, int32_t y, uint8_t buttons) {
+    if (!app_window_live()) {
+        app_buttons_down = 0;
+        return;
+    }
+    struct rect area = app_content();
+    int32_t local_x = x - (int32_t)area.x;
+    int32_t local_y = y - (int32_t)area.y;
+    for (uint32_t button = 1; button <= 2; button <<= 1) {
+        if ((app_buttons_down & button) != 0 && (buttons & button) == 0) {
+            app_buttons_down &= ~button;
+            struct desktop_app_event event = {
+                .type = APP_EVENT_MOUSE_UP, .x = local_x, .y = local_y,
+                .button = button, .buttons = app_buttons_down,
+            };
+            app_push(&event);
+        }
+    }
+    bool hovering = window_focused(WINDOW_APP) && rect_contains(area, x, y)
+        && window_at(x, y) == WINDOW_APP;
+    if ((app_buttons_down != 0 || hovering)
+        && (local_x != app_mouse_x || local_y != app_mouse_y)) {
+        app_mouse_x = local_x;
+        app_mouse_y = local_y;
+        struct desktop_app_event event = {
+            .type = APP_EVENT_MOUSE_MOVE, .x = local_x, .y = local_y,
+            .buttons = app_buttons_down,
+        };
+        app_push(&event);
+    }
+}
+
+/* Tells the program when its content area changes size. */
+static void app_check_resize(void) {
+    if (!app_window_live()) {
+        return;
+    }
+    struct rect area = app_content();
+    int64_t width = area.width < 0 ? 0 : area.width;
+    int64_t height = area.height < 0 ? 0 : area.height;
+    if (width != app_reported_width || height != app_reported_height) {
+        app_reported_width = width;
+        app_reported_height = height;
+        struct desktop_app_event event = {
+            .type = APP_EVENT_RESIZE,
+            .width = (uint32_t)width, .height = (uint32_t)height,
+        };
+        app_push(&event);
+    }
+}
+
+static void draw_app(struct rect area) {
+    fill(area, 12, 16, 26);
+    if (app_surface == NULL || app_width == 0 || app_height == 0) {
+        return;
+    }
+    int64_t skip_x = area.x < 0 ? -area.x : 0;
+    int64_t skip_y = area.y < 0 ? -area.y : 0;
+    int64_t width = (int64_t)app_width < area.width
+        ? (int64_t)app_width : area.width;
+    int64_t height = (int64_t)app_height < area.height
+        ? (int64_t)app_height : area.height;
+    if (width <= skip_x || height <= skip_y) {
+        return;
+    }
+    console_draw_pixels((uint64_t)(area.x + skip_x),
+                        (uint64_t)(area.y + skip_y),
+                        (uint64_t)(width - skip_x),
+                        (uint64_t)(height - skip_y),
+                        app_surface + skip_y * APP_SURFACE_WIDTH + skip_x,
+                        APP_SURFACE_WIDTH);
+}
+
+/* The window went away (close button, Super+Q, log out). */
+static void app_window_closed(void) {
+    if (app_owner != 0) {
+        app_closed = true;
+        app_event_count = 0;
+        app_buttons_down = 0;
+    }
+}
+
+/* Called after every program ends: its window goes with it. */
+static void app_program_finished(void) {
+    app_owner = 0;
+    if (windows[WINDOW_APP].open) {
+        window_close(WINDOW_APP);
+    }
+    app_closed = false;
+    app_close_sent = false;
+    app_event_count = 0;
+    app_buttons_down = 0;
+    app_width = 0;
+    app_height = 0;
+}
+
+int64_t desktop_app_window_create(uint64_t owner, const char *title,
+                                  size_t title_length, uint32_t width,
+                                  uint32_t height) {
+    if (!desktop_active || login_active) {
+        return -19; /* ENODEV: no desktop (kernel shell) */
+    }
+    if (owner == 0 || app_owner != 0 || app_closed) {
+        return -16; /* EBUSY: one window per program */
+    }
+    if (app_surface == NULL) {
+        uint64_t bytes = (uint64_t)APP_SURFACE_WIDTH * APP_SURFACE_HEIGHT
+            * sizeof(uint32_t);
+        uint64_t physical = physical_pages_alloc_contiguous(
+            (bytes + 4095) / 4096);
+        if (physical == 0) {
+            return -12;
+        }
+        app_surface = physical_page_to_hhdm(physical);
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < title_length && used + 1 < sizeof(app_title);
+         i++) {
+        char c = title[i];
+        if (c >= ' ' && c <= '~') {
+            app_title[used++] = c;
+        }
+    }
+    if (used == 0) {
+        static const char fallback[] = "PROGRAM";
+        for (; fallback[used] != '\0'; used++) {
+            app_title[used] = fallback[used];
+        }
+    }
+    app_title[used] = '\0';
+    width = width == 0 ? 320 : width > APP_SURFACE_WIDTH
+        ? APP_SURFACE_WIDTH : width;
+    height = height == 0 ? 240 : height > APP_SURFACE_HEIGHT
+        ? APP_SURFACE_HEIGHT : height;
+
+    app_owner = owner;
+    app_closed = false;
+    app_close_sent = false;
+    app_event_head = 0;
+    app_event_count = 0;
+    app_buttons_down = 0;
+    app_width = 0;
+    app_height = 0;
+    app_reported_width = -1;
+    app_reported_height = -1;
+    app_mouse_x = -1;
+    app_mouse_y = -1;
+    window_open(WINDOW_APP);
+    struct rect area = workspace_area();
+    int64_t frame_width = (int64_t)width + 2 * BORDER;
+    int64_t frame_height = (int64_t)height + 2 * BORDER + TITLE_HEIGHT;
+    if (frame_width > area.width) {
+        frame_width = area.width;
+    }
+    if (frame_height > area.height) {
+        frame_height = area.height;
+    }
+    windows[WINDOW_APP].floating = (struct rect){
+        area.x + (area.width - frame_width) / 2,
+        area.y + (area.height - frame_height) / 2,
+        frame_width, frame_height
+    };
+    app_check_resize();
+    draw_scene();
+    return 0;
+}
+
+int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t stride) {
+    if (owner == 0 || owner != app_owner) {
+        return -9; /* EBADF: no window */
+    }
+    if (app_closed) {
+        return 0;
+    }
+    uint32_t copy_width = width > APP_SURFACE_WIDTH ? APP_SURFACE_WIDTH
+                                                    : width;
+    uint32_t copy_height = height > APP_SURFACE_HEIGHT ? APP_SURFACE_HEIGHT
+                                                       : height;
+    for (uint32_t row = 0; row < copy_height; row++) {
+        const uint32_t *source = pixels + (uint64_t)row * stride;
+        uint32_t *target = app_surface + (uint64_t)row * APP_SURFACE_WIDTH;
+        for (uint32_t column = 0; column < copy_width; column++) {
+            target[column] = source[column];
+        }
+    }
+    app_width = copy_width;
+    app_height = copy_height;
+    draw_scene();
+    return 0;
+}
+
+uint64_t desktop_app_window_size(uint64_t owner) {
+    if (owner == 0 || owner != app_owner || !app_window_live()) {
+        return 0;
+    }
+    struct rect area = app_content();
+    uint64_t width = area.width < 0 ? 0 : (uint64_t)area.width;
+    uint64_t height = area.height < 0 ? 0 : (uint64_t)area.height;
+    return width << 32 | height;
+}
+
+static bool desktop_step(bool in_program);
+
+int64_t desktop_app_window_event(uint64_t owner,
+                                 struct desktop_app_event *event,
+                                 int64_t timeout_ms, bool *terminate) {
+    *terminate = false;
+    if (owner == 0 || owner != app_owner) {
+        return -9;
+    }
+    if (app_pumping) {
+        return -16; /* another thread of the program is already waiting */
+    }
+    uint64_t deadline = timeout_ms > 0
+        ? timer_ticks() + ((uint64_t)timeout_ms + 9) / 10 : 0;
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
+    /* System calls start with interrupts off; the desktop needs the
+       keyboard, mouse and timer while it runs. */
+    __asm__ volatile ("sti" : : : "memory");
+    app_pumping = true;
+    int64_t result = 0;
+    for (;;) {
+        if (app_closed) {
+            if (app_close_sent) {
+                /* Asked to close and still waiting: end it. */
+                *terminate = true;
+                break;
+            }
+            app_close_sent = true;
+            *event = (struct desktop_app_event){.type = APP_EVENT_CLOSE};
+            result = 1;
+            break;
+        }
+        if (app_event_count != 0) {
+            *event = app_events[app_event_head];
+            app_event_head = (app_event_head + 1) % APP_EVENT_CAPACITY;
+            app_event_count--;
+            result = 1;
+            break;
+        }
+        if (timeout_ms == 0
+            || (timeout_ms > 0 && timer_ticks() >= deadline)) {
+            break;
+        }
+        if (desktop_step(true)) {
+            /* Log out, shell or power: the program goes first. */
+            desktop_exit_pending = true;
+            window_close(WINDOW_APP);
+        }
+    }
+    app_pumping = false;
+    if ((flags & (1u << 9)) == 0) {
+        __asm__ volatile ("cli" : : : "memory");
+    }
+    return result;
+}
+
+/*
+ * One pass of the desktop: input, host resize, mouse, clock. Returns true
+ * when the desktop should end (shell, log out to the shell). in_program:
+ * called from a program waiting for events, which lets other threads run
+ * while idle instead of halting.
+ */
+static struct mouse_state loop_mouse;
+static uint8_t loop_previous_buttons;
+static struct drag_state loop_drag;
+static uint64_t loop_drawn_tick;
+
+static bool desktop_step(bool in_program) {
+    bool redraw = false;
+    char character;
+    bool super_pending = false;
+    while (keyboard_read_character(&character)) {
+        redraw = true;
+        if (character == KEY_SUPER_PREFIX) {
+            super_pending = true;
+            continue;
+        }
+        enum desktop_result result = handle_key(character, super_pending);
+        super_pending = false;
+        if (result == DESKTOP_EXIT || exit_to_shell) {
+            return true;
+        }
+    }
+
+    /* The host may resize the screen (VMware "Autofit Guest"). */
+    int64_t width_before = screen_width();
+    int64_t height_before = screen_height();
+    vmware_tools_poll();
+    if (screen_width() != width_before || screen_height() != height_before) {
+        windows_fit_screen();
+        redraw = true;
+    }
+    if (mouse_read_state(&loop_mouse)) {
+        struct mouse_state mouse = loop_mouse;
+        bool pressed = (mouse.buttons & 1) != 0;
+        bool was_pressed = (loop_previous_buttons & 1) != 0;
+        if (pressed && !was_pressed) {
+            status_text[0] = '\0';
+            if (handle_press(mouse.x, mouse.y, &loop_drag) == DESKTOP_EXIT) {
+                return true;
+            }
+            redraw = true;
+        } else if (pressed && loop_drag.active) {
+            if (loop_drag.mode == DRAG_RESIZE) {
+                redraw |= handle_resize(&loop_drag, mouse.x, mouse.y);
+            } else if (loop_drag.mode == DRAG_SPLIT) {
+                redraw |= handle_split(&loop_drag, mouse.x, mouse.y);
+            } else {
+                redraw |= handle_drag(&loop_drag, mouse.x, mouse.y);
+            }
+        } else if (!pressed) {
+            loop_drag.active = false;
+        }
+        if ((mouse.buttons & 2) != 0 && (loop_previous_buttons & 2) == 0) {
+            handle_right_press(mouse.x, mouse.y);
+            redraw = true;
+        }
+        loop_previous_buttons = mouse.buttons;
+        app_mouse_update(mouse.x, mouse.y, mouse.buttons);
+    }
+    app_check_resize();
+    if (exit_to_shell) {
+        return true;
+    }
+
+    /* Half-second tick drives the clock and the terminal caret blink. */
+    uint64_t tick = timer_ticks() / 50;
+    if (tick != loop_drawn_tick) {
+        redraw = true;
+    }
+    if (redraw) {
+        loop_drawn_tick = tick;
+        draw_scene();
+    } else {
+        console_cursor_refresh();
+        if (in_program) {
+            (void)scheduler_sleep_until(timer_ticks() + 1);
+        } else {
+            __asm__ volatile ("hlt" : : : "memory");
+        }
+    }
+    return false;
 }
 
 void desktop_run(void) {
@@ -6208,79 +6727,21 @@ void desktop_run(void) {
         }
     }
 
-    struct mouse_state mouse = {0};
-    bool have_mouse = mouse_read_state(&mouse);
-    uint8_t previous_buttons = have_mouse ? mouse.buttons : 0;
-    struct drag_state drag = {0};
-    uint64_t drawn_tick = timer_ticks() / 50;
+    loop_mouse = (struct mouse_state){0};
+    loop_previous_buttons = mouse_read_state(&loop_mouse)
+        ? loop_mouse.buttons : 0;
+    loop_drag = (struct drag_state){0};
+    loop_drawn_tick = timer_ticks() / 50;
+    desktop_active = true;
+    desktop_exit_pending = false;
     draw_scene();
 
     for (;;) {
-        bool redraw = false;
-        char character;
-        bool super_pending = false;
-        while (keyboard_read_character(&character)) {
-            redraw = true;
-            if (character == KEY_SUPER_PREFIX) {
-                super_pending = true;
-                continue;
-            }
-            enum desktop_result result = handle_key(character, super_pending);
-            super_pending = false;
-            if (result == DESKTOP_EXIT || exit_to_shell) {
-                console_clear();
-                return;
-            }
-        }
-
-        /* The host may resize the screen (VMware "Autofit Guest"). */
-        int64_t width_before = screen_width();
-        int64_t height_before = screen_height();
-        vmware_tools_poll();
-        if (screen_width() != width_before || screen_height() != height_before) {
-            windows_fit_screen();
-            redraw = true;
-        }
-        have_mouse = mouse_read_state(&mouse);
-        if (have_mouse) {
-            bool pressed = (mouse.buttons & 1) != 0;
-            bool was_pressed = (previous_buttons & 1) != 0;
-            if (pressed && !was_pressed) {
-                status_text[0] = '\0';
-                if (handle_press(mouse.x, mouse.y, &drag) == DESKTOP_EXIT) {
-                    console_clear();
-                    return;
-                }
-                redraw = true;
-            } else if (pressed && drag.active) {
-                if (drag.mode == DRAG_RESIZE) {
-                    redraw |= handle_resize(&drag, mouse.x, mouse.y);
-                } else if (drag.mode == DRAG_SPLIT) {
-                    redraw |= handle_split(&drag, mouse.x, mouse.y);
-                } else {
-                    redraw |= handle_drag(&drag, mouse.x, mouse.y);
-                }
-            } else if (!pressed) {
-                drag.active = false;
-            }
-            if ((mouse.buttons & 2) != 0 && (previous_buttons & 2) == 0) {
-                handle_right_press(mouse.x, mouse.y);
-                redraw = true;
-            }
-            previous_buttons = mouse.buttons;
-        }
-
-        /* Half-second tick drives the clock and the terminal caret blink. */
-        uint64_t tick = timer_ticks() / 50;
-        if (tick != drawn_tick) {
-            redraw = true;
-        }
-        if (redraw) {
-            drawn_tick = tick;
-            draw_scene();
-        } else {
-            console_cursor_refresh();
-            __asm__ volatile ("hlt" : : : "memory");
+        if (desktop_step(false) || desktop_exit_pending) {
+            desktop_active = false;
+            desktop_exit_pending = false;
+            console_clear();
+            return;
         }
     }
 }

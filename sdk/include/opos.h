@@ -45,6 +45,14 @@
 #define OPOS_ENOSYS 38
 #define OPOS_ENOTEMPTY 39
 
+static inline size_t opos_strlen(const char *text) {
+    size_t length = 0;
+    while (text[length] != '\0') {
+        length++;
+    }
+    return length;
+}
+
 /* --------------------------------------------------------- raw calls */
 
 static inline long opos_syscall0(long number) {
@@ -86,6 +94,19 @@ static inline long opos_syscall4(long number, long a, long b, long c,
     return result;
 }
 
+static inline long opos_syscall6(long number, long a, long b, long c,
+                                 long d, long e, long f) {
+    long result;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    register long r9 __asm__("r9") = f;
+    __asm__ volatile ("syscall" : "=a"(result)
+                      : "a"(number), "D"(a), "S"(b), "d"(c), "r"(r10),
+                        "r"(r8), "r"(r9)
+                      : "rcx", "r11", "memory");
+    return result;
+}
+
 /* ------------------------------------------------------- native calls */
 
 #define OPOS_SYS_ABI_VERSION 0x4f500000L
@@ -111,6 +132,105 @@ struct opos_user_info {
 static inline long opos_user_info(struct opos_user_info *info) {
     info->size = sizeof(*info);
     return opos_syscall1(OPOS_SYS_USER_INFO, (long)info);
+}
+
+/* ------------------------------------------------------------ windows */
+
+/*
+ * One window per program, drawn by the desktop. Draw 0x00RRGGBB pixels in
+ * your own memory and present them; the desktop shows them at the top left
+ * of the window's content area (at most 1024 x 768 pixels are kept).
+ * Then wait for events. While a program waits, the desktop keeps working.
+ *
+ * The window closes when the program ends. When the user closes it, the
+ * program gets OPOS_EVENT_CLOSE and should exit; waiting again ends it.
+ * Programs started from the kernel shell cannot open windows (-19).
+ */
+#define OPOS_SYS_WINDOW_CREATE 0x4f500010L
+#define OPOS_SYS_WINDOW_PRESENT 0x4f500011L
+#define OPOS_SYS_WINDOW_EVENT 0x4f500012L
+#define OPOS_SYS_WINDOW_SIZE 0x4f500013L
+
+#define OPOS_EVENT_NONE 0
+#define OPOS_EVENT_KEY 1        /* key */
+#define OPOS_EVENT_MOUSE_DOWN 2 /* x, y, button, buttons */
+#define OPOS_EVENT_MOUSE_UP 3   /* x, y, button, buttons */
+#define OPOS_EVENT_MOUSE_MOVE 4 /* x, y, buttons */
+#define OPOS_EVENT_RESIZE 5     /* width, height of the content area */
+#define OPOS_EVENT_CLOSE 6      /* the user closed the window */
+
+#define OPOS_BUTTON_LEFT 1u
+#define OPOS_BUTTON_RIGHT 2u
+
+/* Keys: printable ASCII, '\n' (Enter), '\b' (Backspace), '\t', and: */
+#define OPOS_KEY_UP 0x11
+#define OPOS_KEY_DOWN 0x12
+#define OPOS_KEY_LEFT 0x13
+#define OPOS_KEY_RIGHT 0x14
+#define OPOS_KEY_DELETE 0x17
+#define OPOS_KEY_HOME 0x18
+#define OPOS_KEY_END 0x19
+#define OPOS_KEY_PAGE_UP 0x1a
+#define OPOS_KEY_ESCAPE 0x1b
+#define OPOS_KEY_PAGE_DOWN 0x1c
+
+struct opos_event {
+    uint32_t type;    /* OPOS_EVENT_* */
+    uint32_t key;     /* KEY: the character or OPOS_KEY_* */
+    int32_t x;        /* MOUSE_*: position in the content area; may be */
+    int32_t y;        /*   outside it while a button is held */
+    uint32_t button;  /* MOUSE_DOWN/UP: the button that changed */
+    uint32_t buttons; /* MOUSE_*: buttons held now */
+    uint32_t width;   /* RESIZE */
+    uint32_t height;
+};
+
+/* Opens the window with a content area of about width x height. The
+   first event is OPOS_EVENT_RESIZE with the size it really got. */
+static inline long opos_window_create(const char *title, uint32_t width,
+                                      uint32_t height) {
+    return opos_syscall4(OPOS_SYS_WINDOW_CREATE, (long)title,
+                         (long)opos_strlen(title), width, height);
+}
+
+/* Shows width x height pixels; stride is the row length in pixels. */
+static inline long opos_window_present(const uint32_t *pixels,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t stride) {
+    return opos_syscall4(OPOS_SYS_WINDOW_PRESENT, (long)pixels, width, height,
+                         stride);
+}
+
+/* Waits for an event: timeout_ms < 0 waits for ever, 0 only checks.
+   Returns 1 with an event, 0 on timeout, or a negative error. */
+static inline long opos_window_event(struct opos_event *event,
+                                     long timeout_ms) {
+    return opos_syscall2(OPOS_SYS_WINDOW_EVENT, (long)event, timeout_ms);
+}
+
+/* The content area's current size. */
+static inline long opos_window_size(uint32_t *width, uint32_t *height) {
+    long size = opos_syscall0(OPOS_SYS_WINDOW_SIZE);
+    if (size > 0) {
+        *width = (uint32_t)((unsigned long)size >> 32);
+        *height = (uint32_t)size;
+        return 0;
+    }
+    return size;
+}
+
+/* ------------------------------------------------------------- memory */
+
+/* Zero-filled, readable and writable memory; up to 4 MiB in total per
+   program. Returns NULL on failure. */
+static inline void *opos_alloc(size_t size) {
+    long address = opos_syscall6(9, 0, (long)size, 3 /* read, write */,
+                                 0x22 /* private, anonymous */, -1, 0);
+    return address < 0 && address > -4096 ? (void *)0 : (void *)address;
+}
+
+static inline long opos_free(void *address, size_t size) {
+    return opos_syscall2(11, (long)address, (long)size);
 }
 
 /* ------------------------------------------------------- Linux calls */
@@ -197,14 +317,6 @@ __attribute__((noreturn)) static inline void opos_exit(int status) {
 }
 
 /* ----------------------------------------------------------- helpers */
-
-static inline size_t opos_strlen(const char *text) {
-    size_t length = 0;
-    while (text[length] != '\0') {
-        length++;
-    }
-    return length;
-}
 
 /* Writes a zero-terminated string to standard output. */
 static inline long opos_print(const char *text) {

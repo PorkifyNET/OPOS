@@ -7,6 +7,9 @@
 #include "timer.h"
 
 #define SCHEDULER_STACK_SIZE 16384
+/* System calls, and the desktop while a program waits for window events
+   (desktop_app_window_event), run on this stack. */
+#define SCHEDULER_INTERRUPT_STACK_SIZE 32768
 #define KERNEL_CODE_SELECTOR 0x28
 #define INITIAL_FLAGS 0x202
 #define SELF_TEST_TICKS 6
@@ -70,7 +73,7 @@ struct scheduler_task {
     uint64_t user_fs_base;
     uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
     uint8_t stack[SCHEDULER_STACK_SIZE] __attribute__((aligned(16)));
-    uint8_t interrupt_stack[SCHEDULER_STACK_SIZE] __attribute__((aligned(16)));
+    uint8_t interrupt_stack[SCHEDULER_INTERRUPT_STACK_SIZE] __attribute__((aligned(16)));
 };
 
 _Static_assert(sizeof(struct scheduler_interrupt_frame) == 176,

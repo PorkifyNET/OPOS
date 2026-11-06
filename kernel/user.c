@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include "console.h"
+#include "desktop.h"
 #include "elf.h"
 #include "initramfs.h"
 #include "keyboard.h"
@@ -60,7 +61,7 @@
 #define USER_EXEC_VECTOR_MAX 16
 #define USER_EXEC_STRING_MAX 1024
 #define USER_MMAP_BASE 0x10000000ULL
-#define USER_MMAP_MAX_PAGES 128
+#define USER_MMAP_MAX_PAGES 1024
 #define USER_MMAP_ANONYMOUS 0x20
 #define USER_MMAP_PRIVATE 0x02
 #define USER_PROT_WRITE 0x02
@@ -458,80 +459,6 @@ static void user_fill_random(uint8_t destination[16]) {
         destination[i] = (uint8_t)(first >> (i * 8));
         destination[sizeof(first) + i] = (uint8_t)(second >> (i * 8));
     }
-}
-
-static uintptr_t user_prepare_elf_stack(uint8_t *stack,
-                                         const struct elf_load_plan *plan,
-                                         const char *exec_path,
-                                         size_t exec_path_length) {
-    if (stack == NULL || plan == NULL || exec_path == NULL
-        || exec_path_length == 0 || exec_path_length >= USER_FILE_PATH_CAPACITY) {
-        return 0;
-    }
-    size_t argument_offset = PAGE_SIZE - exec_path_length - 1;
-    uintptr_t argument_address = USER_STACK_ADDRESS + argument_offset;
-    for (size_t i = 0; i < exec_path_length; i++) {
-        stack[argument_offset + i] = (uint8_t)exec_path[i];
-    }
-    stack[argument_offset + exec_path_length] = '\0';
-    static const char platform[] = "x86_64";
-    size_t platform_offset = argument_offset - sizeof(platform);
-    for (size_t i = 0; i < sizeof(platform); i++) {
-        stack[platform_offset + i] = (uint8_t)platform[i];
-    }
-    size_t random_offset = (platform_offset - 16) & ~(size_t)15;
-    user_fill_random(stack + random_offset);
-    uintptr_t random_address = USER_STACK_ADDRESS + random_offset;
-
-    const uint64_t initial_words[] = {
-        1,
-        argument_address,
-        0,
-        0,
-        USER_AT_PHDR,
-        plan->program_header_address,
-        USER_AT_PHENT,
-        plan->program_header_size,
-        USER_AT_PHNUM,
-        plan->program_header_count,
-        USER_AT_PAGESZ,
-        PAGE_SIZE,
-        USER_AT_ENTRY,
-        plan->entry_point,
-        USER_AT_UID,
-        0,
-        USER_AT_EUID,
-        0,
-        USER_AT_GID,
-        0,
-        USER_AT_EGID,
-        0,
-        USER_AT_SECURE,
-        0,
-        USER_AT_RANDOM,
-        random_address,
-        USER_AT_EXECFN,
-        argument_address,
-        USER_AT_PLATFORM,
-        USER_STACK_ADDRESS + platform_offset,
-        USER_AT_HWCAP,
-        user_cpu_hwcap(),
-        USER_AT_HWCAP2,
-        0,
-        USER_AT_CLKTCK,
-        USER_CLOCK_TICKS_PER_SECOND,
-        USER_AT_FLAGS,
-        0,
-        USER_AT_NULL,
-        0
-    };
-    size_t stack_offset =
-        (random_offset - sizeof(initial_words)) & ~(size_t)15;
-    uint64_t *destination = (uint64_t *)(stack + stack_offset);
-    for (size_t i = 0; i < sizeof(initial_words) / sizeof(initial_words[0]); i++) {
-        destination[i] = initial_words[i];
-    }
-    return USER_STACK_ADDRESS + stack_offset;
 }
 
 static bool allocate_user_pages(size_t count, uint64_t physical_pages[],
@@ -2178,8 +2105,10 @@ static uintptr_t user_prepare_exec_stack(
     uint8_t *stack, const struct elf_load_plan *plan,
     const struct user_exec_vectors *vectors, uintptr_t interpreter_base,
     const char *exec_path, size_t exec_path_length) {
+    /* exec_path NULL: AT_EXECFN points at argv[0] (a program started by
+       the kernel, whose argv[0] is its path). */
     if (stack == NULL || plan == NULL || vectors == NULL
-        || exec_path == NULL || exec_path_length == 0
+        || (exec_path != NULL && exec_path_length == 0)
         || exec_path_length >= USER_FILE_PATH_CAPACITY
         || vectors->argument_count == 0
         || vectors->argument_count > USER_EXEC_VECTOR_MAX
@@ -2191,19 +2120,24 @@ static uintptr_t user_prepare_exec_stack(
     for (size_t i = 0; i < vectors->string_size; i++) {
         stack[string_offset + i] = (uint8_t)vectors->strings[i];
     }
-    if (exec_path_length + 1 > string_offset) {
-        return 0;
+    size_t execfn_offset = string_offset + vectors->argument_offsets[0];
+    size_t below_strings = string_offset;
+    if (exec_path != NULL) {
+        if (exec_path_length + 1 > string_offset) {
+            return 0;
+        }
+        execfn_offset = string_offset - exec_path_length - 1;
+        for (size_t i = 0; i < exec_path_length; i++) {
+            stack[execfn_offset + i] = (uint8_t)exec_path[i];
+        }
+        stack[execfn_offset + exec_path_length] = '\0';
+        below_strings = execfn_offset;
     }
-    size_t execfn_offset = string_offset - exec_path_length - 1;
-    for (size_t i = 0; i < exec_path_length; i++) {
-        stack[execfn_offset + i] = (uint8_t)exec_path[i];
-    }
-    stack[execfn_offset + exec_path_length] = '\0';
     static const char platform[] = "x86_64";
-    if (execfn_offset < sizeof(platform)) {
+    if (below_strings < sizeof(platform)) {
         return 0;
     }
-    size_t platform_offset = execfn_offset - sizeof(platform);
+    size_t platform_offset = below_strings - sizeof(platform);
     for (size_t i = 0; i < sizeof(platform); i++) {
         stack[platform_offset + i] = (uint8_t)platform[i];
     }
@@ -2562,45 +2496,49 @@ static int64_t user_linux_fork(struct user_process *parent,
         }
     }
 
-    struct user_process child = {0};
-    child.fault_status = parent->fault_status;
-    child.faulted = false;
-    child.elf_image = parent->elf_image;
-    child.initial_break = parent->initial_break;
-    child.current_break = parent->current_break;
-    child.heap_base = parent->heap_base;
-    child.heap_page_count = parent->heap_page_count;
-    child.image_segment_count = parent->image_segment_count;
-    child.image_page_count = parent->image_page_count;
+    /* Too large for the kernel stack. fork does not block, so one copy
+       is enough. */
+    static struct user_process fork_child;
+    struct user_process *child = &fork_child;
+    *child = (struct user_process) {0};
+    child->fault_status = parent->fault_status;
+    child->faulted = false;
+    child->elf_image = parent->elf_image;
+    child->initial_break = parent->initial_break;
+    child->current_break = parent->current_break;
+    child->heap_base = parent->heap_base;
+    child->heap_page_count = parent->heap_page_count;
+    child->image_segment_count = parent->image_segment_count;
+    child->image_page_count = parent->image_page_count;
     for (size_t i = 0; i < LINUX_SIGNAL_COUNT; i++) {
-        child.signal_actions[i] = parent->signal_actions[i];
+        child->signal_actions[i] = parent->signal_actions[i];
     }
     for (size_t i = 0; i < parent->image_segment_count; i++) {
-        child.image_segments[i] = parent->image_segments[i];
+        child->image_segments[i] = parent->image_segments[i];
     }
-    child.identity = parent->identity;
-    child.cwd_length = parent->cwd_length;
+    child->identity = parent->identity;
+    child->cwd_length = parent->cwd_length;
     for (size_t i = 0; i < parent->cwd_length; i++) {
-        child.cwd[i] = parent->cwd[i];
+        child->cwd[i] = parent->cwd[i];
     }
     for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-        child.mmap_flags[i] = parent->mmap_flags[i];
+        child->mmap_flags[i] = parent->mmap_flags[i];
     }
     bool cloned = user_clone_page_array(parent->image_pages,
                                          parent->image_page_count,
-                                         child.image_pages)
-        && user_clone_page_array(&parent->stack_page, 1, &child.stack_page)
+                                         child->image_pages)
+        && user_clone_page_array(&parent->stack_page, 1, &child->stack_page)
         && user_clone_page_array(parent->heap_pages,
                                  parent->heap_page_count,
-                                 child.heap_pages);
+                                 child->heap_pages);
     for (size_t i = 0; cloned && i < USER_MMAP_MAX_PAGES; i++) {
         if (parent->mmap_pages[i] != 0) {
             cloned = user_clone_page_array(&parent->mmap_pages[i], 1,
-                                           &child.mmap_pages[i]);
+                                           &child->mmap_pages[i]);
         }
     }
     if (!cloned) {
-        user_discard_cloned_process(&child);
+        user_discard_cloned_process(child);
         return -12;
     }
 
@@ -2608,10 +2546,10 @@ static int64_t user_linux_fork(struct user_process *parent,
     bool kernel_active = scheduler_activate_current_address_space(
         paging_kernel_address_space());
     bool address_space_created = kernel_active
-        && paging_address_space_create(&child.address_space);
+        && paging_address_space_create(&child->address_space);
     bool child_active = address_space_created
-        && scheduler_activate_current_address_space(child.address_space);
-    bool mapped = child_active && user_map_cloned_process(&child);
+        && scheduler_activate_current_address_space(child->address_space);
+    bool mapped = child_active && user_map_cloned_process(child);
     bool parent_restored = kernel_active
         && scheduler_activate_current_address_space(parent_address_space);
     if (!mapped || !parent_restored) {
@@ -2622,7 +2560,7 @@ static int64_t user_linux_fork(struct user_process *parent,
                 __asm__ volatile ("hlt");
             }
         }
-        user_discard_cloned_process(&child);
+        user_discard_cloned_process(child);
         return -12;
     }
 
@@ -2638,7 +2576,7 @@ static int64_t user_linux_fork(struct user_process *parent,
     job->fork_frame.rax = 0;
     if (!scheduler_spawn(user_child_worker, job, &job->task_id)) {
         job->state = USER_CHILD_UNUSED;
-        user_discard_cloned_process(&child);
+        user_discard_cloned_process(child);
         return -11;
     }
     size_t child_slot;
@@ -2651,18 +2589,18 @@ static int64_t user_linux_fork(struct user_process *parent,
             __asm__ volatile ("hlt");
         }
     }
-    child.id = __atomic_fetch_add(&next_process_id, 1, __ATOMIC_RELAXED);
-    child.state = USER_PROCESS_RUNNING;
-    child.active_threads = 1;
+    child->id = __atomic_fetch_add(&next_process_id, 1, __ATOMIC_RELAXED);
+    child->state = USER_PROCESS_RUNNING;
+    child->active_threads = 1;
     for (size_t i = 0; i < USER_DESCRIPTOR_CAPACITY; i++) {
-        child.descriptors[i] = parent->descriptors[i];
+        child->descriptors[i] = parent->descriptors[i];
         if (parent->descriptors[i].used) {
-            open_files[child.descriptors[i].file_slot].references++;
+            open_files[child->descriptors[i].file_slot].references++;
         }
     }
-    process_slots[child_slot] = child;
-    job->process_id = child.id;
-    return (int64_t)child.id;
+    process_slots[child_slot] = *child;
+    job->process_id = child->id;
+    return (int64_t)child->id;
 }
 
 static int64_t user_linux_execve(struct user_process *process,
@@ -2960,6 +2898,98 @@ static int64_t user_opos_user_info(const struct user_process *process,
     return 0;
 }
 
+
+/*
+ * Windows (ABI 1): one window per program, shown by the desktop. See
+ * desktop_app_window_* in desktop.c and sdk/include/opos.h.
+ */
+#define OPOS_SYSCALL_WINDOW_CREATE (OPOS_SYSCALL_BASE + 0x10)
+#define OPOS_SYSCALL_WINDOW_PRESENT (OPOS_SYSCALL_BASE + 0x11)
+#define OPOS_SYSCALL_WINDOW_EVENT (OPOS_SYSCALL_BASE + 0x12)
+#define OPOS_SYSCALL_WINDOW_SIZE (OPOS_SYSCALL_BASE + 0x13)
+#define OPOS_WINDOW_TITLE_MAX 64
+#define OPOS_WINDOW_PIXELS_MAX 4096
+
+/* Returns true when the process must end (frame->rax holds the status). */
+static bool user_opos_window(const struct user_process *process,
+                             struct linux_syscall_frame *frame) {
+    uint64_t number = frame->rax;
+    int64_t result = -22;
+    if (number == OPOS_SYSCALL_WINDOW_CREATE) {
+        uintptr_t title_address = (uintptr_t)frame->rdi;
+        size_t title_length = (size_t)frame->rsi;
+        char title[OPOS_WINDOW_TITLE_MAX];
+        if (title_length > sizeof(title)) {
+            title_length = sizeof(title);
+        }
+        if (!paging_user_range_valid(title_address, title_length, false,
+                                     false)) {
+            result = -14;
+        } else if (frame->rdx > 0xffffffffULL || frame->r10 > 0xffffffffULL) {
+            result = -22;
+        } else {
+            for (size_t i = 0; i < title_length; i++) {
+                title[i] = ((const char *)title_address)[i];
+            }
+            result = desktop_app_window_create(
+                process->id, title, title_length, (uint32_t)frame->rdx,
+                (uint32_t)frame->r10);
+        }
+    } else if (number == OPOS_SYSCALL_WINDOW_PRESENT) {
+        uintptr_t pixels = (uintptr_t)frame->rdi;
+        uint64_t width = frame->rsi;
+        uint64_t height = frame->rdx;
+        uint64_t stride = frame->r10;
+        if (width == 0 || height == 0 || width > OPOS_WINDOW_PIXELS_MAX
+            || height > OPOS_WINDOW_PIXELS_MAX || stride < width
+            || stride > OPOS_WINDOW_PIXELS_MAX) {
+            result = -22;
+        } else if ((pixels & 3) != 0
+                   || !paging_user_range_valid(
+                          pixels, ((height - 1) * stride + width) * 4,
+                          false, false)) {
+            result = -14;
+        } else {
+            /* Interrupts stay off: nothing can unmap the pixels while they
+               are copied. */
+            result = desktop_app_window_present(
+                process->id, (const uint32_t *)pixels, (uint32_t)width,
+                (uint32_t)height, (uint32_t)stride);
+        }
+    } else if (number == OPOS_SYSCALL_WINDOW_EVENT) {
+        uintptr_t address = (uintptr_t)frame->rdi;
+        struct desktop_app_event event = {0};
+        bool terminate = false;
+        if (!paging_user_range_valid(address, sizeof(event), true, false)) {
+            result = -14;
+        } else {
+            result = desktop_app_window_event(process->id, &event,
+                                              (int64_t)frame->rsi,
+                                              &terminate);
+            if (terminate) {
+                frame->rax = 128 + 9; /* as if killed */
+                return true;
+            }
+            /* The desktop ran meanwhile; the memory may be gone. */
+            if (result > 0) {
+                if (paging_user_range_valid(address, sizeof(event), true,
+                                            false)) {
+                    *(struct desktop_app_event *)address = event;
+                } else {
+                    result = -14;
+                }
+            }
+        }
+    } else if (number == OPOS_SYSCALL_WINDOW_SIZE) {
+        uint64_t size = desktop_app_window_size(process->id);
+        result = size == 0 ? -9 : (int64_t)size;
+    } else {
+        result = -38;
+    }
+    frame->rax = (uint64_t)result;
+    return false;
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -2976,6 +3006,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         frame->rax = (uint64_t)user_opos_user_info(process,
                                                    (uintptr_t)frame->rdi);
         return false;
+    }
+    if (number >= OPOS_SYSCALL_WINDOW_CREATE
+        && number <= OPOS_SYSCALL_WINDOW_SIZE) {
+        return user_opos_window(process, frame);
     }
     uint64_t file_descriptor = frame->rdi;
     uintptr_t buffer_address = (uintptr_t)frame->rsi;
@@ -4224,6 +4258,58 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
         && address_space_freed;
 }
 
+/*
+ * argv for a program started from the desktop: argv[0] is its path, then
+ * the typed arguments split at spaces; "double quotes" keep spaces.
+ */
+static bool user_build_start_vectors(struct user_exec_vectors *vectors,
+                                     const char *exec_path,
+                                     size_t exec_path_length,
+                                     const char *arguments,
+                                     size_t arguments_length) {
+    *vectors = (struct user_exec_vectors) {0};
+    if (exec_path == NULL || exec_path_length + 1 > USER_EXEC_STRING_MAX) {
+        return false;
+    }
+    vectors->argument_offsets[vectors->argument_count++] = 0;
+    for (size_t i = 0; i < exec_path_length; i++) {
+        vectors->strings[vectors->string_size++] = exec_path[i];
+    }
+    vectors->strings[vectors->string_size++] = '\0';
+    size_t i = 0;
+    while (arguments != NULL && i < arguments_length) {
+        if (arguments[i] == ' ') {
+            i++;
+            continue;
+        }
+        if (vectors->argument_count == USER_EXEC_VECTOR_MAX) {
+            return false;
+        }
+        vectors->argument_offsets[vectors->argument_count++] =
+            (uint16_t)vectors->string_size;
+        bool quoted = false;
+        for (; i < arguments_length; i++) {
+            char c = arguments[i];
+            if (c == '"') {
+                quoted = !quoted;
+                continue;
+            }
+            if (c == ' ' && !quoted) {
+                break;
+            }
+            if (c == '\0') {
+                continue;
+            }
+            if (vectors->string_size + 2 > USER_EXEC_STRING_MAX) {
+                return false;
+            }
+            vectors->strings[vectors->string_size++] = c;
+        }
+        vectors->strings[vectors->string_size++] = '\0';
+    }
+    return true;
+}
+
 static bool user_process_run_image(enum user_program program,
                                    const uint8_t *image_data,
                                    size_t elf_image_size,
@@ -4232,6 +4318,8 @@ static bool user_process_run_image(enum user_program program,
                                    const char *initial_execfn,
                                    size_t initial_execfn_length,
                                    const struct permission_identity *identity,
+                                   const char *arguments,
+                                   size_t arguments_length,
                                    uint64_t *process_id,
                                    uint64_t *exit_status) {
     size_t task_slot = scheduler_current_slot();
@@ -4476,25 +4564,17 @@ static bool user_process_run_image(enum user_program program,
     }
 
     uintptr_t initial_stack = USER_STACK_TOP;
-    if (is_elf_image && elf_plan.has_interpreter) {
-        /* The interpreter needs AT_BASE; argv[0] is the executable path. */
-        struct user_exec_vectors vectors = {0};
-        if (initial_execfn_length + 1 <= sizeof(vectors.strings)) {
-            for (size_t i = 0; i < initial_execfn_length; i++) {
-                vectors.strings[i] = initial_execfn[i];
-            }
-            vectors.strings[initial_execfn_length] = '\0';
-            vectors.string_size = initial_execfn_length + 1;
-            vectors.argument_offsets[0] = 0;
-            vectors.argument_count = 1;
-        }
-        initial_stack = user_prepare_exec_stack(
-            stack_buffers[0], &elf_plan, &vectors, USER_MMAP_BASE,
-            initial_execfn, initial_execfn_length);
-    } else if (is_elf_image) {
-        initial_stack = user_prepare_elf_stack(stack_buffers[0], &elf_plan,
-                                               initial_execfn,
-                                               initial_execfn_length);
+    if (is_elf_image) {
+        /* argv[0] is the executable path; an interpreter also gets
+           AT_BASE. */
+        static struct user_exec_vectors start_vectors[SCHEDULER_TASK_CAPACITY];
+        struct user_exec_vectors *vectors = &start_vectors[task_slot];
+        initial_stack = user_build_start_vectors(
+                vectors, initial_execfn, initial_execfn_length, arguments,
+                arguments_length)
+            ? user_prepare_exec_stack(stack_buffers[0], &elf_plan, vectors,
+                                      USER_MMAP_BASE, NULL, 0)
+            : 0;
     }
     if (initial_stack == 0) {
         bool image_freed = release_elf_plan_pages(
@@ -4570,7 +4650,7 @@ bool user_process_run(enum user_program program, uint64_t *process_id,
         program, NULL, 0, NULL, 0,
         program == USER_PROGRAM_MODULE_ELF ? default_execfn : NULL,
         program == USER_PROGRAM_MODULE_ELF ? sizeof(default_execfn) - 1 : 0,
-                                  NULL, process_id, exit_status);
+                                  NULL, NULL, 0, process_id, exit_status);
 }
 
 bool user_process_run_elf(const uint8_t *image, size_t image_size,
@@ -4584,12 +4664,22 @@ bool user_process_run_elf(const uint8_t *image, size_t image_size,
 bool user_process_run_elf_path(const uint8_t *image, size_t image_size,
                                const char *exec_path, size_t exec_path_length,
                                uint64_t *process_id, uint64_t *exit_status) {
+    return user_process_run_elf_args(image, image_size, exec_path,
+                                     exec_path_length, NULL, 0, process_id,
+                                     exit_status);
+}
+
+bool user_process_run_elf_args(const uint8_t *image, size_t image_size,
+                               const char *exec_path, size_t exec_path_length,
+                               const char *arguments, size_t arguments_length,
+                               uint64_t *process_id, uint64_t *exit_status) {
     if (image == NULL || image_size == 0) {
         return false;
     }
     return user_process_run_image(USER_PROGRAM_MODULE_ELF, image, image_size,
                                   NULL, 0, exec_path, exec_path_length,
-                                  NULL, process_id, exit_status);
+                                  NULL, arguments, arguments_length,
+                                  process_id, exit_status);
 }
 
 static void user_child_worker(void *argument) {
@@ -4633,7 +4723,7 @@ static void user_child_worker(void *argument) {
             job->cwd, job->cwd_length,
             job->elf_image ? "/bin/elf-test" : NULL,
             job->elf_image ? sizeof("/bin/elf-test") - 1 : 0,
-            &job->identity, &job->process_id, &job->exit_status);
+            &job->identity, NULL, 0, &job->process_id, &job->exit_status);
     }
 
     uint64_t flags;

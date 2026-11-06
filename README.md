@@ -54,13 +54,14 @@ are goals, not current features.
 - Preemptive scheduler, isolated per-process address spaces, NX and
   write-protected user code, SMEP and UMIP when the CPU has them.
 - Native application SDK in [sdk/](sdk/README.md): build an OPOS program
-  with any x86-64 GCC, copy it to the disk and run it.
+  with any x86-64 GCC, copy it to the disk and run it with arguments. Programs
+  can open a window, draw pixels and get keyboard and mouse events.
 - ELF loader with a small dynamic interpreter, and a subset of Linux x86-64
   syscalls (files, pipes, fork/execve/wait, mmap, threads with futexes) that
   runs static musl programs. See [docs/linux-compat.md](docs/linux-compat.md).
 
-**Not yet:** networking, USB, sound, per-application sandboxes, graphical
-third-party apps, general Linux or Windows application support.
+**Not yet:** networking, USB, sound, per-application sandboxes, a widget
+toolkit for apps, general Linux or Windows application support.
 
 ## Building
 

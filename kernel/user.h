@@ -26,6 +26,12 @@ bool user_process_run_elf(const uint8_t *image, size_t image_size,
 bool user_process_run_elf_path(const uint8_t *image, size_t image_size,
                                const char *exec_path, size_t exec_path_length,
                                uint64_t *process_id, uint64_t *exit_status);
+/* Like user_process_run_elf_path, with arguments for argv[1...]: split at
+   spaces, "double quotes" keep spaces. */
+bool user_process_run_elf_args(const uint8_t *image, size_t image_size,
+                               const char *exec_path, size_t exec_path_length,
+                               const char *arguments, size_t arguments_length,
+                               uint64_t *process_id, uint64_t *exit_status);
 bool user_process_self_test(void);
 bool user_process_concurrent_self_test(void);
 bool user_process_input_wait_self_test(void);

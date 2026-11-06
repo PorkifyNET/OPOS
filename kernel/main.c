@@ -411,6 +411,69 @@ void console_draw_rectangle(uint64_t x, uint64_t y, uint64_t width, uint64_t hei
     framebuffer_cursor_show();
 }
 
+void console_draw_pixels(uint64_t x, uint64_t y, uint64_t width,
+                         uint64_t height, const uint32_t *pixels,
+                         uint64_t stride) {
+    if (active_framebuffer == NULL || pixels == NULL
+        || active_framebuffer->bpp != 32) {
+        return;
+    }
+    uint64_t skip_x = 0;
+    uint64_t skip_y = 0;
+    if (x < clip_left) {
+        skip_x = clip_left - x;
+        x = clip_left;
+    }
+    if (y < clip_top) {
+        skip_y = clip_top - y;
+        y = clip_top;
+    }
+    if (skip_x >= width || skip_y >= height) {
+        return;
+    }
+    width -= skip_x;
+    height -= skip_y;
+    uint64_t right = clip_right < active_framebuffer->width
+        ? clip_right : active_framebuffer->width;
+    uint64_t bottom = clip_bottom < active_framebuffer->height
+        ? clip_bottom : active_framebuffer->height;
+    if (x >= right || y >= bottom) {
+        return;
+    }
+    if (width > right - x) {
+        width = right - x;
+    }
+    if (height > bottom - y) {
+        height = bottom - y;
+    }
+    /* Pixels are 0x00RRGGBB; most framebuffers use exactly that. */
+    bool direct = active_framebuffer->red_mask_shift == 16
+        && active_framebuffer->green_mask_shift == 8
+        && active_framebuffer->blue_mask_shift == 0
+        && active_framebuffer->red_mask_size == 8
+        && active_framebuffer->green_mask_size == 8
+        && active_framebuffer->blue_mask_size == 8;
+    framebuffer_cursor_hide();
+    for (uint64_t row = 0; row < height; row++) {
+        const uint32_t *source = pixels + (skip_y + row) * stride + skip_x;
+        volatile uint32_t *target = (volatile uint32_t *)
+            (draw_base + (y + row) * draw_pitch) + x;
+        if (direct) {
+            for (uint64_t column = 0; column < width; column++) {
+                target[column] = source[column] & 0x00ffffffu;
+            }
+        } else {
+            for (uint64_t column = 0; column < width; column++) {
+                uint32_t value = source[column];
+                target[column] = framebuffer_color(
+                    active_framebuffer, (uint8_t)(value >> 16),
+                    (uint8_t)(value >> 8), (uint8_t)value);
+            }
+        }
+    }
+    framebuffer_cursor_show();
+}
+
 void console_draw_text(uint64_t x, uint64_t y, const char *text,
                        uint8_t red, uint8_t green, uint8_t blue) {
     if (active_framebuffer == NULL || text == NULL) {

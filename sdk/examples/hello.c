@@ -8,7 +8,15 @@ int main(int argc, char **argv, char **envp) {
     opos_print("Hello, OPOS!\n");
     opos_print("Program: ");
     opos_print(argv[0]);
-    opos_print("\nKernel ABI version: ");
+    opos_print("\n");
+    for (int i = 1; i < argc; i++) {
+        opos_print("Argument ");
+        opos_print_number(i);
+        opos_print(": ");
+        opos_print(argv[i]);
+        opos_print("\n");
+    }
+    opos_print("Kernel ABI version: ");
     opos_print_number(opos_abi_version());
     opos_print("\n");
     if (opos_user_info(&user) == 0 && (user.flags & OPOS_USER_ACCOUNT)) {

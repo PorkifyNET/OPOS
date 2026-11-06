@@ -8,7 +8,7 @@ you need: a header, a start-up file and a linker script.
 On Linux or WSL with GCC (or Clang as `CC=clang`):
 
 ```sh
-make                # builds build/hello and build/permtest
+make                # builds build/hello, build/permtest and build/sketch
 make APP=myapp      # builds build/myapp from myapp.c in this folder
 ```
 
@@ -35,7 +35,67 @@ mcopy -i disk.img@@1M build/hello ::hello
 ```
 
 In OPOS, type `run /disk/hello` in the Terminal, or double-click the
-file in Files. Output appears in the Terminal window.
+file in Files. Output appears in the Terminal window, which opens when a
+program first writes something.
+
+Arguments follow the path: `run /disk/hello one "two words"` gives
+`argv[1]` = `one` and `argv[2]` = `two words`. A path with spaces goes in
+double quotes too. Up to 15 arguments fit. Files starts programs without
+arguments.
+
+One program runs at a time. While it waits for window events, the desktop
+keeps working; starting a second program shows "ANOTHER PROGRAM IS
+RUNNING".
+
+## Windows
+
+A program can open one window. It draws 0x00RRGGBB pixels in its own
+memory, presents them, and waits for events:
+
+```c
+uint32_t *pixels = opos_alloc(640 * 480 * 4);
+opos_window_create("MY APP", 640, 480);
+struct opos_event event;
+for (;;) {
+    opos_window_event(&event, -1);           /* wait */
+    if (event.type == OPOS_EVENT_CLOSE) {
+        return 0;
+    }
+    /* ... draw into pixels ... */
+    opos_window_present(pixels, 640, 480, 640);
+}
+```
+
+- `opos_window_create(title, width, height)` asks for a content area of
+  that size (at most 1024 x 768). In tiled layout the window gets its tile
+  instead. The first event is `OPOS_EVENT_RESIZE` with the real size, and
+  another follows whenever the user resizes the window.
+- `opos_window_present(pixels, width, height, stride)` copies the pixels
+  to the window's top left. `stride` is the row length in pixels. Parts
+  outside the window are cut off; the rest of the window is dark.
+- `opos_window_event(&event, timeout_ms)`: `-1` waits for ever, `0` only
+  checks, otherwise waits at most that long. Returns 1 with an event and 0
+  without one. Events:
+
+  | Type | Fields |
+  | --- | --- |
+  | `OPOS_EVENT_KEY` | `key`: printable ASCII, `'\n'`, `'\b'`, `'\t'`, or `OPOS_KEY_*` (arrows, Home, End, Page Up/Down, Delete, Escape) |
+  | `OPOS_EVENT_MOUSE_DOWN`, `_UP` | `x`, `y` in the content area; `button` (`OPOS_BUTTON_LEFT` or `_RIGHT`); `buttons` held |
+  | `OPOS_EVENT_MOUSE_MOVE` | `x`, `y`, `buttons`. Sent while the pointer is over the focused window, or while a button pressed in it is held (then `x`, `y` can be outside) |
+  | `OPOS_EVENT_RESIZE` | `width`, `height` of the content area |
+  | `OPOS_EVENT_CLOSE` | The user closed the window or logged out. Save and exit: waiting again ends the program |
+
+- `opos_window_size(&width, &height)` reads the current content size.
+- The desktop keeps the Super shortcuts; every other key goes to the
+  focused program window.
+- Windows only open from the desktop. From the kernel shell,
+  `opos_window_create` returns `-19`.
+
+`examples/sketch.c` is a small drawing program built on these calls:
+`run /disk/sketch [width height]`.
+
+Memory: `opos_alloc(size)` returns zeroed memory (`mmap`), up to 4 MiB per
+program in total; `opos_free(address, size)` returns it.
 
 ## The ABI
 
@@ -52,6 +112,10 @@ file in Files. Output appears in the Terminal window.
   | --- | --- | --- |
   | 0x4f500000 | `opos_abi_version()` | kernel ABI version (1) |
   | 0x4f500001 | `opos_user_info(&info)` | account name, home folder, admin flag |
+  | 0x4f500010 | `opos_window_create(title, w, h)` | 0, or -16 (already open), -19 (no desktop) |
+  | 0x4f500011 | `opos_window_present(pixels, w, h, stride)` | 0 |
+  | 0x4f500012 | `opos_window_event(&event, timeout_ms)` | 1 (event) or 0 |
+  | 0x4f500013 | `opos_window_size(&w, &h)` | content area size |
 
 - Errors are negative error numbers (`-OPOS_EACCES`, ...).
 - Every file carries an ELF note named `OPOS` (type 1) with the ABI
@@ -73,6 +137,8 @@ See `docs/security-model.md`.
 
 - No C library yet: no `printf`, `malloc` (use `brk`/`mmap` through
   `opos_syscall*`), or floating-point formatting.
-- No graphics or windows yet; programs use the Terminal for text.
-- Programs started from the desktop get only `argv[0]`.
+- One window per program, one program at a time. No text drawing or
+  widgets: programs draw their own pixels.
+- The user stack is one page (4 KiB): keep big arrays in `opos_alloc`
+  memory, not in local variables.
 - Images over 64 KiB do not load.

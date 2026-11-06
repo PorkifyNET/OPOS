@@ -20,7 +20,7 @@ CFLAGS := -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
-EXAMPLES := hello permtest sketch notepad fetch update
+EXAMPLES := hello permtest sketch notepad fetch update fonttest
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)
@@ -35,7 +35,7 @@ BEARSSL_CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -Ibearssl/src 	-DBR_USE_
 LIBRARIES := -Wl,--start-group $(LIBRARY) $(BEARSSL) -Wl,--end-group
 
 .PHONY: all clean
-all: $(LIBRARY) $(BEARSSL) $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))
+all: $(LIBRARY) $(BEARSSL) $(BUILD)/browser $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))
 
 $(BUILD)/crt0.o: src/crt0.S
 	mkdir -p $(BUILD)
@@ -56,6 +56,12 @@ $(BUILD)/bearssl/%.o: bearssl/src/%.c
 $(BEARSSL): $(BEARSSL_OBJECTS)
 	rm -f $@
 	$(AR) rcs $@ $^
+
+BROWSER_SOURCES := $(wildcard browser/*.c)
+BROWSER_HEADERS := $(wildcard browser/*.h)
+
+$(BUILD)/browser: $(BROWSER_SOURCES) $(BROWSER_HEADERS) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
+	$(CC) $(CFLAGS) -Ibrowser $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BROWSER_SOURCES) $(LIBRARIES)
 
 $(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)

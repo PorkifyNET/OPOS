@@ -188,3 +188,10 @@ include Limine's license text with them.
 `sdk/bearssl/LICENSE.txt`), used for TLS. `data/ssl/ca-certificates.crt` is the
 Mozilla root certificate bundle (MPL 2.0), shipped as
 `/etc/ssl/certs/ca-certificates.crt`.
+
+`sdk/stb/stb_truetype.h` is [stb_truetype](https://github.com/nothings/stb)
+1.26 (public domain or MIT license, at the user's choice; see the end of the
+file), used to draw TrueType fonts in the browser. `data/fonts/` holds the
+[Noto Sans](https://fonts.google.com/noto) and Noto Sans Mono fonts (SIL Open
+Font License 1.1, see `data/fonts/OFL.txt`). They are shipped with the license
+text as `/share/fonts/`.

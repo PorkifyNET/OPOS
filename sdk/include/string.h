@@ -21,6 +21,8 @@ char *strncat(char *destination, const char *source, size_t length);
 char *strchr(const char *text, int character);
 char *strrchr(const char *text, int character);
 char *strstr(const char *text, const char *part);
+size_t strspn(const char *text, const char *accept);
+size_t strcspn(const char *text, const char *reject);
 char *strdup(const char *text);
 
 #endif

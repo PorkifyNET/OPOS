@@ -176,3 +176,19 @@ char *strdup(const char *text) {
     }
     return copy;
 }
+
+size_t strspn(const char *text, const char *accept) {
+    size_t length = 0;
+    while (text[length] != '\0' && strchr(accept, text[length]) != NULL) {
+        length++;
+    }
+    return length;
+}
+
+size_t strcspn(const char *text, const char *reject) {
+    size_t length = 0;
+    while (text[length] != '\0' && strchr(reject, text[length]) == NULL) {
+        length++;
+    }
+    return length;
+}

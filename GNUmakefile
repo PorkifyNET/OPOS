@@ -28,7 +28,10 @@ INITRAMFS := $(BUILD)/initramfs.tar
 SDK_NOTEPAD := sdk/build/notepad
 SDK_FETCH := sdk/build/fetch
 SDK_UPDATE := sdk/build/update
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/lib/image.c sdk/include/opos_tls.h sdk/include/opos_image.h
+SDK_FONTTEST := sdk/build/fonttest
+SDK_BROWSER := sdk/build/browser
+FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt)
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -177,6 +180,12 @@ $(SDK_NOTEPAD): $(SDK_SOURCES)
 $(SDK_FETCH): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/fetch
 
+$(SDK_FONTTEST): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/fonttest
+
+$(SDK_BROWSER): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/browser
+
 $(SDK_UPDATE): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/update
 
@@ -188,7 +197,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
+$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -205,6 +214,10 @@ $(INITRAMFS): $(WALLPAPERS) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDAT
 	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
 	cp $(SDK_FETCH) $(BUILD)/initramfs_root/bin/fetch
 	cp $(SDK_UPDATE) $(BUILD)/initramfs_root/bin/update
+	cp $(SDK_BROWSER) $(BUILD)/initramfs_root/bin/browser
+	cp $(SDK_FONTTEST) $(BUILD)/initramfs_root/tests/fonttest
+	mkdir -p $(BUILD)/initramfs_root/share/fonts
+	cp $(FONTS) $(BUILD)/initramfs_root/share/fonts/
 	mkdir -p $(BUILD)/initramfs_root/share/wallpapers
 	cp $(WALLPAPERS) $(BUILD)/initramfs_root/share/wallpapers/
 	mkdir -p $(BUILD)/initramfs_root/etc/ssl/certs

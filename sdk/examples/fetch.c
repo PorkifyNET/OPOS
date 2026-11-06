@@ -5,56 +5,16 @@
  *   run /bin/fetch https://example.com/some/path
  *   run /bin/fetch -o /disk/page.html https://example.com
  *
- * With -o the body (without headers) goes to a file instead.
+ * Redirects are followed, and chunked and gzip coding are decoded (see
+ * opos_http.h). With -o the body goes to a file instead of the screen.
  */
+#include <opos_http.h>
 #include <opos_tls.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* One connection, plain or TLS. */
-struct connection {
-    long fd;
-    struct opos_tls *tls;
-};
-
-static long connection_write(struct connection *c, const void *data,
-                             size_t length) {
-    return c->tls != NULL ? opos_tls_write(c->tls, data, length)
-                          : opos_send(c->fd, data, length);
-}
-
-static long connection_read(struct connection *c, void *buffer,
-                            size_t capacity) {
-    return c->tls != NULL ? opos_tls_read(c->tls, buffer, capacity)
-                          : opos_recv(c->fd, buffer, capacity);
-}
-
-static void connection_close(struct connection *c) {
-    if (c->tls != NULL) {
-        opos_tls_close(c->tls);
-    } else {
-        opos_close((int)c->fd);
-    }
-}
-
-static long connect_plain(const char *host, uint16_t port,
-                          struct connection *c) {
-    uint8_t ip[4];
-    long result = opos_net_resolve(host, ip);
-    if (result < 0) {
-        return result;
-    }
-    c->fd = opos_socket(OPOS_SOCK_STREAM);
-    if (c->fd < 0) {
-        return c->fd;
-    }
-    struct opos_sockaddr address = opos_net_address(ip, port);
-    result = opos_connect(c->fd, &address);
-    if (result < 0) {
-        opos_close((int)c->fd);
-    }
-    return result;
-}
+#define MAX_BODY (16u * 1024 * 1024)
 
 static void usage(void) {
     printf("Usage: fetch [-o FILE] [http://|https://]HOST[:PORT][/PATH]\n");
@@ -71,123 +31,57 @@ int main(int argc, char **argv) {
         usage();
         return 2;
     }
-    const char *url = argv[argument];
-    bool secure = false;
-    if (strncmp(url, "https://", 8) == 0) {
-        secure = true;
-        url += 8;
-    } else if (strncmp(url, "http://", 7) == 0) {
-        url += 7;
+    char url[OPOS_HTTP_URL_MAX];
+    if (strncmp(argv[argument], "http://", 7) == 0
+        || strncmp(argv[argument], "https://", 8) == 0) {
+        snprintf(url, sizeof(url), "%s", argv[argument]);
+    } else {
+        snprintf(url, sizeof(url), "http://%s", argv[argument]);
     }
-    char host[256];
-    size_t host_length = 0;
-    while (url[host_length] != '\0' && url[host_length] != '/'
-           && url[host_length] != ':') {
-        host_length++;
-    }
-    if (host_length == 0 || host_length >= sizeof(host)) {
-        usage();
-        return 2;
-    }
-    memcpy(host, url, host_length);
-    host[host_length] = '\0';
-    const char *rest = url + host_length;
-    unsigned port = secure ? 443 : 80;
-    if (*rest == ':') {
-        port = 0;
-        rest++;
-        while (*rest >= '0' && *rest <= '9') {
-            port = port * 10 + (unsigned)(*rest++ - '0');
-        }
-        if (port == 0 || port > 65535) {
-            usage();
-            return 2;
-        }
-    }
-    const char *path = *rest == '/' ? rest : "/";
 
-    struct connection connection = {-1, NULL};
-    printf("Connecting to %s:%u%s...\n", host, port, secure ? " (TLS)" : "");
-    long result = secure
-        ? opos_tls_connect(host, (uint16_t)port, &connection.tls)
-        : connect_plain(host, (uint16_t)port, &connection);
+    struct opos_http_response response;
+    long result = opos_http_get(url, MAX_BODY, &response);
     if (result < 0) {
         printf("fetch: %s (error %ld)\n", opos_tls_error_text(result),
                -result);
         return 1;
     }
-    char request[640];
-    int length = snprintf(request, sizeof(request),
-                          "GET %s HTTP/1.0\r\nHost: %s\r\n"
-                          "User-Agent: OPOS-fetch\r\n"
-                          "Connection: close\r\n\r\n", path, host);
-    if (connection_write(&connection, request, (size_t)length) != length) {
-        printf("fetch: sending failed\n");
-        connection_close(&connection);
-        return 1;
-    }
-
-    long file = -1;
+    printf("%s -> %ld %s (%u bytes)\n", response.url, response.status,
+           response.content_type, (unsigned)response.length);
+    int status = response.status == 200 ? 0 : 1;
     if (output != NULL) {
-        file = opos_open(output, OPOS_O_WRONLY | OPOS_O_CREAT
-                                     | OPOS_O_TRUNC);
-        if (file < 0) {
-            printf("fetch: cannot write %s\n", output);
-            connection_close(&connection);
-            return 1;
-        }
-    }
-    char buffer[2048];
-    long got;
-    size_t body = 0;
-    /* With -o the headers are printed and the body saved; the end of the
-       headers is the first empty line. */
-    bool in_headers = output != NULL;
-    int line_length = 0;
-    while ((got = connection_read(&connection, buffer, sizeof(buffer) - 1))
-           > 0) {
-        size_t start = 0;
-        if (in_headers) {
-            while (start < (size_t)got && in_headers) {
-                char character = buffer[start++];
-                if (character == '\n') {
-                    if (line_length == 0) {
-                        in_headers = false;
-                    }
-                    line_length = 0;
-                } else if (character != '\r') {
-                    line_length++;
-                }
-            }
-            buffer[start] = '\0';
-            printf("%.*s", (int)start, buffer);
-        }
-        if (start == (size_t)got) {
-            continue;
-        }
-        if (file >= 0) {
-            if (opos_write((int)file, buffer + start, (size_t)got - start)
-                != got - (long)start) {
-                printf("fetch: writing %s failed\n", output);
-                got = -1;
+        long file = opos_open(output, OPOS_O_WRONLY | OPOS_O_CREAT
+                                          | OPOS_O_TRUNC);
+        /* One write call moves at most 4 KiB: loop until it is all out. */
+        size_t written = 0;
+        while (file >= 0 && written < response.length) {
+            size_t piece = response.length - written;
+            long put = opos_write((int)file, response.body + written,
+                                  piece > 4096 ? 4096 : piece);
+            if (put <= 0) {
                 break;
             }
-        } else {
-            buffer[got] = '\0';
-            printf("%s", buffer + start);
+            written += (size_t)put;
         }
-        body += (size_t)got - start;
-    }
-    connection_close(&connection);
-    if (file >= 0) {
-        opos_close((int)file);
-        printf("Saved %u bytes to %s\n", (unsigned)body, output);
+        if (file < 0 || written != response.length) {
+            printf("fetch: cannot write %s\n", output);
+            status = 1;
+        } else {
+            printf("Saved %u bytes to %s\n", (unsigned)response.length,
+                   output);
+        }
+        if (file >= 0) {
+            opos_close((int)file);
+        }
     } else {
+        /* printf cannot take huge strings: print in pieces. */
+        for (size_t at = 0; at < response.length; at += 1024) {
+            size_t take = response.length - at < 1024 ? response.length - at
+                                                      : 1024;
+            printf("%.*s", (int)take, (const char *)response.body + at);
+        }
         printf("\n");
     }
-    if (got < 0) {
-        printf("fetch: %s (error %ld)\n", opos_tls_error_text(got), -got);
-        return 1;
-    }
-    return 0;
+    opos_http_free(&response);
+    return status;
 }

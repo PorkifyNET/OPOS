@@ -412,7 +412,7 @@ page_boundary_test:
     jne 1f
 
     movq $228, %rax
-    xorq %rdi, %rdi
+    movq $5, %rdi
     leaq -16(%rsp), %rsi
     syscall
     cmpq $-22, %rax

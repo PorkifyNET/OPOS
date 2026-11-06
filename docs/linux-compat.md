@@ -159,6 +159,14 @@ ready). `fcntl` handles `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD`,
 and fetches `/` over HTTP; `/tests/musl-net-test serve [port]` answers one
 HTTP request (test it in QEMU with `hostfwd=tcp::8080-:8080` and `curl`).
 
+Sockets read and write up to 64 KiB per call (files stay at 4 KiB); larger
+requests are short, as Linux allows.
+
+`clock_gettime`/`clock_getres` accept `CLOCK_REALTIME`, and `gettimeofday`
+returns wall-clock time: the CMOS real-time clock (taken as UTC) read at
+first use, advanced by the monotonic timer. `getrandom` fills up to 4 KiB
+per call from RDRAND (or the timer-based fallback).
+
 The main thread's stack is 32 pages (128 KiB) below `0x80000000`; the top
 page holds argv, envp and the auxiliary vector.
 

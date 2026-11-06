@@ -11,6 +11,7 @@
 #include "permissions.h"
 #include "accounts.h"
 #include "scheduler.h"
+#include "cmos.h"
 #include "net.h"
 #include "timer.h"
 #include "user.h"
@@ -64,6 +65,9 @@
 #define USER_PIPE_BUFFER_CAPACITY 4096
 #define USER_FILE_PATH_CAPACITY 256
 #define USER_FILE_IO_MAX 4096
+/* Sockets move at most this much per call (short reads/writes are
+   normal for them). */
+#define USER_SOCKET_IO_MAX 65536
 /* Largest program file; interpreters (ld.so) are smaller. */
 #define USER_EXEC_IMAGE_MAX (1024 * 1024)
 #define USER_INTERPRETER_IMAGE_MAX 65536
@@ -112,6 +116,7 @@
 #define USER_SIGNAL_FRAME_MAGIC 0x4f504f535349474eULL
 #define LINUX_ARCH_SET_FS 0x1002
 #define LINUX_ARCH_GET_FS 0x1003
+#define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1
 #define LINUX_UTS_FIELD_SIZE 65
 #define LINUX_AT_FDCWD (-100)
@@ -3786,23 +3791,21 @@ static int64_t user_linux_sendto(struct user_process *process,
         }
         to = ip;
     }
-    if (frame->rdx > USER_FILE_IO_MAX) {
-        return -22;
-    }
+    size_t length = frame->rdx > USER_SOCKET_IO_MAX ? USER_SOCKET_IO_MAX
+                                                    : (size_t)frame->rdx;
     return user_socket_send(process, frame->rdi, (uintptr_t)frame->rsi,
-                            (size_t)frame->rdx, frame->r10, to, port, false);
+                            length, frame->r10, to, port, false);
 }
 
 static int64_t user_linux_recvfrom(struct user_process *process,
                                    struct linux_syscall_frame *frame) {
     uint8_t ip[4] = {0, 0, 0, 0};
     uint16_t port = 0;
-    if (frame->rdx > USER_FILE_IO_MAX) {
-        return -22;
-    }
+    size_t length = frame->rdx > USER_SOCKET_IO_MAX ? USER_SOCKET_IO_MAX
+                                                    : (size_t)frame->rdx;
     int64_t result = user_socket_receive(
-        process, frame->rdi, (uintptr_t)frame->rsi, (size_t)frame->rdx,
-        frame->r10, ip, &port, false);
+        process, frame->rdi, (uintptr_t)frame->rsi, length, frame->r10, ip,
+        &port, false);
     if (result >= 0 && frame->r8 != 0) {
         int64_t error = user_write_sockaddr((uintptr_t)frame->r8,
                                             (uintptr_t)frame->r9, ip, port);
@@ -4403,6 +4406,57 @@ static bool user_linux_socket_syscall(struct user_process *process,
     return true;
 }
 
+/*
+ * Wall-clock time: the real-time clock read once (taken as UTC), then
+ * advanced with the monotonic timer.
+ */
+static bool user_wall_clock_known;
+static int64_t user_wall_clock_offset; /* seconds: wall minus monotonic */
+
+static int64_t user_days_from_civil(int64_t year, unsigned month,
+                                    unsigned day) {
+    year -= month <= 2;
+    int64_t era = (year >= 0 ? year : year - 399) / 400;
+    unsigned year_of_era = (unsigned)(year - era * 400);
+    unsigned day_of_year = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5
+                         + day - 1;
+    unsigned day_of_era = year_of_era * 365 + year_of_era / 4
+                        - year_of_era / 100 + day_of_year;
+    return era * 146097 + (int64_t)day_of_era - 719468;
+}
+
+static void user_wall_time(uint64_t *seconds, uint64_t *nanoseconds) {
+    uint64_t monotonic_seconds;
+    timer_monotonic_time(&monotonic_seconds, nanoseconds);
+    if (!user_wall_clock_known) {
+        struct rtc_time now;
+        if (rtc_read(&now) && now.month >= 1 && now.month <= 12) {
+            int64_t wall = user_days_from_civil(now.year, now.month, now.day)
+                * 86400 + now.hour * 3600 + now.minute * 60 + now.second;
+            user_wall_clock_offset = wall - (int64_t)monotonic_seconds;
+            user_wall_clock_known = true;
+        }
+    }
+    *seconds = (uint64_t)((int64_t)monotonic_seconds + user_wall_clock_offset);
+}
+
+static int64_t user_linux_getrandom(uintptr_t buffer, size_t length) {
+    if (length > 4096) {
+        length = 4096;
+    }
+    if (length != 0 && !paging_user_range_valid(buffer, length, true, false)) {
+        return -14;
+    }
+    bool hardware_random = user_rdrand_supported();
+    for (size_t i = 0; i < length; i += 8) {
+        uint64_t word = user_random_word(hardware_random);
+        for (size_t j = 0; j < 8 && i + j < length; j++) {
+            ((uint8_t *)buffer)[i + j] = (uint8_t)(word >> (j * 8));
+        }
+    }
+    return (int64_t)length;
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -4453,10 +4507,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         }
         struct user_file_descriptor *file =
             user_file_descriptor(process, file_descriptor);
+        if (file != NULL && file->kind == USER_OPEN_FILE_SOCKET
+            && length > USER_SOCKET_IO_MAX) {
+            length = USER_SOCKET_IO_MAX;
+        }
         if (file == NULL || !file->writable) {
             frame->rax = (uint64_t)(int64_t)(file != NULL && file->directory
                                              ? -21 : -9);
-        } else if (length > USER_FILE_IO_MAX) {
+        } else if (length > USER_FILE_IO_MAX
+                   && file->kind != USER_OPEN_FILE_SOCKET) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, false, false)) {
@@ -4543,10 +4602,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         }
         struct user_file_descriptor *file =
             user_file_descriptor(process, file_descriptor);
+        if (file != NULL && file->kind == USER_OPEN_FILE_SOCKET
+            && length > USER_SOCKET_IO_MAX) {
+            length = USER_SOCKET_IO_MAX;
+        }
         if (file == NULL || !file->readable || file->directory) {
             frame->rax = (uint64_t)(int64_t)(file != NULL && file->directory
                                              ? -21 : -9);
-        } else if (length > USER_FILE_IO_MAX) {
+        } else if (length > USER_FILE_IO_MAX
+                   && file->kind != USER_OPEN_FILE_SOCKET) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, true, false)) {
@@ -5066,7 +5130,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                     (struct linux_timeval *)(uintptr_t)frame->rdi;
                 uint64_t seconds;
                 uint64_t nanoseconds;
-                timer_monotonic_time(&seconds, &nanoseconds);
+                user_wall_time(&seconds, &nanoseconds);
                 time->seconds = (int64_t)seconds;
                 time->microseconds = (int64_t)(nanoseconds / 1000);
             }
@@ -5105,8 +5169,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
 
+    if (number == 318) {
+        frame->rax = (uint64_t)user_linux_getrandom((uintptr_t)frame->rdi,
+                                                    (size_t)frame->rsi);
+        return false;
+    }
+
     if (number == 228) {
-        if (frame->rdi != LINUX_CLOCK_MONOTONIC) {
+        if (frame->rdi != LINUX_CLOCK_MONOTONIC
+            && frame->rdi != LINUX_CLOCK_REALTIME) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else if (!paging_user_range_valid((uintptr_t)frame->rsi,
                                             sizeof(struct linux_timespec),
@@ -5117,7 +5188,11 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 (struct linux_timespec *)(uintptr_t)frame->rsi;
             uint64_t seconds;
             uint64_t nanoseconds;
-            timer_monotonic_time(&seconds, &nanoseconds);
+            if (frame->rdi == LINUX_CLOCK_REALTIME) {
+                user_wall_time(&seconds, &nanoseconds);
+            } else {
+                timer_monotonic_time(&seconds, &nanoseconds);
+            }
             time->seconds = (int64_t)seconds;
             time->nanoseconds = (int64_t)nanoseconds;
             frame->rax = 0;
@@ -5126,7 +5201,8 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     }
 
     if (number == 229) {
-        if (frame->rdi != LINUX_CLOCK_MONOTONIC) {
+        if (frame->rdi != LINUX_CLOCK_MONOTONIC
+            && frame->rdi != LINUX_CLOCK_REALTIME) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else if (frame->rsi != 0
                    && !paging_user_range_valid((uintptr_t)frame->rsi,

@@ -122,8 +122,16 @@ Networking: `opos_net.h` has IPv4 TCP and UDP sockets (the Linux socket
 calls: `opos_socket`, `opos_connect`, `opos_bind`, `opos_listen`,
 `opos_accept`, `opos_send`, `opos_recv`, `opos_sendto`, `opos_recvfrom`,
 `opos_poll`, closed with `opos_close`) and `opos_net_resolve` for DNS.
-`examples/fetch.c` prints a web page over HTTP; it ships as `/bin/fetch`:
-`run /bin/fetch example.com`.
+`examples/fetch.c` prints a web page over HTTP or HTTPS; it ships as
+`/bin/fetch`: `run /bin/fetch https://example.com`, or
+`run /bin/fetch -o /disk/page.html https://example.com` to save the body.
+
+HTTPS: `opos_tls.h` (`opos_tls_connect`, `opos_tls_read`, `opos_tls_write`,
+`opos_tls_close`, `opos_tls_error_text`) runs TLS 1.0-1.2 with BearSSL
+(`bearssl/`, MIT licence, built as `build/libbearssl.a` and linked only
+into programs that use it; about 120 KiB). Certificates are checked
+against `/etc/ssl/certs/ca-certificates.crt`, the host name and the clock.
+The full BearSSL API is available through `<bearssl.h>` too.
 
 Images: `opos_image.h` decodes PNG (every colour type and bit depth,
 interlaced too), JPEG (baseline and progressive) and BMP. It is the same

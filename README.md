@@ -183,3 +183,8 @@ The build downloads the [Limine](https://github.com/Limine-Bootloader/Limine)
 bootloader, which is under the BSD 2-Clause license. ISO images built from this
 repository contain Limine binaries, so anyone who distributes those images must
 include Limine's license text with them.
+
+`sdk/bearssl/` is [BearSSL](https://www.bearssl.org/) 0.6 (MIT license, see
+`sdk/bearssl/LICENSE.txt`), used for TLS. `data/ssl/ca-certificates.crt` is the
+Mozilla root certificate bundle (MPL 2.0), shipped as
+`/etc/ssl/certs/ca-certificates.crt`.

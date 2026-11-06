@@ -16,7 +16,7 @@ BUILD := build
 
 CFLAGS := -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
 	-fno-stack-protector -fno-pie -fno-pic -fno-asynchronous-unwind-tables \
-	-mno-red-zone -Iinclude
+	-mno-red-zone -Iinclude -Ibearssl/inc
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
@@ -26,8 +26,16 @@ LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)
 LIBRARY := $(BUILD)/libopos.a
 
+# BearSSL (bearssl/, MIT licence) for opos_tls.h. Linked into a program
+# only when it uses TLS.
+BEARSSL := $(BUILD)/libbearssl.a
+BEARSSL_SOURCES := $(shell find bearssl/src -name '*.c')
+BEARSSL_OBJECTS := $(patsubst bearssl/src/%.c,$(BUILD)/bearssl/%.o,$(BEARSSL_SOURCES))
+BEARSSL_CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -Ibearssl/src 	-DBR_USE_UNIX_TIME=0 -DBR_USE_URANDOM=0 -DBR_USE_GETENTROPY=0 	-DBR_USE_WIN32_RAND=0 -DBR_USE_WIN32_TIME=0 -DBR_RDRAND=0 	-DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_POWER8=0
+LIBRARIES := -Wl,--start-group $(LIBRARY) $(BEARSSL) -Wl,--end-group
+
 .PHONY: all clean
-all: $(LIBRARY) $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))
+all: $(LIBRARY) $(BEARSSL) $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))
 
 $(BUILD)/crt0.o: src/crt0.S
 	mkdir -p $(BUILD)
@@ -41,11 +49,19 @@ $(LIBRARY): $(LIB_OBJECTS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
-$(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(HEADERS) opos.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARY)
+$(BUILD)/bearssl/%.o: bearssl/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(BEARSSL_CFLAGS) -c $< -o $@
 
-$(BUILD)/%: %.c $(BUILD)/crt0.o $(LIBRARY) $(HEADERS) opos.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARY)
+$(BEARSSL): $(BEARSSL_OBJECTS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+$(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
+
+$(BUILD)/%: %.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
 
 clean:
 	rm -rf $(BUILD)

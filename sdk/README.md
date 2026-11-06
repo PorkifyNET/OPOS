@@ -117,6 +117,27 @@ Examples built on these calls:
   (for text files) open it. It shows text drawing, keyboard shortcuts
   with modifiers, mouse selection, and loading and saving files.
 
+Images: `opos_image.h` decodes PNG (every colour type and bit depth,
+interlaced too), JPEG (baseline and progressive) and BMP. It is the same
+decoder the desktop uses (`lib/image.c` is generated from
+`kernel/image.c`; edit that one). It needs no C library: probe the file
+for its size and the scratch memory it needs, then decode into that
+memory. Pixels come out as 0xAARRGGBB:
+
+```c
+struct image_info info;
+if (image_probe(data, size, &info) == IMAGE_OK) {
+    void *scratch = opos_alloc(info.scratch_bytes);
+    struct image picture;
+    if (image_decode(data, size, scratch, info.scratch_bytes,
+                     &picture) == IMAGE_OK) {
+        /* picture.width, picture.height, picture.pixels */
+    }
+}
+```
+
+`image_resample` scales (part of) a picture to another size.
+
 Memory: `opos_alloc(size)` returns zeroed memory (`mmap`);
 `opos_free(address, size)` returns it. `malloc` takes its memory from
 there too. A program has 64 MiB of such memory in total, including its

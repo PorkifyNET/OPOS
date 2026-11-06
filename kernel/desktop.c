@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "appearance.h"
 #include "block.h"
 #include "cmos.h"
 #include "console.h"
@@ -66,6 +67,7 @@ enum window_kind {
     WINDOW_INSTALLER,
     WINDOW_ACCOUNTS,
     WINDOW_TASKS,
+    WINDOW_IMAGE,
     /* Program windows: one kind per slot (see "program windows"). */
     WINDOW_APP,
     WINDOW_APP_LAST = WINDOW_APP + 3,
@@ -79,7 +81,7 @@ static bool window_is_app(enum window_kind kind) {
 
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "SYSTEM INFO", "WELCOME", "SETTINGS", "TEXT EDITOR",
-    "INSTALL OPOS", "ACCOUNTS", "TASK MANAGER", "PROGRAM"
+    "INSTALL OPOS", "ACCOUNTS", "TASK MANAGER", "IMAGE VIEWER", "PROGRAM"
 };
 
 static const char *app_window_title(size_t slot);
@@ -214,6 +216,7 @@ static void draw_text_clipped(int64_t x, int64_t y, int64_t max_width,
         i++;
     }
     clipped[i] = '\0';
+    appearance_map_color(&red, &green, &blue);
     console_draw_text((uint64_t)x, (uint64_t)y, clipped, red, green, blue);
 }
 
@@ -232,6 +235,7 @@ static void fill(struct rect area, uint8_t red, uint8_t green, uint8_t blue) {
     if (area.width <= 0 || area.height <= 0) {
         return;
     }
+    appearance_map_color(&red, &green, &blue);
     console_draw_rectangle((uint64_t)area.x, (uint64_t)area.y,
                            (uint64_t)area.width, (uint64_t)area.height,
                            red, green, blue);
@@ -2405,7 +2409,10 @@ static void files_open_drive(size_t row) {
     set_status(message);
 }
 
-/* Opens a row: ".." goes up, folders are entered, programs run. */
+static void viewer_open(const char *path, size_t length);
+
+/* Opens a row: ".." goes up, folders are entered, pictures are shown,
+   programs run. */
 static void files_open_row(size_t row) {
     if (files_in_drives()) {
         files_open_drive(row);
@@ -2425,8 +2432,299 @@ static void files_open_row(size_t row) {
     size_t length = files_entry_path(row, path, sizeof(path));
     if (files_entries[row].directory) {
         (void)files_visit(path, length);
+    } else if (appearance_is_image_name(files_entries[row].name,
+                                        text_length(files_entries[row].name))) {
+        viewer_open(path, length);
     } else {
         files_run_program(path, length);
+    }
+}
+
+/* Settings and Accounts: show the Pictures folder (bundled backgrounds
+   without an account), where a right-click sets the picture. */
+static void files_browse_pictures(void) {
+    char path[FILES_PATH_CAPACITY];
+    size_t length = accounts_home_path("Pictures", path, sizeof(path));
+    if (length == 0) {
+        length = append_text(path, sizeof(path), 0, WALLPAPER_DIRECTORY);
+    }
+    window_open(WINDOW_FILES);
+    window_raise(WINDOW_FILES);
+    if (files_visit(path, length)) {
+        set_status("RIGHT-CLICK A PICTURE TO USE IT");
+    }
+}
+
+/* -------------------------------------------------------- image viewer */
+
+/*
+ * Shows one PNG, JPEG or BMP file, scaled down to fit the window (never
+ * up). Left/Right step through the pictures of the folder Files shows;
+ * B makes the picture the background.
+ */
+static char viewer_path[FILES_PATH_CAPACITY];
+static size_t viewer_path_length;
+static struct image viewer_image;
+static enum image_format viewer_format;
+static enum image_result viewer_result = IMAGE_UNKNOWN_FORMAT;
+/* Scaled copy for the current window size and background colour. */
+static uint32_t *viewer_scaled;
+static uint32_t viewer_scaled_width;
+static uint32_t viewer_scaled_height;
+static uint32_t viewer_scaled_background;
+#define VIEWER_TOOLBAR 44
+
+static void viewer_open(const char *path, size_t length) {
+    if (length >= sizeof(viewer_path)) {
+        return;
+    }
+    for (size_t i = 0; i < length; i++) {
+        viewer_path[i] = path[i];
+    }
+    viewer_path[length] = '\0';
+    viewer_path_length = length;
+    viewer_scaled = NULL;
+    viewer_result = appearance_image_load(IMAGE_SLOT_VIEWER, path, length,
+                                          &viewer_image, &viewer_format);
+    window_open(WINDOW_IMAGE);
+    window_raise(WINDOW_IMAGE);
+}
+
+static const char *viewer_name(void) {
+    size_t start = viewer_path_length;
+    while (start > 0 && viewer_path[start - 1] != '/') {
+        start--;
+    }
+    return viewer_path + start;
+}
+
+/* Next (delta 1) or previous picture in the folder Files shows. */
+static void viewer_step(int delta) {
+    size_t folder = viewer_path_length - text_length(viewer_name());
+    if (folder > 1) {
+        folder--; /* without the '/' */
+    }
+    if (!files_path_is(viewer_path, folder) || files_count == 0) {
+        return;
+    }
+    const char *name = viewer_name();
+    size_t current = files_count;
+    for (size_t i = 0; i < files_count; i++) {
+        if (text_equals(name, text_length(name), files_entries[i].name)) {
+            current = i;
+        }
+    }
+    for (size_t step = 1; step <= files_count; step++) {
+        size_t i = current == files_count
+            ? (delta > 0 ? step - 1 : files_count - step)
+            : (current + files_count + (delta > 0 ? step : files_count - step))
+                  % files_count;
+        const struct files_entry *entry = &files_entries[i];
+        if (!entry->directory
+            && appearance_is_image_name(entry->name,
+                                        text_length(entry->name))) {
+            char path[FILES_PATH_CAPACITY];
+            size_t length = files_entry_path(i, path, sizeof(path));
+            files_selection = i + (files_at_root() ? 0 : 1);
+            viewer_open(path, length);
+            return;
+        }
+    }
+}
+
+static void viewer_set_background(void) {
+    enum image_result result = appearance_set_wallpaper(viewer_path,
+                                                        viewer_path_length);
+    set_status(result == IMAGE_OK ? "BACKGROUND CHANGED"
+                                  : image_result_text(result));
+}
+
+static struct rect viewer_button_rect(struct rect area) {
+    int64_t width = 20 * CHAR_WIDTH;
+    return (struct rect){area.x + area.width - width - 8,
+                         area.y + area.height - VIEWER_TOOLBAR + 6, width,
+                         VIEWER_TOOLBAR - 12};
+}
+
+static void draw_button(struct rect area, const char *label, bool active);
+
+static void draw_viewer(struct rect area) {
+    fill(area, 12, 16, 26);
+    struct rect bar = {area.x, area.y + area.height - VIEWER_TOOLBAR,
+                       area.width, VIEWER_TOOLBAR};
+    fill(bar, 24, 30, 46);
+    char info[96];
+    size_t used = append_text(info, sizeof(info), 0, viewer_name());
+    if (viewer_result == IMAGE_OK) {
+        used = append_text(info, sizeof(info), used, "  ");
+        used = append_decimal(info, sizeof(info), used, viewer_image.width);
+        used = append_text(info, sizeof(info), used, "x");
+        used = append_decimal(info, sizeof(info), used, viewer_image.height);
+        used = append_text(info, sizeof(info), used, " ");
+        append_text(info, sizeof(info), used, image_format_name(viewer_format));
+    }
+    struct rect button = viewer_button_rect(area);
+    draw_text_clipped(bar.x + 10, bar.y + (VIEWER_TOOLBAR - CHAR_HEIGHT) / 2,
+                      button.x - bar.x - 20, info, 200, 214, 255);
+    if (viewer_result == IMAGE_OK) {
+        draw_button(button, "SET AS BACKGROUND", false);
+    }
+
+    struct rect view = {area.x + 8, area.y + 8, area.width - 16,
+                        area.height - VIEWER_TOOLBAR - 16};
+    if (view.width <= 0 || view.height <= 0) {
+        return;
+    }
+    if (viewer_result != IMAGE_OK) {
+        draw_text_clipped(view.x + 8, view.y + 8, view.width - 16,
+                          image_result_text(viewer_result), 255, 120, 120);
+        return;
+    }
+    uint32_t width = viewer_image.width;
+    uint32_t height = viewer_image.height;
+    if (width > view.width || height > view.height) {
+        if ((uint64_t)width * (uint64_t)view.height
+            > (uint64_t)height * (uint64_t)view.width) {
+            height = (uint32_t)((uint64_t)height * (uint64_t)view.width / width);
+            width = (uint32_t)view.width;
+        } else {
+            width = (uint32_t)((uint64_t)width * (uint64_t)view.height / height);
+            height = (uint32_t)view.height;
+        }
+        width = width == 0 ? 1 : width;
+        height = height == 0 ? 1 : height;
+    }
+    uint8_t red = 12, green = 16, blue = 26;
+    appearance_map_color(&red, &green, &blue);
+    uint32_t background = (uint32_t)red << 16 | (uint32_t)green << 8 | blue;
+    if (viewer_scaled == NULL || viewer_scaled_width != width
+        || viewer_scaled_height != height
+        || viewer_scaled_background != background) {
+        viewer_scaled = appearance_scale_buffer(IMAGE_SLOT_VIEWER,
+                                                (size_t)width * height);
+        if (viewer_scaled == NULL) {
+            draw_text_clipped(view.x + 8, view.y + 8, view.width - 16,
+                              image_result_text(IMAGE_NO_MEMORY),
+                              255, 120, 120);
+            return;
+        }
+        image_resample(viewer_image.pixels, viewer_image.width, 0, 0,
+                       viewer_image.width, viewer_image.height,
+                       viewer_scaled, width, width, height);
+        /* Transparent parts show the window background. */
+        for (size_t i = 0; i < (size_t)width * height; i++) {
+            uint32_t pixel = viewer_scaled[i];
+            uint32_t alpha = pixel >> 24;
+            uint32_t mixed = 0;
+            for (unsigned shift = 0; shift < 24; shift += 8) {
+                uint32_t a = (pixel >> shift) & 0xff;
+                uint32_t b = (background >> shift) & 0xff;
+                mixed |= ((a * alpha + b * (255 - alpha) + 127) / 255) << shift;
+            }
+            viewer_scaled[i] = mixed;
+        }
+        viewer_scaled_width = width;
+        viewer_scaled_height = height;
+        viewer_scaled_background = background;
+    }
+    console_draw_pixels((uint64_t)(view.x + (view.width - width) / 2),
+                        (uint64_t)(view.y + (view.height - height) / 2),
+                        width, height, viewer_scaled, width);
+}
+
+static void viewer_key(char character) {
+    if (character == KEY_RIGHT || character == ' ') {
+        viewer_step(1);
+    } else if (character == KEY_LEFT) {
+        viewer_step(-1);
+    } else if ((character == 'b' || character == 'B')
+               && viewer_result == IMAGE_OK) {
+        viewer_set_background();
+    }
+}
+
+static void viewer_click(struct rect area, int32_t x, int32_t y) {
+    if (viewer_result == IMAGE_OK
+        && rect_contains(viewer_button_rect(area), x, y)) {
+        viewer_set_background();
+    }
+}
+
+/* ------------------------------------------------------------- avatars */
+
+/*
+ * An account's picture in a circle, or its initial on a coloured disc.
+ * (r, g, b) is the colour behind it, in the Ocean palette.
+ */
+static void draw_avatar(int64_t x, int64_t y, int64_t size, size_t account,
+                        uint8_t red, uint8_t green, uint8_t blue) {
+    static uint32_t buffer[ACCOUNT_PICTURE_SIZE * ACCOUNT_PICTURE_SIZE];
+    if (size <= 0 || size > ACCOUNT_PICTURE_SIZE || x < 0 || y < 0
+        || account >= accounts_count()) {
+        return;
+    }
+    appearance_map_color(&red, &green, &blue);
+    uint32_t background = (uint32_t)red << 16 | (uint32_t)green << 8 | blue;
+    const uint32_t *picture = appearance_account_picture(account);
+    const char *name = accounts_name(account);
+    uint32_t disc = 0;
+    if (picture != NULL) {
+        if (size == ACCOUNT_PICTURE_SIZE) {
+            for (size_t i = 0; i < ACCOUNT_PICTURE_SIZE * ACCOUNT_PICTURE_SIZE;
+                 i++) {
+                buffer[i] = picture[i];
+            }
+        } else {
+            image_resample(picture, ACCOUNT_PICTURE_SIZE, 0, 0,
+                           ACCOUNT_PICTURE_SIZE, ACCOUNT_PICTURE_SIZE, buffer,
+                           (uint32_t)size, (uint32_t)size, (uint32_t)size);
+        }
+    } else {
+        static const uint32_t colors[] = {
+            0x3f7fd8, 0x2fa37a, 0x9a5fd0, 0xd0566e, 0xd88a32, 0x3aa0b8,
+        };
+        uint32_t hash = 2166136261u; /* FNV-1a, case-insensitive */
+        for (size_t i = 0; name[i] != '\0'; i++) {
+            char c = name[i];
+            hash ^= (uint32_t)(uint8_t)(c >= 'a' && c <= 'z' ? c - 32 : c);
+            hash *= 16777619u;
+        }
+        disc = colors[hash % (sizeof(colors) / sizeof(colors[0]))];
+    }
+    int64_t outer = (size + 1) * (size + 1);
+    int64_t inner = (size - 1) * (size - 1);
+    for (int64_t row = 0; row < size; row++) {
+        for (int64_t column = 0; column < size; column++) {
+            int64_t dx = 2 * column + 1 - size;
+            int64_t dy = 2 * row + 1 - size;
+            int64_t distance = dx * dx + dy * dy;
+            uint32_t alpha = distance <= inner ? 255
+                           : distance >= outer ? 0
+                           : (uint32_t)((outer - distance) * 255
+                                        / (outer - inner));
+            uint32_t *pixel = &buffer[row * size + column];
+            uint32_t color = picture != NULL ? *pixel : 0xff000000u | disc;
+            alpha = alpha * (color >> 24) / 255;
+            uint32_t mixed = 0;
+            for (unsigned shift = 0; shift < 24; shift += 8) {
+                uint32_t a = (color >> shift) & 0xff;
+                uint32_t b = (background >> shift) & 0xff;
+                mixed |= ((a * alpha + b * (255 - alpha) + 127) / 255) << shift;
+            }
+            *pixel = mixed;
+        }
+    }
+    console_draw_pixels((uint64_t)x, (uint64_t)y, (uint64_t)size,
+                        (uint64_t)size, buffer, (uint64_t)size);
+    if (picture == NULL && name[0] != '\0') {
+        char initial[2] = {name[0], '\0'};
+        if (initial[0] >= 'a' && initial[0] <= 'z') {
+            initial[0] = (char)(initial[0] - 32);
+        }
+        /* The glyph is drawn at double size; centre it. */
+        console_draw_text((uint64_t)(x + (size - CHAR_WIDTH) / 2 + 1),
+                          (uint64_t)(y + (size - CHAR_HEIGHT) / 2),
+                          initial, 255, 255, 255);
     }
 }
 
@@ -2809,6 +3107,10 @@ enum setting_row_kind {
     ROW_HOUR,
     ROW_MINUTE,
     ROW_RESOLUTION,
+    ROW_THEME,
+    ROW_WALLPAPER,
+    ROW_WALLPAPER_STYLE,
+    ROW_WALLPAPER_BROWSE,
 };
 
 struct setting_row {
@@ -2828,17 +3130,41 @@ static const struct setting_row setting_rows[] = {
     {"HOUR", ROW_HOUR, 0},
     {"MINUTE", ROW_MINUTE, 0},
     {"RESOLUTION", ROW_RESOLUTION, 0},
+    {"COLOR THEME", ROW_THEME, 0},
+    {"BACKGROUND", ROW_WALLPAPER, 0},
+    {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0},
+    {"USE YOUR OWN PICTURE (RIGHT-CLICK IT IN FILES)",
+     ROW_WALLPAPER_BROWSE, 0},
 };
 #define SETTING_ROW_COUNT (sizeof(setting_rows) / sizeof(setting_rows[0]))
-#define SETTING_VALUE_WIDTH (14 * CHAR_WIDTH + 12)
+#define SETTING_VALUE_WIDTH (18 * CHAR_WIDTH + 12)
 
 static const char *const date_format_names[DATE_FORMAT_COUNT] = {
     "YYYY-MM-DD", "DD.MM.YYYY", "MM/DD/YYYY", "DD/MM/YYYY",
 };
 
+/* First row shown; rows scroll so the selected one stays visible. */
+static size_t settings_scroll;
+
 static struct rect setting_row_rect(struct rect area, size_t index) {
-    return (struct rect){area.x + 8, area.y + 44 + (int64_t)index * 36,
+    return (struct rect){area.x + 8,
+                         area.y + 44
+                             + ((int64_t)index - (int64_t)settings_scroll) * 36,
                          area.width - 16, 32};
+}
+
+static void settings_fit(struct rect area) {
+    size_t visible = area.height >= 76 ? (size_t)(area.height - 76) / 36 + 1
+                                       : 1;
+    if (settings_selection < settings_scroll) {
+        settings_scroll = settings_selection;
+    } else if (settings_selection >= settings_scroll + visible) {
+        settings_scroll = settings_selection + 1 - visible;
+    }
+    if (settings_scroll + visible > SETTING_ROW_COUNT) {
+        settings_scroll = visible >= SETTING_ROW_COUNT
+                        ? 0 : SETTING_ROW_COUNT - visible;
+    }
 }
 
 static struct rect setting_value_rect(struct rect row) {
@@ -2904,8 +3230,27 @@ static size_t append_time(char *buffer, size_t capacity, size_t length,
 static void setting_value_text(const struct setting_row *row,
                                const struct rtc_time *now,
                                char *text, size_t capacity) {
+    if (row->kind == ROW_WALLPAPER_BROWSE) {
+        append_text(text, capacity, 0, "OPEN FILES");
+        return;
+    }
     size_t length = append_text(text, capacity, 0, "< ");
     switch (row->kind) {
+    case ROW_THEME:
+        length = append_text(text, capacity, length,
+                             appearance_theme_name(appearance_theme()));
+        break;
+    case ROW_WALLPAPER: {
+        char name[24];
+        appearance_wallpaper_label(name, sizeof(name));
+        length = append_text(text, capacity, length, name);
+        break;
+    }
+    case ROW_WALLPAPER_STYLE:
+        length = append_text(text, capacity, length,
+                             appearance_wallpaper_style_name(
+                                 appearance_wallpaper_style()));
+        break;
     case ROW_DATE_FORMAT:
         length = append_text(text, capacity, length,
                              date_format_names[settings_date_format()]);
@@ -2958,7 +3303,8 @@ static void draw_settings(struct rect area, bool focused) {
         now = rtc_fallback;
     }
     int64_t bottom = area.y + area.height;
-    for (size_t i = 0; i < SETTING_ROW_COUNT; i++) {
+    settings_fit(area);
+    for (size_t i = settings_scroll; i < SETTING_ROW_COUNT; i++) {
         struct rect row = setting_row_rect(area, i);
         if (row.y + row.height > bottom) {
             break;
@@ -3067,6 +3413,25 @@ static void settings_change(size_t index, int delta) {
     }
     if (row->kind == ROW_RESOLUTION) {
         settings_change_resolution(delta);
+        return;
+    }
+    if (row->kind == ROW_THEME) {
+        appearance_set_theme((enum theme)wrap_step(appearance_theme(), delta,
+                                                   0, THEME_COUNT - 1));
+        return;
+    }
+    if (row->kind == ROW_WALLPAPER) {
+        appearance_cycle_wallpaper(delta);
+        return;
+    }
+    if (row->kind == ROW_WALLPAPER_STYLE) {
+        appearance_set_wallpaper_style((enum wallpaper_style)wrap_step(
+            appearance_wallpaper_style(), delta, 0,
+            WALLPAPER_STYLE_COUNT - 1));
+        return;
+    }
+    if (row->kind == ROW_WALLPAPER_BROWSE) {
+        files_browse_pictures();
         return;
     }
     struct rtc_time now;
@@ -3191,7 +3556,7 @@ static void draw_text_button(struct rect area, const char *label,
  * password-protected one (see accounts_login_required).
  */
 #define LOGIN_PANEL_WIDTH 560
-#define LOGIN_ROW_HEIGHT 36
+#define LOGIN_ROW_HEIGHT 54
 
 static bool login_active;
 static size_t login_selection;
@@ -3268,11 +3633,15 @@ static void draw_login(void) {
     for (size_t i = 0; i < accounts_count(); i++) {
         struct rect row = login_row_rect(i);
         bool selected = i == login_selection;
-        fill(row, selected ? 70 : 32, selected ? 100 : 40,
-             selected ? 160 : 62);
-        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
-                          row.width - 20 - 9 * CHAR_WIDTH, accounts_name(i),
-                          240, 245, 255);
+        uint8_t red = selected ? 70 : 32;
+        uint8_t green = selected ? 100 : 40;
+        uint8_t blue = selected ? 160 : 62;
+        fill(row, red, green, blue);
+        draw_avatar(row.x + 4, row.y + 3, row.height - 6, i, red, green, blue);
+        draw_text_clipped(row.x + row.height + 8,
+                          row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - row.height - 18 - 9 * CHAR_WIDTH,
+                          accounts_name(i), 240, 245, 255);
         if (accounts_has_password(i)) {
             draw_text_clipped(row.x + row.width - 9 * CHAR_WIDTH - 10,
                               row.y + (row.height - CHAR_HEIGHT) / 2,
@@ -3333,12 +3702,22 @@ enum accounts_action {
     ACCOUNTS_PASSWORD,
     ACCOUNTS_ADMIN,
     ACCOUNTS_DELETE,
+    ACCOUNTS_PICTURE,
     ACCOUNTS_ACTION_COUNT
 };
 
 static const char *const accounts_action_labels[ACCOUNTS_ACTION_COUNT] = {
-    "NEW", "RENAME", "PASSWORD", "ADMIN", "DELETE",
+    "NEW", "RENAME", "PASSWORD", "ADMIN", "DELETE", "PICTURE",
 };
+
+/* PICTURE becomes NO PICTURE (remove) while the account has one. */
+static const char *accounts_action_label(size_t action) {
+    if (action == ACCOUNTS_PICTURE && accounts_current() != ACCOUNT_NONE
+        && appearance_account_picture(accounts_current()) != NULL) {
+        return "NO PICTURE";
+    }
+    return accounts_action_labels[action];
+}
 
 enum accounts_prompt {
     ACCOUNTS_PROMPT_NONE,
@@ -3380,10 +3759,14 @@ static bool accounts_action_allowed(enum accounts_action action) {
         return selected && admin;
     case ACCOUNTS_DELETE:
         return selected && admin && !self;
+    case ACCOUNTS_PICTURE:
+        return self;
     default:
         return false;
     }
 }
+
+static void files_browse_pictures(void);
 
 static void accounts_report(enum account_result result, const char *done) {
     accounts_message_error = result != ACCOUNT_OK;
@@ -3418,6 +3801,15 @@ static void accounts_start(enum accounts_action action) {
         break;
     case ACCOUNTS_DELETE:
         accounts_prompt = ACCOUNTS_PROMPT_DELETE;
+        break;
+    case ACCOUNTS_PICTURE:
+        if (appearance_account_picture(accounts_current()) != NULL) {
+            accounts_message_error = !appearance_remove_account_picture();
+            accounts_message = accounts_message_error
+                ? "THE PICTURE COULD NOT BE REMOVED" : "PICTURE REMOVED";
+        } else {
+            files_browse_pictures();
+        }
         break;
     default:
         break;
@@ -3522,16 +3914,19 @@ static void accounts_key(char character) {
         accounts_start(ACCOUNTS_ADMIN);
     } else if (character == KEY_DELETE) {
         accounts_start(ACCOUNTS_DELETE);
+    } else if (character == 'i' || character == 'I') {
+        accounts_start(ACCOUNTS_PICTURE);
     }
 }
 
 static struct rect accounts_row_rect(struct rect area, size_t index) {
-    return (struct rect){area.x + 16, area.y + 70 + (int64_t)index * 34,
-                         area.width - 32, 30};
+    return (struct rect){area.x + 16, area.y + 70 + (int64_t)index * 40,
+                         area.width - 32, 36};
 }
 
 static struct rect accounts_action_rect(struct rect area, size_t index) {
-    int64_t width = (area.width - 32 - 4 * 8) / ACCOUNTS_ACTION_COUNT;
+    int64_t width = (area.width - 32 - (ACCOUNTS_ACTION_COUNT - 1) * 8)
+                  / ACCOUNTS_ACTION_COUNT;
     return (struct rect){area.x + 16 + (int64_t)index * (width + 8),
                          area.y + area.height - 48, width, 34};
 }
@@ -3576,15 +3971,19 @@ static void draw_accounts(struct rect area, bool focused) {
     for (size_t i = 0; i < accounts_count(); i++) {
         struct rect row = accounts_row_rect(area, i);
         bool selected = i == accounts_selection;
-        fill(row, selected ? (focused ? 70 : 46) : 32,
-             selected ? (focused ? 100 : 62) : 40,
-             selected ? (focused ? 160 : 96) : 62);
+        uint8_t red = selected ? (focused ? 70 : 46) : 32;
+        uint8_t green = selected ? (focused ? 100 : 62) : 40;
+        uint8_t blue = selected ? (focused ? 160 : 96) : 62;
+        fill(row, red, green, blue);
+        draw_avatar(row.x + 4, row.y + 3, row.height - 6, i, red, green, blue);
         char line[96] = "";
         size_t length = append_text(line, sizeof(line), 0, accounts_name(i));
         if (i == me) {
             length = append_text(line, sizeof(line), length, " (YOU)");
         }
-        draw_text_clipped(row.x + 10, row.y + 4, row.width / 2, line,
+        int64_t text_y = row.y + (row.height - CHAR_HEIGHT) / 2;
+        draw_text_clipped(row.x + row.height + 6, text_y,
+                          row.width / 2 - row.height - 6, line,
                           240, 245, 255);
         char details[48] = "";
         size_t details_length = append_text(
@@ -3592,7 +3991,7 @@ static void draw_accounts(struct rect area, bool focused) {
             accounts_is_admin(i) ? "ADMIN" : "STANDARD");
         append_text(details, sizeof(details), details_length,
                     accounts_has_password(i) ? ", PASSWORD" : ", NO PASSWORD");
-        draw_text_clipped(row.x + row.width / 2, row.y + 4,
+        draw_text_clipped(row.x + row.width / 2, text_y,
                           row.width / 2 - 10, details, 170, 185, 215);
     }
 
@@ -3633,7 +4032,7 @@ static void draw_accounts(struct rect area, bool focused) {
     }
     for (size_t i = 0; i < ACCOUNTS_ACTION_COUNT; i++) {
         draw_text_button(accounts_action_rect(area, i),
-                         accounts_action_labels[i],
+                         accounts_action_label(i),
                          accounts_prompt == ACCOUNTS_PROMPT_NONE
                          && accounts_action_allowed(
                              (enum accounts_action)i));
@@ -3662,6 +4061,7 @@ static void accounts_click(struct rect area, int32_t x, int32_t y) {
 
 /* After login: the account's places and home folder, default windows. */
 static void desktop_session_start(void) {
+    appearance_load();
     files_places_rebuild();
     char home[96];
     size_t length = accounts_home_path(NULL, home, sizeof(home));
@@ -3690,6 +4090,7 @@ static void desktop_session_end(void) {
         window_close(z_order[z_count - 1]);
     }
     accounts_logout();
+    appearance_load();
     files_places_rebuild();
     files_set_path("/", 1);
     status_text[0] = '\0';
@@ -5108,6 +5509,9 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_TASKS:
         draw_tasks(content, focused);
         break;
+    case WINDOW_IMAGE:
+        draw_viewer(content);
+        break;
     case WINDOW_SETTINGS:
         draw_settings(content, focused);
         break;
@@ -5190,8 +5594,16 @@ static enum menu_action menu_action_at(size_t index) {
     return MENU_COUNT;
 }
 
+/* With an account logged in, the menu starts with its picture and name. */
+#define MENU_HEADER_HEIGHT 56
+
+static int64_t menu_header_height(void) {
+    return accounts_current() != ACCOUNT_NONE ? MENU_HEADER_HEIGHT : 0;
+}
+
 static struct rect menu_rect(void) {
-    int64_t height = (int64_t)menu_visible_count() * MENU_ITEM_HEIGHT + 12;
+    int64_t height = (int64_t)menu_visible_count() * MENU_ITEM_HEIGHT + 12
+                   + menu_header_height();
     return (struct rect){6, screen_height() - TASKBAR_HEIGHT - height - 4,
                          MENU_WIDTH, height};
 }
@@ -5199,7 +5611,8 @@ static struct rect menu_rect(void) {
 static struct rect menu_item_rect(size_t index) {
     struct rect menu = menu_rect();
     return (struct rect){menu.x + 6,
-                         menu.y + 6 + (int64_t)index * MENU_ITEM_HEIGHT,
+                         menu.y + 6 + menu_header_height()
+                             + (int64_t)index * MENU_ITEM_HEIGHT,
                          menu.width - 12, MENU_ITEM_HEIGHT};
 }
 
@@ -5250,6 +5663,14 @@ static void draw_start_menu(void) {
     fill(menu, 110, 160, 255);
     fill((struct rect){menu.x + 2, menu.y + 2, menu.width - 4,
                        menu.height - 4}, 26, 34, 54);
+    size_t me = accounts_current();
+    if (me != ACCOUNT_NONE) {
+        draw_avatar(menu.x + 12, menu.y + 10, 40, me, 26, 34, 54);
+        draw_text_clipped(menu.x + 62, menu.y + 10 + (40 - CHAR_HEIGHT) / 2,
+                          menu.width - 74, accounts_name(me), 240, 245, 255);
+        fill((struct rect){menu.x + 12, menu.y + MENU_HEADER_HEIGHT + 2,
+                           menu.width - 24, 1}, 58, 66, 88);
+    }
     for (size_t i = 0; i < menu_visible_count(); i++) {
         struct rect item = menu_item_rect(i);
         enum menu_action action = menu_action_at(i);
@@ -5267,6 +5688,14 @@ static void draw_start_menu(void) {
 
 static void draw_wallpaper(void) {
     int64_t height = screen_height() - TASKBAR_HEIGHT;
+    const uint32_t *picture = appearance_wallpaper_pixels(
+        (uint32_t)screen_width(), (uint32_t)screen_height());
+    if (picture != NULL) {
+        console_draw_pixels(0, 0, (uint64_t)screen_width(),
+                            (uint64_t)screen_height(), picture,
+                            (uint64_t)screen_width());
+        return;
+    }
     const int64_t band = 8;
     for (int64_t y = 0; y < height; y += band) {
         uint64_t shade = (uint64_t)(y * 64 / (height == 0 ? 1 : height));
@@ -5288,8 +5717,12 @@ static void draw_scene(void) {
     bool buffered = console_frame_begin();
     draw_wallpaper();
     if (login_active) {
-        /* No taskbar on the login screen; cover its strip too. */
-        fill(taskbar_rect(), 14, 20, 38);
+        /* No taskbar on the login screen; the gradient covers its strip
+           too (a picture already fills the whole screen). */
+        if (appearance_wallpaper_pixels((uint32_t)screen_width(),
+                                        (uint32_t)screen_height()) == NULL) {
+            fill(taskbar_rect(), 14, 20, 38);
+        }
         draw_login();
         if (buffered) {
             console_frame_present();
@@ -5476,13 +5909,17 @@ enum files_action {
     FILES_ACTION_DELETE,
     FILES_ACTION_NEW_FOLDER,
     FILES_ACTION_NEW_FILE,
+    FILES_ACTION_SET_BACKGROUND,
+    FILES_ACTION_SET_PICTURE,
 };
+#define FILES_MENU_MAX 7
 
 static const char *const files_action_labels[] = {
     "OPEN", "RENAME", "DELETE", "NEW FOLDER", "NEW FILE",
+    "SET AS BACKGROUND", "SET AS ACCOUNT PICTURE",
 };
 
-#define FILES_MENU_WIDTH (14 * CHAR_WIDTH + 16)
+#define FILES_MENU_WIDTH (23 * CHAR_WIDTH + 24)
 #define FILES_DELETE_DEPTH 8
 
 static bool files_location_read_only(void) {
@@ -5812,6 +6249,16 @@ static size_t files_menu_items(enum files_action *items) {
     size_t count = 0;
     if (files_menu_on_item) {
         items[count++] = FILES_ACTION_OPEN;
+        size_t index;
+        if (!files_in_drives() && files_selected_entry(&index)
+            && !files_entries[index].directory
+            && appearance_is_image_name(files_entries[index].name,
+                                        text_length(files_entries[index].name))) {
+            items[count++] = FILES_ACTION_SET_BACKGROUND;
+            if (accounts_current() != ACCOUNT_NONE) {
+                items[count++] = FILES_ACTION_SET_PICTURE;
+            }
+        }
         items[count++] = FILES_ACTION_RENAME;
         items[count++] = FILES_ACTION_DELETE;
     }
@@ -5821,7 +6268,7 @@ static size_t files_menu_items(enum files_action *items) {
 }
 
 static struct rect files_menu_rect(void) {
-    enum files_action items[5];
+    enum files_action items[FILES_MENU_MAX];
     size_t count = files_menu_items(items);
     int64_t height = (int64_t)count * LINE_HEIGHT + 8;
     int64_t x = files_menu_x;
@@ -5841,7 +6288,31 @@ static struct rect files_menu_item_rect(struct rect menu, size_t index) {
 }
 
 static bool files_action_enabled(enum files_action action) {
-    return action == FILES_ACTION_OPEN || !files_location_read_only();
+    return action == FILES_ACTION_OPEN
+        || action == FILES_ACTION_SET_BACKGROUND
+        || action == FILES_ACTION_SET_PICTURE
+        || !files_location_read_only();
+}
+
+/* SET AS BACKGROUND / SET AS ACCOUNT PICTURE on the selected file. */
+static void files_use_picture(bool account_picture) {
+    size_t index;
+    if (!files_selected_entry(&index)) {
+        return;
+    }
+    char path[FILES_PATH_CAPACITY];
+    size_t length = files_entry_path(index, path, sizeof(path));
+    set_status("LOADING PICTURE...");
+    draw_scene();
+    enum image_result result = account_picture
+        ? appearance_set_account_picture(path, length)
+        : appearance_set_wallpaper(path, length);
+    if (result != IMAGE_OK) {
+        set_status(image_result_text(result));
+    } else {
+        set_status(account_picture ? "ACCOUNT PICTURE CHANGED"
+                                   : "BACKGROUND CHANGED");
+    }
 }
 
 /* Opens the right-click menu for the Files content area at (x, y). */
@@ -5879,6 +6350,12 @@ static void files_menu_activate(enum files_action action) {
     case FILES_ACTION_OPEN:
         files_open_row(files_selection);
         break;
+    case FILES_ACTION_SET_BACKGROUND:
+        files_use_picture(false);
+        break;
+    case FILES_ACTION_SET_PICTURE:
+        files_use_picture(true);
+        break;
     case FILES_ACTION_RENAME:
         files_start_prompt(FILES_PROMPT_RENAME);
         break;
@@ -5904,7 +6381,7 @@ static bool files_menu_press(int32_t x, int32_t y) {
         return false;
     }
     struct rect menu = files_menu_rect();
-    enum files_action items[5];
+    enum files_action items[FILES_MENU_MAX];
     size_t count = files_menu_items(items);
     for (size_t i = 0; i < count; i++) {
         if (rect_contains(files_menu_item_rect(menu, i), x, y)) {
@@ -5923,7 +6400,7 @@ static void draw_files_menu(void) {
     fill(menu, 70, 90, 130);
     fill((struct rect){menu.x + 1, menu.y + 1, menu.width - 2,
                        menu.height - 2}, 28, 35, 54);
-    enum files_action items[5];
+    enum files_action items[FILES_MENU_MAX];
     size_t count = files_menu_items(items);
     for (size_t i = 0; i < count; i++) {
         struct rect line = files_menu_item_rect(menu, i);
@@ -6251,11 +6728,13 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         accounts_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_TASKS) {
         tasks_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_IMAGE) {
+        viewer_click(content_rect(frame), x, y);
     } else if (window_is_app(kind)) {
         app_mouse_press(kind - WINDOW_APP, x, y, 1);
     } else if (kind == WINDOW_SETTINGS) {
         struct rect area = content_rect(frame);
-        for (size_t i = 0; i < SETTING_ROW_COUNT; i++) {
+        for (size_t i = settings_scroll; i < SETTING_ROW_COUNT; i++) {
             struct rect row = setting_row_rect(area, i);
             if (row.y + row.height <= area.y + area.height
                 && rect_contains(row, x, y)) {
@@ -6505,6 +6984,8 @@ static enum desktop_result handle_key(char character, bool super) {
         accounts_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_TASKS) {
         tasks_key(character);
+    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_IMAGE) {
+        viewer_key(character);
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
         app_key(z_order[z_count - 1] - WINDOW_APP, character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
@@ -7796,6 +8277,7 @@ void desktop_run(void) {
     if (installer_available()) {
         /* Live session: no accounts, the installer opens. */
         accounts_logout();
+        appearance_load();
         files_places_rebuild();
         installer_open();
     } else {
@@ -7804,6 +8286,7 @@ void desktop_run(void) {
             accounts_load();
         }
         files_places_rebuild();
+        appearance_load();
         if (accounts_current() != ACCOUNT_NONE) {
             desktop_session_start();
         } else if (accounts_login_required()) {

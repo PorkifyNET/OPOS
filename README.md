@@ -19,8 +19,13 @@ are goals, not current features.
   switchable per user (Super+T). Windows resize by their edges (floating),
   by dragging the gap between them (tiled), or with Super+Shift+arrows.
 - Taskbar with Start menu, window buttons and clock.
-- Built-in apps: Terminal, Files, Text Editor, System Info, Settings, Accounts,
-  and a Welcome window shown on each user's first login.
+- Built-in apps: Terminal, Files, Text Editor, Image Viewer, System Info,
+  Settings, Accounts, and a Welcome window shown on each user's first login.
+- Appearance per user: six colour themes (Ocean, Emerald, Violet, Rose,
+  Graphite, Light), a background picture (four bundled ones, or any PNG,
+  JPEG or BMP; fill, fit, stretch, center or tile), and an account picture
+  shown on the login screen, in the Start menu and in Accounts. Right-click
+  a picture in Files to use it.
 - Files: browse folders, open and run files, rename, delete, and create files
   and folders (right-click menu); sidebar with home folders and every mounted
   volume; back/forward/up buttons and an address bar (Ctrl+L).

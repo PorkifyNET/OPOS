@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "e1000.h"
+#include "nic.h"
 #include "net.h"
 #include "timer.h"
 
@@ -256,7 +256,7 @@ static bool ethernet_send(const uint8_t destination[6], uint16_t type,
     copy(frame_out, destination, 6);
     copy(frame_out + 6, our_mac, 6);
     put16(frame_out + 12, type);
-    return e1000_send(frame_out, ETHERNET_HEADER + payload_length);
+    return nic_send(frame_out, ETHERNET_HEADER + payload_length);
 }
 
 /* ---------------------------------------------------------------- ARP */
@@ -600,7 +600,7 @@ static void dhcp_begin(void) {
 }
 
 void net_dhcp_restart(void) {
-    if (!e1000_ready()) {
+    if (!nic_ready()) {
         return;
     }
     configured = false;
@@ -1571,7 +1571,7 @@ static void icmp_receive(const uint8_t *ip, const uint8_t *icmp,
 
 static bool session_begin(enum session_kind kind, const char *host,
                           size_t length) {
-    if (!e1000_ready()) {
+    if (!nic_ready()) {
         output("No network card.");
         return false;
     }
@@ -1832,15 +1832,15 @@ static void session_poll(void) {
 /* -------------------------------------------------------------- driver */
 
 void net_initialize(void) {
-    if (!e1000_initialize()) {
+    if (!nic_initialize()) {
         return;
     }
-    e1000_mac_address(our_mac);
+    nic_mac_address(our_mac);
     dhcp_begin();
 }
 
 void net_poll(void) {
-    if (!e1000_ready()) {
+    if (!nic_ready()) {
         return;
     }
     /* A link that comes back may lead to another network: ask DHCP again
@@ -1849,14 +1849,14 @@ void net_poll(void) {
     static uint64_t link_checked;
     if (timer_ticks() - link_checked >= TICKS_PER_SECOND / 2) {
         link_checked = timer_ticks();
-        bool link = e1000_link_up();
+        bool link = nic_link_up();
         if (link && !link_was_up) {
             net_dhcp_restart();
         }
         link_was_up = link;
     }
     for (int frames = 0; frames < 32; frames++) {
-        size_t length = e1000_receive(frame_in, sizeof(frame_in));
+        size_t length = nic_receive(frame_in, sizeof(frame_in));
         if (length == 0) {
             break;
         }
@@ -1879,14 +1879,14 @@ void net_poll(void) {
 
 void net_get_status(struct net_status *status) {
     zero(status, sizeof(*status));
-    status->card = e1000_ready();
+    status->card = nic_ready();
     if (!status->card) {
         status->state = "no network card";
         return;
     }
-    status->link = e1000_link_up();
+    status->link = nic_link_up();
     status->configured = configured;
-    status->pci_id = e1000_pci_id();
+    status->pci_id = nic_pci_id();
     copy(status->mac, our_mac, 6);
     copy(status->ip, our_ip, 4);
     copy(status->mask, our_mask, 4);
@@ -1897,8 +1897,8 @@ void net_get_status(struct net_status *status) {
         "off", "asking for an address", "requesting the address", "bound",
     };
     status->state = names[dhcp_state];
-    status->sent = e1000_sent_count();
-    status->received = e1000_received_count();
+    status->sent = nic_sent_count();
+    status->received = nic_received_count();
 }
 
 void net_describe(void (*print)(const char *line)) {
@@ -1906,11 +1906,18 @@ void net_describe(void (*print)(const char *line)) {
     net_get_status(&status);
     char line[LINE_CAPACITY];
     if (!status.card) {
-        print("No supported network card (Intel e1000/e1000e).");
+        print("No supported network card (Intel e1000/e1000e or VMware vmxnet3).");
         return;
     }
-    size_t used = append(line, sizeof(line), 0, "Card: Intel e1000 (8086:");
     static const char hex[] = "0123456789abcdef";
+    size_t used = append(line, sizeof(line), 0, "Card: ");
+    used = append(line, sizeof(line), used, nic_name());
+    used = append(line, sizeof(line), used, " (");
+    char vendor[6] = {hex[status.pci_id >> 28 & 15],
+                      hex[status.pci_id >> 24 & 15],
+                      hex[status.pci_id >> 20 & 15],
+                      hex[status.pci_id >> 16 & 15], ':', '\0'};
+    used = append(line, sizeof(line), used, vendor);
     char id[5] = {hex[status.pci_id >> 12 & 15], hex[status.pci_id >> 8 & 15],
                   hex[status.pci_id >> 4 & 15], hex[status.pci_id & 15], '\0'};
     used = append(line, sizeof(line), used, id);

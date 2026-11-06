@@ -40,7 +40,7 @@
 #include "boot_display.h"
 #include "sdhci.h"
 #include "net.h"
-#include "e1000.h"
+#include "nic.h"
 
 #define COM1 0x3f8
 #define GLYPH_SCALE 2
@@ -1349,8 +1349,8 @@ void kmain(void) {
                                      : "OPOS: no USB controller used\n");
     /* Network card; DHCP starts in the background (net_poll). */
     net_initialize();
-    console_write_string(e1000_ready() ? "OPOS: e1000 network card ready\n"
-                                       : "OPOS: no network card found\n");
+    console_write_string(nic_ready() ? "OPOS: network card ready\n"
+                                     : "OPOS: no network card found\n");
     /* I2C touchpad (laptops). Its reset waits about 150 ms. */
     if (i2c_hid_initialize()) {
         console_write_string("OPOS: I2C touchpad ready\n");

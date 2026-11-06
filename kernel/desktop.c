@@ -39,6 +39,8 @@
 #define CHAR_WIDTH ((FONT_WIDTH + 1) * 2)
 #define CHAR_HEIGHT (FONT_HEIGHT * 2)
 #define TASKBAR_HEIGHT 40
+#define TASKBAR_SIDE_WIDTH (TASK_BUTTON_WIDTH + 12)
+#define TASKBAR_MENU_WIDTH (18 * CHAR_WIDTH + 44)
 #define TITLE_HEIGHT 28
 #define BORDER 2
 #define GAP 10
@@ -62,12 +64,10 @@ struct rect {
 enum window_kind {
     WINDOW_TERMINAL,
     WINDOW_FILES,
-    WINDOW_SYSTEM_INFO,
     WINDOW_WELCOME,
     WINDOW_SETTINGS,
     WINDOW_EDITOR,
     WINDOW_INSTALLER,
-    WINDOW_ACCOUNTS,
     WINDOW_TASKS,
     WINDOW_IMAGE,
     /* Program windows: one kind per slot (see "program windows"). */
@@ -82,8 +82,8 @@ static bool window_is_app(enum window_kind kind) {
 }
 
 static const char *const window_titles[WINDOW_COUNT] = {
-    "TERMINAL", "FILES", "SYSTEM INFO", "WELCOME", "SETTINGS", "TEXT EDITOR",
-    "INSTALL OPOS", "ACCOUNTS", "TASK MANAGER", "IMAGE VIEWER", "PROGRAM"
+    "TERMINAL", "FILES", "WELCOME", "SETTINGS", "TEXT EDITOR",
+    "INSTALL OPOS", "TASK MANAGER", "IMAGE VIEWER", "PROGRAM"
 };
 
 static const char *app_window_title(size_t slot);
@@ -113,22 +113,24 @@ static bool tiled_layout = true;
 #define SPLIT_MAX 850
 static uint16_t split_ratio[WINDOW_COUNT];
 static void layout_load(void);
+static void layout_toggle(void);
+static void taskbar_move(enum taskbar_position position);
 static void welcome_open_first_time(void);
 static bool start_menu_open;
 static size_t menu_selection;
 static size_t settings_selection;
 static bool exit_to_shell;
 static char status_text[64];
+/* When the status message was set; it disappears STATUS_TICKS later. */
+static uint64_t status_tick;
+#define STATUS_TICKS 1000
 
 enum menu_action {
     MENU_TERMINAL,
     MENU_FILES,
     MENU_TEXT_EDITOR,
-    MENU_SYSTEM_INFO,
     MENU_TASK_MANAGER,
-    MENU_TOGGLE_LAYOUT,
     MENU_SETTINGS,
-    MENU_ACCOUNTS,
     MENU_INSTALL,
     MENU_LOG_OUT,
     MENU_REBOOT,
@@ -137,7 +139,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "SYSTEM INFO", "TASK MANAGER", "TOGGLE TILING", "SETTINGS", "ACCOUNTS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -258,6 +260,7 @@ static int64_t screen_height(void) {
 
 static void set_status(const char *text) {
     text_copy(status_text, sizeof(status_text), text);
+    status_tick = timer_ticks();
 }
 
 static bool text_contains(const char *text, const char *needle) {
@@ -594,11 +597,58 @@ static bool terminal_execute(void) {
 
 /* --------------------------------------------------------------- layout */
 
+/*
+ * The taskbar runs along one edge of the screen (a personal setting).
+ * Along the top or bottom it is TASKBAR_HEIGHT tall; on the left or right
+ * it is TASKBAR_SIDE_WIDTH wide, with the buttons stacked.
+ */
+static bool taskbar_vertical(void) {
+    enum taskbar_position position = appearance_taskbar();
+    return position == TASKBAR_LEFT || position == TASKBAR_RIGHT;
+}
+
+static struct rect taskbar_rect(void) {
+    switch (appearance_taskbar()) {
+    case TASKBAR_TOP:
+        return (struct rect){0, 0, screen_width(), TASKBAR_HEIGHT};
+    case TASKBAR_LEFT:
+        return (struct rect){0, 0, TASKBAR_SIDE_WIDTH, screen_height()};
+    case TASKBAR_RIGHT:
+        return (struct rect){screen_width() - TASKBAR_SIDE_WIDTH, 0,
+                             TASKBAR_SIDE_WIDTH, screen_height()};
+    default:
+        return (struct rect){0, screen_height() - TASKBAR_HEIGHT,
+                             screen_width(), TASKBAR_HEIGHT};
+    }
+}
+
+/* The screen without the taskbar. */
+static struct rect desktop_area(void) {
+    struct rect area = {0, 0, screen_width(), screen_height()};
+    struct rect bar = taskbar_rect();
+    switch (appearance_taskbar()) {
+    case TASKBAR_TOP:
+        area.y = bar.height;
+        area.height -= bar.height;
+        break;
+    case TASKBAR_LEFT:
+        area.x = bar.width;
+        area.width -= bar.width;
+        break;
+    case TASKBAR_RIGHT:
+        area.width -= bar.width;
+        break;
+    default:
+        area.height -= bar.height;
+        break;
+    }
+    return area;
+}
+
 static struct rect workspace_area(void) {
-    return (struct rect){
-        GAP, GAP, screen_width() - 2 * GAP,
-        screen_height() - TASKBAR_HEIGHT - 2 * GAP
-    };
+    struct rect area = desktop_area();
+    return (struct rect){area.x + GAP, area.y + GAP, area.width - 2 * GAP,
+                         area.height - 2 * GAP};
 }
 
 /*
@@ -3068,8 +3118,8 @@ static void draw_files(struct rect area, bool focused) {
                       list.width - 24, hint, 120, 140, 175);
 }
 
-static void draw_system_info(struct rect area) {
-    fill(area, 24, 30, 46);
+/* Settings > ABOUT (it used to be the System Info window). */
+static void draw_about(struct rect area) {
     char memory[48] = "USABLE MEMORY: ";
     size_t length = append_decimal(memory, sizeof(memory), 15,
                                    memory_total_pages() * 4096 / (1024 * 1024));
@@ -3081,9 +3131,19 @@ static void draw_system_info(struct rect area) {
     length = append_decimal(screen, sizeof(screen), 8, console_screen_width());
     length = append_text(screen, sizeof(screen), length, " X ");
     append_decimal(screen, sizeof(screen), length, console_screen_height());
+    char disks[48] = "DISKS: ";
+    append_decimal(disks, sizeof(disks), 7, block_disk_count());
+    char user[48] = "SIGNED IN AS: ";
+    size_t me = accounts_current();
+    append_text(user, sizeof(user), 14,
+                installer_available() ? "LIVE SESSION"
+                : me != ACCOUNT_NONE ? accounts_name(me) : "NO ACCOUNT");
 
     const char *lines[] = {
-        "OPOS X86-64", memory, uptime, screen, "PIT TIMER: 100 HZ",
+        "OPOS X86-64", user, memory, uptime, screen,
+        svga_available() ? "DISPLAY: VMWARE SVGA II"
+                         : "DISPLAY: FIRMWARE FRAMEBUFFER",
+        disks, "PIT TIMER: 100 HZ",
         tiled_layout ? "LAYOUT: DWINDLE TILING" : "LAYOUT: FLOATING",
     };
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
@@ -3104,6 +3164,8 @@ static void draw_welcome(struct rect area) {
         "SUPER+ARROWS: FOCUS WINDOW",
         "SUPER+ENTER: TERMINAL  SUPER+E: FILES",
         "SUPER+Q: CLOSE  SUPER+T: TILE/FLOAT",
+        "SUPER+I: SETTINGS",
+        "RIGHT-CLICK THE TASKBAR FOR ITS OPTIONS",
         "SUPER+TAB: CYCLE FOCUS",
         "CTRL+SHIFT+ESC: TASK MANAGER",
         "DRAG TITLE BARS IN FLOATING MODE",
@@ -3132,62 +3194,157 @@ enum setting_row_kind {
     ROW_TAP_TO_CLICK,
     ROW_SCROLL_DIRECTION,
     ROW_POINTER_SPEED,
+    ROW_LAYOUT,
+    ROW_TASKBAR_POSITION,
+};
+
+/* Settings pages, listed in the window's sidebar. */
+enum settings_category {
+    CATEGORY_SYSTEM,
+    CATEGORY_ACCOUNTS,
+    CATEGORY_DISPLAY,
+    CATEGORY_APPEARANCE,
+    CATEGORY_DESKTOP,
+    CATEGORY_DATE_TIME,
+    CATEGORY_TOUCHPAD,
+    CATEGORY_ABOUT,
+    CATEGORY_COUNT
+};
+
+static const char *const category_names[CATEGORY_COUNT] = {
+    "SYSTEM", "ACCOUNTS", "DISPLAY", "APPEARANCE", "DESKTOP", "DATE & TIME", "TOUCHPAD",
+    "ABOUT",
 };
 
 struct setting_row {
     const char *label;
     enum setting_row_kind kind;
     uint8_t setting; /* ROW_TOGGLE only */
+    enum settings_category category;
 };
 
 static const struct setting_row setting_rows[] = {
-    {"OPEN DESKTOP ON BOOT", ROW_TOGGLE, SETTING_AUTOSTART_DESKTOP},
-    {"COLORED TERMINAL MESSAGES", ROW_TOGGLE, SETTING_TERMINAL_COLORS},
-    {"12-HOUR CLOCK", ROW_TOGGLE, SETTING_CLOCK_12H},
-    {"DATE FORMAT", ROW_DATE_FORMAT, 0},
-    {"YEAR", ROW_YEAR, 0},
-    {"MONTH", ROW_MONTH, 0},
-    {"DAY", ROW_DAY, 0},
-    {"HOUR", ROW_HOUR, 0},
-    {"MINUTE", ROW_MINUTE, 0},
-    {"RESOLUTION", ROW_RESOLUTION, 0},
-    {"COLOR THEME", ROW_THEME, 0},
-    {"BACKGROUND", ROW_WALLPAPER, 0},
-    {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0},
+    {"OPEN DESKTOP ON BOOT", ROW_TOGGLE, SETTING_AUTOSTART_DESKTOP,
+     CATEGORY_SYSTEM},
+    {"COLORED TERMINAL MESSAGES", ROW_TOGGLE, SETTING_TERMINAL_COLORS,
+     CATEGORY_SYSTEM},
+    {"RESOLUTION", ROW_RESOLUTION, 0, CATEGORY_DISPLAY},
+    {"COLOR THEME", ROW_THEME, 0, CATEGORY_APPEARANCE},
+    {"BACKGROUND", ROW_WALLPAPER, 0, CATEGORY_APPEARANCE},
+    {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0, CATEGORY_APPEARANCE},
     {"USE YOUR OWN PICTURE (RIGHT-CLICK IT IN FILES)",
-     ROW_WALLPAPER_BROWSE, 0},
-    {"TOUCHPAD: TAP TO CLICK", ROW_TAP_TO_CLICK, 0},
-    {"TOUCHPAD: TWO-FINGER SCROLLING", ROW_SCROLL_DIRECTION, 0},
-    {"TOUCHPAD: POINTER SPEED", ROW_POINTER_SPEED, 0},
+     ROW_WALLPAPER_BROWSE, 0, CATEGORY_APPEARANCE},
+    {"WINDOW LAYOUT (SUPER+T)", ROW_LAYOUT, 0, CATEGORY_DESKTOP},
+    {"TASKBAR POSITION", ROW_TASKBAR_POSITION, 0, CATEGORY_DESKTOP},
+    {"12-HOUR CLOCK", ROW_TOGGLE, SETTING_CLOCK_12H, CATEGORY_DATE_TIME},
+    {"DATE FORMAT", ROW_DATE_FORMAT, 0, CATEGORY_DATE_TIME},
+    {"YEAR", ROW_YEAR, 0, CATEGORY_DATE_TIME},
+    {"MONTH", ROW_MONTH, 0, CATEGORY_DATE_TIME},
+    {"DAY", ROW_DAY, 0, CATEGORY_DATE_TIME},
+    {"HOUR", ROW_HOUR, 0, CATEGORY_DATE_TIME},
+    {"MINUTE", ROW_MINUTE, 0, CATEGORY_DATE_TIME},
+    {"TAP TO CLICK", ROW_TAP_TO_CLICK, 0, CATEGORY_TOUCHPAD},
+    {"TWO-FINGER SCROLLING", ROW_SCROLL_DIRECTION, 0, CATEGORY_TOUCHPAD},
+    {"POINTER SPEED", ROW_POINTER_SPEED, 0, CATEGORY_TOUCHPAD},
 };
-#define SETTING_ROW_COUNT (sizeof(setting_rows) / sizeof(setting_rows[0]))
+#define SETTING_ROW_TOTAL (sizeof(setting_rows) / sizeof(setting_rows[0]))
 #define SETTING_VALUE_WIDTH (18 * CHAR_WIDTH + 12)
+#define SETTINGS_SIDEBAR_WIDTH (12 * CHAR_WIDTH + 32)
+#define SETTINGS_CATEGORY_HEIGHT 32
 
 static const char *const date_format_names[DATE_FORMAT_COUNT] = {
     "YYYY-MM-DD", "DD.MM.YYYY", "MM/DD/YYYY", "DD/MM/YYYY",
 };
 
+/*
+ * The page shown, and whether the keyboard is in the sidebar (Up/Down pick
+ * a page) or in the page's rows. settings_selection and settings_scroll
+ * count rows of the current page only.
+ */
+static enum settings_category settings_category;
+/* The ACCOUNTS page is the accounts manager (see "accounts page"). */
+static void draw_accounts(struct rect area, bool focused);
+static void accounts_key(char character);
+static void accounts_click(struct rect area, int32_t x, int32_t y);
+static bool accounts_prompt_active(void);
+static bool settings_in_sidebar = true;
 /* First row shown; rows scroll so the selected one stays visible. */
 static size_t settings_scroll;
 
-static struct rect setting_row_rect(struct rect area, size_t index) {
-    return (struct rect){area.x + 8,
-                         area.y + 44
-                             + ((int64_t)index - (int64_t)settings_scroll) * 36,
-                         area.width - 16, 32};
+static size_t settings_row_count(void) {
+    size_t count = 0;
+    for (size_t i = 0; i < SETTING_ROW_TOTAL; i++) {
+        count += setting_rows[i].category == settings_category ? 1 : 0;
+    }
+    return count;
 }
 
-static void settings_fit(struct rect area) {
-    size_t visible = area.height >= 76 ? (size_t)(area.height - 76) / 36 + 1
-                                       : 1;
+/* The page's row number index, as an index into setting_rows. */
+static size_t settings_row_index(size_t index) {
+    for (size_t i = 0; i < SETTING_ROW_TOTAL; i++) {
+        if (setting_rows[i].category == settings_category && index-- == 0) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* Pages the keyboard can enter: those with rows, and ACCOUNTS. */
+static bool settings_page_has_focus(void) {
+    return settings_row_count() != 0 || settings_category == CATEGORY_ACCOUNTS;
+}
+
+static void settings_show_category(enum settings_category category) {
+    settings_category = category;
+    settings_selection = 0;
+    settings_scroll = 0;
+}
+
+static struct rect settings_sidebar_rect(struct rect area) {
+    int64_t width = SETTINGS_SIDEBAR_WIDTH < area.width / 2
+                  ? SETTINGS_SIDEBAR_WIDTH : area.width / 2;
+    return (struct rect){area.x, area.y, width, area.height};
+}
+
+static struct rect settings_category_rect(struct rect area, size_t index) {
+    struct rect sidebar = settings_sidebar_rect(area);
+    return (struct rect){sidebar.x + 6,
+                         sidebar.y + 10
+                             + (int64_t)index * SETTINGS_CATEGORY_HEIGHT,
+                         sidebar.width - 12, SETTINGS_CATEGORY_HEIGHT - 4};
+}
+
+/* The page: the window without the sidebar. */
+static struct rect settings_page_rect(struct rect area) {
+    struct rect sidebar = settings_sidebar_rect(area);
+    return (struct rect){area.x + sidebar.width, area.y,
+                         area.width - sidebar.width, area.height};
+}
+
+static size_t settings_visible_rows(struct rect page) {
+    return page.height >= 76 ? (size_t)(page.height - 76) / 36 + 1 : 1;
+}
+
+static struct rect setting_row_rect(struct rect page, size_t index) {
+    return (struct rect){page.x + 8,
+                         page.y + 44
+                             + ((int64_t)index - (int64_t)settings_scroll) * 36,
+                         page.width - 16, 32};
+}
+
+static void settings_fit(struct rect page) {
+    size_t visible = settings_visible_rows(page);
+    size_t count = settings_row_count();
+    if (settings_selection >= count) {
+        settings_selection = count == 0 ? 0 : count - 1;
+    }
     if (settings_selection < settings_scroll) {
         settings_scroll = settings_selection;
     } else if (settings_selection >= settings_scroll + visible) {
         settings_scroll = settings_selection + 1 - visible;
     }
-    if (settings_scroll + visible > SETTING_ROW_COUNT) {
-        settings_scroll = visible >= SETTING_ROW_COUNT
-                        ? 0 : SETTING_ROW_COUNT - visible;
+    if (settings_scroll + visible > count) {
+        settings_scroll = visible >= count ? 0 : count - visible;
     }
 }
 
@@ -3262,6 +3419,14 @@ static void setting_value_text(const struct setting_row *row,
     struct tp_options touchpad;
     appearance_touchpad(&touchpad);
     switch (row->kind) {
+    case ROW_LAYOUT:
+        length = append_text(text, capacity, length,
+                             tiled_layout ? "TILED" : "FLOATING");
+        break;
+    case ROW_TASKBAR_POSITION:
+        length = append_text(text, capacity, length,
+                             appearance_taskbar_name(appearance_taskbar()));
+        break;
     case ROW_TAP_TO_CLICK:
         length = append_text(text, capacity, length,
                              touchpad.tap_to_click ? "ON" : "OFF");
@@ -3348,44 +3513,82 @@ static void setting_value_text(const struct setting_row *row,
 
 static void draw_settings(struct rect area, bool focused) {
     fill(area, 24, 30, 46);
-    draw_text_clipped(area.x + 16, area.y + 14, area.width - 32,
-                      "ENTER: TOGGLE  LEFT/RIGHT: CHANGE", 151, 190, 235);
+    struct rect sidebar = settings_sidebar_rect(area);
+    fill(sidebar, 30, 38, 58);
+    for (size_t i = 0; i < CATEGORY_COUNT; i++) {
+        struct rect item = settings_category_rect(area, i);
+        if (item.y + item.height > sidebar.y + sidebar.height) {
+            break;
+        }
+        if (i == settings_category) {
+            bool active = focused && settings_in_sidebar;
+            fill(item, active ? 70 : 52, active ? 100 : 66,
+                 active ? 160 : 100);
+        }
+        draw_text_clipped(item.x + 10, item.y + (item.height - CHAR_HEIGHT) / 2,
+                          item.width - 20, category_names[i],
+                          230, 238, 255);
+    }
+
+    struct rect page = settings_page_rect(area);
+    size_t count = settings_row_count();
+    const char *hint = settings_in_sidebar || !settings_page_has_focus()
+        ? "UP/DOWN: PAGE  TAB: OPEN"
+        : settings_category == CATEGORY_ACCOUNTS
+        ? "N R P A I DEL: ACTIONS  TAB: PAGES"
+        : "LEFT/RIGHT: CHANGE  TAB: PAGES";
+    draw_text_clipped(page.x + 16, page.y + 14, page.width - 32, hint,
+                      151, 190, 235);
+    if (settings_category == CATEGORY_ACCOUNTS) {
+        draw_accounts((struct rect){page.x, page.y + 32, page.width,
+                                    page.height - 32},
+                      focused && !settings_in_sidebar);
+        return;
+    }
+    if (settings_category == CATEGORY_ABOUT) {
+        draw_about((struct rect){page.x, page.y + 32, page.width,
+                                 page.height - 32});
+        return;
+    }
     struct rtc_time now;
     if (!rtc_read(&now)) {
         now = rtc_fallback;
     }
-    int64_t bottom = area.y + area.height;
-    settings_fit(area);
-    for (size_t i = settings_scroll; i < SETTING_ROW_COUNT; i++) {
-        struct rect row = setting_row_rect(area, i);
+    int64_t bottom = page.y + page.height;
+    settings_fit(page);
+    for (size_t i = settings_scroll; i < count; i++) {
+        struct rect row = setting_row_rect(page, i);
         if (row.y + row.height > bottom) {
             break;
         }
-        if (focused && i == settings_selection) {
+        const struct setting_row *setting = &setting_rows[settings_row_index(i)];
+        if (focused && !settings_in_sidebar && i == settings_selection) {
             fill(row, 43, 56, 84);
         }
         struct rect value = setting_value_rect(row);
-        if (setting_rows[i].kind == ROW_TOGGLE) {
-            bool on = settings_get(setting_rows[i].setting);
+        if (setting->kind == ROW_TOGGLE) {
+            bool on = settings_get(setting->setting);
             fill(value, on ? 70 : 60, on ? 160 : 66, on ? 110 : 88);
             draw_text_clipped(value.x + 6, value.y + 1, value.width - 12,
                               on ? "ON" : "OFF", 255, 255, 255);
         } else {
             char text[32];
-            setting_value_text(&setting_rows[i], &now, text, sizeof(text));
+            setting_value_text(setting, &now, text, sizeof(text));
             fill(value, 52, 66, 100);
             draw_text_clipped(value.x + 6, value.y + 1, value.width - 12,
                               text, 255, 255, 255);
         }
         int64_t label_x = value.x + value.width + 16;
-        const char *label = setting_rows[i].label;
         draw_text_clipped(label_x, row.y + 7, row.x + row.width - label_x - 8,
-                          label, 230, 238, 255);
+                          setting->label, 230, 238, 255);
     }
-    struct rect footer = setting_row_rect(area, SETTING_ROW_COUNT);
-    if (footer.y + CHAR_HEIGHT + 12 <= bottom) {
+    /* Only the SYSTEM page holds machine-wide settings (OPOS.CFG/CMOS);
+       the other pages are saved per account. */
+    struct rect footer = setting_row_rect(page, count);
+    if (settings_category == CATEGORY_SYSTEM
+        && footer.y + CHAR_HEIGHT + 12 <= bottom) {
         bool disk = fat16_system_mounted();
-        draw_text_clipped(area.x + 16, footer.y + 12, area.width - 32,
+        draw_text_clipped(page.x + 16, footer.y + 12, page.width - 32,
                           disk ? "SAVED TO OPOS.CFG ON THE DISK"
                                : "NO FAT DISK: SAVED IN CMOS ONLY",
                           disk ? 110 : 240, disk ? 140 : 205,
@@ -3503,6 +3706,15 @@ static void settings_change(size_t index, int delta) {
         settings_change_resolution(delta);
         return;
     }
+    if (row->kind == ROW_LAYOUT) {
+        layout_toggle();
+        return;
+    }
+    if (row->kind == ROW_TASKBAR_POSITION) {
+        taskbar_move((enum taskbar_position)wrap_step(
+            appearance_taskbar(), delta, 0, TASKBAR_POSITION_COUNT - 1));
+        return;
+    }
     if (row->kind == ROW_TAP_TO_CLICK || row->kind == ROW_SCROLL_DIRECTION
         || row->kind == ROW_POINTER_SPEED) {
         struct tp_options touchpad;
@@ -3575,6 +3787,91 @@ static void settings_change(size_t index, int delta) {
         now.day = last_day;
     }
     (void)rtc_write(&now);
+}
+
+/*
+ * Keys: in the sidebar Up/Down pick a page and Tab, Enter or Right open
+ * it; in a page Up/Down pick a row, Enter/Space/Right and Left change it,
+ * and Tab or Esc go back to the sidebar. Page Up/Down switch pages from
+ * anywhere. On the ACCOUNTS page the other keys go to the accounts
+ * manager, and all keys do while it asks for a name or password.
+ */
+static void settings_key(char character) {
+    size_t count = settings_row_count();
+    bool accounts_page = settings_category == CATEGORY_ACCOUNTS
+                       && !settings_in_sidebar;
+    if (accounts_page && accounts_prompt_active()) {
+        accounts_key(character); /* typing a name or password */
+        return;
+    }
+    if (character == KEY_PAGE_UP || character == KEY_PAGE_DOWN) {
+        settings_show_category((enum settings_category)wrap_step(
+            settings_category, character == KEY_PAGE_UP ? -1 : 1, 0,
+            CATEGORY_COUNT - 1));
+        settings_in_sidebar = !settings_page_has_focus();
+        return;
+    }
+    if (settings_in_sidebar || !settings_page_has_focus()) {
+        settings_in_sidebar = true;
+        if (character == KEY_UP || character == KEY_DOWN) {
+            settings_show_category((enum settings_category)wrap_step(
+                settings_category, character == KEY_UP ? -1 : 1, 0,
+                CATEGORY_COUNT - 1));
+        } else if ((character == '\t' || character == '\n'
+                    || character == KEY_RIGHT) && settings_page_has_focus()) {
+            settings_in_sidebar = false;
+        }
+        return;
+    }
+    if (character == '\t' || character == KEY_ESCAPE) {
+        settings_in_sidebar = true;
+    } else if (accounts_page) {
+        accounts_key(character);
+    } else if (character == KEY_UP) {
+        settings_selection = (settings_selection + count - 1) % count;
+    } else if (character == KEY_DOWN) {
+        settings_selection = (settings_selection + 1) % count;
+    } else if (character == '\n' || character == ' '
+               || character == KEY_RIGHT) {
+        settings_change(settings_row_index(settings_selection), 1);
+    } else if (character == KEY_LEFT) {
+        settings_change(settings_row_index(settings_selection), -1);
+    }
+}
+
+static void settings_click(struct rect area, int32_t x, int32_t y) {
+    for (size_t i = 0; i < CATEGORY_COUNT; i++) {
+        if (rect_contains(settings_category_rect(area, i), x, y)) {
+            if (i != settings_category) {
+                settings_show_category((enum settings_category)i);
+            }
+            settings_in_sidebar = true;
+            return;
+        }
+    }
+    struct rect page = settings_page_rect(area);
+    if (settings_category == CATEGORY_ACCOUNTS) {
+        if (x >= page.x) {
+            settings_in_sidebar = false;
+            accounts_click((struct rect){page.x, page.y + 32, page.width,
+                                         page.height - 32}, x, y);
+        }
+        return;
+    }
+    size_t count = settings_row_count();
+    for (size_t i = settings_scroll; i < count; i++) {
+        struct rect row = setting_row_rect(page, i);
+        if (row.y + row.height <= page.y + page.height
+            && rect_contains(row, x, y)) {
+            /* Left half of the value box steps down, the rest up. */
+            struct rect value = setting_value_rect(row);
+            bool down = rect_contains(value, x, y)
+                      && x < value.x + value.width / 2;
+            settings_selection = i;
+            settings_in_sidebar = false;
+            settings_change(settings_row_index(i), down ? -1 : 1);
+        }
+    }
 }
 
 static void draw_scene(void);
@@ -3802,7 +4099,9 @@ static void login_press(int32_t x, int32_t y) {
     }
 }
 
-/* ------------------------------------------------------ accounts window */
+/* -------------------------------------------------------- accounts page */
+
+/* Settings > ACCOUNTS. */
 
 enum accounts_action {
     ACCOUNTS_NEW,
@@ -3980,6 +4279,10 @@ static void accounts_commit(void) {
     field_reset(&accounts_field, ACCOUNT_PASSWORD_MAX, true);
 }
 
+static bool accounts_prompt_active(void) {
+    return accounts_prompt != ACCOUNTS_PROMPT_NONE;
+}
+
 static void accounts_key(char character) {
     if (accounts_prompt == ACCOUNTS_PROMPT_DELETE) {
         if (character == 'y' || character == 'Y') {
@@ -4032,15 +4335,31 @@ static struct rect accounts_row_rect(struct rect area, size_t index) {
                          area.width - 32, 36};
 }
 
-static struct rect accounts_action_rect(struct rect area, size_t index) {
+/* The action buttons sit in one row, or in two when the labels (up to
+   "NO PICTURE") would not fit. */
+static size_t accounts_action_columns(struct rect area) {
     int64_t width = (area.width - 32 - (ACCOUNTS_ACTION_COUNT - 1) * 8)
                   / ACCOUNTS_ACTION_COUNT;
-    return (struct rect){area.x + 16 + (int64_t)index * (width + 8),
-                         area.y + area.height - 48, width, 34};
+    return width >= 10 * CHAR_WIDTH + 20 ? ACCOUNTS_ACTION_COUNT
+                                          : (ACCOUNTS_ACTION_COUNT + 1) / 2;
+}
+
+static struct rect accounts_action_rect(struct rect area, size_t index) {
+    size_t columns = accounts_action_columns(area);
+    size_t rows = (ACCOUNTS_ACTION_COUNT + columns - 1) / columns;
+    int64_t width = (area.width - 32 - ((int64_t)columns - 1) * 8)
+                  / (int64_t)columns;
+    int64_t row = (int64_t)(index / columns);
+    return (struct rect){
+        area.x + 16 + (int64_t)(index % columns) * (width + 8),
+        area.y + area.height - 48 - ((int64_t)rows - 1 - row) * 40,
+        width, 34};
 }
 
 static struct rect accounts_field_rect(struct rect area) {
-    return (struct rect){area.x + 16, area.y + area.height - 128,
+    size_t columns = accounts_action_columns(area);
+    int64_t extra = columns < ACCOUNTS_ACTION_COUNT ? 40 : 0;
+    return (struct rect){area.x + 16, area.y + area.height - 128 - extra,
                          area.width - 32, 34};
 }
 
@@ -5611,9 +5930,6 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_FILES:
         draw_files(content, focused);
         break;
-    case WINDOW_SYSTEM_INFO:
-        draw_system_info(content);
-        break;
     case WINDOW_TASKS:
         draw_tasks(content, focused);
         break;
@@ -5629,9 +5945,6 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_INSTALLER:
         draw_installer(content, focused);
         break;
-    case WINDOW_ACCOUNTS:
-        draw_accounts(content, focused);
-        break;
     default:
         if (window_is_app(kind)) {
             draw_app(kind - WINDOW_APP, content);
@@ -5645,29 +5958,49 @@ static void draw_window(enum window_kind kind) {
 
 /* -------------------------------------------------------------- taskbar */
 
-static struct rect taskbar_rect(void) {
-    return (struct rect){0, screen_height() - TASKBAR_HEIGHT, screen_width(),
-                         TASKBAR_HEIGHT};
-}
-
 static struct rect start_button_rect(void) {
     struct rect bar = taskbar_rect();
+    if (taskbar_vertical()) {
+        return (struct rect){bar.x + 6, bar.y + 6, bar.width - 12,
+                             TASKBAR_HEIGHT - 10};
+    }
     return (struct rect){bar.x + 6, bar.y + 5, START_BUTTON_WIDTH,
                          TASKBAR_HEIGHT - 10};
 }
 
-static struct rect layout_button_rect(void) {
+static struct rect task_button_rect(size_t index) {
     struct rect start = start_button_rect();
-    return (struct rect){start.x + start.width + 8, start.y,
-                         LAYOUT_BUTTON_WIDTH, start.height};
+    if (taskbar_vertical()) {
+        return (struct rect){
+            start.x,
+            start.y + start.height + 16 + (int64_t)index * (start.height + 6),
+            start.width, start.height
+        };
+    }
+    return (struct rect){
+        start.x + start.width + 16 + (int64_t)index * (TASK_BUTTON_WIDTH + 6),
+        start.y, TASK_BUTTON_WIDTH, start.height
+    };
 }
 
-static struct rect task_button_rect(size_t index) {
-    struct rect layout = layout_button_rect();
-    return (struct rect){
-        layout.x + layout.width + 16 + (int64_t)index * (TASK_BUTTON_WIDTH + 6),
-        layout.y, TASK_BUTTON_WIDTH, layout.height
-    };
+/* Date and time: one line along the top or bottom, two lines (date over
+   time) at the bottom of a side taskbar. */
+static struct rect clock_rect(void) {
+    struct rect bar = taskbar_rect();
+    if (taskbar_vertical()) {
+        int64_t height = 2 * CHAR_HEIGHT + 16;
+        return (struct rect){bar.x + 6, bar.y + bar.height - height - 6,
+                             bar.width - 12, height};
+    }
+    return (struct rect){bar.x + bar.width - CLOCK_WIDTH, bar.y,
+                         CLOCK_WIDTH - 10, bar.height};
+}
+
+/* False when the button would run into the clock. */
+static bool task_button_fits(struct rect button) {
+    struct rect clock = clock_rect();
+    return taskbar_vertical() ? button.y + button.height <= clock.y - 10
+                              : button.x + button.width <= clock.x - 10;
 }
 
 /* INSTALL OPOS is listed only on installation media, LOG OUT only while
@@ -5709,11 +6042,41 @@ static int64_t menu_header_height(void) {
     return accounts_current() != ACCOUNT_NONE ? MENU_HEADER_HEIGHT : 0;
 }
 
+/*
+ * A popup of the given size next to the taskbar: above or below it at x
+ * (top/bottom taskbar), or beside it at y (side taskbar); kept on screen.
+ */
+static struct rect taskbar_popup_rect(int64_t x, int64_t y, int64_t width,
+                                      int64_t height) {
+    struct rect bar = taskbar_rect();
+    switch (appearance_taskbar()) {
+    case TASKBAR_TOP:
+        y = bar.y + bar.height + 4;
+        break;
+    case TASKBAR_LEFT:
+        x = bar.x + bar.width + 4;
+        break;
+    case TASKBAR_RIGHT:
+        x = bar.x - width - 4;
+        break;
+    default:
+        y = bar.y - height - 4;
+        break;
+    }
+    if (x + width > screen_width()) {
+        x = screen_width() - width;
+    }
+    if (y + height > screen_height()) {
+        y = screen_height() - height;
+    }
+    return (struct rect){x < 0 ? 0 : x, y < 0 ? 0 : y, width, height};
+}
+
 static struct rect menu_rect(void) {
     int64_t height = (int64_t)menu_visible_count() * MENU_ITEM_HEIGHT + 12
                    + menu_header_height();
-    return (struct rect){6, screen_height() - TASKBAR_HEIGHT - height - 4,
-                         MENU_WIDTH, height};
+    struct rect start = start_button_rect();
+    return taskbar_popup_rect(6, start.y, MENU_WIDTH, height);
 }
 
 static struct rect menu_item_rect(size_t index) {
@@ -5722,6 +6085,59 @@ static struct rect menu_item_rect(size_t index) {
                          menu.y + 6 + menu_header_height()
                              + (int64_t)index * MENU_ITEM_HEIGHT,
                          menu.width - 12, MENU_ITEM_HEIGHT};
+}
+
+/*
+ * Taskbar context menu (right-click on the taskbar): window layout,
+ * taskbar position, Task Manager and the Settings DESKTOP page.
+ */
+enum taskbar_menu_item {
+    TASKBAR_MENU_LAYOUT,
+    TASKBAR_MENU_BOTTOM,
+    TASKBAR_MENU_TOP,
+    TASKBAR_MENU_LEFT,
+    TASKBAR_MENU_RIGHT,
+    TASKBAR_MENU_TASKS,
+    TASKBAR_MENU_SETTINGS,
+    TASKBAR_MENU_COUNT
+};
+
+static bool taskbar_menu_open;
+static size_t taskbar_menu_selection;
+static int64_t taskbar_menu_x;
+static int64_t taskbar_menu_y;
+
+static struct rect taskbar_menu_rect(void) {
+    return taskbar_popup_rect(taskbar_menu_x, taskbar_menu_y,
+                              TASKBAR_MENU_WIDTH,
+                              TASKBAR_MENU_COUNT * MENU_ITEM_HEIGHT + 12);
+}
+
+static struct rect taskbar_menu_item_rect(size_t index) {
+    struct rect menu = taskbar_menu_rect();
+    return (struct rect){menu.x + 6,
+                         menu.y + 6 + (int64_t)index * MENU_ITEM_HEIGHT,
+                         menu.width - 12, MENU_ITEM_HEIGHT};
+}
+
+static void taskbar_menu_label(size_t item, char *text, size_t capacity) {
+    static const char *const labels[TASKBAR_MENU_COUNT] = {
+        "", "BOTTOM", "TOP", "LEFT", "RIGHT", "TASK MANAGER",
+        "TASKBAR SETTINGS",
+    };
+    if (item == TASKBAR_MENU_LAYOUT) {
+        append_text(text, capacity, 0,
+                    tiled_layout ? "SWITCH TO FLOATING" : "SWITCH TO TILING");
+        return;
+    }
+    size_t length = 0;
+    if (item >= TASKBAR_MENU_BOTTOM && item <= TASKBAR_MENU_RIGHT) {
+        bool current = appearance_taskbar()
+                     == (enum taskbar_position)(item - TASKBAR_MENU_BOTTOM);
+        length = append_text(text, capacity, 0, current ? "* " : "  ");
+        length = append_text(text, capacity, length, "TASKBAR ");
+    }
+    append_text(text, capacity, length, labels[item]);
 }
 
 static void draw_button(struct rect area, const char *label, bool active) {
@@ -5733,37 +6149,89 @@ static void draw_button(struct rect area, const char *label, bool active) {
 static void draw_taskbar(void) {
     struct rect bar = taskbar_rect();
     fill(bar, 20, 26, 40);
-    fill((struct rect){bar.x, bar.y, bar.width, 1}, 70, 90, 130);
+    /* A light line on the edge that faces the windows. */
+    switch (appearance_taskbar()) {
+    case TASKBAR_TOP:
+        fill((struct rect){bar.x, bar.y + bar.height - 1, bar.width, 1},
+             70, 90, 130);
+        break;
+    case TASKBAR_LEFT:
+        fill((struct rect){bar.x + bar.width - 1, bar.y, 1, bar.height},
+             70, 90, 130);
+        break;
+    case TASKBAR_RIGHT:
+        fill((struct rect){bar.x, bar.y, 1, bar.height}, 70, 90, 130);
+        break;
+    default:
+        fill((struct rect){bar.x, bar.y, bar.width, 1}, 70, 90, 130);
+        break;
+    }
     draw_button(start_button_rect(), "START", start_menu_open);
-    draw_button(layout_button_rect(), tiled_layout ? "TILED" : "FLOAT",
-                tiled_layout);
     for (size_t i = 0; i < tile_count; i++) {
         struct rect button = task_button_rect(i);
-        if (button.x + button.width > bar.width - CLOCK_WIDTH - 10) {
+        if (!task_button_fits(button)) {
             break;
         }
         draw_button(button, window_title(tile_order[i]),
                     window_focused(tile_order[i]));
     }
 
-    char clock[32] = "";
-    size_t length = 0;
+    char date[16] = "";
+    char time[16] = "";
     struct rtc_time now;
     if (rtc_read(&now)) {
-        length = append_date(clock, sizeof(clock), 0, &now);
-        length = append_text(clock, sizeof(clock), length, " ");
-        append_time(clock, sizeof(clock), length, &now);
+        append_date(date, sizeof(date), 0, &now);
+        append_time(time, sizeof(time), 0, &now);
     } else {
         uint64_t seconds = timer_ticks() / 100;
-        length = append_two_digits(clock, sizeof(clock), 0, seconds / 3600);
-        length = append_text(clock, sizeof(clock), length, ":");
-        length = append_two_digits(clock, sizeof(clock), length,
+        size_t length = append_two_digits(time, sizeof(time), 0,
+                                          seconds / 3600);
+        length = append_text(time, sizeof(time), length, ":");
+        length = append_two_digits(time, sizeof(time), length,
                                    seconds / 60 % 60);
-        length = append_text(clock, sizeof(clock), length, ":");
-        append_two_digits(clock, sizeof(clock), length, seconds % 60);
+        length = append_text(time, sizeof(time), length, ":");
+        append_two_digits(time, sizeof(time), length, seconds % 60);
     }
-    draw_text_clipped(bar.width - CLOCK_WIDTH, bar.y + 11, CLOCK_WIDTH - 10,
-                      clock, 230, 238, 255);
+    struct rect clock = clock_rect();
+    if (taskbar_vertical()) {
+        draw_text_clipped(clock.x + 4, clock.y + 4, clock.width - 8, date,
+                          230, 238, 255);
+        draw_text_clipped(clock.x + 4, clock.y + 8 + CHAR_HEIGHT,
+                          clock.width - 8, time, 230, 238, 255);
+    } else {
+        char line[32] = "";
+        size_t length = append_text(line, sizeof(line), 0, date);
+        if (length != 0) {
+            length = append_text(line, sizeof(line), length, " ");
+        }
+        append_text(line, sizeof(line), length, time);
+        draw_text_clipped(clock.x, clock.y + (clock.height - CHAR_HEIGHT) / 2,
+                          clock.width, line, 230, 238, 255);
+    }
+}
+
+static void draw_taskbar_menu(void) {
+    if (!taskbar_menu_open) {
+        return;
+    }
+    struct rect menu = taskbar_menu_rect();
+    fill(menu, 110, 160, 255);
+    fill((struct rect){menu.x + 2, menu.y + 2, menu.width - 4,
+                       menu.height - 4}, 26, 34, 54);
+    for (size_t i = 0; i < TASKBAR_MENU_COUNT; i++) {
+        struct rect item = taskbar_menu_item_rect(i);
+        if (i == TASKBAR_MENU_BOTTOM || i == TASKBAR_MENU_TASKS) {
+            fill((struct rect){item.x, item.y, item.width, 1}, 58, 66, 88);
+        }
+        if (i == taskbar_menu_selection) {
+            fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
+                 70, 100, 160);
+        }
+        char label[32] = "";
+        taskbar_menu_label(i, label, sizeof(label));
+        draw_text_clipped(item.x + 10, item.y + 7, item.width - 20, label,
+                          230, 238, 255);
+    }
 }
 
 static void draw_start_menu(void) {
@@ -5782,7 +6250,7 @@ static void draw_start_menu(void) {
     for (size_t i = 0; i < menu_visible_count(); i++) {
         struct rect item = menu_item_rect(i);
         enum menu_action action = menu_action_at(i);
-        if (action == MENU_TOGGLE_LAYOUT || action == MENU_REBOOT) {
+        if (action == MENU_SETTINGS || action == MENU_REBOOT) {
             fill((struct rect){item.x, item.y, item.width, 1}, 58, 66, 88);
         }
         if (i == menu_selection) {
@@ -5795,7 +6263,7 @@ static void draw_start_menu(void) {
 }
 
 static void draw_wallpaper(void) {
-    int64_t height = screen_height() - TASKBAR_HEIGHT;
+    int64_t height = screen_height();
     const uint32_t *picture = appearance_wallpaper_pixels(
         (uint32_t)screen_width(), (uint32_t)screen_height());
     if (picture != NULL) {
@@ -5811,26 +6279,65 @@ static void draw_wallpaper(void) {
              (uint8_t)(14 + shade / 4), (uint8_t)(20 + shade / 3),
              (uint8_t)(38 + shade / 2));
     }
-    if (z_count == 0) {
-        draw_text_clipped(screen_width() / 2 - 9 * CHAR_WIDTH,
-                          height / 2 - 20, 18 * CHAR_WIDTH,
-                          "OPOS DESKTOP", 151, 190, 235);
-        draw_text_clipped(screen_width() / 2 - 15 * CHAR_WIDTH,
-                          height / 2 + 14, 32 * CHAR_WIDTH,
-                          "CLICK START TO OPEN AN APP", 110, 140, 180);
+    if (z_count == 0 && !login_active) {
+        struct rect area = desktop_area();
+        int64_t center_x = area.x + area.width / 2;
+        int64_t center_y = area.y + area.height / 2;
+        draw_text_clipped(center_x - 6 * CHAR_WIDTH, center_y - 20,
+                          18 * CHAR_WIDTH, "OPOS DESKTOP", 151, 190, 235);
+        draw_text_clipped(center_x - 13 * CHAR_WIDTH, center_y + 14,
+                          32 * CHAR_WIDTH, "CLICK START TO OPEN AN APP",
+                          110, 140, 180);
     }
+}
+
+/*
+ * The status message: in a top or bottom taskbar after the window buttons
+ * when it fits there, otherwise in a box at the edge of the desktop next
+ * to the taskbar.
+ */
+static void draw_status(void) {
+    if (status_text[0] != '\0' && timer_ticks() - status_tick > STATUS_TICKS) {
+        status_text[0] = '\0';
+    }
+    if (status_text[0] == '\0') {
+        return;
+    }
+    int64_t text_width = (int64_t)text_length(status_text) * CHAR_WIDTH;
+    if (!taskbar_vertical()) {
+        size_t shown = 0;
+        while (shown < tile_count && task_button_fits(task_button_rect(shown))) {
+            shown++;
+        }
+        int64_t x = task_button_rect(shown).x;
+        int64_t width = clock_rect().x - 10 - x;
+        if (width >= text_width) {
+            struct rect bar = taskbar_rect();
+            draw_text_clipped(x, bar.y + (bar.height - CHAR_HEIGHT) / 2,
+                              width, status_text, 240, 205, 120);
+            return;
+        }
+    }
+    struct rect area = desktop_area();
+    int64_t width = text_width + 24 < area.width - 2 * GAP
+                  ? text_width + 24 : area.width - 2 * GAP;
+    int64_t height = CHAR_HEIGHT + 16;
+    int64_t y = appearance_taskbar() == TASKBAR_TOP
+              ? area.y + GAP : area.y + area.height - height - GAP;
+    struct rect box = {area.x + (area.width - width) / 2, y, width, height};
+    fill(box, 110, 160, 255);
+    fill((struct rect){box.x + 1, box.y + 1, box.width - 2, box.height - 2},
+         20, 26, 40);
+    draw_text_clipped(box.x + 12, box.y + 8, box.width - 24, status_text,
+                      240, 205, 120);
 }
 
 static void draw_scene(void) {
     bool buffered = console_frame_begin();
     draw_wallpaper();
     if (login_active) {
-        /* No taskbar on the login screen; the gradient covers its strip
-           too (a picture already fills the whole screen). */
-        if (appearance_wallpaper_pixels((uint32_t)screen_width(),
-                                        (uint32_t)screen_height()) == NULL) {
-            fill(taskbar_rect(), 14, 20, 38);
-        }
+        /* No taskbar on the login screen; the background fills the whole
+           screen. */
         draw_login();
         if (buffered) {
             console_frame_present();
@@ -5844,15 +6351,11 @@ static void draw_scene(void) {
     }
     draw_files_menu();
     draw_taskbar();
-    if (status_text[0] != '\0') {
-        int64_t x = task_button_rect(tile_count).x;
-        int64_t width = screen_width() - CLOCK_WIDTH - 10 - x;
-        draw_text_clipped(x, taskbar_rect().y + 11, width, status_text,
-                          240, 205, 120);
-    }
+    draw_status();
     if (start_menu_open) {
         draw_start_menu();
     }
+    draw_taskbar_menu();
     if (buffered) {
         console_frame_present();
     } else {
@@ -5875,6 +6378,61 @@ static void layout_toggle(void) {
 
 static void layout_load(void) {
     tiled_layout = !settings_get(SETTING_FLOATING_LAYOUT);
+}
+
+/* The taskbar position is personal too (DESKTOP.CFG). Floating windows
+   are pulled out from under the taskbar's new place. */
+static void taskbar_move(enum taskbar_position position) {
+    appearance_set_taskbar(position);
+    windows_fit_screen();
+}
+
+static void settings_open_category(enum settings_category category) {
+    window_open(WINDOW_SETTINGS);
+    settings_show_category(category);
+    settings_in_sidebar = false;
+}
+
+static void taskbar_menu_activate(size_t item) {
+    taskbar_menu_open = false;
+    switch (item) {
+    case TASKBAR_MENU_LAYOUT:
+        layout_toggle();
+        break;
+    case TASKBAR_MENU_BOTTOM:
+    case TASKBAR_MENU_TOP:
+    case TASKBAR_MENU_LEFT:
+    case TASKBAR_MENU_RIGHT:
+        taskbar_move((enum taskbar_position)(item - TASKBAR_MENU_BOTTOM));
+        break;
+    case TASKBAR_MENU_TASKS:
+        tasks_open();
+        break;
+    case TASKBAR_MENU_SETTINGS:
+        settings_open_category(CATEGORY_DESKTOP);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Up/Down/Home/End move, Enter picks, Esc closes. */
+static void taskbar_menu_key(char character) {
+    if (character == KEY_UP) {
+        taskbar_menu_selection = (taskbar_menu_selection + TASKBAR_MENU_COUNT
+                                  - 1) % TASKBAR_MENU_COUNT;
+    } else if (character == KEY_DOWN) {
+        taskbar_menu_selection = (taskbar_menu_selection + 1)
+                               % TASKBAR_MENU_COUNT;
+    } else if (character == KEY_HOME) {
+        taskbar_menu_selection = 0;
+    } else if (character == KEY_END) {
+        taskbar_menu_selection = TASKBAR_MENU_COUNT - 1;
+    } else if (character == '\n' || character == ' ') {
+        taskbar_menu_activate(taskbar_menu_selection);
+    } else if (character == KEY_ESCAPE) {
+        taskbar_menu_open = false;
+    }
 }
 
 /* Welcome opens only the first time each account (or the machine, without
@@ -5903,20 +6461,11 @@ static enum desktop_result menu_activate(enum menu_action action) {
     case MENU_TASK_MANAGER:
         tasks_open();
         break;
-    case MENU_SYSTEM_INFO:
-        window_open(WINDOW_SYSTEM_INFO);
-        break;
-    case MENU_TOGGLE_LAYOUT:
-        layout_toggle();
-        break;
     case MENU_SETTINGS:
         window_open(WINDOW_SETTINGS);
         break;
     case MENU_INSTALL:
         installer_open();
-        break;
-    case MENU_ACCOUNTS:
-        window_open(WINDOW_ACCOUNTS);
         break;
     case MENU_LOG_OUT:
         desktop_session_end();
@@ -6381,11 +6930,12 @@ static struct rect files_menu_rect(void) {
     int64_t height = (int64_t)count * LINE_HEIGHT + 8;
     int64_t x = files_menu_x;
     int64_t y = files_menu_y;
-    if (x + FILES_MENU_WIDTH > screen_width()) {
-        x = screen_width() - FILES_MENU_WIDTH;
+    struct rect area = desktop_area();
+    if (x + FILES_MENU_WIDTH > area.x + area.width) {
+        x = area.x + area.width - FILES_MENU_WIDTH;
     }
-    if (y + height > screen_height() - TASKBAR_HEIGHT) {
-        y = screen_height() - TASKBAR_HEIGHT - height;
+    if (y + height > area.y + area.height) {
+        y = area.y + area.height - height;
     }
     return (struct rect){x, y, FILES_MENU_WIDTH, height};
 }
@@ -6718,14 +7268,15 @@ static bool handle_resize(const struct drag_state *drag, int32_t x, int32_t y) {
     int64_t dy = y - drag->start_y;
     int64_t right = frame.x + frame.width;
     int64_t bottom = frame.y + frame.height;
-    int64_t max_bottom = screen_height() - TASKBAR_HEIGHT;
+    struct rect area = desktop_area();
+    int64_t max_bottom = area.y + area.height;
     if (drag->edges & EDGE_LEFT) {
         int64_t left = frame.x + dx;
         if (left > right - MIN_WINDOW_WIDTH) {
             left = right - MIN_WINDOW_WIDTH;
         }
-        if (left < 0) {
-            left = 0;
+        if (left < area.x) {
+            left = area.x;
         }
         frame.x = left;
         frame.width = right - left;
@@ -6735,8 +7286,8 @@ static bool handle_resize(const struct drag_state *drag, int32_t x, int32_t y) {
         if (new_right < frame.x + MIN_WINDOW_WIDTH) {
             new_right = frame.x + MIN_WINDOW_WIDTH;
         }
-        if (new_right > screen_width()) {
-            new_right = screen_width();
+        if (new_right > area.x + area.width) {
+            new_right = area.x + area.width;
         }
         frame.width = new_right - frame.x;
     }
@@ -6745,8 +7296,8 @@ static bool handle_resize(const struct drag_state *drag, int32_t x, int32_t y) {
         if (top > bottom - MIN_WINDOW_HEIGHT) {
             top = bottom - MIN_WINDOW_HEIGHT;
         }
-        if (top < 0) {
-            top = 0;
+        if (top < area.y) {
+            top = area.y;
         }
         frame.y = top;
         frame.height = bottom - top;
@@ -6837,6 +7388,18 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     if (files_menu_press(x, y)) {
         return DESKTOP_CONTINUE;
     }
+    if (taskbar_menu_open) {
+        taskbar_menu_open = false;
+        for (size_t i = 0; i < TASKBAR_MENU_COUNT; i++) {
+            if (rect_contains(taskbar_menu_item_rect(i), x, y)) {
+                taskbar_menu_activate(i);
+                return DESKTOP_CONTINUE;
+            }
+        }
+        if (rect_contains(taskbar_menu_rect(), x, y)) {
+            return DESKTOP_CONTINUE;
+        }
+    }
     if (start_menu_open) {
         for (size_t i = 0; i < menu_visible_count(); i++) {
             if (rect_contains(menu_item_rect(i), x, y)) {
@@ -6844,6 +7407,14 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
             }
         }
         start_menu_open = false;
+        /* The header (picture and name) opens Settings > ACCOUNTS. */
+        struct rect menu = menu_rect();
+        if (menu_header_height() != 0
+            && rect_contains((struct rect){menu.x, menu.y, menu.width,
+                                           menu_header_height()}, x, y)) {
+            settings_open_category(CATEGORY_ACCOUNTS);
+            return DESKTOP_CONTINUE;
+        }
         if (rect_contains(menu_rect(), x, y)
             || rect_contains(start_button_rect(), x, y)) {
             return DESKTOP_CONTINUE;
@@ -6854,11 +7425,10 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         if (rect_contains(start_button_rect(), x, y)) {
             start_menu_open = true;
             menu_selection = 0;
-        } else if (rect_contains(layout_button_rect(), x, y)) {
-            layout_toggle();
         } else {
             for (size_t i = 0; i < tile_count; i++) {
-                if (rect_contains(task_button_rect(i), x, y)) {
+                if (task_button_fits(task_button_rect(i))
+                    && rect_contains(task_button_rect(i), x, y)) {
                     window_raise(tile_order[i]);
                     break;
                 }
@@ -6892,8 +7462,6 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         editor_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_INSTALLER) {
         installer_click(content_rect(frame), x, y);
-    } else if (kind == WINDOW_ACCOUNTS) {
-        accounts_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_TASKS) {
         tasks_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_IMAGE) {
@@ -6901,19 +7469,7 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     } else if (window_is_app(kind)) {
         app_mouse_press(kind - WINDOW_APP, x, y, 1);
     } else if (kind == WINDOW_SETTINGS) {
-        struct rect area = content_rect(frame);
-        for (size_t i = settings_scroll; i < SETTING_ROW_COUNT; i++) {
-            struct rect row = setting_row_rect(area, i);
-            if (row.y + row.height <= area.y + area.height
-                && rect_contains(row, x, y)) {
-                /* Left half of the value box steps down, the rest up. */
-                struct rect value = setting_value_rect(row);
-                bool down = rect_contains(value, x, y)
-                          && x < value.x + value.width / 2;
-                settings_selection = i;
-                settings_change(i, down ? -1 : 1);
-            }
-        }
+        settings_click(content_rect(frame), x, y);
     }
     return DESKTOP_CONTINUE;
 }
@@ -6922,16 +7478,17 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
     struct rect *frame = &windows[drag->kind].floating;
     int64_t new_x = x - drag->offset_x;
     int64_t new_y = y - drag->offset_y;
-    int64_t max_x = screen_width() - 60;
-    int64_t max_y = screen_height() - TASKBAR_HEIGHT - TITLE_HEIGHT;
-    if (new_x < 60 - frame->width) {
-        new_x = 60 - frame->width;
+    struct rect area = desktop_area();
+    int64_t max_x = area.x + area.width - 60;
+    int64_t max_y = area.y + area.height - TITLE_HEIGHT;
+    if (new_x < area.x + 60 - frame->width) {
+        new_x = area.x + 60 - frame->width;
     }
     if (new_x > max_x) {
         new_x = max_x;
     }
-    if (new_y < 0) {
-        new_y = 0;
+    if (new_y < area.y) {
+        new_y = area.y;
     }
     if (new_y > max_y) {
         new_y = max_y;
@@ -7065,7 +7622,12 @@ static void resize_focused(char direction) {
 /* Super+key shortcuts, Hyprland style. */
 static enum desktop_result handle_super_key(char character) {
     start_menu_open = false;
+    taskbar_menu_open = false;
     switch (character) {
+    case 'i':
+    case 'I':
+        window_open(WINDOW_SETTINGS);
+        break;
     case KEY_LEFT:
     case KEY_RIGHT:
     case KEY_UP:
@@ -7119,12 +7681,18 @@ static enum desktop_result handle_key(char character, bool super) {
     if (character == KEY_SUPER) {
         start_menu_open = !start_menu_open;
         menu_selection = 0;
+        taskbar_menu_open = false;
         return DESKTOP_CONTINUE;
     }
     if (character == KEY_ESCAPE && keyboard_last_ctrl()
         && keyboard_last_shift()) {
         start_menu_open = false;
+        taskbar_menu_open = false;
         tasks_open();
+        return DESKTOP_CONTINUE;
+    }
+    if (taskbar_menu_open) {
+        taskbar_menu_key(character);
         return DESKTOP_CONTINUE;
     }
     if (start_menu_open) {
@@ -7148,8 +7716,6 @@ static enum desktop_result handle_key(char character, bool super) {
         editor_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_INSTALLER) {
         installer_key(character);
-    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_ACCOUNTS) {
-        accounts_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_TASKS) {
         tasks_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_IMAGE) {
@@ -7157,28 +7723,27 @@ static enum desktop_result handle_key(char character, bool super) {
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
         app_key(z_order[z_count - 1] - WINDOW_APP, character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
-        if (character == KEY_UP) {
-            settings_selection = (settings_selection + SETTING_ROW_COUNT - 1)
-                               % SETTING_ROW_COUNT;
-        } else if (character == KEY_DOWN) {
-            settings_selection = (settings_selection + 1) % SETTING_ROW_COUNT;
-        } else if (character == '\n' || character == ' '
-                   || character == KEY_RIGHT) {
-            settings_change(settings_selection, 1);
-        } else if (character == KEY_LEFT) {
-            settings_change(settings_selection, -1);
-        }
+        settings_key(character);
     }
     return DESKTOP_CONTINUE;
 }
 
-/* Right click: raises the window under the pointer; Files gets a menu. */
+/* Right click: raises the window under the pointer; Files gets a menu,
+   and so does the taskbar. */
 static void handle_right_press(int32_t x, int32_t y) {
     if (login_active) {
         return;
     }
     start_menu_open = false;
     files_menu_open = false;
+    taskbar_menu_open = false;
+    if (rect_contains(taskbar_rect(), x, y)) {
+        taskbar_menu_open = true;
+        taskbar_menu_selection = 0;
+        taskbar_menu_x = x;
+        taskbar_menu_y = y;
+        return;
+    }
     enum window_kind kind = window_at(x, y);
     if (kind == WINDOW_COUNT) {
         return;
@@ -8424,12 +8989,22 @@ static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
         return true;
     }
     if (kind == WINDOW_SETTINGS) {
-        /* Same row count as settings_fit. */
-        size_t visible = area.height >= 76
-                       ? (size_t)(area.height - 76) / 36 + 1 : 1;
-        settings_fit(area);
+        struct rect page = settings_page_rect(area);
+        if (x < page.x) {
+            /* Over the sidebar: the wheel flips through the pages. */
+            settings_show_category((enum settings_category)wrap_step(
+                settings_category, notches > 0 ? -1 : 1, 0,
+                CATEGORY_COUNT - 1));
+            return true;
+        }
+        size_t count = settings_row_count();
+        size_t visible = settings_visible_rows(page);
+        if (count == 0) {
+            return false;
+        }
+        settings_fit(page);
         settings_scroll = wheel_scrolled(settings_scroll, notches, 1,
-                                         SETTING_ROW_COUNT, visible);
+                                         count, visible);
         if (settings_selection < settings_scroll) {
             settings_selection = settings_scroll;
         } else if (settings_selection >= settings_scroll + visible) {

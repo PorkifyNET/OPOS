@@ -18,13 +18,18 @@ are goals, not current features.
 - Window manager with floating windows and Hyprland-style dwindle tiling,
   switchable per user (Super+T). Windows resize by their edges (floating),
   by dragging the gap between them (tiled), or with Super+Shift+arrows.
-- Taskbar with Start menu, window buttons and clock.
-- Built-in apps: Terminal, Files, Text Editor, Image Viewer, System Info,
-  Settings, Accounts, and a Welcome window shown on each user's first login.
+- Taskbar with Start menu, window buttons and clock, on the bottom, top,
+  left or right edge of the screen (per user). Right-click it for the window
+  layout, its position, Task Manager and taskbar settings.
+- Built-in apps: Terminal, Files, Text Editor, Image Viewer, Settings, and a
+  Welcome window shown on each user's first login.
+- Settings has pages for System, Accounts, Display, Appearance, Desktop,
+  Date & Time, Touchpad and About (memory, uptime, screen, disks). Clicking
+  your name in the Start menu opens Accounts.
 - Appearance per user: six colour themes (Ocean, Emerald, Violet, Rose,
   Graphite, Light), a background picture (four bundled ones, or any PNG,
   JPEG or BMP; fill, fit, stretch, center or tile), and an account picture
-  shown on the login screen, in the Start menu and in Accounts. Right-click
+  shown on the login screen, in the Start menu and in Settings > Accounts. Right-click
   a picture in Files to use it.
 - Files: browse folders, open and run files, rename, delete, and create files
   and folders (right-click menu); sidebar with home folders and every mounted
@@ -129,6 +134,7 @@ Add `-vga vmware` to test the SVGA driver, or the OVMF firmware
 | Super+Enter | Terminal |
 | Super+E | Files |
 | Super+T | Toggle tiling and floating |
+| Super+I | Settings |
 | Super+Q | Close window |
 | Super+Tab, Super+Arrows | Move focus |
 | Ctrl while choosing Reboot | Boot into the kernel shell once |

@@ -37,6 +37,15 @@ enum wallpaper_style {
     WALLPAPER_STYLE_COUNT
 };
 
+/* Where the taskbar sits; the windows get the rest of the screen. */
+enum taskbar_position {
+    TASKBAR_BOTTOM,
+    TASKBAR_TOP,
+    TASKBAR_LEFT,
+    TASKBAR_RIGHT,
+    TASKBAR_POSITION_COUNT
+};
+
 /* Bundled pictures live here (initramfs). */
 #define WALLPAPER_DIRECTORY "/share/wallpapers"
 #define ACCOUNT_PICTURE_SIZE 96
@@ -66,6 +75,10 @@ void appearance_cycle_wallpaper(int delta);
 enum wallpaper_style appearance_wallpaper_style(void);
 const char *appearance_wallpaper_style_name(enum wallpaper_style style);
 void appearance_set_wallpaper_style(enum wallpaper_style style);
+
+enum taskbar_position appearance_taskbar(void);
+const char *appearance_taskbar_name(enum taskbar_position position);
+void appearance_set_taskbar(enum taskbar_position position);
 
 /* Touchpad gestures (tap-to-click, scroll direction, pointer speed),
    saved with the other choices; applied to the touchpad on load. */

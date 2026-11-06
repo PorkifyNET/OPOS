@@ -661,10 +661,20 @@ int main(int argc, char **argv, char **envp) {
     }
 
     struct opos_event event;
+    /* Handle every queued event, then draw once: a held key queues them
+       faster than a redraw per key could keep up with. */
+    long timeout = -1;
     for (;;) {
-        if (opos_window_event(&event, -1) <= 0) {
+        long got = opos_window_event(&event, timeout);
+        if (got < 0) {
             continue;
         }
+        if (got == 0) {
+            draw();
+            timeout = -1;
+            continue;
+        }
+        timeout = 0;
         switch (event.type) {
         case OPOS_EVENT_RESIZE:
             view_width = (int)event.width;
@@ -701,6 +711,5 @@ int main(int argc, char **argv, char **envp) {
         default:
             break;
         }
-        draw();
     }
 }

@@ -131,6 +131,19 @@ static uint32_t *back_buffer;
 static uint64_t back_buffer_pixels;
 static bool back_buffer_failed;
 static bool frame_active;
+/*
+ * What the framebuffer shows, kept in RAM so a present writes only the
+ * pixels that changed. Video memory is slow to write (and very slow when it
+ * is uncached), so copying a whole frame for every typed key used to keep
+ * the processor busy. front_valid drops whenever anything draws on the
+ * screen directly, which forces the next present to copy everything.
+ */
+static uint32_t *front_buffer;
+static uint64_t front_buffer_pixels;
+static bool front_buffer_failed;
+static bool front_valid;
+static uint64_t front_width;
+static uint64_t front_height;
 static const char cursor_shape[][11] = {
     "X........",
     "XX.......",
@@ -247,6 +260,7 @@ static void framebuffer_cursor_show(void) {
     if (!frame_active) {
         /* Every direct-draw path ends here, so this marks the screen dirty. */
         display_dirty = true;
+        front_valid = false;
     }
     if (!frame_active && mouse_read_state(&state)) {
         cursor_x = state.x;
@@ -528,6 +542,23 @@ bool console_frame_begin(void) {
     if (back_buffer == NULL) {
         return false;
     }
+    if (front_buffer != NULL && front_buffer_pixels < pixels) {
+        front_buffer = NULL;
+        front_buffer_failed = false;
+        front_valid = false;
+    }
+    if (front_buffer == NULL && !front_buffer_failed) {
+        /* Same size as the back buffer, so growth up to it needs no new
+           allocation either. Without it presents copy whole frames. */
+        uint64_t room = back_buffer_pixels;
+        uint64_t physical = physical_pages_alloc_contiguous(
+            (room * sizeof(uint32_t) + 4095) / 4096);
+        front_buffer = physical == 0 ? NULL
+                                     : (uint32_t *)physical_page_to_hhdm(physical);
+        front_buffer_pixels = front_buffer == NULL ? 0 : room;
+        front_buffer_failed = front_buffer == NULL;
+        front_valid = false;
+    }
     framebuffer_cursor_hide();
     frame_active = true;
     draw_base = (uint8_t *)back_buffer;
@@ -543,20 +574,55 @@ void console_frame_present(void) {
     draw_base = (uint8_t *)active_framebuffer->address;
     draw_pitch = active_framebuffer->pitch;
     uint64_t width = active_framebuffer->width;
-    for (uint64_t y = 0; y < active_framebuffer->height; y++) {
-        const uint64_t *source = (const uint64_t *)(back_buffer + y * width);
-        volatile uint64_t *destination = (volatile uint64_t *)
+    uint64_t height = active_framebuffer->height;
+    bool shadow = front_buffer != NULL && width * height <= front_buffer_pixels;
+    bool full = !shadow || !front_valid || front_width != width
+        || front_height != height;
+    for (uint64_t y = 0; y < height; y++) {
+        const uint32_t *source = back_buffer + y * width;
+        volatile uint32_t *destination = (volatile uint32_t *)
             (draw_base + y * draw_pitch);
-        for (uint64_t x = 0; x < width / 2; x++) {
+        uint64_t first = 0;
+        uint64_t last = width;
+        if (!full) {
+            /* Only the span between the first and last changed pixel. */
+            uint32_t *shown = front_buffer + y * width;
+            while (first < width && shown[first] == source[first]) {
+                first++;
+            }
+            if (first == width) {
+                continue;
+            }
+            while (last > first && shown[last - 1] == source[last - 1]) {
+                last--;
+            }
+        }
+        uint64_t x = first;
+        if ((x & 1) != 0 && x < last) {
+            destination[x] = source[x];
+            x++;
+        }
+        for (; x + 1 < last; x += 2) {
+            ((volatile uint64_t *)destination)[x / 2] =
+                ((const uint64_t *)source)[x / 2];
+        }
+        if (x < last) {
             destination[x] = source[x];
         }
-        if ((width & 1) != 0) {
-            ((volatile uint32_t *)destination)[width - 1] =
-                back_buffer[y * width + width - 1];
+        if (shadow) {
+            uint32_t *shown = front_buffer + y * width;
+            for (uint64_t i = first; i < last; i++) {
+                shown[i] = source[i];
+            }
         }
     }
     cursor_drawn = false;
     framebuffer_cursor_show();
+    /* The cursor is drawn over the frame and removed again before the next
+       one, so the shadow still matches what lies under it. */
+    front_valid = shadow;
+    front_width = width;
+    front_height = height;
 }
 
 uint64_t console_screen_width(void) {

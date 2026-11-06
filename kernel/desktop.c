@@ -7406,8 +7406,10 @@ static bool desktop_step(void) {
         draw_scene();
     } else {
         console_cursor_refresh();
-        (void)scheduler_sleep_until(timer_ticks() + 1);
     }
+    /* Sleep after every pass, drawn or not: programs only run while the
+       desktop sleeps, and a held key must not keep it drawing nonstop. */
+    (void)scheduler_sleep_until(timer_ticks() + 1);
     return false;
 }
 

@@ -21,6 +21,8 @@
 #define KEY_PAGE_UP ((char)0x1a)
 #define KEY_PAGE_DOWN ((char)0x1c)
 #define KEY_ESCAPE ((char)0x1b)
+/* Menu (Application) key or Shift+F10: opens a context menu. */
+#define KEY_MENU ((char)0x1d)
 
 void keyboard_initialize(void);
 void keyboard_irq_handler(void);

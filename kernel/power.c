@@ -3,6 +3,7 @@
 
 #include "io.h"
 #include "memory.h"
+#include "paging.h"
 #include "power.h"
 
 #define ACPI_MAX_TABLE_SIZE (1024 * 1024)
@@ -37,11 +38,27 @@ struct acpi_table_header {
     uint32_t creator_revision;
 } __attribute__((packed));
 
+/* FADT fields used for reboot (ACPI 2.0+). */
+#define ACPI_FADT_FLAGS_OFFSET 112
+#define ACPI_FADT_RESET_REG_OFFSET 116
+#define ACPI_FADT_RESET_VALUE_OFFSET 128
+#define ACPI_FADT_RESET_REG_SUPPORTED (1u << 10)
+#define ACPI_SPACE_MEMORY 0
+#define ACPI_SPACE_IO 1
+#define ACPI_SPACE_PCI_CONFIG 2
+/* Free kernel window for a memory-mapped reset register. */
+#define ACPI_RESET_MMIO_BASE 0xffffc00000100000ULL
+
 static uint16_t pm1a_control_port;
 static uint16_t pm1b_control_port;
 static uint8_t sleep_type_a;
 static uint8_t sleep_type_b;
 static bool shutdown_available;
+
+static bool reset_register_available;
+static uint8_t reset_space;
+static uint64_t reset_address;
+static uint8_t reset_value;
 
 static bool checksum_valid(const void *data, size_t length) {
     const uint8_t *bytes = data;
@@ -240,6 +257,20 @@ bool power_initialize(const void *rsdp_address) {
         return false;
     }
     const uint8_t *fields = (const uint8_t *)fadt;
+    reset_register_available = false;
+    if (fadt->revision >= 2 && fadt->length > ACPI_FADT_RESET_VALUE_OFFSET
+        && (read_u32(fields + ACPI_FADT_FLAGS_OFFSET)
+            & ACPI_FADT_RESET_REG_SUPPORTED) != 0) {
+        const uint8_t *reg = fields + ACPI_FADT_RESET_REG_OFFSET;
+        reset_space = reg[0];
+        reset_address = read_u64(reg + 4);
+        reset_value = fields[ACPI_FADT_RESET_VALUE_OFFSET];
+        reset_register_available = reset_address != 0
+            && (reset_space == ACPI_SPACE_MEMORY
+                || (reset_space == ACPI_SPACE_IO
+                    && reset_address <= UINT16_MAX)
+                || reset_space == ACPI_SPACE_PCI_CONFIG);
+    }
     uint64_t dsdt_address = read_u32(fields + 40);
     uint32_t control_a = read_u32(fields + 64);
     uint32_t control_b = read_u32(fields + 68);
@@ -291,8 +322,58 @@ bool power_shutdown(void) {
     }
 }
 
+/* Roughly count microseconds; port 0x80 reads take about 1 us on PCs. */
+static void reboot_delay(uint32_t microseconds) {
+    for (uint32_t i = 0; i < microseconds; i++) {
+        io_in8(0x80);
+    }
+}
+
+/* Writes the FADT RESET_VALUE to RESET_REG (memory, I/O or PCI bus 0). */
+static void acpi_reset(void) {
+    if (!reset_register_available) {
+        return;
+    }
+    if (reset_space == ACPI_SPACE_IO) {
+        io_out8((uint16_t)reset_address, reset_value);
+    } else if (reset_space == ACPI_SPACE_MEMORY) {
+        uint64_t page = reset_address & ~(uint64_t)0xfff;
+        if (paging_map_page(ACPI_RESET_MMIO_BASE, page,
+                            PAGING_WRITABLE | PAGING_CACHE_DISABLE
+                            | PAGING_NO_EXECUTE)) {
+            volatile uint8_t *reg = (volatile uint8_t *)(uintptr_t)
+                (ACPI_RESET_MMIO_BASE + (reset_address & 0xfff));
+            *reg = reset_value;
+        }
+    } else {
+        /* Address: device in bits 32-47, function 16-31, offset 0-15. */
+        uint32_t device = (uint32_t)(reset_address >> 32) & 0x1f;
+        uint32_t function = (uint32_t)(reset_address >> 16) & 0x07;
+        uint32_t offset = (uint32_t)reset_address & 0xff;
+        io_out32(0xcf8, 0x80000000u | device << 11 | function << 8
+                            | (offset & 0xfc));
+        io_out8((uint16_t)(0xcfc + (offset & 3)), reset_value);
+    }
+    reboot_delay(100000);
+}
+
+/* Intel-style reset control register: system reset, then full reset. */
+static void reset_control_register(void) {
+    uint8_t value = io_in8(0xcf9) & (uint8_t)~0x0e;
+    io_out8(0xcf9, value | 0x02);
+    reboot_delay(50);
+    io_out8(0xcf9, value | 0x0e);
+    reboot_delay(100000);
+}
+
+/*
+ * Tries, in order: the ACPI reset register, the 8042 keyboard controller,
+ * the 0xCF9 reset control register, and a triple fault. Many UEFI laptops
+ * have no working 8042 reset and need one of the others.
+ */
 void power_reboot(void) {
     __asm__ volatile ("cli" : : : "memory");
+    acpi_reset();
     uint32_t wait_count = 0;
     while ((io_in8(0x64) & 0x02) != 0 && wait_count < 1000000) {
         wait_count++;
@@ -301,9 +382,8 @@ void power_reboot(void) {
     if (wait_count < 1000000) {
         io_out8(0x64, 0xfe);
     }
-    for (volatile uint32_t i = 0; i < 1000000; i++) {
-        __asm__ volatile ("pause");
-    }
+    reboot_delay(100000);
+    reset_control_register();
     struct {
         uint16_t limit;
         uintptr_t base;

@@ -199,6 +199,7 @@ void keyboard_irq_handler(void) {
         case 0x51: special = KEY_PAGE_DOWN; break;
         case 0x1c: special = '\n'; break;
         case 0x35: special = '/'; break; /* keypad / */
+        case 0x5d: special = KEY_MENU; break;
         default: return;
         }
     }
@@ -219,6 +220,9 @@ void keyboard_irq_handler(void) {
     }
     if (key == 0x01) {
         special = KEY_ESCAPE;
+    }
+    if (key == 0x44 && special == '\0' && (left_shift || right_shift)) {
+        special = KEY_MENU; /* Shift+F10 */
     }
     if (special == '\0' && key == 0x3a) {
         caps_lock = !caps_lock;

@@ -1822,6 +1822,8 @@ static bool files_menu_open;
 static bool files_menu_on_item;
 static int64_t files_menu_x;
 static int64_t files_menu_y;
+/* Item chosen with Up/Down, or -1 when none is (menu opened by mouse). */
+static int files_menu_index;
 
 static void files_draw_prompt(struct rect list);
 static void draw_files_menu(void);
@@ -3045,7 +3047,7 @@ static void draw_files(struct rect area, bool focused) {
         ? "ENTER: GO  ESC: CANCEL  RELATIVE PATHS AND .. WORK"
         : files_skipped != 0
         ? "SOME ITEMS ARE NOT SHOWN (NAME OR COUNT LIMIT)"
-        : "ENTER: OPEN  BACKSPACE: UP  CTRL+L: PATH  RIGHT-CLICK: MORE";
+        : "ENTER: OPEN  BACKSPACE: UP  CTRL+L: PATH  SHIFT+F10: MENU";
     draw_text_clipped(list.x + 12, list.y + list.height - LINE_HEIGHT + 2,
                       list.width - 24, hint, 120, 140, 175);
 }
@@ -3327,9 +3329,6 @@ static void draw_settings(struct rect area, bool focused) {
         }
         int64_t label_x = value.x + value.width + 16;
         const char *label = setting_rows[i].label;
-        if (setting_rows[i].kind == ROW_RESOLUTION && !svga_available()) {
-            label = "RESOLUTION (NEEDS VMWARE SVGA ADAPTER)";
-        }
         draw_text_clipped(label_x, row.y + 7, row.x + row.width - label_x - 8,
                           label, 230, 238, 255);
     }
@@ -3367,7 +3366,7 @@ static int wrap_step(int value, int delta, int low, int high) {
  */
 static void settings_change_resolution(int delta) {
     if (!svga_available()) {
-        set_status("RESOLUTION NEEDS THE VMWARE SVGA ADAPTER");
+        set_status("THIS DISPLAY CANNOT CHANGE RESOLUTION");
         return;
     }
     int count = (int)svga_mode_count();
@@ -6337,7 +6336,63 @@ static void files_context(struct rect area, int32_t x, int32_t y) {
     }
     files_menu_x = x;
     files_menu_y = y;
+    files_menu_index = -1;
     files_menu_open = true;
+}
+
+static void files_menu_activate(enum files_action action);
+
+/*
+ * Menu key / Shift+F10: opens the same menu for the selected row, just
+ * below it, with its first item chosen. Without a visible selection it
+ * opens the folder menu (NEW FOLDER, NEW FILE) at the top of the list.
+ */
+static void files_context_from_keyboard(void) {
+    struct rect content = content_rect(window_rect(WINDOW_FILES));
+    struct rect list = files_list_area(content);
+    files_prompt_kind = FILES_PROMPT_NONE;
+    files_clamp(list);
+    size_t rows = files_row_count();
+    size_t visible = files_visible_rows(list);
+    files_menu_on_item = false;
+    files_menu_x = list.x + 24;
+    files_menu_y = list.y + FILES_LIST_TOP;
+    if (files_selection < rows && files_selection >= files_scroll
+        && files_selection < files_scroll + visible) {
+        struct rect line = files_line_rect(list, files_selection - files_scroll);
+        files_menu_on_item = files_at_root() || files_selection != 0;
+        files_menu_y = line.y + line.height;
+    }
+    files_menu_index = 0;
+    files_menu_open = true;
+}
+
+/* Keys while the menu is open: Up/Down choose, Enter runs, Esc closes.
+   Any other key closes the menu and returns false so it is handled. */
+static bool files_menu_key(char character) {
+    enum files_action items[FILES_MENU_MAX];
+    int count = (int)files_menu_items(items);
+    if (character == KEY_UP || character == KEY_DOWN) {
+        int step = character == KEY_DOWN ? 1 : -1;
+        files_menu_index = files_menu_index < 0
+            ? (step > 0 ? 0 : count - 1)
+            : (files_menu_index + step + count) % count;
+        return true;
+    }
+    if (character == KEY_HOME || character == KEY_END) {
+        files_menu_index = character == KEY_HOME ? 0 : count - 1;
+        return true;
+    }
+    if (character == '\n') {
+        int index = files_menu_index;
+        files_menu_open = false;
+        if (index >= 0 && index < count) {
+            files_menu_activate(items[index]);
+        }
+        return true;
+    }
+    files_menu_open = false;
+    return character == KEY_ESCAPE || character == KEY_MENU;
 }
 
 static void files_menu_activate(enum files_action action) {
@@ -6405,6 +6460,9 @@ static void draw_files_menu(void) {
     for (size_t i = 0; i < count; i++) {
         struct rect line = files_menu_item_rect(menu, i);
         bool enabled = files_action_enabled(items[i]);
+        if ((int)i == files_menu_index) {
+            fill(line, 58, 82, 130);
+        }
         draw_text_clipped(line.x + 8, line.y + 3, line.width - 16,
                           files_action_labels[items[i]],
                           enabled ? 230 : 100, enabled ? 238 : 110,
@@ -6413,11 +6471,8 @@ static void draw_files_menu(void) {
 }
 
 static void files_key(char character) {
-    if (files_menu_open) {
-        files_menu_open = false;
-        if (character == KEY_ESCAPE) {
-            return;
-        }
+    if (files_menu_open && files_menu_key(character)) {
+        return;
     }
     if (files_address_editing) {
         files_address_key(character);
@@ -6425,6 +6480,10 @@ static void files_key(char character) {
     }
     if (files_prompt_kind != FILES_PROMPT_NONE) {
         files_prompt_key(character);
+        return;
+    }
+    if (character == KEY_MENU) {
+        files_context_from_keyboard();
         return;
     }
     if (keyboard_last_ctrl()) {

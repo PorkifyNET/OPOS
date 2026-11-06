@@ -1,3 +1,4 @@
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -6,9 +7,13 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "paging.h"
+#include "power.h"
 #include "scheduler.h"
 #include "timer.h"
 #include "user.h"
+
+/* Set once the local APIC is mapped (interrupts_route_legacy_pic). */
+static bool lapic_mapped;
 
 #define PIC1_COMMAND 0x20
 #define PIC1_DATA 0x21
@@ -135,6 +140,7 @@ extern void irq_stub_14(void);
 extern void irq_stub_15(void);
 extern void syscall_stub(void);
 extern void yield_stub(void);
+extern void device_irq_stub(void);
 extern void syscall_entry(void);
 extern void gdt_load(const struct gdt_register *gdtr);
 extern void tss_load(uint16_t selector);
@@ -293,6 +299,7 @@ bool interrupts_route_legacy_pic(void) {
     value &= ~(APIC_LVT_DELIVERY_MASK | APIC_LVT_MASKED);
     value |= APIC_LVT_DELIVERY_EXTINT;
     *lint0 = value;
+    lapic_mapped = true;
     return true;
 }
 
@@ -308,6 +315,7 @@ void interrupts_initialize(void) {
     }
     idt_set_gate(SYSCALL_VECTOR, (uintptr_t)syscall_stub, 0xee);
     idt_set_gate(SCHEDULER_YIELD_VECTOR, (uintptr_t)yield_stub, 0x8e);
+    idt_set_gate(INTERRUPTS_DEVICE_VECTOR, (uintptr_t)device_irq_stub, 0x8e);
 
     const struct idt_register idtr = {
         .limit = sizeof(idt) - 1,
@@ -335,10 +343,118 @@ void interrupts_unmask_irq(uint8_t irq) {
     }
 }
 
+/* ------------------------------------------- one IOAPIC-routed device
+
+   OPOS runs on the 8259 PIC (through LINT0). A device whose interrupt
+   only reaches the IOAPIC (a GSI above 15, like a laptop's I2C touchpad)
+   gets one redirection entry here, delivered to this CPU's local APIC on
+   INTERRUPTS_DEVICE_VECTOR and acknowledged with a local APIC EOI. */
+
+#define LAPIC_VIRTUAL 0xffffc00000000000ULL
+#define LAPIC_ID 0x20
+#define LAPIC_EOI 0xb0
+#define LAPIC_SPURIOUS 0xf0
+#define IOAPIC_VIRTUAL 0xffffc00000190000ULL
+
+static volatile uint32_t *ioapic;
+static uint32_t routed_pin;
+static uint32_t routed_low;
+static void (*routed_handler)(void);
+
+static uint32_t ioapic_read(uint32_t reg) {
+    ioapic[0] = reg;
+    return ioapic[4];
+}
+
+static void ioapic_write(uint32_t reg, uint32_t value) {
+    ioapic[0] = reg;
+    ioapic[4] = value;
+}
+
+static uint32_t lapic_read(uint32_t offset) {
+    return *(volatile uint32_t *)(LAPIC_VIRTUAL + offset);
+}
+
+static void lapic_write(uint32_t offset, uint32_t value) {
+    *(volatile uint32_t *)(LAPIC_VIRTUAL + offset) = value;
+}
+
+static uint32_t madt_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16
+        | (uint32_t)p[3] << 24;
+}
+
+const char *interrupts_route_gsi(uint32_t gsi, bool level, bool active_low,
+                                 void (*handler)(void)) {
+    if (!lapic_mapped) {
+        return "no local APIC (x2APIC or disabled)";
+    }
+    if ((lapic_read(LAPIC_SPURIOUS) & 0x100) == 0) {
+        return "local APIC software-disabled";
+    }
+    size_t length = 0;
+    const uint8_t *madt = power_find_table("APIC", &length);
+    if (madt == NULL || length < 44) {
+        return "no MADT";
+    }
+    for (size_t at = 44; at + 2 <= length;) {
+        uint8_t type = madt[at];
+        uint8_t entry_length = madt[at + 1];
+        if (entry_length < 2 || at + entry_length > length) {
+            break;
+        }
+        if (type == 1 && entry_length >= 12) {
+            uint32_t address = madt_u32(madt + at + 4);
+            uint32_t base = madt_u32(madt + at + 8);
+            if (gsi >= base) {
+                if (!paging_map_page(IOAPIC_VIRTUAL, address & ~0xfffu,
+                                     PAGING_WRITABLE | PAGING_CACHE_DISABLE
+                                         | PAGING_NO_EXECUTE)) {
+                    return "IOAPIC not mapped";
+                }
+                ioapic = (volatile uint32_t *)(IOAPIC_VIRTUAL + (address & 0xfff));
+                uint32_t entries = ((ioapic_read(1) >> 16) & 0xff) + 1;
+                if (gsi - base < entries) {
+                    routed_pin = gsi - base;
+                    routed_handler = handler;
+                    uint32_t destination = lapic_read(LAPIC_ID) >> 24;
+                    routed_low = INTERRUPTS_DEVICE_VECTOR
+                        | (active_low ? (1u << 13) : 0)
+                        | (level ? (1u << 15) : 0);
+                    ioapic_write(0x10 + 2 * routed_pin, routed_low | (1u << 16));
+                    ioapic_write(0x11 + 2 * routed_pin, destination << 24);
+                    ioapic_write(0x10 + 2 * routed_pin, routed_low);
+                    return NULL;
+                }
+                ioapic = NULL;
+            }
+        }
+        at += entry_length;
+    }
+    return "GSI not on any IOAPIC";
+}
+
+void interrupts_gsi_mask(bool masked) {
+    if (ioapic == NULL) {
+        return;
+    }
+    ioapic_write(0x10 + 2 * routed_pin,
+                 routed_low | (masked ? (1u << 16) : 0));
+}
+
 void *irq_handler(uint64_t vector, void *interrupt_frame) {
     if (vector == SCHEDULER_YIELD_VECTOR) {
         /* Not a hardware interrupt: no end-of-interrupt to send. */
         return user_preempt_check(scheduler_yield(interrupt_frame));
+    }
+    if (vector == INTERRUPTS_DEVICE_VECTOR) {
+        if (routed_handler != NULL) {
+            routed_handler();
+        } else {
+            interrupts_gsi_mask(true);
+        }
+        lapic_write(LAPIC_EOI, 0);
+        return interrupt_frame;
     }
     if (vector == PIC1_OFFSET) {
         timer_irq_handler();

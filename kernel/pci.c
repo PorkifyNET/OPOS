@@ -224,6 +224,38 @@ bool pci_enable_nvme_memory_and_bus_master(void) {
     return true;
 }
 
+size_t pci_list(struct pci_function_info *functions, size_t max) {
+    size_t count = 0;
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            if (!pci_function_exists((uint8_t)bus, device, 0)) {
+                continue;
+            }
+            uint8_t header_type = (uint8_t)(pci_read_config32(
+                (uint8_t)bus, device, 0, 0x0c) >> 16);
+            uint8_t function_count =
+                (header_type & PCI_HEADER_TYPE_MULTI_FUNCTION) != 0 ? 8 : 1;
+            for (uint8_t function = 0; function < function_count; function++) {
+                uint32_t identifier =
+                    pci_read_config32((uint8_t)bus, device, function, 0);
+                if ((uint16_t)identifier == PCI_VENDOR_ID_INVALID) {
+                    continue;
+                }
+                if (count < max) {
+                    functions[count] = (struct pci_function_info){
+                        {(uint8_t)bus, device, function,
+                         (uint16_t)identifier, (uint16_t)(identifier >> 16)},
+                        pci_read_config32((uint8_t)bus, device, function, 0x08)
+                            >> 8,
+                    };
+                }
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 bool pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
                     size_t index, struct pci_device *found) {
     for (uint16_t bus = 0; bus < 256; bus++) {
@@ -260,6 +292,45 @@ bool pci_find_class(uint8_t class_code, uint8_t subclass, uint8_t prog_if,
         }
     }
     return false;
+}
+
+int pci_set_power_d0(const struct pci_device *device) {
+    if (device == NULL) {
+        return -1;
+    }
+    uint32_t status = pci_read_config32(device->bus, device->device,
+                                        device->function, 0x04) >> 16;
+    if ((status & (1u << 4)) == 0) {
+        return -1; /* no capability list */
+    }
+    uint8_t pointer = (uint8_t)pci_read_config32(
+        device->bus, device->device, device->function, 0x34) & 0xfc;
+    for (int guard = 0; pointer >= 0x40 && guard < 48; guard++) {
+        uint32_t header = pci_read_config32(device->bus, device->device,
+                                            device->function, pointer);
+        if ((uint8_t)header == 0x01) {
+            uint8_t control = pointer + 4;
+            uint32_t value = pci_read_config32(device->bus, device->device,
+                                               device->function, control);
+            int state = (int)(value & 3);
+            if (state != 0) {
+                /* Keep PME status (bit 15, write-1-to-clear) untouched. */
+                value &= ~(uint32_t)(3u | (1u << 15));
+                io_out32(PCI_CONFIG_ADDRESS,
+                         0x80000000u | ((uint32_t)device->bus << 16)
+                             | ((uint32_t)device->device << 11)
+                             | ((uint32_t)device->function << 8) | control);
+                io_out32(PCI_CONFIG_DATA, value);
+                /* D3hot to D0 needs 10 ms before the device is used. */
+                for (uint32_t i = 0; i < 10000; i++) {
+                    io_in8(0x80);
+                }
+            }
+            return state;
+        }
+        pointer = (uint8_t)(header >> 8) & 0xfc;
+    }
+    return -1;
 }
 
 uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset) {

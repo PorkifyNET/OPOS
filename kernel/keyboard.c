@@ -5,6 +5,7 @@
 #include "interrupts.h"
 #include "io.h"
 #include "keyboard.h"
+#include "mouse.h"
 #include "scheduler.h"
 
 #define KEYBOARD_DATA_PORT 0x60
@@ -138,6 +139,17 @@ void keyboard_initialize(void) {
 }
 
 void keyboard_irq_handler(void) {
+    /* Real 8042s can raise IRQ 1 while the byte waiting is the
+       touchpad's (AUX flag set): hand it to the mouse driver instead of
+       reading it as a key. An empty buffer means a spurious IRQ. */
+    uint8_t status = io_in8(KEYBOARD_STATUS_PORT);
+    if ((status & 0x01) == 0) {
+        return;
+    }
+    if ((status & 0x20) != 0) {
+        mouse_irq_handler();
+        return;
+    }
     uint8_t scancode = io_in8(KEYBOARD_DATA_PORT);
     if (scancode == KEYBOARD_ACK || scancode == KEYBOARD_RESEND) {
         if (led_command_pending) {

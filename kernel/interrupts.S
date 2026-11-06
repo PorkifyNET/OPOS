@@ -76,6 +76,13 @@ IRQ_STUB 13
 IRQ_STUB 14
 IRQ_STUB 15
 
+.global device_irq_stub
+.type device_irq_stub, @function
+device_irq_stub:
+    pushq $0
+    pushq $0x70
+    jmp irq_common
+
 .global yield_stub
 .type yield_stub, @function
 yield_stub:

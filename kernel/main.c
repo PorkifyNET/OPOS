@@ -12,6 +12,7 @@
 #include "keyboard.h"
 #include "memory.h"
 #include "mouse.h"
+#include "i2c_hid.h"
 #include "paging.h"
 #include "power.h"
 #include "scheduler.h"
@@ -1301,7 +1302,9 @@ void kmain(void) {
     if (mouse_initialize(active_framebuffer->width, active_framebuffer->height)) {
         console_write_string("OPOS: PS/2 mouse ready\n");
     } else {
-        console_write_string("OPOS: PS/2 mouse unavailable\n");
+        console_write_string("OPOS: PS/2 mouse unavailable: ");
+        console_write_string(mouse_failure_reason());
+        console_write_string("\n");
     }
     vmware_initialize();
     vmware_set_autofit(settings_display_mode() == VMWARE_DISPLAY_AUTOFIT);
@@ -1316,6 +1319,14 @@ void kmain(void) {
     storage_initialize();
     serial_write_string(xhci_ready() ? "OPOS: USB controller ready\n"
                                      : "OPOS: no USB controller used\n");
+    /* I2C touchpad (laptops). Its reset waits about 150 ms. */
+    if (i2c_hid_initialize()) {
+        console_write_string("OPOS: I2C touchpad ready\n");
+    } else if (i2c_hid_present()) {
+        console_write_string("OPOS: I2C touchpad unavailable: ");
+        console_write_string(i2c_hid_stage());
+        console_write_string("\n");
+    }
     for (size_t i = 0; i < block_disk_count(); i++) {
         struct block_disk_info info;
         if (block_disk_info(i, &info) && info.removable) {
@@ -1342,6 +1353,7 @@ void kmain(void) {
             shell_handle_character(character);
         }
         vmware_tools_poll();
+        i2c_hid_poll();
         console_cursor_refresh();
 
         uint64_t dropped = keyboard_dropped_characters();

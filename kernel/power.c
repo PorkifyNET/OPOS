@@ -55,6 +55,11 @@ static uint8_t sleep_type_a;
 static uint8_t sleep_type_b;
 static bool shutdown_available;
 
+/* Kept for power_scan_input_devices. */
+static const struct acpi_table_header *acpi_root;
+static size_t acpi_entry_size;
+static const struct acpi_table_header *acpi_fadt;
+
 static bool reset_register_available;
 static uint8_t reset_space;
 static uint64_t reset_address;
@@ -253,6 +258,9 @@ bool power_initialize(const void *rsdp_address) {
     }
 
     const struct acpi_table_header *fadt = find_fadt(root, entry_size);
+    acpi_root = root;
+    acpi_entry_size = entry_size;
+    acpi_fadt = fadt;
     if (fadt == NULL || fadt->length < 90) {
         return false;
     }
@@ -390,4 +398,207 @@ void power_reboot(void) {
     } __attribute__((packed)) invalid_idt = {0, 0};
     __asm__ volatile ("lidt %0; int3" : : "m"(invalid_idt) : "memory");
     __builtin_unreachable();
+}
+
+/* ------------------------------------------- input device discovery */
+
+/* EISA IDs as AML stores them after a DWordPrefix (0x0C): the compressed
+   vendor "PNP" is 0x41 0xD0, then the product number, high byte first. */
+static bool eisa_id_at(const uint8_t *aml, size_t i, size_t end,
+                       uint8_t product_high, int product_low) {
+    return i + 5 <= end && aml[i] == 0x0c && aml[i + 1] == 0x41
+        && aml[i + 2] == 0xd0 && aml[i + 3] == product_high
+        && (product_low < 0 || aml[i + 4] == (uint8_t)product_low);
+}
+
+static bool string_at(const uint8_t *aml, size_t i, size_t end,
+                      const char *text) {
+    /* StringPrefix (0x0D), the text, then NUL. */
+    if (i >= end || aml[i] != 0x0d) {
+        return false;
+    }
+    size_t at = i + 1;
+    for (; *text != '\0'; text++, at++) {
+        if (at >= end || aml[at] != (uint8_t)*text) {
+            return false;
+        }
+    }
+    return at < end && aml[at] == 0;
+}
+
+static bool starts_with(const char *text, const char *prefix) {
+    for (; *prefix != '\0'; prefix++, text++) {
+        if (*text != *prefix) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* _HID strings of the common touchpad makers (PS/2 and I2C). */
+static bool touchpad_vendor(const char *hid) {
+    static const char *const prefixes[] = {
+        "SYN", "ELAN", "ETD", "ALP", "DLL", "CYAP", "FTE", "MSFT0001",
+        "ATML", "GXTP", "PIXA", "HTIX", "SPPT", "BLTP", "LEN0", "ACPI0C50",
+    };
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        if (starts_with(hid, prefixes[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void note_hid(struct power_input_report *report, const char *hid) {
+    for (size_t i = 0; i < report->touchpad_hid_count; i++) {
+        size_t j = 0;
+        while (j < sizeof(report->touchpad_hids[i]) && hid[j] != '\0'
+               && report->touchpad_hids[i][j] == hid[j]) {
+            j++;
+        }
+        if (hid[j] == '\0' && report->touchpad_hids[i][j] == '\0') {
+            return;
+        }
+    }
+    if (report->touchpad_hid_count < POWER_INPUT_MAX_HIDS) {
+        char *slot = report->touchpad_hids[report->touchpad_hid_count++];
+        size_t j = 0;
+        for (; j + 1 < sizeof(report->touchpad_hids[0]) && hid[j] != '\0'; j++) {
+            slot[j] = hid[j];
+        }
+        slot[j] = '\0';
+    }
+}
+
+static void scan_table(const struct acpi_table_header *table,
+                       struct power_input_report *report) {
+    const uint8_t *aml = (const uint8_t *)table;
+    size_t end = table->length;
+    for (size_t i = sizeof(*table); i < end; i++) {
+        if (eisa_id_at(aml, i, end, 0x0f, -1)
+            || string_at(aml, i, end, "PNP0F13")) {
+            report->ps2_mouse++;            /* PNP0Fxx: PS/2 mouse */
+        } else if (eisa_id_at(aml, i, end, 0x03, -1)) {
+            report->ps2_keyboard++;         /* PNP03xx: PS/2 keyboard */
+        } else if (eisa_id_at(aml, i, end, 0x0c, 0x50)
+                   || string_at(aml, i, end, "PNP0C50")
+                   || string_at(aml, i, end, "ACPI0C50")) {
+            report->i2c_hid++;              /* HID over I2C */
+        }
+        /* Name (_HID, "XXXX....") */
+        if (i + 6 < end && aml[i] == 0x08 && aml[i + 1] == '_'
+            && aml[i + 2] == 'H' && aml[i + 3] == 'I' && aml[i + 4] == 'D'
+            && aml[i + 5] == 0x0d) {
+            char hid[POWER_INPUT_HID_LENGTH];
+            size_t length = 0;
+            size_t at = i + 6;
+            while (at < end && aml[at] >= 0x20 && aml[at] < 0x7f
+                   && length + 1 < sizeof(hid)) {
+                hid[length++] = (char)aml[at++];
+            }
+            hid[length] = '\0';
+            if (at < end && aml[at] == 0 && length >= 7 && touchpad_vendor(hid)) {
+                note_hid(report, hid);
+            }
+        }
+    }
+}
+
+static bool signature_is(const struct acpi_table_header *table,
+                         const char *signature) {
+    return table->signature[0] == signature[0]
+        && table->signature[1] == signature[1]
+        && table->signature[2] == signature[2]
+        && table->signature[3] == signature[3];
+}
+
+const uint8_t *power_find_table(const char *signature, size_t *length) {
+    if (acpi_root == NULL) {
+        return NULL;
+    }
+    size_t entries_length = acpi_root->length - sizeof(*acpi_root);
+    const uint8_t *entries = (const uint8_t *)acpi_root + sizeof(*acpi_root);
+    for (size_t offset = 0; offset + acpi_entry_size <= entries_length;
+         offset += acpi_entry_size) {
+        uint64_t address = acpi_entry_size == 8
+            ? read_u64(entries + offset) : read_u32(entries + offset);
+        const struct acpi_table_header *table = physical_table(address);
+        if (table != NULL && signature_is(table, signature)) {
+            *length = table->length;
+            return (const uint8_t *)table;
+        }
+    }
+    return NULL;
+}
+
+size_t power_aml_tables(struct power_aml_table *tables, size_t max) {
+    size_t count = 0;
+    if (acpi_root == NULL) {
+        return 0;
+    }
+    if (acpi_fadt != NULL && acpi_fadt->length >= 44 && count < max) {
+        const uint8_t *fields = (const uint8_t *)acpi_fadt;
+        uint64_t dsdt_address = read_u32(fields + 40);
+        if (acpi_fadt->length >= 148 && read_u64(fields + 140) != 0) {
+            dsdt_address = read_u64(fields + 140);
+        }
+        const struct acpi_table_header *dsdt =
+            dsdt_address != 0 ? physical_table(dsdt_address) : NULL;
+        if (dsdt != NULL && signature_is(dsdt, "DSDT")) {
+            tables[count++] = (struct power_aml_table){
+                (const uint8_t *)dsdt, dsdt->length,
+            };
+        }
+    }
+    size_t entries_length = acpi_root->length - sizeof(*acpi_root);
+    const uint8_t *entries = (const uint8_t *)acpi_root + sizeof(*acpi_root);
+    for (size_t offset = 0; offset + acpi_entry_size <= entries_length
+         && count < max; offset += acpi_entry_size) {
+        uint64_t address = acpi_entry_size == 8
+            ? read_u64(entries + offset) : read_u32(entries + offset);
+        const struct acpi_table_header *table = physical_table(address);
+        if (table != NULL && signature_is(table, "SSDT")) {
+            tables[count++] = (struct power_aml_table){
+                (const uint8_t *)table, table->length,
+            };
+        }
+    }
+    return count;
+}
+
+void power_scan_input_devices(struct power_input_report *report) {
+    *report = (struct power_input_report){0};
+    if (acpi_root == NULL) {
+        return;
+    }
+    if (acpi_fadt != NULL) {
+        const uint8_t *fields = (const uint8_t *)acpi_fadt;
+        /* IAPC_BOOT_ARCH (ACPI 2.0+), bit 1: the board has an 8042. */
+        if (acpi_fadt->revision >= 2 && acpi_fadt->length >= 111) {
+            report->boot_flags_valid = true;
+            report->has_8042 = (fields[109] & 0x02) != 0;
+        }
+        uint64_t dsdt_address = acpi_fadt->length >= 44 ? read_u32(fields + 40) : 0;
+        if (acpi_fadt->length >= 148 && read_u64(fields + 140) != 0) {
+            dsdt_address = read_u64(fields + 140);
+        }
+        const struct acpi_table_header *dsdt =
+            dsdt_address != 0 ? physical_table(dsdt_address) : NULL;
+        if (dsdt != NULL && signature_is(dsdt, "DSDT")) {
+            scan_table(dsdt, report);
+            report->tables_scanned++;
+        }
+    }
+    size_t entries_length = acpi_root->length - sizeof(*acpi_root);
+    const uint8_t *entries = (const uint8_t *)acpi_root + sizeof(*acpi_root);
+    for (size_t offset = 0; offset + acpi_entry_size <= entries_length;
+         offset += acpi_entry_size) {
+        uint64_t address = acpi_entry_size == 8
+            ? read_u64(entries + offset) : read_u32(entries + offset);
+        const struct acpi_table_header *table = physical_table(address);
+        if (table != NULL && signature_is(table, "SSDT")) {
+            scan_table(table, report);
+            report->tables_scanned++;
+        }
+    }
 }

@@ -30,6 +30,13 @@ struct pci_device {
     uint16_t device_id;
 };
 
+struct pci_function_info {
+    struct pci_device device;
+    uint32_t class_code; /* class << 16 | subclass << 8 | prog-if */
+};
+/* Stores up to max functions; returns how many exist (may be more). */
+size_t pci_list(struct pci_function_info *functions, size_t max);
+
 /* Finds the first function with this vendor/device ID. */
 bool pci_find_device(uint16_t vendor_id, uint16_t device_id,
                      struct pci_device *found);
@@ -43,6 +50,9 @@ uint64_t pci_bar_address(const struct pci_device *device, uint8_t bar,
                          bool *io_space);
 /* Sets I/O space, memory space and bus master in the command register. */
 void pci_enable_device(const struct pci_device *device);
+/* Puts the function in power state D0 through its PCI power management
+   capability. Returns the state it was in (0-3), or -1 without one. */
+int pci_set_power_d0(const struct pci_device *device);
 /* Reads a 32-bit configuration register (offset is rounded down to 4). */
 uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset);
 

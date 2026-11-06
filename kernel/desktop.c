@@ -8,6 +8,7 @@
 #include "cmos.h"
 #include "console.h"
 #include "desktop.h"
+#include "i2c_hid.h"
 #include "fat16.h"
 #include "font.h"
 #include "initramfs.h"
@@ -8315,6 +8316,7 @@ static bool desktop_step(void) {
     int64_t width_before = screen_width();
     int64_t height_before = screen_height();
     vmware_tools_poll();
+    i2c_hid_poll();
     if (screen_width() != width_before || screen_height() != height_before) {
         windows_fit_screen();
         redraw = true;

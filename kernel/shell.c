@@ -5,6 +5,8 @@
 #include "console.h"
 #include "desktop.h"
 #include "accounts.h"
+#include "acpi_dump.h"
+#include "i2c_hid.h"
 #include "ahci.h"
 #include "block.h"
 #include "fat16.h"
@@ -495,7 +497,7 @@ static void execute_command(void) {
         return;
     }
     if (command_matches(command, command_length, "help")) {
-        console_write_string("Commands: help, echo, uptime, clear, mouse, desktop, disk, "
+        console_write_string("Commands: help, echo, uptime, clear, mouse, touchpad, pci, desktop, disk, "
                              "storage, drives, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
                              "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
                              "run nx, run input, run user-shell, run elf, run [/]path, "
@@ -536,7 +538,9 @@ static void execute_command(void) {
     } else if (command_matches(command, command_length, "mouse")) {
         struct mouse_state state;
         if (!mouse_read_state(&state)) {
-            console_write_warning("PS/2 mouse unavailable.\n");
+            console_write_warning("PS/2 mouse unavailable: ");
+            console_write_warning(mouse_failure_reason());
+            console_write_warning("\n");
         } else {
             console_write_string("Pointer: x=");
             write_decimal((uint64_t)state.x);
@@ -546,6 +550,43 @@ static void execute_command(void) {
             write_decimal(state.buttons);
             console_write_string("\n");
         }
+        uint8_t device_id;
+        if (mouse_reset_info(&device_id)) {
+            console_write_string("PS/2 device ID: ");
+            console_write_hex(device_id);
+            console_write_string("\n");
+        } else {
+            console_write_string("PS/2 device did not answer a reset.\n");
+        }
+        /* What the firmware says is there, to tell a PS/2 touchpad from
+           an I2C one that OPOS has no driver for yet. */
+        struct power_input_report input;
+        power_scan_input_devices(&input);
+        console_write_string("ACPI tables scanned: ");
+        write_decimal(input.tables_scanned);
+        console_write_string("\n8042 controller flag: ");
+        console_write_string(!input.boot_flags_valid ? "not reported"
+                             : input.has_8042 ? "yes" : "no");
+        console_write_string("\nACPI PS/2 keyboard entries: ");
+        write_decimal(input.ps2_keyboard);
+        console_write_string("\nACPI PS/2 mouse entries: ");
+        write_decimal(input.ps2_mouse);
+        console_write_string("\nACPI I2C HID entries: ");
+        write_decimal(input.i2c_hid);
+        console_write_string("\nTouchpad IDs:");
+        if (input.touchpad_hid_count == 0) {
+            console_write_string(" none");
+        }
+        for (size_t i = 0; i < input.touchpad_hid_count; i++) {
+            console_write_string(" ");
+            console_write_string(input.touchpad_hids[i]);
+        }
+        console_write_string("\n");
+    } else if (command_matches(command, command_length, "touchpad")) {
+        acpi_dump_touchpad();
+        i2c_hid_write_status();
+    } else if (command_matches(command, command_length, "pci")) {
+        acpi_dump_pci();
     } else if (command_matches(command, command_length, "desktop")) {
         desktop_run();
     } else if (command_matches(command, command_length, "drives")) {

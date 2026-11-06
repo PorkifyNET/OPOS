@@ -14,4 +14,14 @@ void exception_handler(uint64_t vector, uint64_t error_code, uint64_t instructio
                        uint64_t code_segment, void *exception_frame);
 void *irq_handler(uint64_t vector, void *interrupt_frame);
 
+/* Vector of the one device routed through the IOAPIC. */
+#define INTERRUPTS_DEVICE_VECTOR 0x70
+/* Routes ACPI GSI gsi to handler (runs in interrupt context; the local
+   APIC EOI is sent after it). Returns NULL on success, else the reason.
+   Only one GSI can be routed. */
+const char *interrupts_route_gsi(uint32_t gsi, bool level, bool active_low,
+                                 void (*handler)(void));
+/* Masks or unmasks the routed GSI. */
+void interrupts_gsi_mask(bool masked);
+
 #endif

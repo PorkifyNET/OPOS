@@ -32,8 +32,12 @@ are goals, not current features.
   shown on the login screen, in the Start menu and in Settings > Accounts. Right-click
   a picture in Files to use it.
 - Files: browse folders, open and run files, rename, delete, and create files
-  and folders (right-click menu); sidebar with home folders and every mounted
-  volume; back/forward/up buttons and an address bar (Ctrl+L).
+  and folders (right-click menu); select several items with Ctrl+click,
+  Shift+click, Shift+arrows or Ctrl+A; drag items onto a folder, `..` or a
+  sidebar place to move them (copied when they come from a read-only place
+  or another volume); a sidebar grouped into your folders and This PC;
+  back/forward/up buttons and an address bar (Ctrl+L).
+- Start > Programs lists the programs in `/bin`.
 - Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
   selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
   editor remains for administrators editing system files and as a fallback.

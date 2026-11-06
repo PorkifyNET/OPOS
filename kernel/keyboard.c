@@ -344,6 +344,10 @@ bool keyboard_ctrl_held(void) {
     return ctrl_down;
 }
 
+bool keyboard_shift_held(void) {
+    return left_shift || right_shift;
+}
+
 uint64_t keyboard_dropped_characters(void) {
     return dropped_characters;
 }

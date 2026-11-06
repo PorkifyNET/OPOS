@@ -30,6 +30,8 @@ bool keyboard_read_character(char *character);
 bool keyboard_wait_character(char *character);
 uint64_t keyboard_dropped_characters(void);
 bool keyboard_ctrl_held(void);
+/* Whether Shift is held now (for Shift+click). */
+bool keyboard_shift_held(void);
 /* Whether Ctrl was held when the last character read was typed. Use this
    for shortcuts: Ctrl may be released before the character is handled. */
 bool keyboard_last_ctrl(void);

@@ -117,6 +117,7 @@ static void layout_toggle(void);
 static void taskbar_move(enum taskbar_position position);
 static void welcome_open_first_time(void);
 static bool start_menu_open;
+static bool programs_open; /* Start > PROGRAMS submenu (see programs_*) */
 static size_t menu_selection;
 static size_t settings_selection;
 static bool exit_to_shell;
@@ -130,6 +131,7 @@ enum menu_action {
     MENU_FILES,
     MENU_TEXT_EDITOR,
     MENU_TASK_MANAGER,
+    MENU_PROGRAMS,
     MENU_SETTINGS,
     MENU_INSTALL,
     MENU_LOG_OUT,
@@ -139,7 +141,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "PROGRAMS", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -1771,14 +1773,45 @@ static size_t files_scroll;
 static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
 
+/*
+ * Multi-selection: entries marked with Ctrl+click, Shift+click,
+ * Shift+arrows or Ctrl+A. With nothing marked, the cursor row
+ * (files_selection) alone is selected. files_anchor is the row that
+ * Shift extends from. Reloading the folder clears the marks.
+ */
+static bool files_marked[FILES_ENTRY_CAPACITY];
+static size_t files_marked_count;
+static size_t files_anchor;
+
+/* Dragging the selection: files_dragging once the pointer moved far
+   enough; the drop target under the pointer is highlighted. */
+#define FILES_DRAG_THRESHOLD 6
+static bool files_drag_armed;
+static bool files_dragging;
+static int32_t files_drag_start_x;
+static int32_t files_drag_start_y;
+static int32_t files_drag_x;
+static int32_t files_drag_y;
+static size_t files_drop_place = (size_t)-1;
+static size_t files_drop_row = (size_t)-1;
+
+static void files_marks_clear(void) {
+    for (size_t i = 0; i < FILES_ENTRY_CAPACITY; i++) {
+        files_marked[i] = false;
+    }
+    files_marked_count = 0;
+}
+
 struct files_place {
-    char label[16];
+    char label[24];
     char path[96];
+    bool heading; /* a group title; it opens its path too */
 };
 
-/* Sidebar places: the logged-in account's home folders, then the system
-   places. Rebuilt on login, logout, account rename and whenever the Files
-   folder reloads (volume labels change after a format or install). */
+/* Sidebar places in two groups: the logged-in account (its name opens the
+   home folder) with its personal folders, then THIS PC with the root and
+   every volume. Rebuilt on login, logout, account rename and whenever the
+   Files folder reloads (volume labels change after a format or install). */
 static struct files_place files_places[32];
 static size_t files_place_count;
 
@@ -1805,26 +1838,33 @@ static bool files_is_drives_path(const char *path, size_t length) {
     return true;
 }
 
-static void files_place_add(const char *label, const char *path) {
+static void files_place_add_kind(const char *label, const char *path,
+                                 bool heading) {
     if (files_place_count >= sizeof(files_places) / sizeof(files_places[0])) {
         return;
     }
     struct files_place *place = &files_places[files_place_count++];
     text_copy(place->label, sizeof(place->label), label);
     text_copy(place->path, sizeof(place->path), path);
+    place->heading = heading;
+}
+
+static void files_place_add(const char *label, const char *path) {
+    files_place_add_kind(label, path, false);
 }
 
 static void files_places_rebuild(void) {
     static const char *const home_labels[] = {
-        "DOCUMENTS", "PICTURES", "MUSIC", "VIDEOS", "DOWNLOADS",
+        "DOWNLOADS", "DOCUMENTS", "PICTURES", "MUSIC", "VIDEOS",
     };
     static const char *const home_folders[] = {
-        "Documents", "Pictures", "Music", "Videos", "Downloads",
+        "Downloads", "Documents", "Pictures", "Music", "Videos",
     };
     files_place_count = 0;
     char path[96];
-    if (accounts_home_path(NULL, path, sizeof(path)) != 0) {
-        files_place_add("HOME", path);
+    size_t me = accounts_current();
+    if (me != ACCOUNT_NONE && accounts_home_path(NULL, path, sizeof(path)) != 0) {
+        files_place_add_kind(accounts_name(me), path, true);
         for (size_t i = 0; i < sizeof(home_labels) / sizeof(home_labels[0]);
              i++) {
             if (accounts_home_path(home_folders[i], path, sizeof(path)) != 0) {
@@ -1832,10 +1872,8 @@ static void files_places_rebuild(void) {
             }
         }
     }
-    files_place_add("THIS PC", FILES_DRIVES_PATH);
+    files_place_add_kind("THIS PC", FILES_DRIVES_PATH, true);
     files_place_add("ROOT", "/");
-    files_place_add("PROGRAMS", "/bin");
-    files_place_add("LIBRARIES", "/lib");
     files_place_add("DISK", "/disk");
     /* Other FAT volumes by label, else "DISK n" (files_place_visible
        hides unmounted ones). */
@@ -1892,6 +1930,7 @@ static int files_menu_index;
 
 static void files_draw_prompt(struct rect list);
 static void draw_files_menu(void);
+static void draw_files_drag(void);
 
 static bool files_in_drives(void) {
     return files_is_drives_path(files_path, files_path_length);
@@ -1904,6 +1943,85 @@ static bool files_at_root(void) {
 
 static size_t files_row_count(void) {
     return files_count + (files_at_root() ? 0 : 1);
+}
+
+/* The entry a row shows; false for ".." and in THIS PC. */
+static bool files_row_entry(size_t row, size_t *index) {
+    if (files_in_drives()) {
+        return false;
+    }
+    if (!files_at_root()) {
+        if (row == 0) {
+            return false;
+        }
+        row--;
+    }
+    if (row >= files_count) {
+        return false;
+    }
+    *index = row;
+    return true;
+}
+
+static bool files_row_selected(size_t row) {
+    size_t index;
+    if (files_marked_count == 0 || !files_row_entry(row, &index)) {
+        return files_marked_count == 0 && row == files_selection;
+    }
+    return files_marked[index];
+}
+
+/* Entries in the selection: the marked ones, else the cursor's entry.
+   Fills indices (FILES_ENTRY_CAPACITY room) and returns the count. */
+static size_t files_selected_entries(size_t *indices) {
+    size_t count = 0;
+    if (files_marked_count == 0) {
+        size_t index;
+        if (files_row_entry(files_selection, &index)) {
+            indices[count++] = index;
+        }
+        return count;
+    }
+    for (size_t i = 0; i < files_count; i++) {
+        if (files_marked[i]) {
+            indices[count++] = i;
+        }
+    }
+    return count;
+}
+
+/* Marks the rows between the anchor and row (Shift+click/arrows). */
+static void files_mark_range(size_t row) {
+    files_marks_clear();
+    size_t first = files_anchor < row ? files_anchor : row;
+    size_t last = files_anchor < row ? row : files_anchor;
+    for (size_t r = first; r <= last; r++) {
+        size_t index;
+        if (files_row_entry(r, &index)) {
+            files_marked[index] = true;
+            files_marked_count++;
+        }
+    }
+    files_selection = row;
+}
+
+/* Ctrl+click: adds or removes one row, keeping the rest. */
+static void files_mark_toggle(size_t row) {
+    size_t index;
+    if (files_marked_count == 0 && files_row_entry(files_selection, &index)) {
+        files_marked[index] = true; /* the old cursor row stays selected */
+        files_marked_count = 1;
+    }
+    if (files_row_entry(row, &index)) {
+        files_marked[index] = !files_marked[index];
+        if (files_marked[index]) {
+            files_marked_count++;
+        } else {
+            files_marked_count--;
+        }
+    }
+    files_selection = row;
+    files_anchor = row;
 }
 
 static bool files_place_visible(size_t index) {
@@ -1987,6 +2105,7 @@ static bool files_load_drives(void) {
 static bool files_load(void) {
     files_count = 0;
     files_skipped = 0;
+    files_marks_clear();
     if (files_in_drives()) {
         return files_load_drives();
     }
@@ -2092,6 +2211,7 @@ static bool files_navigate(const char *path, size_t length) {
     }
     files_set_path(path, length);
     files_selection = 0;
+    files_anchor = 0;
     files_scroll = 0;
     files_last_click_row = (size_t)-1;
     files_prompt_kind = FILES_PROMPT_NONE;
@@ -2803,7 +2923,7 @@ static struct rect files_list_area(struct rect area) {
 }
 
 static struct rect files_place_rect(struct rect area, size_t slot) {
-    return (struct rect){area.x + 6, area.y + 34 + (int64_t)slot * LINE_HEIGHT,
+    return (struct rect){area.x + 6, area.y + 8 + (int64_t)slot * LINE_HEIGHT,
                          FILES_SIDEBAR_WIDTH - 12, LINE_HEIGHT};
 }
 
@@ -2894,8 +3014,6 @@ static void draw_files(struct rect area, bool focused) {
         struct rect sidebar = {area.x, area.y, FILES_SIDEBAR_WIDTH,
                                area.height};
         fill(sidebar, 18, 23, 36);
-        draw_text_clipped(area.x + 12, area.y + 12, FILES_SIDEBAR_WIDTH - 24,
-                          "PLACES", 151, 190, 235);
         size_t active = files_active_place();
         size_t slot = 0;
         for (size_t i = 0; i < files_place_count; i++) {
@@ -2906,8 +3024,16 @@ static void draw_files(struct rect area, bool focused) {
             if (i == active) {
                 fill(line, 46, 62, 96);
             }
-            draw_text_clipped(line.x + 6, line.y + 3, line.width - 12,
-                              files_places[i].label, 230, 238, 255);
+            if (files_drop_place == i) {
+                fill(line, 70, 100, 160); /* drop target while dragging */
+            }
+            /* Group titles in the accent colour, their places indented. */
+            bool heading = files_places[i].heading;
+            int64_t indent = heading ? 6 : 18;
+            draw_text_clipped(line.x + indent, line.y + 3,
+                              line.width - indent - 6, files_places[i].label,
+                              heading ? 151 : 230, heading ? 190 : 238,
+                              heading ? 235 : 255);
         }
     }
 
@@ -2946,10 +3072,18 @@ static void draw_files(struct rect area, bool focused) {
                           240, 245, 255);
     } else {
         char count_text[32];
-        size_t count_length = append_decimal(count_text, sizeof(count_text), 0,
-                                             files_count);
+        size_t count_length = 0;
+        if (files_marked_count > 1) {
+            count_length = append_decimal(count_text, sizeof(count_text), 0,
+                                          files_marked_count);
+            count_length = append_text(count_text, sizeof(count_text),
+                                       count_length, " OF ");
+        }
+        count_length = append_decimal(count_text, sizeof(count_text),
+                                      count_length, files_count);
         append_text(count_text, sizeof(count_text), count_length,
-                    files_count == 1 ? " ITEM" : " ITEMS");
+                    files_marked_count > 1 ? " SELECTED"
+                    : files_count == 1 ? " ITEM" : " ITEMS");
         int64_t count_width = (int64_t)text_length(count_text) * CHAR_WIDTH;
         fill(bar, 32, 40, 62);
         /* A long path shows its end; that is the folder you are in. */
@@ -3023,11 +3157,19 @@ static void draw_files(struct rect area, bool focused) {
                 append_text(detail, sizeof(detail), used, unit);
             }
         }
-        if (row == files_selection) {
+        if (row == files_drop_row) {
+            fill(line, 90, 130, 200); /* drop target while dragging */
+        } else if (files_row_selected(row)) {
             fill(line, focused ? 70 : 52, focused ? 100 : 66,
                  focused ? 160 : 100);
         } else if (row % 2 == 0) {
             fill(line, 30, 38, 58);
+        }
+        if (files_marked_count != 0 && row == files_selection && focused) {
+            /* The cursor inside a multi-selection: a thin frame. */
+            fill((struct rect){line.x, line.y, line.width, 1}, 151, 190, 235);
+            fill((struct rect){line.x, line.y + line.height - 1, line.width,
+                               1}, 151, 190, 235);
         }
         if (directory) {
             draw_text_clipped(line.x + 6, line.y + 3,
@@ -6234,6 +6376,214 @@ static void draw_taskbar_menu(void) {
     }
 }
 
+/*
+ * Start > PROGRAMS: the programs in /bin, in a submenu beside the Start
+ * menu (Windows XP style). It opens when the pointer rests on PROGRAMS,
+ * or with Right/Enter; the list is read each time it opens.
+ */
+#define PROGRAMS_MAX 32
+#define PROGRAMS_NAME_CAPACITY 32
+#define PROGRAMS_DIRECTORY "/bin"
+#define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
+
+static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
+static size_t programs_count;
+static bool programs_focus;  /* the keyboard is in the submenu */
+static size_t programs_selection;
+static int32_t menu_hover_x = -1;
+static int32_t menu_hover_y = -1;
+/* Leaving PROGRAMS closes the submenu only after a short delay, so the
+   pointer can cross other items on its way there; 0: no close pending. */
+#define PROGRAMS_CLOSE_TICKS 40
+static uint64_t programs_close_at;
+
+static char ascii_upper(char character) {
+    return character >= 'a' && character <= 'z' ? (char)(character - 32)
+                                                : character;
+}
+
+static void programs_load(void) {
+    static const char directory[] = PROGRAMS_DIRECTORY;
+    programs_count = 0;
+    size_t count;
+    if (!vfs_directory_count(directory, sizeof(directory) - 1, &count)) {
+        return;
+    }
+    for (size_t i = 0; i < count && programs_count < PROGRAMS_MAX; i++) {
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at(directory, sizeof(directory) - 1, i,
+                                    &entry)) {
+            break;
+        }
+        if (entry.type != VFS_NODE_FILE
+            || entry.name_length >= PROGRAMS_NAME_CAPACITY) {
+            continue;
+        }
+        /* Sorted by name, case ignored. */
+        size_t at = programs_count++;
+        while (at > 0) {
+            const char *other = programs_names[at - 1];
+            size_t j = 0;
+            while (j < entry.name_length && other[j] != '\0'
+                   && ascii_upper(entry.name[j]) == ascii_upper(other[j])) {
+                j++;
+            }
+            char mine = j < entry.name_length ? ascii_upper(entry.name[j]) : 0;
+            if (mine >= ascii_upper(other[j])) {
+                break;
+            }
+            text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
+            at--;
+        }
+        for (size_t j = 0; j < entry.name_length; j++) {
+            programs_names[at][j] = entry.name[j];
+        }
+        programs_names[at][entry.name_length] = '\0';
+    }
+}
+
+static void programs_show(bool focus) {
+    if (!programs_open) {
+        programs_load();
+        programs_selection = 0;
+    }
+    programs_open = true;
+    programs_focus = focus;
+    programs_close_at = 0;
+}
+
+/* Runs the delayed close; true when the submenu just closed. */
+static bool programs_close_check(void) {
+    if (programs_close_at == 0 || timer_ticks() < programs_close_at) {
+        return false;
+    }
+    programs_close_at = 0;
+    if (!programs_open || programs_focus) {
+        return false;
+    }
+    programs_open = false;
+    return true;
+}
+
+static size_t menu_index_of(enum menu_action action) {
+    for (size_t i = 0; i < menu_visible_count(); i++) {
+        if (menu_action_at(i) == action) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static struct rect programs_rect(void) {
+    struct rect menu = menu_rect();
+    struct rect item = menu_item_rect(menu_index_of(MENU_PROGRAMS));
+    size_t rows = programs_count == 0 ? 1 : programs_count;
+    int64_t height = (int64_t)rows * MENU_ITEM_HEIGHT + 12;
+    int64_t x = menu.x + menu.width - 2;
+    if (x + PROGRAMS_WIDTH > screen_width()) {
+        x = menu.x - PROGRAMS_WIDTH + 2; /* no room on the right */
+    }
+    int64_t y = item.y - 6;
+    if (y + height > screen_height()) {
+        y = screen_height() - height;
+    }
+    return (struct rect){x, y < 0 ? 0 : y, PROGRAMS_WIDTH, height};
+}
+
+static struct rect programs_item_rect(size_t index) {
+    struct rect box = programs_rect();
+    return (struct rect){box.x + 6, box.y + 6
+                             + (int64_t)index * MENU_ITEM_HEIGHT,
+                         box.width - 12, MENU_ITEM_HEIGHT};
+}
+
+static void programs_launch(size_t index) {
+    if (index >= programs_count) {
+        return;
+    }
+    start_menu_open = false;
+    programs_open = false;
+    char path[64];
+    size_t length = append_text(path, sizeof(path), 0, PROGRAMS_DIRECTORY "/");
+    length = append_text(path, sizeof(path), length, programs_names[index]);
+    files_run_program(path, length);
+}
+
+static void draw_programs_menu(void) {
+    if (!programs_open) {
+        return;
+    }
+    struct rect box = programs_rect();
+    fill(box, 110, 160, 255);
+    fill((struct rect){box.x + 2, box.y + 2, box.width - 4, box.height - 4},
+         26, 34, 54);
+    if (programs_count == 0) {
+        struct rect item = programs_item_rect(0);
+        draw_text_clipped(item.x + 10, item.y + 7, item.width - 20,
+                          "(NO PROGRAMS)", 120, 130, 150);
+        return;
+    }
+    for (size_t i = 0; i < programs_count; i++) {
+        struct rect item = programs_item_rect(i);
+        if (i == programs_selection) {
+            fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
+                 70, 100, 160);
+        }
+        draw_text_clipped(item.x + 10, item.y + 7, item.width - 20,
+                          programs_names[i], 230, 238, 255);
+    }
+}
+
+/* Pointer moves while the Start menu is open: the item under it is
+   chosen, and resting on PROGRAMS opens its submenu. */
+static bool start_menu_hover(int32_t x, int32_t y) {
+    if (!start_menu_open || (x == menu_hover_x && y == menu_hover_y)) {
+        return false;
+    }
+    menu_hover_x = x;
+    menu_hover_y = y;
+    if (programs_open && rect_contains(programs_rect(), x, y)) {
+        programs_close_at = 0;
+        for (size_t i = 0; i < programs_count; i++) {
+            if (rect_contains(programs_item_rect(i), x, y)) {
+                programs_selection = i;
+            }
+        }
+        return true;
+    }
+    for (size_t i = 0; i < menu_visible_count(); i++) {
+        if (rect_contains(menu_item_rect(i), x, y)) {
+            menu_selection = i;
+            if (menu_action_at(i) == MENU_PROGRAMS) {
+                programs_show(false);
+            } else if (programs_open && programs_close_at == 0) {
+                programs_close_at = timer_ticks() + PROGRAMS_CLOSE_TICKS;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Keys for the submenu; false when it does not have the keyboard. */
+static bool programs_key(char character) {
+    if (!programs_open || !programs_focus) {
+        return false;
+    }
+    size_t count = programs_count == 0 ? 1 : programs_count;
+    if (character == KEY_UP) {
+        programs_selection = (programs_selection + count - 1) % count;
+    } else if (character == KEY_DOWN) {
+        programs_selection = (programs_selection + 1) % count;
+    } else if (character == '\n' || character == KEY_RIGHT) {
+        programs_launch(programs_selection);
+    } else if (character == KEY_LEFT || character == KEY_ESCAPE) {
+        programs_open = false;
+        programs_focus = false;
+    }
+    return true;
+}
+
 static void draw_start_menu(void) {
     struct rect menu = menu_rect();
     fill(menu, 110, 160, 255);
@@ -6259,7 +6609,12 @@ static void draw_start_menu(void) {
         }
         draw_text_clipped(item.x + 10, item.y + 7, item.width - 20,
                           menu_labels[action], 230, 238, 255);
+        if (action == MENU_PROGRAMS) {
+            draw_text_clipped(item.x + item.width - 10 - CHAR_WIDTH,
+                              item.y + 7, CHAR_WIDTH, ">", 230, 238, 255);
+        }
     }
+    draw_programs_menu();
 }
 
 static void draw_wallpaper(void) {
@@ -6350,6 +6705,7 @@ static void draw_scene(void) {
         draw_window(z_order[i]);
     }
     draw_files_menu();
+    draw_files_drag();
     draw_taskbar();
     draw_status();
     if (start_menu_open) {
@@ -6488,7 +6844,8 @@ static enum desktop_result menu_activate(enum menu_action action) {
     return DESKTOP_CONTINUE;
 }
 
-static void files_click(struct rect area, int32_t x, int32_t y) {
+/* Returns true when the press may start dragging the selection. */
+static bool files_click(struct rect area, int32_t x, int32_t y) {
     struct rect list = files_list_area(area);
     if (list.x != area.x && x < list.x) {
         size_t slot = 0;
@@ -6499,10 +6856,10 @@ static void files_click(struct rect area, int32_t x, int32_t y) {
             if (rect_contains(files_place_rect(area, slot++), x, y)) {
                 const char *path = files_places[i].path;
                 (void)files_visit(path, text_length(path));
-                return;
+                return false;
             }
         }
-        return;
+        return false;
     }
     for (size_t i = 0; i < FILES_NAV_BUTTONS; i++) {
         if (rect_contains(files_nav_rect(list, i), x, y)) {
@@ -6512,14 +6869,14 @@ static void files_click(struct rect area, int32_t x, int32_t y) {
             } else {
                 files_history_step(i == 1);
             }
-            return;
+            return false;
         }
     }
     if (rect_contains(files_address_rect(list), x, y)) {
         if (!files_address_editing) {
             files_address_start();
         }
-        return;
+        return false;
     }
     files_address_editing = false;
     files_clamp(list);
@@ -6530,17 +6887,39 @@ static void files_click(struct rect area, int32_t x, int32_t y) {
         if (!rect_contains(files_line_rect(list, row - files_scroll), x, y)) {
             continue;
         }
+        /* Ctrl+click adds or removes a row, Shift+click selects from the
+           anchor to here. */
+        if (keyboard_shift_held()) {
+            files_mark_range(row);
+            files_last_click_row = (size_t)-1;
+            return false;
+        }
+        if (keyboard_ctrl_held()) {
+            files_mark_toggle(row);
+            files_last_click_row = (size_t)-1;
+            return false;
+        }
         uint64_t now = timer_ticks();
         bool double_click = row == files_last_click_row
             && now - files_last_click_tick <= FILES_DOUBLE_CLICK_TICKS;
+        /* A plain click on a selected row keeps the selection, so it can
+           be dragged; releasing without dragging narrows it to the row. */
+        if (!files_row_selected(row)) {
+            files_marks_clear();
+        }
         files_selection = row;
+        files_anchor = row;
         files_last_click_row = double_click ? (size_t)-1 : row;
         files_last_click_tick = now;
         if (double_click) {
+            files_marks_clear();
             files_open_row(row);
+            return false;
         }
-        return;
+        size_t index;
+        return files_row_entry(row, &index);
     }
+    return false;
 }
 
 static void files_key_navigate(char character) {
@@ -6549,13 +6928,36 @@ static void files_key_navigate(char character) {
         files_go_up();
     } else if (count == 0) {
         return;
-    } else if (character == KEY_UP) {
-        files_selection = (files_selection + count - 1) % count;
-    } else if (character == KEY_DOWN) {
-        files_selection = (files_selection + 1) % count;
+    } else if (character == KEY_UP || character == KEY_DOWN) {
+        size_t row = character == KEY_UP
+                   ? (files_selection + count - 1) % count
+                   : (files_selection + 1) % count;
+        if (keyboard_last_shift()) {
+            /* Shift+arrows extend the selection and stop at the ends. */
+            bool wrapped = character == KEY_UP ? files_selection == 0
+                                               : row == 0;
+            files_mark_range(wrapped ? files_selection : row);
+        } else {
+            files_marks_clear();
+            files_selection = row;
+            files_anchor = row;
+        }
     } else if (character == '\n' || character == KEY_RIGHT) {
+        files_marks_clear();
         files_open_row(files_selection < count ? files_selection : 0);
     }
+}
+
+/* Ctrl+A: every entry (not ".."). */
+static void files_select_all(void) {
+    if (files_in_drives()) {
+        return;
+    }
+    files_marks_clear();
+    for (size_t i = 0; i < files_count; i++) {
+        files_marked[i] = true;
+    }
+    files_marked_count = files_count;
 }
 
 /* ------------------------------------------- Files: rename, delete, new */
@@ -6632,6 +7034,9 @@ static void files_start_prompt(enum files_prompt_kind kind) {
     files_menu_open = false;
     size_t index = 0;
     bool has_entry = files_selected_entry(&index);
+    if (kind == FILES_PROMPT_DELETE && files_marked_count != 0) {
+        has_entry = true; /* the marked entries go */
+    }
     if ((kind == FILES_PROMPT_RENAME || kind == FILES_PROMPT_DELETE)
         && !has_entry) {
         set_status("SELECT A FILE OR FOLDER FIRST");
@@ -6714,6 +7119,374 @@ static bool files_delete_tree(char *path, size_t length, size_t depth) {
     return vfs_remove(path, length, true, &not_empty);
 }
 
+/* ---------------------------------------------- Files: move and copy */
+
+/* Copies a file, or a folder with everything in it, to a path that does
+   not exist yet. Both path buffers need FILES_PATH_CAPACITY bytes. */
+static bool files_copy_tree(char *source, size_t source_length,
+                            char *target, size_t target_length,
+                            size_t depth) {
+    static uint8_t buffer[32 * 1024];
+    struct vfs_metadata metadata;
+    if (!vfs_stat(source, source_length, &metadata)) {
+        return false;
+    }
+    if (metadata.type != VFS_NODE_DIRECTORY) {
+        if (!vfs_create_file(target, target_length, true)) {
+            return false;
+        }
+        size_t offset = 0;
+        while (offset < metadata.size) {
+            size_t chunk = metadata.size - offset < sizeof(buffer)
+                         ? metadata.size - offset : sizeof(buffer);
+            size_t done = 0;
+            if (!vfs_read_at(source, source_length, offset, buffer, chunk,
+                             &done) || done == 0) {
+                return false;
+            }
+            size_t written = 0;
+            if (!vfs_write_at(target, target_length, offset, buffer, done,
+                              &written) || written != done) {
+                return false;
+            }
+            offset += done;
+        }
+        return true;
+    }
+    if (depth >= FILES_DELETE_DEPTH
+        || !vfs_create_directory(target, target_length)) {
+        return false;
+    }
+    size_t count;
+    if (!vfs_directory_count(source, source_length, &count)) {
+        return false;
+    }
+    bool copied = true;
+    for (size_t i = 0; i < count; i++) {
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at(source, source_length, i, &entry)) {
+            return false;
+        }
+        if (source_length + 1 + entry.name_length >= FILES_PATH_CAPACITY
+            || target_length + 1 + entry.name_length >= FILES_PATH_CAPACITY) {
+            copied = false;
+            continue;
+        }
+        source[source_length] = '/';
+        target[target_length] = '/';
+        for (size_t j = 0; j < entry.name_length; j++) {
+            source[source_length + 1 + j] = entry.name[j];
+            target[target_length + 1 + j] = entry.name[j];
+        }
+        size_t child_source = source_length + 1 + entry.name_length;
+        size_t child_target = target_length + 1 + entry.name_length;
+        source[child_source] = '\0';
+        target[child_target] = '\0';
+        copied = files_copy_tree(source, child_source, target, child_target,
+                                 depth + 1) && copied;
+        source[source_length] = '\0';
+        target[target_length] = '\0';
+    }
+    return copied;
+}
+
+/* True when path is base or lies inside it. */
+static bool files_path_within(const char *path, size_t length,
+                              const char *base, size_t base_length) {
+    if (length < base_length) {
+        return false;
+    }
+    for (size_t i = 0; i < base_length; i++) {
+        if (path[i] != base[i]) {
+            return false;
+        }
+    }
+    return length == base_length || path[base_length] == '/'
+        || (base_length == 1 && base[0] == '/');
+}
+
+/* An editor showing a moved file (or a file inside a moved folder)
+   follows it. */
+static void files_editor_follow(const char *old_path, size_t old_length,
+                                const char *new_path, size_t new_length) {
+    if (editor_path_length == 0
+        || !files_path_within(editor_path, editor_path_length, old_path,
+                              old_length)) {
+        return;
+    }
+    char moved[FILES_PATH_CAPACITY];
+    size_t rest = editor_path_length - old_length;
+    if (new_length + rest >= sizeof(moved)) {
+        return;
+    }
+    for (size_t i = 0; i < new_length; i++) {
+        moved[i] = new_path[i];
+    }
+    for (size_t i = 0; i < rest; i++) {
+        moved[new_length + i] = editor_path[old_length + i];
+    }
+    moved[new_length + rest] = '\0';
+    editor_set_path(moved, new_length + rest);
+}
+
+/*
+ * Moves the selection into the folder target. Within one volume this is
+ * a rename; across volumes the items are copied and then deleted. From a
+ * read-only place (the initramfs, a CD) they are copied.
+ */
+static void files_move_selection(const char *target, size_t target_length) {
+    static size_t indices[FILES_ENTRY_CAPACITY];
+    size_t count = files_selected_entries(indices);
+    if (count == 0) {
+        return;
+    }
+    if (files_path_is(target, target_length)) {
+        set_status("ALREADY IN THIS FOLDER");
+        return;
+    }
+    if (vfs_path_read_only(target, target_length)) {
+        set_status("THE TARGET FOLDER IS READ-ONLY");
+        return;
+    }
+    if (!permission_ui_allows(target, target_length, PERMISSION_WRITE)) {
+        set_status("ACCESS DENIED");
+        return;
+    }
+    bool copy_only = vfs_path_read_only(files_path, files_path_length);
+    set_status(copy_only ? "COPYING..." : "MOVING...");
+    draw_scene();
+    size_t done = 0;
+    const char *failure = NULL;
+    for (size_t i = 0; i < count; i++) {
+        const struct files_entry *entry = &files_entries[indices[i]];
+        size_t name_length = text_length(entry->name);
+        char source[FILES_PATH_CAPACITY];
+        size_t source_length;
+        char destination[FILES_PATH_CAPACITY];
+        if (!files_child_path(entry->name, name_length, source,
+                              &source_length)
+            || target_length + 1 + name_length >= FILES_PATH_CAPACITY) {
+            failure = "PATH TOO LONG";
+            continue;
+        }
+        size_t destination_length = append_text(destination,
+                                                 sizeof(destination), 0,
+                                                 target);
+        if (destination_length != 1) {
+            destination[destination_length++] = '/';
+        }
+        for (size_t j = 0; j < name_length; j++) {
+            destination[destination_length++] = entry->name[j];
+        }
+        destination[destination_length] = '\0';
+        if (files_path_within(target, target_length, source, source_length)) {
+            failure = "A FOLDER CANNOT GO INTO ITSELF";
+            continue;
+        }
+        struct vfs_metadata metadata;
+        if (vfs_stat(destination, destination_length, &metadata)) {
+            failure = "NAME ALREADY EXISTS THERE";
+            continue;
+        }
+        if (!copy_only && !permission_ui_allows(source, source_length,
+                                                PERMISSION_REMOVE)) {
+            failure = "ACCESS DENIED";
+            continue;
+        }
+        enum vfs_rename_result result = copy_only ? VFS_RENAME_CROSS_VOLUME
+            : vfs_rename(source, source_length, destination,
+                         destination_length);
+        if (result == VFS_RENAME_CROSS_VOLUME) {
+            if (!files_copy_tree(source, source_length, destination,
+                                 destination_length, 0)) {
+                /* Leave no half copy behind; the source is untouched. */
+                (void)files_delete_tree(destination, destination_length, 0);
+                failure = "COULD NOT COPY - DISK FULL?";
+                continue;
+            }
+            if (!copy_only
+                && !files_delete_tree(source, source_length, 0)) {
+                failure = "COPIED, BUT THE ORIGINAL COULD NOT BE DELETED";
+                continue;
+            }
+        } else if (result != VFS_RENAME_OK) {
+            failure = result == VFS_RENAME_READ_ONLY ? "READ-ONLY"
+                                                     : "COULD NOT MOVE";
+            continue;
+        }
+        if (!copy_only) {
+            files_editor_follow(source, source_length, destination,
+                                destination_length);
+        }
+        done++;
+    }
+    files_refresh();
+    if (failure != NULL) {
+        set_status(failure);
+    } else {
+        char message[48];
+        size_t used = append_text(message, sizeof(message), 0,
+                                  copy_only ? "COPIED " : "MOVED ");
+        used = append_decimal(message, sizeof(message), used, done);
+        append_text(message, sizeof(message), used,
+                    done == 1 ? " ITEM" : " ITEMS");
+        set_status(message);
+    }
+}
+
+/* The folder under (x, y) that the selection could be dropped into:
+   a folder row (not one being dragged), "..", or a sidebar place. */
+static bool files_drop_target(int32_t x, int32_t y, char *path,
+                              size_t *length, size_t *place, size_t *row) {
+    *place = (size_t)-1;
+    *row = (size_t)-1;
+    if (!windows[WINDOW_FILES].open || window_at(x, y) != WINDOW_FILES
+        || files_in_drives()) {
+        return false;
+    }
+    struct rect area = content_rect(window_rect(WINDOW_FILES));
+    struct rect list = files_list_area(area);
+    if (!rect_contains(area, x, y)) {
+        return false;
+    }
+    if (list.x != area.x && x < list.x) {
+        size_t slot = 0;
+        for (size_t i = 0; i < files_place_count; i++) {
+            if (!files_place_visible(i)) {
+                continue;
+            }
+            if (rect_contains(files_place_rect(area, slot++), x, y)) {
+                const char *target = files_places[i].path;
+                if (target[0] != '/') {
+                    return false; /* THIS PC */
+                }
+                *length = append_text(path, FILES_PATH_CAPACITY, 0, target);
+                *place = i;
+                return true;
+            }
+        }
+        return false;
+    }
+    size_t rows = files_row_count();
+    size_t visible = files_visible_rows(list);
+    for (size_t r = files_scroll; r < rows && r < files_scroll + visible;
+         r++) {
+        if (!rect_contains(files_line_rect(list, r - files_scroll), x, y)) {
+            continue;
+        }
+        size_t index;
+        if (!files_row_entry(r, &index)) {
+            /* "..": the parent folder. */
+            size_t parent = files_path_length;
+            while (parent > 1 && files_path[parent - 1] != '/') {
+                parent--;
+            }
+            if (parent > 1) {
+                parent--;
+            }
+            for (size_t i = 0; i < parent; i++) {
+                path[i] = files_path[i];
+            }
+            path[parent] = '\0';
+            *length = parent;
+            *row = r;
+            return true;
+        }
+        if (!files_entries[index].directory || files_row_selected(r)) {
+            return false;
+        }
+        *length = files_entry_path(index, path, FILES_PATH_CAPACITY);
+        *row = r;
+        return true;
+    }
+    return false;
+}
+
+/* Pointer moves while the button is held after files_click armed a drag. */
+static bool files_drag_motion(int32_t x, int32_t y) {
+    if (!files_drag_armed) {
+        return false;
+    }
+    if (!files_dragging) {
+        int32_t dx = x - files_drag_start_x;
+        int32_t dy = y - files_drag_start_y;
+        if (dx * dx + dy * dy < FILES_DRAG_THRESHOLD * FILES_DRAG_THRESHOLD) {
+            return false;
+        }
+        files_dragging = true;
+        files_last_click_row = (size_t)-1; /* no double click after this */
+    }
+    files_drag_x = x;
+    files_drag_y = y;
+    char path[FILES_PATH_CAPACITY];
+    size_t length;
+    (void)files_drop_target(x, y, path, &length, &files_drop_place,
+                            &files_drop_row);
+    return true;
+}
+
+static void files_drag_start(int32_t x, int32_t y) {
+    files_drag_armed = true;
+    files_dragging = false;
+    files_drag_start_x = x;
+    files_drag_start_y = y;
+}
+
+/* Button released: drop onto the target, or (no drag) narrow the
+   selection to the clicked row. */
+static void files_drag_end(int32_t x, int32_t y) {
+    if (!files_drag_armed) {
+        return;
+    }
+    bool dragged = files_dragging;
+    files_drag_armed = false;
+    files_dragging = false;
+    files_drop_place = (size_t)-1;
+    files_drop_row = (size_t)-1;
+    if (!dragged) {
+        files_marks_clear();
+        files_anchor = files_selection;
+        return;
+    }
+    char path[FILES_PATH_CAPACITY];
+    size_t length;
+    size_t place;
+    size_t row;
+    if (files_drop_target(x, y, path, &length, &place, &row)) {
+        files_move_selection(path, length);
+    }
+}
+
+/* The dragged items, next to the pointer. */
+static void draw_files_drag(void) {
+    if (!files_dragging) {
+        return;
+    }
+    static size_t indices[FILES_ENTRY_CAPACITY];
+    size_t count = files_selected_entries(indices);
+    if (count == 0) {
+        return;
+    }
+    char label[FILES_NAME_CAPACITY + 16];
+    if (count == 1) {
+        text_copy(label, sizeof(label), files_entries[indices[0]].name);
+    } else {
+        size_t used = append_decimal(label, sizeof(label), 0, count);
+        append_text(label, sizeof(label), used, " ITEMS");
+    }
+    int64_t width = (int64_t)text_length(label) * CHAR_WIDTH + 16;
+    if (width > 320) {
+        width = 320;
+    }
+    struct rect box = {files_drag_x + 14, files_drag_y + 14, width,
+                       CHAR_HEIGHT + 8};
+    fill(box, 110, 160, 255);
+    fill((struct rect){box.x + 1, box.y + 1, box.width - 2, box.height - 2},
+         36, 52, 86);
+    draw_text_clipped(box.x + 8, box.y + 4, box.width - 16, label,
+                      240, 245, 255);
+}
+
 static bool files_name_valid(const char *name, size_t length) {
     if (length == 0) {
         set_status("ENTER A NAME");
@@ -6750,23 +7523,32 @@ static void files_prompt_commit(void) {
     char path[FILES_PATH_CAPACITY];
     size_t length;
     if (kind == FILES_PROMPT_DELETE) {
-        if (files_prompt_target >= files_count) {
-            return;
+        static size_t indices[FILES_ENTRY_CAPACITY];
+        size_t count = files_selected_entries(indices);
+        if (files_marked_count == 0 && files_prompt_target < files_count) {
+            indices[0] = files_prompt_target;
+            count = 1;
         }
-        const struct files_entry *entry = &files_entries[files_prompt_target];
-        if (!files_child_path(entry->name, text_length(entry->name), path,
-                              &length)) {
-            return;
+        bool removed = true;
+        bool denied = false;
+        for (size_t i = 0; i < count; i++) {
+            const struct files_entry *entry = &files_entries[indices[i]];
+            if (!files_child_path(entry->name, text_length(entry->name), path,
+                                  &length)) {
+                removed = false;
+                continue;
+            }
+            if (!permission_ui_allows(path, length, PERMISSION_REMOVE)) {
+                denied = true;
+                continue;
+            }
+            removed = files_delete_tree(path, length, 0) && removed;
         }
-        if (!permission_ui_allows(path, length, PERMISSION_REMOVE)) {
-            set_status("ACCESS DENIED");
-            return;
-        }
-        bool removed = files_delete_tree(path, length, 0);
         size_t selection = files_selection;
         files_refresh();
         files_selection = selection;
-        set_status(removed ? "DELETED" : "COULD NOT DELETE EVERYTHING");
+        set_status(denied ? "ACCESS DENIED"
+                   : removed ? "DELETED" : "COULD NOT DELETE EVERYTHING");
         return;
     }
 
@@ -6885,6 +7667,16 @@ static void files_draw_prompt(struct rect list) {
         length = append_text(text, sizeof(text), 0, "NEW FILE: ");
         break;
     default: {
+        if (files_marked_count > 1) {
+            length = append_text(text, sizeof(text), 0, "DELETE ");
+            length = append_decimal(text, sizeof(text), length,
+                                    files_marked_count);
+            append_text(text, sizeof(text), length,
+                        " ITEMS AND EVERYTHING IN THEM? (Y/N)");
+            draw_text_clipped(line.x + 6, line.y + 3, line.width - 12, text,
+                              255, 190, 150);
+            return;
+        }
         const struct files_entry *entry = &files_entries[files_prompt_target];
         length = append_text(text, sizeof(text), 0, "DELETE ");
         length = append_text(text, sizeof(text), length, entry->name);
@@ -6904,7 +7696,9 @@ static void files_draw_prompt(struct rect list) {
 /* Menu items for the current menu, in display order. */
 static size_t files_menu_items(enum files_action *items) {
     size_t count = 0;
-    if (files_menu_on_item) {
+    if (files_menu_on_item && files_marked_count > 1) {
+        items[count++] = FILES_ACTION_DELETE;
+    } else if (files_menu_on_item) {
         items[count++] = FILES_ACTION_OPEN;
         size_t index;
         if (!files_in_drives() && files_selected_entry(&index)
@@ -6988,7 +7782,12 @@ static void files_context(struct rect area, int32_t x, int32_t y) {
     for (size_t row = files_scroll; row < rows
          && row < files_scroll + visible; row++) {
         if (rect_contains(files_line_rect(list, row - files_scroll), x, y)) {
+            /* Right-clicking outside the selection selects just that row. */
+            if (!files_row_selected(row)) {
+                files_marks_clear();
+            }
             files_selection = row;
+            files_anchor = row;
             files_menu_on_item = files_at_root() || row != 0;
             break;
         }
@@ -7148,6 +7947,8 @@ static void files_key(char character) {
     if (keyboard_last_ctrl()) {
         if (character == 'l' || character == 'L') {
             files_address_start();
+        } else if (character == 'a' || character == 'A') {
+            files_select_all();
         } else if (character == 'r' || character == 'R') {
             files_start_prompt(FILES_PROMPT_RENAME);
         } else if (character == 'N') {
@@ -7168,7 +7969,8 @@ static void files_key(char character) {
 enum drag_mode {
     DRAG_MOVE,
     DRAG_RESIZE,
-    DRAG_SPLIT
+    DRAG_SPLIT,
+    DRAG_FILES /* the Files selection (files_drag_*) */
 };
 
 #define EDGE_LEFT 1
@@ -7401,8 +8203,21 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         }
     }
     if (start_menu_open) {
+        if (programs_open && rect_contains(programs_rect(), x, y)) {
+            for (size_t i = 0; i < programs_count; i++) {
+                if (rect_contains(programs_item_rect(i), x, y)) {
+                    programs_launch(i);
+                }
+            }
+            return DESKTOP_CONTINUE;
+        }
         for (size_t i = 0; i < menu_visible_count(); i++) {
             if (rect_contains(menu_item_rect(i), x, y)) {
+                if (menu_action_at(i) == MENU_PROGRAMS) {
+                    menu_selection = i;
+                    programs_show(false);
+                    return DESKTOP_CONTINUE;
+                }
                 return menu_activate(menu_action_at(i));
             }
         }
@@ -7425,6 +8240,7 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         if (rect_contains(start_button_rect(), x, y)) {
             start_menu_open = true;
             menu_selection = 0;
+            programs_open = false;
         } else {
             for (size_t i = 0; i < tile_count; i++) {
                 if (task_button_fits(task_button_rect(i))
@@ -7457,7 +8273,11 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
             drag->offset_y = y - (int32_t)frame.y;
         }
     } else if (kind == WINDOW_FILES) {
-        files_click(content_rect(frame), x, y);
+        if (files_click(content_rect(frame), x, y)) {
+            files_drag_start(x, y);
+            drag->active = true;
+            drag->mode = DRAG_FILES;
+        }
     } else if (kind == WINDOW_EDITOR) {
         editor_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_INSTALLER) {
@@ -7681,6 +8501,7 @@ static enum desktop_result handle_key(char character, bool super) {
     if (character == KEY_SUPER) {
         start_menu_open = !start_menu_open;
         menu_selection = 0;
+        programs_open = false;
         taskbar_menu_open = false;
         return DESKTOP_CONTINUE;
     }
@@ -7696,11 +8517,20 @@ static enum desktop_result handle_key(char character, bool super) {
         return DESKTOP_CONTINUE;
     }
     if (start_menu_open) {
+        if (programs_key(character)) {
+            return DESKTOP_CONTINUE;
+        }
+        bool on_programs = menu_action_at(menu_selection) == MENU_PROGRAMS;
         if (character == KEY_UP) {
+            programs_open = false;
             menu_selection = (menu_selection + menu_visible_count() - 1)
                            % menu_visible_count();
         } else if (character == KEY_DOWN) {
+            programs_open = false;
             menu_selection = (menu_selection + 1) % menu_visible_count();
+        } else if (on_programs && (character == '\n'
+                                   || character == KEY_RIGHT)) {
+            programs_show(true);
         } else if (character == '\n') {
             return menu_activate(menu_action_at(menu_selection));
         } else if (character == KEY_ESCAPE) {
@@ -9056,10 +9886,17 @@ static bool desktop_step(void) {
                 redraw |= handle_resize(&loop_drag, mouse.x, mouse.y);
             } else if (loop_drag.mode == DRAG_SPLIT) {
                 redraw |= handle_split(&loop_drag, mouse.x, mouse.y);
+            } else if (loop_drag.mode == DRAG_FILES) {
+                redraw |= files_drag_motion(mouse.x, mouse.y);
             } else {
                 redraw |= handle_drag(&loop_drag, mouse.x, mouse.y);
             }
         } else if (!pressed) {
+            if (was_pressed && loop_drag.active
+                && loop_drag.mode == DRAG_FILES) {
+                files_drag_end(mouse.x, mouse.y);
+                redraw = true;
+            }
             loop_drag.active = false;
         }
         if ((mouse.buttons & 2) != 0 && (loop_previous_buttons & 2) == 0) {
@@ -9067,10 +9904,12 @@ static bool desktop_step(void) {
             redraw = true;
         }
         loop_previous_buttons = mouse.buttons;
+        redraw |= start_menu_hover(mouse.x, mouse.y);
         apps_mouse_update(mouse.x, mouse.y, mouse.buttons);
         redraw |= handle_wheel(mouse.x, mouse.y, mouse_take_wheel());
     }
     apps_check_resize();
+    redraw |= programs_close_check();
     if (exit_to_shell) {
         return true;
     }

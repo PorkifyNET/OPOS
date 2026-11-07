@@ -504,6 +504,33 @@ static void paint_page(void) {
         if (y + item->height < top || y > bottom) {
             continue;
         }
+        if (item->round
+            && (item->kind == ITEM_RECT || item->kind == ITEM_OUTLINE)) {
+            /* A disc, or a one-pixel ring: per row, the span between
+               the circle's edges (for a ring, only those edges). */
+            int size = item->width;
+            for (int row = 0; row < size; row++) {
+                int in = round_inset(size, row);
+                int span = size - 2 * in;
+                if (item->kind == ITEM_RECT) {
+                    fill_clipped(x + in, y + row, span, 1, item->colour,
+                                 top, bottom);
+                    continue;
+                }
+                int above = round_inset(size, row - 1);
+                int below = round_inset(size, row + 1);
+                int inner = above > below ? above : below;
+                int edge = inner > in ? inner - in : 1;
+                if (above < 0 || below < 0) {
+                    edge = span; /* top and bottom rows are solid */
+                }
+                fill_clipped(x + in, y + row, edge, 1, item->colour, top,
+                             bottom);
+                fill_clipped(x + size - in - edge, y + row, edge, 1,
+                             item->colour, top, bottom);
+            }
+            continue;
+        }
         switch (item->kind) {
         case ITEM_RECT:
             if (item->transparency == 0) {

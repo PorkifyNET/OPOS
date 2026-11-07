@@ -882,12 +882,14 @@ static void emit_line(struct ctx *c, size_t count, int used,
             if (fill != NULL) {
                 fill->colour = field ? 0x00ffffff : 0x00e9e9ed;
                 fill->control = item->node;
+                fill->round = item->box == BOX_RADIO;
             }
             struct display_item *outline = add_item(c, ITEM_OUTLINE, x,
                                                     box_top, item->width,
                                                     item->height);
             if (outline != NULL) {
                 outline->colour = item->focused ? 0x000645ad : 0x00767676;
+                outline->round = item->box == BOX_RADIO;
             }
             if (item->focused) {
                 struct display_item *ring = add_item(c, ITEM_OUTLINE, x - 1,
@@ -896,6 +898,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
                                                      item->height + 2);
                 if (ring != NULL) {
                     ring->colour = 0x000645ad;
+                    ring->round = item->box == BOX_RADIO;
                 }
             }
             if (item->box == BOX_CHECKBOX || item->box == BOX_RADIO) {
@@ -905,6 +908,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
                         item->height - 6);
                     if (mark != NULL) {
                         mark->colour = 0x000645ad;
+                        mark->round = item->box == BOX_RADIO;
                     }
                 }
                 break;

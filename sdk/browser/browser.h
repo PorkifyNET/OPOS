@@ -136,7 +136,24 @@ struct display_item {
     struct image_ref *image;
     /* the form control a control's background rectangle belongs to */
     const struct opos_html_node *control;
+    bool round;                /* rect/outline: a circle in the square box */
 };
+
+/* For a round item of the given diameter: how many pixels row `row`
+   leaves empty at each end. -1 for the row past the end. */
+static inline int round_inset(int size, int row) {
+    if (row < 0 || row >= size) {
+        return -1;
+    }
+    int dy = 2 * row + 1 - size;
+    for (int col = 0; col < size / 2; col++) {
+        int dx = 2 * col + 1 - size;
+        if (dx * dx + dy * dy <= size * size) {
+            return col;
+        }
+    }
+    return size / 2;
+}
 
 enum field_kind {
     FIELD_NONE, FIELD_TEXT, FIELD_PASSWORD, FIELD_CHECKBOX, FIELD_RADIO,

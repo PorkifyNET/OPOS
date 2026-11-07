@@ -4,6 +4,9 @@
  *   update                    same as "update check"
  *   update check              shows whether a newer version is out
  *   update install            downloads and installs it (administrators)
+ *   update install --ignoreversion  permits same/older versions
+ *   update install --force    bypasses signature and file hash checks
+ *   update install --no-prev-version  skips the rollback copy
  *   update ... --source URL   uses another release folder, for example
  *                             http://10.0.2.2:8000/ for local testing
  *                             (or put the URL in SOURCE_FILE)
@@ -567,7 +570,9 @@ static bool file_write(void *context, const uint8_t *data, size_t length) {
 /* ---------------------------------------------------------------- main */
 
 static void usage(void) {
-    printf("Usage: update [check|install] [--source URL|FOLDER]\n");
+    printf("Usage: update [check|install] [--ignoreversion] [--force] "
+           "[--no-prev-version] "
+           "[--source URL|FOLDER]\n");
 }
 
 static void report_status(const char *status) {
@@ -692,8 +697,63 @@ static const char *configured_source(void) {
         || text[0] == '/' ? text : NULL;
 }
 
+static bool confirm_install(const char *source, const char *installed,
+                            const char *version, long needed, long count,
+                            bool ignore_version, bool force,
+                            bool no_previous) {
+    printf("\nINSTALL SUMMARY\n");
+    printf("  Source: %s\n", source);
+    printf("  Version: OPOS %s -> OPOS %s\n", installed, version);
+    printf("  Payload: %ld of %ld files, %lu KB\n", needed, count,
+           (unsigned long)(download_total / 1024));
+    printf("  Previous version backup: %s\n",
+           no_previous ? "DISABLED" : "enabled");
+    printf("  Flags:\n");
+    if (!ignore_version && !force && !no_previous) {
+        printf("    (none) - signature, version and file hashes are checked\n");
+    }
+    if (ignore_version) {
+        printf("    --ignoreversion - permits same-version installs and "
+               "downgrades\n");
+    }
+    if (force) {
+        printf("    --force - trusts an unsigned or damaged payload; "
+               "signature and SHA-256 failures are ignored\n");
+    }
+    if (no_previous) {
+        printf("    --no-prev-version - does not save the current kernel "
+               "and initramfs for rollback\n");
+    }
+    printf("  Dangers:\n");
+    printf("    Installing changes boot files. Power loss or bad files can "
+           "make OPOS unbootable.\n");
+    if (ignore_version) {
+        printf("    Downgrading can restore old bugs or incompatible data.\n");
+    }
+    if (force) {
+        printf("    Authenticity and integrity are NOT guaranteed; malicious "
+               "or corrupted code may be installed.\n");
+    }
+    if (no_previous) {
+        printf("    This install will not create a bootable rollback copy.\n");
+    }
+    printf("\nType YES to download and install, or anything else to cancel: ");
+    char answer[16];
+    long length = opos_read(OPOS_STDIN, answer, sizeof(answer));
+    size_t used = length > 0 ? (size_t)length : 0;
+    while (used != 0
+           && (answer[used - 1] == '\n' || answer[used - 1] == '\r')) {
+        used--;
+    }
+    return used == 3 && answer[0] == 'Y' && answer[1] == 'E'
+        && answer[2] == 'S';
+}
+
 int main(int argc, char **argv) {
     bool install = false;
+    bool ignore_version = false;
+    bool force = false;
+    bool no_previous = false;
     /* --source, else update media, else SOURCE_FILE, else GitHub. */
     const char *source = NULL;
     for (int i = 1; i < argc; i++) {
@@ -701,6 +761,12 @@ int main(int argc, char **argv) {
             install = false;
         } else if (strcmp(argv[i], "install") == 0) {
             install = true;
+        } else if (strcmp(argv[i], "--ignoreversion") == 0) {
+            ignore_version = true;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
+        } else if (strcmp(argv[i], "--no-prev-version") == 0) {
+            no_previous = true;
         } else if (strcmp(argv[i], "--gui") == 0) {
             gui = true;
         } else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
@@ -709,6 +775,14 @@ int main(int argc, char **argv) {
             usage();
             return 2;
         }
+    }
+    bool install_option = ignore_version || force || no_previous;
+    if (install_option && gui) {
+        usage();
+        return 2;
+    }
+    if (install_option) {
+        install = true;
     }
     if (source == NULL) {
         source = media_source();
@@ -750,8 +824,13 @@ int main(int argc, char **argv) {
     join(url, source, SIGNATURE_NAME);
     result = source_get(url, memory_write, &signature_sink);
     if (result != 0) {
-        describe_download_error(SIGNATURE_NAME, result);
-        return 1;
+        if (!force) {
+            describe_download_error(SIGNATURE_NAME, result);
+            return 1;
+        }
+        printf("WARNING: signature could not be loaded; --force will "
+               "continue.\n");
+        signature_sink.length = 0;
     }
     char version[32];
     if (!manifest_version((const char *)manifest, manifest_sink.length,
@@ -769,8 +848,17 @@ int main(int argc, char **argv) {
         && (user.flags & OPOS_USER_ADMIN) != 0;
     long count = -OPOS_UPDATE_ENOT_ADMIN;
     if (admin || install) {
-        count = opos_update_begin(manifest, manifest_sink.length, signature,
-                                  signature_sink.length);
+        uint32_t options = (ignore_version ? OPOS_UPDATE_IGNORE_VERSION : 0)
+            | (force ? OPOS_UPDATE_FORCE : 0)
+            | (no_previous ? OPOS_UPDATE_NO_PREVIOUS : 0);
+        if (options != 0) {
+            count = opos_update_begin_options(manifest, manifest_sink.length,
+                                              signature,
+                                              signature_sink.length, options);
+        } else {
+            count = opos_update_begin(manifest, manifest_sink.length,
+                                      signature, signature_sink.length);
+        }
     }
     if (count == -OPOS_UPDATE_ENOT_NEWER) {
         printf("OPOS is up to date.\n");
@@ -810,13 +898,24 @@ int main(int argc, char **argv) {
             needed++;
         }
     }
-    printf("The signature is valid. %ld of %ld files changed (%lu KB to "
-           "download).\n", needed, count,
-           (unsigned long)(download_total / 1024));
+    if (force) {
+        printf("WARNING: signature and file hash checks are bypassed. ");
+    } else {
+        printf("The signature is valid. ");
+    }
+    printf("%ld of %ld files will be installed (%lu KB to download).\n",
+           needed, count, (unsigned long)(download_total / 1024));
     if (!install) {
         opos_update_cancel();
         printf("Run \"update install\" to install it.\n");
         report_status("available");
+        return 0;
+    }
+
+    if (!confirm_install(source, current_version(), version, needed, count,
+                         ignore_version, force, no_previous)) {
+        printf("Update cancelled.\n");
+        opos_update_cancel();
         return 0;
     }
 
@@ -878,13 +977,22 @@ int main(int argc, char **argv) {
     result = opos_update_commit();
     if (result < 0) {
         report_error(update_error_text(result));
-        printf("If OPOS does not start, choose \"OPOS (previous version)\" "
-               "in the boot menu.\n");
+        if (no_previous) {
+            printf("No previous-version backup was created.\n");
+        } else {
+            printf("If OPOS does not start, choose \"OPOS (previous "
+                   "version)\" in the boot menu.\n");
+        }
         return 1;
     }
     report_progress(100);
-    printf("OPOS %s is installed. Restart to use it; the boot menu keeps "
-           "\"OPOS (previous version)\".\n", version);
+    if (no_previous) {
+        printf("OPOS %s is installed. Restart to use it; no previous-version "
+               "backup was created.\n", version);
+    } else {
+        printf("OPOS %s is installed. Restart to use it; the boot menu keeps "
+               "\"OPOS (previous version)\".\n", version);
+    }
     report_status("installed");
     return 0;
 }

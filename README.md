@@ -9,8 +9,8 @@ eventually run native OPOS, Linux and Windows applications.
 
 OPOS is in early, active development. It boots into a graphical desktop and can
 install itself to a disk, but it is not ready for everyday use. Broad
-application compatibility, security isolation between users, and networking
-are goals, not current features.
+application compatibility, audio, per-application sandboxing, and broad
+hardware support remain future work.
 
 ## What works today
 
@@ -21,8 +21,9 @@ are goals, not current features.
 - Taskbar with Start menu, window buttons and clock, on the bottom, top,
   left or right edge of the screen (per user). Right-click it for the window
   layout, its position, Task Manager and taskbar settings.
-- Built-in apps: Terminal, Files, Text Editor, Image Viewer, Settings, and a
-  Welcome window shown on each user's first login.
+- Desktop apps: Terminal, Files, Text Editor, Image Viewer, Settings, Browser,
+  and a Welcome window shown on each user's first login. Text Editor and
+  Browser are native SDK programs; the others currently live in the desktop.
 - Settings has pages for System, Accounts, Display, Appearance, Desktop,
   Date & Time, Touchpad and About (memory, uptime, screen, disks). Clicking
   your name in the Start menu opens Accounts.
@@ -65,10 +66,18 @@ are goals, not current features.
 - Partition tables: MBR and GPT. Filesystems: FAT16 and FAT32 with long file
   names; every FAT volume is mounted (`/disk`, `/disk2`...).
 - Input: PS/2 keyboard (Num Lock, keypad, LEDs) and mouse, VMware absolute
-  mouse.
+  mouse. xHCI USB mass-storage devices are supported.
 - Display: Limine framebuffer, VMware SVGA II with resolution switching and VM
   window autofit.
 - RTC clock, ACPI shutdown, reboot.
+
+**Networking and web**
+- Ethernet: Intel E1000, VMware VMXNET3 and AMD PCnet adapters, with ARP,
+  DHCP, IPv4, ICMP, UDP, TCP and DNS.
+- Native Browser (`/bin/browser`) with HTTP/HTTPS, HTML, a CSS subset,
+  TrueType text, images, selection, find-in-page and GET/POST forms. It has
+  no JavaScript engine, so many modern sites do not work fully.
+- `/bin/fetch` downloads HTTP or HTTPS resources from the Terminal.
 
 **Kernel and programs**
 - Preemptive scheduler, isolated per-process address spaces, NX and
@@ -81,8 +90,8 @@ are goals, not current features.
   syscalls (files, pipes, fork/execve/wait, mmap, threads with futexes) that
   runs static musl programs. See [docs/linux-compat.md](docs/linux-compat.md).
 
-**Not yet:** networking, USB, sound, per-application sandboxes, a widget
-toolkit for apps, general Linux or Windows application support.
+**Not yet:** sound, Wi-Fi, per-application sandboxes, a widget toolkit for
+apps, or general Linux and Windows application support.
 
 ## Building
 

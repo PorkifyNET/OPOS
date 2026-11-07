@@ -5,20 +5,23 @@
 OPOS is early development software. Do not use it to protect sensitive data.
 In particular:
 
-- User accounts do not enforce file permissions yet. Any account, and any
-  program, can read and change every file on every mounted volume.
-- The kernel shell (reached with Ctrl while choosing Reboot) skips the login
-  screen.
-- Programs run in isolated address spaces, but there is no sandboxing or
-  permission system for what they may access.
+- User accounts enforce a location-based access policy on OPOS system files
+  and home folders. FAT has no ownership metadata; this is not a general Unix
+  permission model. See [docs/security-model.md](docs/security-model.md).
+- The kernel shell requires an administrator login when accounts exist, but
+  physical access still permits booting other media and reading unencrypted
+  disks.
+- Programs run in isolated address spaces and inherit their account's file
+  access. There is no per-application sandbox or permission prompt system.
+- OPOS has not had an external security audit. Do not treat these boundaries
+  as production-grade protection.
 
-These are known gaps, so you do not need to report them. They are planned work;
-see the README.
+The missing sandbox, disk encryption and external audit are known gaps; they
+do not need separate reports. See the README and security-model document.
 
 ## Supported versions
 
-No release has been published yet. Security fixes go to the latest `main`
-branch only.
+Security fixes go to the latest `main` branch only.
 
 | Version | Supported |
 | --- | --- |

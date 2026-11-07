@@ -5,11 +5,23 @@ Releases. Settings > UPDATES checks when it is first opened and shows the
 release notes, an UPDATE button, progress, and the updater's log under
 SHOW DETAILS. In the Terminal or kernel shell, `update` checks and
 `update install` installs. Only an administrator can install updates.
+Terminal installs show a summary and require typing `YES` before payload files
+are downloaded. Development-only flags are available:
+
+- `--ignoreversion` permits same-version installs and downgrades.
+- `--force` bypasses signature and file SHA-256 checks. It does not bypass
+  administrator, manifest/path, download-completeness or disk-write checks.
+- `--no-prev-version` skips backing up the current kernel and initramfs and
+  does not create a new previous-version boot entry.
+
+These flags compose. The summary explains every active flag and its risks.
+Using any of them implies `install`, so `update --ignoreversion` is shorthand
+for `update install --ignoreversion`.
 
 ## Publishing a release
 
-1. Raise the number in `VERSION` (for example `0.1.0` to `0.2.0`). Installs
-   only accept a version higher than their own. Up to four numbers.
+1. Raise the number in `VERSION` (for example `0.1.0` to `0.2.0`). Normal
+   installs only accept a version higher than their own. Up to four numbers.
 2. `make release` (in WSL). It builds the ISO and writes `build/release/`:
    - `opos-update.manifest`: the version and each system file's SHA-256,
      size, release file name and install path;
@@ -100,7 +112,14 @@ QEMU's user network reaches the host at 10.0.2.2:
     python3 -m http.server 8000 --directory build/release
     update install --source http://10.0.2.2:8000/
 
+During development, add `--ignoreversion` to reinstall rebuilt files without
+changing `VERSION`. Add `--force` only when intentionally testing unsigned or
+hash-mismatched files. Both modes remain administrator-only. The first build
+using these flags must be installed normally so the running kernel supports
+the new updater options.
+
 Settings > UPDATES takes no arguments: put the URL on the first line of
 `/disk/OPOS/UPDATE-SOURCE.TXT` instead (delete the file to go back to
-GitHub). The signature is checked whatever the source, so a test release
-must be signed with the real key too.
+GitHub). The signature is checked whatever the source unless the explicitly
+unsafe `--force` flag is used, so a normal test release must be signed with the
+real key too.

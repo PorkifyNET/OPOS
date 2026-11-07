@@ -1,15 +1,15 @@
 # Contributing to OPOS
 
-Thanks for your interest in OPOS. The project is young and not yet public, so
-these guidelines are short and will grow as more people join.
+Thanks for your interest in OPOS. The project is young, so these guidelines
+are short and will grow as more people join.
 
 ## Before you start
 
 - Read the [README](README.md) to learn what works today and how to build.
 - For anything bigger than a bug fix, open an issue or start a discussion
   first, so the design can be agreed before you write a lot of code.
-- Good first areas: desktop polish (window resizing, Files address bar),
-  documentation, testing on more VMs and hardware, and build tooling.
+- Good first areas: browser polish, documentation, testing on more VMs and
+  hardware, and build tooling.
 
 ## Development setup
 
@@ -48,8 +48,9 @@ care about. Use throwaway disk images.
 - For storage or filesystem changes, check the disk afterwards from Linux
   (`fsck.fat -n`, `sgdisk -v`, `sfdisk -l`) and confirm that partitions you
   did not touch are byte-identical.
-- `make persistence-test` covers FAT writes, rename, delete and the
-  Linux-style file syscalls.
+- `make persistence-test` is intended to cover FAT writes, rename, delete and
+  Linux-style file syscalls. Its shell-boot harness currently needs updating
+  for installation media that starts the desktop automatically.
 - `tools/qemu_cmds.sh` boots the ISO and types shell commands, which is useful
   for scripted checks.
 
@@ -74,11 +75,12 @@ Include:
 
 ## Security
 
-OPOS does not yet isolate users from each other, so do not rely on it to
-protect data. If you find a security problem in code that is meant to
-enforce a boundary (process isolation, syscall validation, the password
-store), report it privately as described in [SECURITY.md](SECURITY.md), not
-in a public issue. For help and questions, see [SUPPORT.md](SUPPORT.md).
+OPOS enforces its documented account and process boundaries, but it is still
+experimental and unaudited. Do not rely on it to protect sensitive data. If
+you find a security problem in process isolation, file access checks, syscall
+validation or the password store, report it privately as described in
+[SECURITY.md](SECURITY.md), not in a public issue. For help and questions, see
+[SUPPORT.md](SUPPORT.md).
 
 ## License
 

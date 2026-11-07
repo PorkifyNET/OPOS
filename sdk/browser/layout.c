@@ -67,6 +67,7 @@ struct inline_item {
     bool checked;
     bool placeholder;
     bool focused;
+    size_t field_offset;
     const struct opos_html_node *node;
 };
 
@@ -454,17 +455,6 @@ static void append_text(const struct opos_html_node *node, char *out,
     out[*used] = '\0';
 }
 
-/* Number of UTF-8 characters in text. */
-static size_t utf8_count(const char *text, size_t length) {
-    size_t count = 0;
-    for (size_t i = 0; i < length; i++) {
-        if (((unsigned char)text[i] & 0xc0) != 0x80) {
-            count++;
-        }
-    }
-    return count;
-}
-
 static void add_control(struct ctx *c, const struct opos_html_node *node,
                         const struct style *style) {
     enum field_kind kind = form_kind(node);
@@ -482,6 +472,7 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
     bool checked = field != NULL ? field->checked
                  : opos_html_attribute(node, "checked") != NULL;
     bool placeholder = false;
+    size_t field_offset = 0;
     const char *text = "";
     char *owned = NULL;   /* text when it had to be built (malloc'd) */
     char buffer[200];
@@ -558,7 +549,7 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
             }
         }
         if (kind == FIELD_PASSWORD && !placeholder) {
-            size_t n = utf8_count(text, strlen(text));
+            size_t n = browser_utf8_count(text, strlen(text));
             owned = malloc(n + 1);
             if (owned == NULL) {
                 c->failed = true;
@@ -630,23 +621,34 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
                 width = 60;
             }
         } else if (!c->measuring && box != BOX_TEXTAREA) {
-            /* Fit the text in the box: the end of it while typing,
-               otherwise the start. */
+            /* Fit the text in the box. A focused field keeps its caret
+               visible; an unfocused field shows the start. */
             int room = width - 14;
-            while (length > 0 && text_width(c, style, label, length) > room) {
-                if (focused && !placeholder) {
-                    size_t skip = 1;
-                    while (skip < length && (label[skip] & 0xc0) == 0x80) {
-                        skip++;
-                    }
-                    label += skip;
-                    length -= skip;
-                } else {
-                    do {
-                        length--;
-                    } while (length > 0 && (label[length] & 0xc0) == 0x80);
+            size_t start = 0;
+            if (focused && !placeholder && field != NULL) {
+                size_t cursor = kind == FIELD_PASSWORD
+                    ? browser_utf8_count(field->value,
+                                         field->selection_cursor)
+                    : field->selection_cursor;
+                while (start < cursor
+                       && text_width(c, style, label + start,
+                                     cursor - start) > room) {
+                    start = browser_utf8_next(label, length, start);
                 }
             }
+            size_t end = start;
+            while (end < length) {
+                size_t next = browser_utf8_next(label, length, end);
+                if (text_width(c, style, label + start, next - start) > room) {
+                    break;
+                }
+                end = next;
+            }
+            field_offset = kind == FIELD_PASSWORD && field != NULL
+                ? browser_utf8_offset(field->value, field->length, start)
+                : start;
+            label += start;
+            length = end - start;
         }
     }
     free(owned);
@@ -664,6 +666,7 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
     item->checked = checked;
     item->placeholder = placeholder;
     item->focused = focused;
+    item->field_offset = field_offset;
     item->node = node;
 }
 
@@ -773,8 +776,7 @@ static void emit_marker(struct ctx *c, int baseline, int line_top) {
 }
 
 /* A textarea's text, wrapped at spaces to the box width and broken at
-   new lines. While it has focus it shows the last lines and a caret
-   after the text; otherwise the first lines. */
+   new lines. A focused textarea scrolls enough to keep its caret visible. */
 static void draw_textarea(struct ctx *c, const struct inline_item *item,
                           const struct style *style, int x, int box_top) {
     enum { MAX_LINES = 256 };
@@ -825,12 +827,20 @@ static void draw_textarea(struct ctx *c, const struct inline_item *item,
     if (fit < 1) {
         fit = 1;
     }
-    int first = item->focused && lines > fit ? lines - fit : 0;
+    struct form_field *field = form_field(c->page, item->node);
+    size_t cursor = field != NULL ? field->selection_cursor : length;
+    if (cursor > length) {
+        cursor = length;
+    }
+    int caret_line = 0;
+    for (int i = 0; i < lines; i++) {
+        if (starts[i] <= cursor) {
+            caret_line = i;
+        }
+    }
+    int first = item->focused && caret_line >= fit ? caret_line - fit + 1 : 0;
     int y = box_top + 4;
     for (int i = first; i < lines && i < first + fit; i++, y += line_height) {
-        if (lengths[i] == 0) {
-            continue;
-        }
         struct display_item *label = add_item(
             c, ITEM_TEXT, x + 6, y,
             text_width(c, style, text + starts[i], lengths[i]), line_height);
@@ -841,19 +851,28 @@ static void draw_textarea(struct ctx *c, const struct inline_item *item,
             label->size = style->font_size;
             label->baseline = ascent;
             label->colour = item->placeholder ? 0x00757575 : style->colour;
+            label->control = item->node;
+            label->field_offset = item->placeholder ? 0 : starts[i];
         }
     }
     if (item->focused) {
-        int last = lines - 1;
         int caret_x = x + 6;
-        if (!item->placeholder && lengths[last] > 0) {
-            caret_x += text_width(c, style, text + starts[last], lengths[last]);
+        size_t in_line = cursor > starts[caret_line]
+                       ? cursor - starts[caret_line] : 0;
+        if (in_line > lengths[caret_line]) {
+            in_line = lengths[caret_line];
         }
-        int caret_y = box_top + 4 + (last - first) * line_height;
+        if (!item->placeholder && in_line > 0) {
+            caret_x += text_width(c, style, text + starts[caret_line],
+                                  in_line);
+        }
+        int caret_y = box_top + 4 + (caret_line - first) * line_height;
         struct display_item *caret = add_item(c, ITEM_RECT, caret_x, caret_y,
                                               1, line_height);
         if (caret != NULL) {
             caret->colour = style->colour;
+            caret->control = item->node;
+            caret->field_offset = cursor;
         }
     }
 }
@@ -1024,16 +1043,35 @@ static void emit_line(struct ctx *c, size_t count, int used,
                     label->baseline = ascent;
                     label->colour = item->placeholder ? 0x00757575
                                                       : style->colour;
+                    if (item->box == BOX_TEXT) {
+                        label->control = item->node;
+                        label->field_offset = item->field_offset;
+                    }
                 }
             }
             if (item->focused
                 && (item->box == BOX_TEXT || item->box == BOX_TEXTAREA)) {
-                /* The caret, after the text (before a placeholder). */
+                /* The caret at the field's selection cursor. */
                 int ascent, descent;
                 line_metrics(c, style, &ascent, &descent);
                 int caret_x = x + 6;
-                if (!item->placeholder && item->length > 0) {
-                    caret_x += text_width(c, style, item->text, item->length);
+                struct form_field *field = form_field(c->page, item->node);
+                size_t shown = 0;
+                if (!item->placeholder && field != NULL
+                    && field->selection_cursor >= item->field_offset) {
+                    if (field->kind == FIELD_PASSWORD) {
+                        shown = browser_utf8_count(
+                            field->value + item->field_offset,
+                            field->selection_cursor - item->field_offset);
+                    } else {
+                        shown = field->selection_cursor - item->field_offset;
+                    }
+                    if (shown > item->length) {
+                        shown = item->length;
+                    }
+                }
+                if (shown > 0) {
+                    caret_x += text_width(c, style, item->text, shown);
                 }
                 struct display_item *caret = add_item(
                     c, ITEM_RECT, caret_x,
@@ -1041,6 +1079,9 @@ static void emit_line(struct ctx *c, size_t count, int used,
                     ascent + descent);
                 if (caret != NULL) {
                     caret->colour = style->colour;
+                    caret->control = item->node;
+                    caret->field_offset = field != NULL
+                        ? field->selection_cursor : 0;
                 }
             }
             break;

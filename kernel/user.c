@@ -3074,6 +3074,8 @@ static int64_t user_opos_user_info(const struct user_process *process,
 #define OPOS_SYSCALL_UPDATE_WRITE (OPOS_SYSCALL_BASE + 0x22)
 #define OPOS_SYSCALL_UPDATE_COMMIT (OPOS_SYSCALL_BASE + 0x23)
 #define OPOS_SYSCALL_UPDATE_CANCEL (OPOS_SYSCALL_BASE + 0x24)
+#define OPOS_SYSCALL_UPDATE_BEGIN_FORCE (OPOS_SYSCALL_BASE + 0x25)
+#define OPOS_SYSCALL_UPDATE_BEGIN_OPTIONS (OPOS_SYSCALL_BASE + 0x26)
 #define UPDATE_WRITE_MAX (1024 * 1024)
 
 static int64_t user_opos_update(const struct user_process *process,
@@ -3081,22 +3083,35 @@ static int64_t user_opos_update(const struct user_process *process,
                                 uint64_t number) {
     bool admin = process->identity.admin;
     enum update_result result = UPDATE_INVALID;
-    if (number == OPOS_SYSCALL_UPDATE_BEGIN) {
+    if (number == OPOS_SYSCALL_UPDATE_BEGIN
+        || number == OPOS_SYSCALL_UPDATE_BEGIN_FORCE
+        || number == OPOS_SYSCALL_UPDATE_BEGIN_OPTIONS) {
         size_t manifest_length = (size_t)frame->rsi;
         size_t signature_length = (size_t)frame->r10;
+        uint32_t options = number == OPOS_SYSCALL_UPDATE_BEGIN_FORCE
+            ? UPDATE_OPTION_IGNORE_VERSION
+            : number == OPOS_SYSCALL_UPDATE_BEGIN_OPTIONS
+            ? (uint32_t)frame->r8 : 0;
         if (manifest_length == 0 || manifest_length > UPDATE_MANIFEST_MAX
-            || signature_length == 0
+            || (signature_length == 0
+                && (options & UPDATE_OPTION_FORCE) == 0)
             || signature_length > UPDATE_SIGNATURE_MAX) {
+            return -UPDATE_INVALID;
+        }
+        if ((options & ~UPDATE_OPTION_MASK) != 0) {
             return -UPDATE_INVALID;
         }
         if (!paging_user_range_valid((uintptr_t)frame->rdi, manifest_length,
                                      false, false)
-            || !paging_user_range_valid((uintptr_t)frame->rdx,
-                                        signature_length, false, false)) {
+            || (signature_length != 0
+                && !paging_user_range_valid((uintptr_t)frame->rdx,
+                                            signature_length, false,
+                                            false))) {
             return -14;
         }
         size_t count = 0;
-        result = update_begin(admin, (const uint8_t *)(uintptr_t)frame->rdi,
+        result = update_begin(admin, options,
+                              (const uint8_t *)(uintptr_t)frame->rdi,
                               manifest_length,
                               (const uint8_t *)(uintptr_t)frame->rdx,
                               signature_length, &count);
@@ -4582,7 +4597,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return user_opos_window(process, frame);
     }
     if (number >= OPOS_SYSCALL_UPDATE_BEGIN
-        && number <= OPOS_SYSCALL_UPDATE_CANCEL) {
+        && number <= OPOS_SYSCALL_UPDATE_BEGIN_OPTIONS) {
         if (!update_call_enter()) {
             frame->rax = (uint64_t)-(int64_t)UPDATE_BUSY;
         } else {

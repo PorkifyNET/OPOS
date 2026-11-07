@@ -596,9 +596,11 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
         }
         size_t used = 0;
         if (box == BOX_TEXT || box == BOX_TEXTAREA) {
-            /* Typed text keeps its spaces; line breaks show as spaces. */
+            /* Typed text keeps its spaces; line breaks show as spaces,
+               except in a textarea, which shows them as new lines. */
             for (size_t i = 0; i < length; i++) {
-                label[used++] = is_ws(text[i]) ? ' ' : text[i];
+                label[used++] = box == BOX_TEXTAREA && text[i] == '\n'
+                              ? '\n' : is_ws(text[i]) ? ' ' : text[i];
             }
         } else {
             /* Collapse white space in button and option labels. */
@@ -627,7 +629,7 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
             if (width < 60) {
                 width = 60;
             }
-        } else if (!c->measuring) {
+        } else if (!c->measuring && box != BOX_TEXTAREA) {
             /* Fit the text in the box: the end of it while typing,
                otherwise the start. */
             int room = width - 14;
@@ -768,6 +770,92 @@ static void emit_marker(struct ctx *c, int baseline, int line_top) {
     item->size = style->font_size;
     item->baseline = baseline - line_top;
     item->colour = style->colour;
+}
+
+/* A textarea's text, wrapped at spaces to the box width and broken at
+   new lines. While it has focus it shows the last lines and a caret
+   after the text; otherwise the first lines. */
+static void draw_textarea(struct ctx *c, const struct inline_item *item,
+                          const struct style *style, int x, int box_top) {
+    enum { MAX_LINES = 256 };
+    size_t starts[MAX_LINES], lengths[MAX_LINES];
+    int lines = 0;
+    int ascent, descent;
+    line_metrics(c, style, &ascent, &descent);
+    int line_height = ascent + descent;
+    int room = item->width - 12;
+    const char *text = item->text;
+    size_t length = item->length;
+    size_t at = 0;
+    while (lines < MAX_LINES) {
+        size_t end = at;
+        size_t space = 0; /* last space in the line + 1, 0 = none */
+        while (end < length && text[end] != '\n') {
+            size_t next = end + 1;
+            while (next < length && (text[next] & 0xc0) == 0x80) {
+                next++;
+            }
+            if (end > at && text_width(c, style, text + at, next - at) > room) {
+                break;
+            }
+            if (text[end] == ' ') {
+                space = end + 1;
+            }
+            end = next;
+        }
+        bool wrapped = end < length && text[end] != '\n';
+        if (wrapped && space > at) {
+            end = space;
+        }
+        starts[lines] = at;
+        lengths[lines] = end - at;
+        lines++;
+        if (end >= length) {
+            break;
+        }
+        at = end + (text[end] == '\n' ? 1 : 0);
+        if (at >= length && text[end] == '\n' && lines < MAX_LINES) {
+            starts[lines] = at; /* an empty last line after a new line */
+            lengths[lines] = 0;
+            lines++;
+            break;
+        }
+    }
+    int fit = (item->height - 8) / (line_height > 0 ? line_height : 1);
+    if (fit < 1) {
+        fit = 1;
+    }
+    int first = item->focused && lines > fit ? lines - fit : 0;
+    int y = box_top + 4;
+    for (int i = first; i < lines && i < first + fit; i++, y += line_height) {
+        if (lengths[i] == 0) {
+            continue;
+        }
+        struct display_item *label = add_item(
+            c, ITEM_TEXT, x + 6, y,
+            text_width(c, style, text + starts[i], lengths[i]), line_height);
+        if (label != NULL) {
+            label->text = text + starts[i];
+            label->length = lengths[i];
+            label->font = font_index(style);
+            label->size = style->font_size;
+            label->baseline = ascent;
+            label->colour = item->placeholder ? 0x00757575 : style->colour;
+        }
+    }
+    if (item->focused) {
+        int last = lines - 1;
+        int caret_x = x + 6;
+        if (!item->placeholder && lengths[last] > 0) {
+            caret_x += text_width(c, style, text + starts[last], lengths[last]);
+        }
+        int caret_y = box_top + 4 + (last - first) * line_height;
+        struct display_item *caret = add_item(c, ITEM_RECT, caret_x, caret_y,
+                                              1, line_height);
+        if (caret != NULL) {
+            caret->colour = style->colour;
+        }
+    }
 }
 
 static void emit_line(struct ctx *c, size_t count, int used,
@@ -911,6 +999,10 @@ static void emit_line(struct ctx *c, size_t count, int used,
                         mark->round = item->box == BOX_RADIO;
                     }
                 }
+                break;
+            }
+            if (item->box == BOX_TEXTAREA) {
+                draw_textarea(c, item, style, x, box_top);
                 break;
             }
             if (item->length > 0) {

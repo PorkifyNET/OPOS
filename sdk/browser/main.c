@@ -66,6 +66,7 @@ struct browser {
     size_t find_length;
     size_t match;                 /* start of the current match */
     bool have_match;
+    const struct opos_html_node *dropdown; /* the open <select> list */
 };
 
 #define NO_TEXT ((size_t)-1)
@@ -628,6 +629,136 @@ static void draw_button(int x, const char *label, bool enabled) {
                    enabled ? COL_TEXT : OPOS_RGB(150, 152, 160), 2);
 }
 
+/* ------------------------------------------------------ select drop-down */
+
+static void refresh_controls(void);
+
+#define DROP_ROW 22
+#define DROP_TEXT 14
+#define DROP_MAX_ROWS 12
+
+/* An <option>'s text with white space collapsed. */
+static void option_label(const struct opos_html_node *node, char *out,
+                         size_t size) {
+    size_t used = 0;
+    bool space = true;
+    const struct opos_html_node *stack[16];
+    int depth = 0;
+    const struct opos_html_node *n = node != NULL ? node->first_child : NULL;
+    while (n != NULL && used + 1 < size) {
+        if (n->type == HTML_NODE_TEXT) {
+            for (size_t i = 0; i < n->text_length && used + 1 < size; i++) {
+                char ch = n->text[i];
+                bool ws = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
+                if (ws && !space) {
+                    out[used++] = ' ';
+                } else if (!ws) {
+                    out[used++] = ch;
+                }
+                space = ws;
+            }
+        } else if (n->first_child != NULL && depth < 16) {
+            stack[depth++] = n;
+            n = n->first_child;
+            continue;
+        }
+        while (n->next_sibling == NULL && depth > 0) {
+            n = stack[--depth];
+        }
+        n = n->next_sibling;
+    }
+    while (used > 0 && out[used - 1] == ' ') {
+        used--;
+    }
+    out[used] = '\0';
+}
+
+/* The open list's place on the screen; false if the select is not shown. */
+static bool dropdown_rect(int *x, int *y, int *width, int *rows) {
+    if (b.dropdown == NULL || !b.have_page) {
+        return false;
+    }
+    for (size_t i = 0; i < b.page.item_count; i++) {
+        const struct display_item *item = &b.page.items[i];
+        if (item->kind != ITEM_RECT || item->control != b.dropdown) {
+            continue;
+        }
+        int count = form_option_count(b.dropdown);
+        *rows = count < DROP_MAX_ROWS ? count : DROP_MAX_ROWS;
+        *x = MARGIN + item->x;
+        *width = item->width < 120 ? 120 : item->width;
+        int top = TOOLBAR_HEIGHT + MARGIN + item->y - b.scroll;
+        int bottom = TOOLBAR_HEIGHT + viewport_height();
+        *y = top + item->height;
+        if (*y + *rows * DROP_ROW + 2 > bottom && top - *rows * DROP_ROW - 2
+                                                  >= TOOLBAR_HEIGHT) {
+            *y = top - *rows * DROP_ROW - 2; /* no room below: open up */
+        }
+        return *rows > 0;
+    }
+    return false;
+}
+
+/* The first option shown, so that the chosen one is in view. */
+static int dropdown_first(int rows) {
+    struct form_field *field = form_field(&b.page, b.dropdown);
+    int chosen = field != NULL ? field->option : 0;
+    int count = form_option_count(b.dropdown);
+    int first = chosen - rows + 1;
+    if (first < 0) {
+        first = 0;
+    }
+    if (first > count - rows) {
+        first = count - rows;
+    }
+    return first < 0 ? 0 : first;
+}
+
+static void paint_dropdown(void) {
+    int x, y, width, rows;
+    if (!dropdown_rect(&x, &y, &width, &rows)) {
+        return;
+    }
+    struct opos_canvas *canvas = &b.canvas;
+    struct form_field *field = form_field(&b.page, b.dropdown);
+    int chosen = field != NULL ? field->option : 0;
+    int first = dropdown_first(rows);
+    int height = rows * DROP_ROW + 2;
+    opos_fill_rect(canvas, x, y, width, height, COL_FIELD);
+    opos_draw_rect(canvas, x, y, width, height, COL_BORDER);
+    for (int row = 0; row < rows; row++) {
+        int index = first + row;
+        char label[128];
+        option_label(form_option(b.dropdown, index), label, sizeof(label));
+        int row_y = y + 1 + row * DROP_ROW;
+        uint32_t colour = COL_TEXT;
+        if (index == chosen) {
+            opos_fill_rect(canvas, x + 1, row_y, width - 2, DROP_ROW,
+                           OPOS_RGB(6, 69, 173));
+            colour = OPOS_RGB(255, 255, 255);
+        }
+        opos_font_draw(b.fonts[0], canvas, x + 6, row_y + 16, DROP_TEXT,
+                       label, strlen(label), colour);
+    }
+}
+
+/* A click while the list is open: picks the option under it, if any,
+   and closes the list. */
+static void dropdown_click(int click_x, int click_y) {
+    int x, y, width, rows;
+    if (dropdown_rect(&x, &y, &width, &rows) && click_x >= x
+        && click_x < x + width && click_y > y && click_y < y + rows * DROP_ROW) {
+        struct form_field *field = form_field(&b.page, b.dropdown);
+        if (field != NULL) {
+            field->option = dropdown_first(rows) + (click_y - y - 1) / DROP_ROW;
+        }
+    }
+    b.page.focus = b.dropdown;
+    b.dropdown = NULL;
+    refresh_controls();
+    b.dirty = true;
+}
+
 static void paint(void) {
     struct opos_canvas *canvas = &b.canvas;
     opos_fill_rect(canvas, 0, 0, b.width, b.height, COL_TOOLBAR);
@@ -672,6 +803,7 @@ static void paint(void) {
         opos_fill_rect(canvas, cursor + 1, 11, 1, 18, COL_TEXT);
     }
     paint_page();
+    paint_dropdown();
     int status_y = b.height - STATUS_HEIGHT;
     opos_fill_rect(canvas, 0, status_y, b.width, STATUS_HEIGHT, COL_STATUS);
     opos_draw_line(canvas, 0, status_y, b.width, status_y,
@@ -872,6 +1004,7 @@ static void install_document(const char *html, size_t length,
     b.have_page = true;
     b.scroll = 0;
     clear_selection();
+    b.dropdown = NULL;
     b.page.focus = find_autofocus(doc->body);
     relayout();
 }
@@ -1153,11 +1286,8 @@ static void click_control(const struct opos_html_node *node) {
         form_check_radio(&b.page, node);
         break;
     case FIELD_SELECT: {
-        /* No drop-down list yet: each click picks the next option. */
-        int count = form_option_count(node);
-        if (count > 0) {
-            field->option = (field->option + 1) % count;
-        }
+        b.dropdown = form_option_count(node) > 0 ? node : NULL;
+        b.dirty = true;
         break;
     }
     case FIELD_SUBMIT:
@@ -1222,6 +1352,26 @@ static bool field_key(uint32_t key, bool ctrl, bool shift) {
     struct form_field *field = form_field(&b.page, node);
     if (field == NULL) {
         return false;
+    }
+    if (field->kind == FIELD_SELECT) {
+        /* Up and Down pick the previous or next option; Enter, Space
+           and Escape close an open list. */
+        int count = form_option_count(node);
+        if (key == OPOS_KEY_UP || key == OPOS_KEY_DOWN) {
+            int option = field->option + (key == OPOS_KEY_UP ? -1 : 1);
+            if (option >= 0 && option < count) {
+                field->option = option;
+                refresh_controls();
+            }
+            b.dirty = true;
+            return true;
+        }
+        if (b.dropdown != NULL && (key == '\n' || key == ' '
+                                   || key == OPOS_KEY_ESCAPE)) {
+            b.dropdown = NULL;
+            b.dirty = true;
+            return true;
+        }
     }
     if (key == OPOS_KEY_ESCAPE) {
         set_focus(NULL);
@@ -1429,6 +1579,10 @@ static bool link_target(const struct display_item *item, char *out,
 }
 
 static void on_click(int x, int y) {
+    if (b.dropdown != NULL) {
+        dropdown_click(x, y);
+        return;
+    }
     if (y < TOOLBAR_HEIGHT) {
         b.editing = false;
         if (x >= 6 && x < 34) {

@@ -59,6 +59,7 @@ static struct entry entries[UPDATE_MAX_FILES];
 static size_t entry_count;
 static struct version manifest_version;
 static bool session_active;
+static uint32_t session_options;
 static uint8_t chunk[COPY_CHUNK];
 /* Set while a program's call runs: then long file work pauses between
    chunks so the desktop keeps drawing (not during the boot resume,
@@ -493,9 +494,10 @@ static enum update_result parse_manifest(const char *text, size_t length) {
 }
 
 /* Checks and parses manifest_text/signature_bytes. */
-static enum update_result load_manifest(void) {
-    if (!signature_valid(manifest_text, manifest_length, signature_bytes,
-                         signature_length)) {
+static enum update_result load_manifest(bool force) {
+    if (!force
+        && !signature_valid(manifest_text, manifest_length, signature_bytes,
+                            signature_length)) {
         return UPDATE_BAD_SIGNATURE;
     }
     return parse_manifest((const char *)manifest_text, manifest_length);
@@ -503,7 +505,8 @@ static enum update_result load_manifest(void) {
 
 /* ------------------------------------------------------------- session */
 
-enum update_result update_begin(bool admin, const uint8_t *manifest,
+enum update_result update_begin(bool admin, uint32_t options,
+                                const uint8_t *manifest,
                                 size_t length, const uint8_t *signature,
                                 size_t sig_length, size_t *file_count) {
     session_active = false;
@@ -513,7 +516,10 @@ enum update_result update_begin(bool admin, const uint8_t *manifest,
     if (!admin) {
         return UPDATE_NOT_ADMIN;
     }
-    if (length == 0 || length > UPDATE_MANIFEST_MAX || sig_length == 0
+    bool force = (options & UPDATE_OPTION_FORCE) != 0;
+    if ((options & ~UPDATE_OPTION_MASK) != 0
+        || length == 0 || length > UPDATE_MANIFEST_MAX
+        || (sig_length == 0 && !force)
         || sig_length > UPDATE_SIGNATURE_MAX) {
         return UPDATE_INVALID;
     }
@@ -525,20 +531,23 @@ enum update_result update_begin(bool admin, const uint8_t *manifest,
         signature_bytes[i] = signature[i];
     }
     signature_length = sig_length;
-    enum update_result result = load_manifest();
+    enum update_result result = load_manifest(force);
     if (result != UPDATE_OK) {
         return result;
     }
     struct version current;
-    if (parse_version(OPOS_VERSION, text_length(OPOS_VERSION), &current)
-        && compare_versions(&manifest_version, &current) <= 0) {
-        return UPDATE_NOT_NEWER;
+    if ((options & UPDATE_OPTION_IGNORE_VERSION) == 0
+        && parse_version(OPOS_VERSION, text_length(OPOS_VERSION), &current)) {
+        int comparison = compare_versions(&manifest_version, &current);
+        if (comparison <= 0) {
+            return UPDATE_NOT_NEWER;
+        }
     }
     for (size_t i = 0; i < entry_count; i++) {
         char path[FULL_PATH_MAX];
         full_path(entries[i].path, path);
-        entries[i].needed = !file_matches(path, entries[i].size,
-                                          entries[i].hash);
+        entries[i].needed = force
+            || !file_matches(path, entries[i].size, entries[i].hash);
         entries[i].complete = false;
         entries[i].received = 0;
     }
@@ -548,6 +557,7 @@ enum update_result update_begin(bool admin, const uint8_t *manifest,
     /* STATE.TXT of an interrupted install stays until a commit replaces
        it, so the install can still be finished at the next start. */
     session_active = true;
+    session_options = options;
     *file_count = entry_count;
     return UPDATE_OK;
 }
@@ -620,7 +630,8 @@ enum update_result update_write(bool admin, size_t index, uint64_t offset,
     if (e->received == e->size) {
         uint8_t digest[SHA256_DIGEST_SIZE];
         sha256_final(&e->hashing, digest);
-        if (!bytes_equal(digest, e->hash, SHA256_DIGEST_SIZE)) {
+        if ((session_options & UPDATE_OPTION_FORCE) == 0
+            && !bytes_equal(digest, e->hash, SHA256_DIGEST_SIZE)) {
             e->received = 0;
             remove_file(path);
             return UPDATE_BAD_FILE;
@@ -702,11 +713,45 @@ static bool install_staged(void) {
                     }
                 }
             }
-            if (!copy_file(from, to) || !file_matches(to, e->size, e->hash)) {
+            if (!copy_file(from, to)
+                || ((session_options & UPDATE_OPTION_FORCE) == 0
+                    && !file_matches(to, e->size, e->hash))) {
                 return false;
             }
         }
     }
+    return true;
+}
+
+static bool write_state(const char *step) {
+    if (session_options == 0) {
+        return write_text(STAGE_STATE, step, text_length(step));
+    }
+    char state[16];
+    size_t length = 0;
+    while (step[length] != '\0') {
+        state[length] = step[length];
+        length++;
+    }
+    state[length++] = ' ';
+    state[length++] = (char)('0' + session_options);
+    return write_text(STAGE_STATE, state, length);
+}
+
+static bool parse_state_options(const char *state, const char *step,
+                                uint32_t *options) {
+    if (equal_folded(state, step)) {
+        *options = 0;
+        return true;
+    }
+    size_t length = text_length(step);
+    if (text_length(state) != length + 2
+        || !starts_with_folded(state, step) || state[length] != ' '
+        || state[length + 1] < '0' || state[length + 1] > '7'
+        || state[length + 2] != '\0') {
+        return false;
+    }
+    *options = (uint32_t)(state[length + 1] - '0');
     return true;
 }
 
@@ -715,9 +760,9 @@ static enum update_result apply(bool copying) {
     block_begin_batch();
     bool ok = true;
     if (!copying) {
-        ok = keep_previous_version()
-            && write_text(STAGE_STATE, STATE_COPYING,
-                          text_length(STATE_COPYING));
+        ok = ((session_options & UPDATE_OPTION_NO_PREVIOUS) != 0
+              || keep_previous_version())
+            && write_state(STATE_COPYING);
     }
     ok = ok && install_staged();
     if (!block_end_batch()) {
@@ -755,8 +800,7 @@ enum update_result update_commit(bool admin) {
     block_begin_batch();
     bool saved = write_text(STAGE_MANIFEST, manifest_text, manifest_length)
         && write_text(STAGE_SIGNATURE, signature_bytes, signature_length)
-        && write_text(STAGE_STATE, STATE_PREPARED,
-                      text_length(STATE_PREPARED));
+        && write_state(STATE_PREPARED);
     if (!block_end_batch() || !saved) {
         return UPDATE_DISK_ERROR;
     }
@@ -793,9 +837,9 @@ void update_resume(void) {
     }
     state[state_length] = '\0';
     bool copying;
-    if (equal_folded(state, STATE_COPYING)) {
+    if (parse_state_options(state, STATE_COPYING, &session_options)) {
         copying = true;
-    } else if (equal_folded(state, STATE_PREPARED)) {
+    } else if (parse_state_options(state, STATE_PREPARED, &session_options)) {
         copying = false;
     } else {
         return;
@@ -805,7 +849,8 @@ void update_resume(void) {
                     &manifest_length)
         || !read_small(STAGE_SIGNATURE, signature_bytes,
                        sizeof(signature_bytes), &signature_length)
-        || load_manifest() != UPDATE_OK) {
+        || load_manifest((session_options & UPDATE_OPTION_FORCE) != 0)
+            != UPDATE_OK) {
         console_write_string("OPOS: update: staged manifest unusable\n");
         if (!copying) {
             remove_staging();
@@ -818,6 +863,7 @@ void update_resume(void) {
         uint64_t size;
         entries[i].needed = file_size(path, &size);
         if (entries[i].needed
+            && (session_options & UPDATE_OPTION_FORCE) == 0
             && !file_matches(path, entries[i].size, entries[i].hash)) {
             console_write_string("OPOS: update: a staged file is damaged\n");
             if (!copying) {
@@ -826,7 +872,13 @@ void update_resume(void) {
             return;
         }
     }
-    console_write_string(apply(copying) == UPDATE_OK
-        ? "OPOS: update installed\n"
-        : "OPOS: update: installing failed; the previous version is in the boot menu\n");
+    if (apply(copying) == UPDATE_OK) {
+        console_write_string("OPOS: update installed\n");
+    } else if ((session_options & UPDATE_OPTION_NO_PREVIOUS) != 0) {
+        console_write_string(
+            "OPOS: update: installing failed; no previous version was saved\n");
+    } else {
+        console_write_string(
+            "OPOS: update: installing failed; the previous version is in the boot menu\n");
+    }
 }

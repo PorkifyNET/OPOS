@@ -94,6 +94,18 @@ static inline long opos_syscall4(long number, long a, long b, long c,
     return result;
 }
 
+static inline long opos_syscall5(long number, long a, long b, long c,
+                                 long d, long e) {
+    long result;
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    __asm__ volatile ("syscall" : "=a"(result)
+                      : "a"(number), "D"(a), "S"(b), "d"(c), "r"(r10),
+                        "r"(r8)
+                      : "rcx", "r11", "memory");
+    return result;
+}
+
 static inline long opos_syscall6(long number, long a, long b, long c,
                                  long d, long e, long f) {
     long result;
@@ -138,9 +150,9 @@ static inline long opos_user_info(struct opos_user_info *info) {
 
 /*
  * Installing OPOS updates (used by /bin/update; administrators only).
- * The kernel checks the manifest's signature and every file's SHA-256
- * itself, so a program cannot install anything that was not signed with
- * the OPOS release key. Kernels before these calls answer -OPOS_ENOSYS.
+ * The kernel normally checks the manifest's signature and every file's
+ * SHA-256 itself. Explicit unsafe options can bypass those checks for
+ * development. Kernels before these calls answer -OPOS_ENOSYS.
  *
  *   count = opos_update_begin(manifest, length, signature, sig_length);
  *   for each i < count: opos_update_file(i, &info); if info.needed, send
@@ -154,6 +166,13 @@ static inline long opos_user_info(struct opos_user_info *info) {
 #define OPOS_SYS_UPDATE_WRITE 0x4f500022L
 #define OPOS_SYS_UPDATE_COMMIT 0x4f500023L
 #define OPOS_SYS_UPDATE_CANCEL 0x4f500024L
+/* Compatibility with the briefly used same-version call. */
+#define OPOS_SYS_UPDATE_BEGIN_FORCE 0x4f500025L
+#define OPOS_SYS_UPDATE_BEGIN_OPTIONS 0x4f500026L
+
+#define OPOS_UPDATE_IGNORE_VERSION 1u
+#define OPOS_UPDATE_FORCE 2u
+#define OPOS_UPDATE_NO_PREVIOUS 4u
 
 #define OPOS_UPDATE_ENOT_INSTALLED 1  /* live media */
 #define OPOS_UPDATE_ENOT_ADMIN 2
@@ -183,6 +202,27 @@ static inline long opos_update_begin(const void *manifest, size_t length,
                                      size_t signature_length) {
     return opos_syscall4(OPOS_SYS_UPDATE_BEGIN, (long)manifest, (long)length,
                          (long)signature, (long)signature_length);
+}
+
+/* Compatibility call: bypasses version ordering, including downgrades. */
+static inline long opos_update_begin_force(const void *manifest, size_t length,
+                                           const void *signature,
+                                           size_t signature_length) {
+    return opos_syscall4(OPOS_SYS_UPDATE_BEGIN_FORCE, (long)manifest,
+                         (long)length, (long)signature,
+                         (long)signature_length);
+}
+
+/* Unsafe options are explicit and composable. The kernel still requires an
+   administrator and a structurally valid manifest with allowed paths. */
+static inline long opos_update_begin_options(const void *manifest,
+                                             size_t length,
+                                             const void *signature,
+                                             size_t signature_length,
+                                             uint32_t options) {
+    return opos_syscall5(OPOS_SYS_UPDATE_BEGIN_OPTIONS, (long)manifest,
+                         (long)length, (long)signature,
+                         (long)signature_length, (long)options);
 }
 
 static inline long opos_update_file(size_t index,

@@ -139,6 +139,12 @@ bool field_set(struct form_field *field, const char *text, size_t length) {
     free(field->value);
     field->value = copy;
     field->length = length;
+    if (field->selection_anchor > length) {
+        field->selection_anchor = length;
+    }
+    if (field->selection_cursor > length) {
+        field->selection_cursor = length;
+    }
     return true;
 }
 
@@ -200,6 +206,7 @@ struct form_field *form_field(struct page *page,
         free(owned);
         return NULL;
     }
+    field->selection_anchor = field->selection_cursor = field->length;
     free(owned);
     page->field_count++;
     return field;

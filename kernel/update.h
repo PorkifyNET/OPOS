@@ -9,9 +9,10 @@
  * System updates. /bin/update downloads a release (see tools/mkrelease.py)
  * and hands it to the kernel, which checks it and installs it:
  *
- *   update_begin    checks the manifest's signature (ECDSA P-256 with the
- *                   key in update_key.h) and version, and works out which
- *                   files differ from the installed ones;
+ *   update_begin    normally checks the manifest's signature (ECDSA P-256
+ *                   with the key in update_key.h) and version, and works out
+ *                   which files differ from the installed ones. Explicit
+ *                   unsafe options can bypass these development safeguards;
  *   update_write    receives a changed file in order into the staging
  *                   folder /disk/OPOS/UPDATE and checks its SHA-256;
  *   update_commit   installs the staged files.
@@ -28,11 +29,11 @@
  * require a newer updater.
  *
  * Installing: the current boot/kernel.elf and boot/initramfs.tar are
- * copied to boot/old/ and limine.conf gets an "OPOS (previous version)"
- * entry for them, then the staged files are copied over the installed
- * ones (the kernel last). STATE.TXT in the staging folder records the
- * step, so update_resume can finish after a power cut on the next start;
- * until then the previous-version entry still boots.
+ * normally copied to boot/old/ and limine.conf gets an "OPOS (previous
+ * version)" entry for them, then the staged files are copied over the
+ * installed ones (the kernel last). STATE.TXT in the staging folder records
+ * the step and options, so update_resume can finish after a power cut on the
+ * next start. UPDATE_OPTION_NO_PREVIOUS explicitly skips that backup.
  */
 
 enum update_result {
@@ -57,6 +58,11 @@ enum update_result {
 #define UPDATE_ASSET_MAX 64
 #define UPDATE_PATH_MAX 96
 
+#define UPDATE_OPTION_IGNORE_VERSION 1u
+#define UPDATE_OPTION_FORCE 2u
+#define UPDATE_OPTION_NO_PREVIOUS 4u
+#define UPDATE_OPTION_MASK 7u
+
 struct update_file_info {
     uint64_t size;
     uint32_t needed; /* differs from the installed file */
@@ -78,7 +84,8 @@ bool update_call_enter(void);
 void update_call_leave(void);
 
 /* On success *file_count is the manifest's file count. */
-enum update_result update_begin(bool admin, const uint8_t *manifest,
+enum update_result update_begin(bool admin, uint32_t options,
+                                const uint8_t *manifest,
                                 size_t manifest_length,
                                 const uint8_t *signature,
                                 size_t signature_length,

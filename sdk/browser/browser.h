@@ -62,6 +62,8 @@ struct style {
     bool margin_auto_left, margin_auto_right;
     bool no_marker;          /* list-style: none */
     bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
+    bool opacity_zero;       /* opacity: 0 */
+    bool grid_area_set;      /* grid-area or grid-row given: may share a cell */
     int float_side;          /* 0 none, 1 left, 2 right */
     bool clear_both;
     bool flex, flex_wrap, flex_zero; /* flex_zero: flex: N (basis 0) */

@@ -1190,6 +1190,19 @@ void apply_declaration(struct style *style, const char *name,
     } else if (word_is(name, name_length, "position")) {
         style->out_of_flow = word_is(text, strlen(text), "absolute")
                           || word_is(text, strlen(text), "fixed");
+    } else if (word_is(name, name_length, "opacity")) {
+        /* Only exactly zero ("0", "0.0", ".0", "0%") counts. */
+        const char *t = text;
+        bool zero = *t != '\0';
+        for (; *t != '\0' && *t != ' ' && *t != '!'; t++) {
+            if (*t != '0' && *t != '.' && *t != '%') {
+                zero = false;
+            }
+        }
+        style->opacity_zero = zero;
+    } else if (word_is(name, name_length, "grid-area")
+               || word_is(name, name_length, "grid-row")) {
+        style->grid_area_set = !word_is(text, strlen(text), "auto");
     } else if (word_is(name, name_length, "visibility")) {
         style->out_of_flow = word_is(text, strlen(text), "hidden")
                           || word_is(text, strlen(text), "collapse");
@@ -1572,6 +1585,21 @@ void style_compute(const struct opos_html_node *element,
     css_apply(style_sheets, element, style, parent);
     if ((value = opos_html_attribute(element, "style")) != NULL) {
         css_apply_block(style, value, parent);
+    }
+    /* An invisible item placed into a shared grid cell (the "stack"
+       trick: a hidden copy that only reserves size) would otherwise
+       show as a second copy of its sibling's text. The last element
+       in the cell stays, because the rules that pick the visible one
+       often need :has(), which we do not support yet. */
+    if (style->opacity_zero && style->grid_area_set && parent != NULL
+        && parent->grid) {
+        const struct opos_html_node *next = element->next_sibling;
+        while (next != NULL && next->type != HTML_NODE_ELEMENT) {
+            next = next->next_sibling;
+        }
+        if (next != NULL) {
+            style->out_of_flow = true;
+        }
     }
     if (style->out_of_flow) {
         style->display = DISPLAY_NONE;

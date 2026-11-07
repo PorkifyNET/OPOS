@@ -779,6 +779,21 @@ static void parse_box(const char *value, int font_size, int sides[4]) {
     sides[LEFT] = count > 3 ? values[3] : count > 1 ? values[1] : values[0];
 }
 
+/* A grid area name (letters, digits, "-", "_", not starting with a
+   digit) as a non-zero hash; 0 if *p does not start one. Advances *p. */
+static uint32_t grid_name_hash(const char **p) {
+    const char *s = *p;
+    if (!isalpha((unsigned char)*s) && *s != '_' && *s != '-') {
+        return 0;
+    }
+    uint32_t hash = 2166136261u;
+    while (isalnum((unsigned char)*s) || *s == '_' || *s == '-') {
+        hash = (hash ^ (unsigned char)*s++) * 16777619u;
+    }
+    *p = s;
+    return hash != 0 ? hash : 1;
+}
+
 /* grid-template-columns: px, %, fr, auto, minmax(), repeat(). */
 static void grid_add_track(struct style *style, const char *token,
                            size_t length, int font_size) {
@@ -1183,6 +1198,63 @@ void apply_declaration(struct style *style, const char *name,
         }
     } else if (word_is(name, name_length, "grid-template-columns")) {
         parse_grid_columns(style, text);
+    } else if (word_is(name, name_length, "grid-template")) {
+        /* "rows / columns": only the columns matter here. */
+        char *slash = strchr(text, '/');
+        if (slash != NULL && strchr(text, '"') == NULL
+            && strchr(text, '\'') == NULL) {
+            parse_grid_columns(style, (char *)skip_space(slash + 1));
+        }
+    } else if (word_is(name, name_length, "grid-template-areas")) {
+        /* Each quoted string is a row; a name's first row gives its
+           start column and how many columns it spans. */
+        style->area_count = 0;
+        const char *p = text;
+        for (;;) {
+            while (*p != '\0' && *p != '"' && *p != '\'') {
+                p++;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            char quote = *p++;
+            int column = 0;
+            uint32_t previous = 0;
+            while (*p != '\0' && *p != quote) {
+                if (*p == ' ') {
+                    p++;
+                    continue;
+                }
+                uint32_t hash = grid_name_hash(&p);
+                if (hash == 0) {
+                    p++; /* "." or an unknown character: an empty cell */
+                    previous = 0;
+                    column++;
+                    continue;
+                }
+                int found = -1;
+                for (int i = 0; i < style->area_count; i++) {
+                    if (style->area_hash[i] == hash) {
+                        found = i;
+                    }
+                }
+                if (found < 0 && style->area_count < 8) {
+                    found = style->area_count++;
+                    style->area_hash[found] = hash;
+                    style->area_start[found] = (uint8_t)column;
+                    style->area_span[found] = 1;
+                } else if (found >= 0 && previous == hash
+                           && style->area_start[found]
+                              + style->area_span[found] == column) {
+                    style->area_span[found]++;
+                }
+                previous = hash;
+                column++;
+            }
+            if (*p == quote) {
+                p++;
+            }
+        }
     } else if (word_is(name, name_length, "justify-content")) {
         style->justify = strstr(text, "center") ? 1
                        : strstr(text, "end") ? 2
@@ -1202,7 +1274,15 @@ void apply_declaration(struct style *style, const char *name,
         style->opacity_zero = zero;
     } else if (word_is(name, name_length, "grid-area")
                || word_is(name, name_length, "grid-row")) {
-        style->grid_area_set = !word_is(text, strlen(text), "auto");
+        bool none = word_is(text, strlen(text), "auto")
+                 || word_is(text, strlen(text), "unset")
+                 || word_is(text, strlen(text), "initial");
+        style->grid_area_set = !none;
+        style->grid_area_name = 0;
+        if (!none && word_is(name, name_length, "grid-area")) {
+            const char *p = skip_space(text);
+            style->grid_area_name = grid_name_hash(&p);
+        }
     } else if (word_is(name, name_length, "visibility")) {
         style->out_of_flow = word_is(text, strlen(text), "hidden")
                           || word_is(text, strlen(text), "collapse");

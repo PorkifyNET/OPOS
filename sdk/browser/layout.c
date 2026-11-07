@@ -2382,6 +2382,12 @@ static void layout_grid_children(struct ctx *c,
         struct style item_style = *items[index].style;
         int span = item_style.grid_span;
         int start = item_style.grid_start > 0 ? item_style.grid_start - 1 : -1;
+        for (int a = 0; a < st->area_count && item_style.grid_area_name; a++) {
+            if (st->area_hash[a] == item_style.grid_area_name) {
+                start = st->area_start[a];
+                span = st->area_span[a];
+            }
+        }
         if (start >= columns) {
             start = -1;
         }

@@ -64,6 +64,10 @@ struct style {
     bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
     bool opacity_zero;       /* opacity: 0 */
     bool grid_area_set;      /* grid-area or grid-row given: may share a cell */
+    uint32_t grid_area_name; /* grid-area: <name> hash, 0 = none */
+    uint8_t area_count;      /* grid-template-areas: names in the container */
+    uint8_t area_start[8], area_span[8]; /* 0-based column, columns */
+    uint32_t area_hash[8];
     int float_side;          /* 0 none, 1 left, 2 right */
     bool clear_both;
     bool flex, flex_wrap, flex_zero; /* flex_zero: flex: N (basis 0) */

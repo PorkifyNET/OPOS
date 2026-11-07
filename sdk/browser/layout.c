@@ -2351,7 +2351,7 @@ static void layout_grid_children(struct ctx *c,
     int weight = 0;
     for (int i = 0; i < columns; i++) {
         widths[i] = 0;
-        if (kinds[i] == 'p') {
+        if (kinds[i] == 'p' || kinds[i] == 'm') {
             widths[i] = sizes[i];
         } else if (kinds[i] == 'c') {
             widths[i] = avail * sizes[i] / 100;
@@ -2359,7 +2359,17 @@ static void layout_grid_children(struct ctx *c,
             weight += sizes[i];
         } else {
             /* auto: as wide as the widest item in the column */
-            for (int k = i; k < count; k += columns) {
+            for (int k = 0; k < count; k++) {
+                /* Items named into this column alone; others by order. */
+                int at = k % columns;
+                for (int a = 0; a < st->area_count; a++) {
+                    if (st->area_hash[a] == items[k].style->grid_area_name) {
+                        at = st->area_span[a] == 1 ? st->area_start[a] : -1;
+                    }
+                }
+                if (at != i) {
+                    continue;
+                }
                 struct style probe = *items[k].style;
                 int w = measure_content(c, items[k].node, &probe, false);
                 w += 2 * probe.border + probe.padding[LEFT]
@@ -2372,6 +2382,14 @@ static void layout_grid_children(struct ctx *c,
         }
         if (kinds[i] != 'f') {
             fixed += widths[i];
+        }
+    }
+    /* Shrinkable columns give up width when the row is too wide. */
+    for (int i = 0; i < columns && fixed > avail; i++) {
+        if (kinds[i] == 'm') {
+            int cut = fixed - avail < widths[i] ? fixed - avail : widths[i];
+            widths[i] -= cut;
+            fixed -= cut;
         }
     }
     int rest = avail - fixed;

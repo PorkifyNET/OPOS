@@ -806,6 +806,9 @@ static void grid_add_track(struct style *style, const char *token,
     }
     memcpy(text, token, length);
     text[length] = '\0';
+    /* minmax(0, <length>): that length at most, shrinking to fit. */
+    bool shrink = strncmp(text, "minmax(0,", 9) == 0
+               || strncmp(text, "minmax(0px,", 11) == 0;
     if (strncmp(text, "minmax(", 7) == 0) {
         char *comma = strchr(text, ',');
         if (comma != NULL) {
@@ -831,7 +834,7 @@ static void grid_add_track(struct style *style, const char *token,
         if (strncmp(text + strspn(text, "0123456789.-"), "em", 2) == 0) {
             number = number * font_size / 16;
         }
-        style->grid_kind[index] = percent ? 'c' : 'p';
+        style->grid_kind[index] = percent ? 'c' : shrink ? 'm' : 'p';
         style->grid_size[index] = number;
     } else {
         style->grid_kind[index] = 'a';

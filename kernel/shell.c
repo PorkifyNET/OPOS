@@ -524,6 +524,75 @@ static bool bin_program_exists(const char *name, size_t length) {
     return initramfs_find_file(path, &file);
 }
 
+struct shell_help_entry {
+    const char *name;
+    const char *usage;
+    const char *description;
+};
+
+static const struct shell_help_entry shell_help_entries[] = {
+    {"help", "help [COMMAND]", "Lists commands or explains one command."},
+    {"echo", "echo [TEXT]", "Prints text to the console."},
+    {"uptime", "uptime", "Shows time since OPOS started."},
+    {"clear", "clear", "Clears the console."},
+    {"mouse", "mouse", "Shows PS/2 pointer and ACPI input diagnostics."},
+    {"touchpad", "touchpad [mouse|multitouch]",
+     "Shows touchpad diagnostics or changes its mode until restart."},
+    {"pci", "pci", "Lists detected PCI devices."},
+    {"desktop", "desktop", "Starts the graphical desktop."},
+    {"storage", "storage", "Shows storage-controller diagnostics."},
+    {"drives", "drives", "Lists mounted and detected storage volumes."},
+    {"disk", "disk [format|read LBA|ls [PATH]|mkdir PATH|cat PATH|write PATH TEXT|run PATH]",
+     "Inspects or changes the primary FAT disk."},
+    {"ls", "ls [PATH]", "Lists initramfs files or a VFS directory."},
+    {"sum", "sum PATH", "Shows file size, bytes read and an FNV-1a hash."},
+    {"install", "install [DISK] erase-all-data",
+     "Lists install targets or installs OPOS from live media."},
+    {"reboot", "reboot", "Restarts the computer."},
+    {"shutdown", "shutdown", "Turns off the computer through ACPI."},
+    {"run", "run PROGRAM [ARGUMENTS]",
+     "Runs a built-in test or an ELF program by path."},
+    {"net", "net", "Shows network-interface and address status."},
+    {"dhcp", "dhcp", "Restarts DHCP address configuration."},
+    {"ping", "ping HOST", "Sends ICMP echo requests to a host."},
+    {"lookup", "lookup NAME", "Resolves a DNS name."},
+    {"http", "http HOST[/PATH]", "Fetches an HTTP resource for diagnostics."},
+    {"schedtest", "schedtest", "Runs the scheduler self-test."},
+    {"proctest", "proctest", "Runs process isolation and reuse tests."},
+    {"multitest", "multitest", "Runs concurrent-process tests."},
+    {"inputwaittest", "inputwaittest", "Tests blocking program input."},
+    {"update", "update [check|install] [OPTIONS]",
+     "Checks for or installs OPOS updates using /bin/update."},
+    {"fetch", "fetch URL", "Downloads a URL using /bin/fetch."},
+};
+
+static void shell_command_help(const char *name, size_t length) {
+    for (size_t i = 0;
+         i < sizeof(shell_help_entries) / sizeof(shell_help_entries[0]); i++) {
+        const struct shell_help_entry *entry = &shell_help_entries[i];
+        if (!command_matches(name, length, entry->name)) {
+            continue;
+        }
+        console_write_string("Usage: ");
+        console_write_string(entry->usage);
+        console_write_string("\n");
+        console_write_string(entry->description);
+        console_write_string("\n");
+        return;
+    }
+    if (bin_program_exists(name, length)) {
+        console_write_string("Usage: ");
+        console_write_bytes(name, length);
+        console_write_string(" [ARGUMENTS]\nRuns /bin/");
+        console_write_bytes(name, length);
+        console_write_string("; no detailed help is registered.\n");
+        return;
+    }
+    console_write_warning("No help available for '");
+    console_write_bytes(name, length);
+    console_write_warning("'. Type help to list commands.\n");
+}
+
 static void execute_command(void) {
     /* USB sticks may have come or gone since the last command. */
     (void)storage_poll();
@@ -548,13 +617,15 @@ static void execute_command(void) {
         return;
     }
     if (command_matches(command, command_length, "help")) {
-        console_write_string("Commands: help, echo, uptime, clear, mouse, touchpad, touchpad mouse, touchpad multitouch, pci, desktop, disk, "
-                             "storage, drives, disk format, disk read LBA, disk ls [PATH], disk mkdir PATH, disk cat PATH, disk write PATH TEXT, disk run PATH, "
-                             "ls [PATH], sum PATH, install, reboot, shutdown, run demo, run fault, "
-                             "run nx, run input, run user-shell, run elf, run [/]path, "
-                             "run linux-read, run filetest, run spawntest, schedtest, proctest, multitest, inputwaittest, "
-                             "net, dhcp, ping HOST, lookup NAME, http HOST[/PATH], "
-                             "update [install], fetch URL (any program in /bin runs by name)\n");
+        if (arguments_length != 0) {
+            shell_command_help(arguments, arguments_length);
+        } else {
+            console_write_string("Commands: help, echo, uptime, clear, mouse, touchpad, pci, desktop, disk, "
+                                 "storage, drives, ls, sum, install, reboot, shutdown, run, "
+                                 "schedtest, proctest, multitest, inputwaittest, net, dhcp, "
+                                 "ping, lookup, http, update, fetch (any program in /bin runs by name)\n"
+                                 "Type help COMMAND for usage and an explanation.\n");
+        }
     } else if (command_matches(command, command_length, "echo")) {
         console_write_string(arguments);
         console_write_string("\n");

@@ -1,6 +1,6 @@
 # OPOS browser plan
 
-Status (2026-11-06): milestones 1, 2, 3 and 5 are done. Milestones 4 and 6 are partly done; see the notes under each one.
+Status (2026-11-07): milestones 1, 2, 3 and 5 are done. Milestones 4 and 6 are mostly done; see the remaining work below.
 
 The browser is a native SDK program, `/bin/browser`, built from `sdk/browser/`. It needs no new kernel code. It builds on what the SDK already has: sockets, DNS, TCP, HTTPS through BearSSL, the PNG/JPEG/BMP decoders in `opos_image`, the window API (key, mouse and wheel events), a heap, and the shared clipboard.
 
@@ -21,7 +21,7 @@ Each milestone is tested in QEMU before the next one starts.
 3. **Fonts, text and layout without CSS.** Done. Block and inline flow with word wrap, headings, lists, links, `<pre>`, images and tables.
 4. **Browser shell.** Mostly done. Done: address bar (Ctrl+L selects it; Ctrl+C/V copy and paste), back, forward, reload (Ctrl+R), link clicking, hover URL in the status bar, text selection by dragging, Ctrl+A, Ctrl+C to the shared clipboard, find in page (Ctrl+F; Enter and Shift+Enter step through matches, Escape closes), error pages, including one for certificate problems. Not done: tabs, the page title in the window caption (needs a window-title call), `#fragment` scrolling.
 5. **CSS subset.** Done. `css.c` and `style.c`: selectors, specificity, the cascade, custom properties, and colour, background, font, margin, padding, border, width, display, float, flex and a grid subset. Lengths: px, pt, em, rem, %, vw, vh, vmin and vmax.
-6. **Forms and tables.** Mostly done. Tables and flexbox lay out. Forms work: click or Tab into a field and type (Backspace, Ctrl+V paste, `maxlength`, `autofocus`), password fields show stars, checkboxes and radio buttons toggle, a select picks the next option on each click or Space (there is no drop-down list yet), and a submit button or Enter in a text field sends the form by GET or POST (`application/x-www-form-urlencoded`, `formaction`/`formmethod` too). Tested with a local echo server and a DuckDuckGo Lite search. Not done: a caret that moves inside the text (typing only adds at the end), a drop-down list for selects, multi-line display in text areas, `multipart/form-data` and file uploads, reset buttons.
+6. **Forms and tables.** Mostly done. Tables and flexbox lay out. Forms work: click or Tab into a field and edit at a visible caret; arrows, Home, End, Delete, Backspace, mouse/Shift selection and Ctrl+A/C/X/V work in text fields and text areas. Password fields stay masked, checkboxes and radio buttons toggle, and selects open a drop-down list. A submit button or Enter in a text field sends the form by GET or POST (`application/x-www-form-urlencoded`, `formaction`/`formmethod` too). Tested with a local echo server and a DuckDuckGo Lite search. Not done: `multipart/form-data`, file uploads and reset buttons.
 7. **Later.** Cookies, downloads, bookmarks, history, and a JavaScript engine (a separate project).
 
 ## Test pages

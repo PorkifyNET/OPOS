@@ -82,8 +82,9 @@ Linux syscall numbers `read` (0), `write` (1), `open` (2), `close` (3),
 identity, root UID/GID queries, vectored stdout, monotonic clock reads and
 resolution, a PIT-backed relative sleep, uptime-based `gettimeofday`, FS-base thread-local storage
 setup/query, rejects invalid user pointers, obtains its process ID, and exits
-using that ABI. UID/GID queries return 0 because OPOS currently has a single
-root identity and no account or permission model. `uname` returns
+using that ABI. UID/GID queries return 0 because Linux numeric identities are
+not mapped to OPOS accounts; native account identities and file-access rules
+are enforced separately. `uname` returns
 the Linux ABI identity with OPOS-specific release and host fields. The clock
 calls support `CLOCK_MONOTONIC` only and derive time from the 100 Hz PIT;
 `gettimeofday` likewise reports uptime rather than wall-clock epoch time.
@@ -398,4 +399,3 @@ timer path does not support x2APIC.
 Exception reports include their vector, error code, and instruction address.
 Limine is used as the bootloader for now; a custom bootloader can be a later
 project.
-

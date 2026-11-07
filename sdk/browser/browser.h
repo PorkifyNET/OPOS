@@ -136,6 +136,8 @@ struct display_item {
     struct image_ref *image;
     /* the form control a control's background rectangle belongs to */
     const struct opos_html_node *control;
+    /* Byte offset in the control value represented by this text item. */
+    size_t field_offset;
     bool round;                /* rect/outline: a circle in the square box */
 };
 
@@ -167,9 +169,51 @@ struct form_field {
     enum field_kind kind;
     char *value;               /* text fields; malloc'd, NUL-terminated */
     size_t length;
+    size_t selection_anchor;   /* byte offsets in value */
+    size_t selection_cursor;
     bool checked;              /* checkboxes and radio buttons */
     int option;                /* select: index of the chosen option */
 };
+
+static inline size_t browser_utf8_next(const char *text, size_t length,
+                                       size_t at) {
+    if (at >= length) {
+        return length;
+    }
+    at++;
+    while (at < length && ((unsigned char)text[at] & 0xc0) == 0x80) {
+        at++;
+    }
+    return at;
+}
+
+static inline size_t browser_utf8_previous(const char *text, size_t at) {
+    if (at == 0) {
+        return 0;
+    }
+    do {
+        at--;
+    } while (at > 0 && ((unsigned char)text[at] & 0xc0) == 0x80);
+    return at;
+}
+
+static inline size_t browser_utf8_count(const char *text, size_t length) {
+    size_t count = 0;
+    for (size_t at = 0; at < length;
+         at = browser_utf8_next(text, length, at)) {
+        count++;
+    }
+    return count;
+}
+
+static inline size_t browser_utf8_offset(const char *text, size_t length,
+                                         size_t characters) {
+    size_t at = 0;
+    while (characters-- > 0 && at < length) {
+        at = browser_utf8_next(text, length, at);
+    }
+    return at;
+}
 
 /* An <img> of the page, loaded after the page is laid out. */
 struct image_ref {

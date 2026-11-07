@@ -681,6 +681,88 @@ static void terminal_list_files(void) {
     }
 }
 
+struct terminal_help_entry {
+    const char *name;
+    const char *usage;
+    const char *description;
+};
+
+static const struct terminal_help_entry terminal_help_entries[] = {
+    {"help", "help [COMMAND]", "Lists commands or explains one command."},
+    {"ls", "ls", "Lists files shipped in the OPOS initramfs."},
+    {"clear", "clear", "Clears Terminal scrollback."},
+    {"uptime", "uptime", "Shows time since OPOS started."},
+    {"elf", "elf", "Runs the built-in ELF loader test."},
+    {"demo", "demo", "Runs the built-in user-program demo."},
+    {"run", "run PATH [ARGUMENTS]", "Runs an ELF program by path."},
+    {"ps", "ps", "Lists running user programs."},
+    {"kill", "kill PID", "Ends the program with the given process ID."},
+    {"shell", "shell", "Leaves the desktop for the administrator shell."},
+    {"reboot", "reboot", "Restarts the computer."},
+    {"shutdown", "shutdown", "Turns off the computer through ACPI."},
+    {"exit", "exit", "Closes the Terminal window."},
+    {"net", "net", "Shows network-interface and address status."},
+    {"dhcp", "dhcp", "Restarts DHCP address configuration."},
+    {"ping", "ping HOST", "Sends ICMP echo requests to a host."},
+    {"lookup", "lookup NAME", "Resolves a DNS name."},
+    {"http", "http HOST[/PATH]", "Fetches an HTTP resource for diagnostics."},
+    {"update", "update [check|install] [OPTIONS]",
+     "Checks for or installs OPOS updates using /bin/update."},
+    {"fetch", "fetch URL", "Downloads a URL using /bin/fetch."},
+};
+
+static bool terminal_bin_program(const char *name, size_t length) {
+    char path[48] = "bin/";
+    if (length == 0 || length + 5 > sizeof(path)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+              || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+            return false;
+        }
+        path[4 + i] = c;
+    }
+    path[4 + length] = '\0';
+    struct initramfs_file file;
+    return initramfs_find_file(path, &file);
+}
+
+static void terminal_command_help(const char *name, size_t length) {
+    for (size_t i = 0;
+         i < sizeof(terminal_help_entries) / sizeof(terminal_help_entries[0]);
+         i++) {
+        const struct terminal_help_entry *entry = &terminal_help_entries[i];
+        if (!text_equals(name, length, entry->name)) {
+            continue;
+        }
+        char line[TERMINAL_COLUMNS] = "USAGE: ";
+        append_text(line, sizeof(line), 7, entry->usage);
+        terminal_print(line);
+        terminal_print(entry->description);
+        return;
+    }
+    char command[48];
+    if (length < sizeof(command)) {
+        for (size_t i = 0; i < length; i++) {
+            command[i] = name[i];
+        }
+        command[length] = '\0';
+    } else {
+        command[0] = '\0';
+    }
+    if (command[0] != '\0' && terminal_bin_program(command, length)) {
+        char line[TERMINAL_COLUMNS] = "USAGE: ";
+        size_t used = append_text(line, sizeof(line), 7, command);
+        append_text(line, sizeof(line), used, " [ARGUMENTS]");
+        terminal_print(line);
+        terminal_print("Runs the matching program in /bin; no detailed help is registered.");
+    } else {
+        terminal_print("NO HELP AVAILABLE FOR THAT COMMAND - TYPE HELP");
+    }
+}
+
 /* Executes the typed line. Returns false when the terminal should close. */
 static bool terminal_net_session;
 /* Lines from a ping or lookup typed in the Terminal. */
@@ -708,6 +790,14 @@ static bool terminal_execute(void) {
         terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
         terminal_print("NET  DHCP  PING HOST  LOOKUP NAME  HTTP HOST[/PATH]");
         terminal_print("UPDATE [INSTALL]  FETCH URL  (ANY PROGRAM IN /BIN)");
+        terminal_print("TYPE HELP COMMAND FOR USAGE AND AN EXPLANATION");
+    } else if (terminal_length > 5
+               && text_equals(terminal_line, 5, "help ")) {
+        size_t start = 5;
+        while (start < terminal_length && terminal_line[start] == ' ') {
+            start++;
+        }
+        terminal_command_help(terminal_line + start, terminal_length - start);
     } else if (text_equals(terminal_line, terminal_length, "ls")) {
         terminal_list_files();
     } else if (text_equals(terminal_line, terminal_length, "clear")) {

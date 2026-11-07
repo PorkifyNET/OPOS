@@ -216,5 +216,5 @@ See `docs/security-model.md`.
   `FILE` streams and no `qsort`, `time` or `locale`.
 - Program files over 1 MiB do not load. Memory from `opos_alloc`,
   `malloc` and the stack shares 64 MiB per program.
-- Notepad's clipboard is its own; there is no system clipboard for
-  programs yet.
+- Programs share the desktop text clipboard through `opos_clipboard_set` and
+  `opos_clipboard_get`.

@@ -59,6 +59,8 @@ struct browser {
     size_t *item_start;
     size_t selection_anchor, selection_cursor;
     bool selecting;               /* left button held on the page */
+    bool field_selecting;         /* left button held in a form field */
+    const struct opos_html_node *field_selection;
     bool pressed_moved;
     int press_x, press_y;
     bool finding;                 /* the find bar is open */
@@ -217,6 +219,46 @@ static int item_prefix_width(const struct display_item *item, size_t n) {
     }
     return opos_font_text_width(b.fonts[item->font], item->size, item->text,
                                 n);
+}
+
+static bool field_item_selection(const struct display_item *item,
+                                 size_t *from, size_t *to) {
+    if (item->control == NULL || b.page.focus != item->control) {
+        return false;
+    }
+    struct form_field *field = form_field(&b.page, item->control);
+    if (field == NULL || (field->kind != FIELD_TEXT
+                          && field->kind != FIELD_PASSWORD
+                          && field->kind != FIELD_TEXTAREA)) {
+        return false;
+    }
+    size_t low = field->selection_anchor < field->selection_cursor
+               ? field->selection_anchor : field->selection_cursor;
+    size_t high = field->selection_anchor > field->selection_cursor
+                ? field->selection_anchor : field->selection_cursor;
+    if (low == high) {
+        return false;
+    }
+    size_t end = field->kind == FIELD_PASSWORD
+        ? browser_utf8_offset(field->value + item->field_offset,
+                              field->length - item->field_offset,
+                              item->length) + item->field_offset
+        : item->field_offset + item->length;
+    if (high <= item->field_offset || low >= end) {
+        return false;
+    }
+    size_t clipped_low = low > item->field_offset ? low : item->field_offset;
+    size_t clipped_high = high < end ? high : end;
+    if (field->kind == FIELD_PASSWORD) {
+        *from = browser_utf8_count(field->value + item->field_offset,
+                                   clipped_low - item->field_offset);
+        *to = browser_utf8_count(field->value + item->field_offset,
+                                 clipped_high - item->field_offset);
+    } else {
+        *from = clipped_low - item->field_offset;
+        *to = clipped_high - item->field_offset;
+    }
+    return *to > *from;
 }
 
 /* The text offset nearest to a point in page coordinates. */
@@ -554,6 +596,13 @@ static void paint_page(void) {
             int baseline = y + item->baseline;
             if (baseline - item->size > bottom || baseline + item->size < top) {
                 break;
+            }
+            size_t field_from, field_to;
+            if (field_item_selection(item, &field_from, &field_to)) {
+                int x0 = x + item_prefix_width(item, field_from);
+                int x1 = x + item_prefix_width(item, field_to);
+                fill_clipped(x0, y, x1 - x0, item->height, COL_SELECTION,
+                             top, bottom);
             }
             size_t start = b.item_start != NULL ? b.item_start[i] : NO_TEXT;
             size_t low = selection_start(), high = selection_end();
@@ -1004,6 +1053,8 @@ static void install_document(const char *html, size_t length,
     b.have_page = true;
     b.scroll = 0;
     clear_selection();
+    b.field_selecting = false;
+    b.field_selection = NULL;
     b.dropdown = NULL;
     b.page.focus = find_autofocus(doc->body);
     relayout();
@@ -1345,7 +1396,99 @@ static void focus_step(int step) {
     }
 }
 
-/* Keys while a text field has the focus. Returns false for keys the page
+static bool is_text_field(const struct form_field *field) {
+    return field != NULL && (field->kind == FIELD_TEXT
+        || field->kind == FIELD_PASSWORD || field->kind == FIELD_TEXTAREA);
+}
+
+static size_t field_selection_start(const struct form_field *field) {
+    return field->selection_anchor < field->selection_cursor
+         ? field->selection_anchor : field->selection_cursor;
+}
+
+static size_t field_selection_end(const struct form_field *field) {
+    return field->selection_anchor > field->selection_cursor
+         ? field->selection_anchor : field->selection_cursor;
+}
+
+static void field_move(struct form_field *field, size_t position,
+                       bool extend) {
+    if (position > field->length) {
+        position = field->length;
+    }
+    if (!extend) {
+        field->selection_anchor = position;
+    }
+    field->selection_cursor = position;
+}
+
+static bool field_replace_range(struct form_field *field,
+                                const struct opos_html_node *node,
+                                size_t start, size_t end,
+                                const char *insert, size_t insert_length) {
+    const char *maximum = opos_html_attribute(node, "maxlength");
+    long max = maximum != NULL ? strtol(maximum, NULL, 10) : -1;
+    if (max >= 0) {
+        size_t outside = browser_utf8_count(field->value, start)
+            + browser_utf8_count(field->value + end, field->length - end);
+        size_t allowed = outside < (size_t)max ? (size_t)max - outside : 0;
+        insert_length = browser_utf8_offset(insert, insert_length, allowed);
+    }
+    size_t new_length = start + insert_length + field->length - end;
+    char *value = malloc(new_length + 1);
+    if (value == NULL) {
+        return false;
+    }
+    memcpy(value, field->value, start);
+    memcpy(value + start, insert, insert_length);
+    memcpy(value + start + insert_length, field->value + end,
+           field->length - end);
+    value[new_length] = '\0';
+    free(field->value);
+    field->value = value;
+    field->length = new_length;
+    field->selection_anchor = field->selection_cursor = start + insert_length;
+    return true;
+}
+
+static size_t field_line_start(const struct form_field *field, size_t at) {
+    while (at > 0 && field->value[at - 1] != '\n') {
+        at--;
+    }
+    return at;
+}
+
+static size_t field_line_end(const struct form_field *field, size_t at) {
+    while (at < field->length && field->value[at] != '\n') {
+        at = browser_utf8_next(field->value, field->length, at);
+    }
+    return at;
+}
+
+static size_t field_vertical_position(const struct form_field *field,
+                                      int direction) {
+    size_t current_start = field_line_start(field, field->selection_cursor);
+    size_t column = browser_utf8_count(field->value + current_start,
+                                       field->selection_cursor - current_start);
+    size_t target_start;
+    if (direction < 0) {
+        if (current_start == 0) {
+            return 0;
+        }
+        target_start = field_line_start(field, current_start - 1);
+    } else {
+        size_t current_end = field_line_end(field, field->selection_cursor);
+        if (current_end >= field->length) {
+            return field->length;
+        }
+        target_start = current_end + 1;
+    }
+    size_t target_end = field_line_end(field, target_start);
+    return target_start + browser_utf8_offset(
+        field->value + target_start, target_end - target_start, column);
+}
+
+/* Keys while a form control has focus. Returns false for keys the page
    should handle instead (scrolling). */
 static bool field_key(uint32_t key, bool ctrl, bool shift) {
     const struct opos_html_node *node = b.page.focus;
@@ -1381,8 +1524,7 @@ static bool field_key(uint32_t key, bool ctrl, bool shift) {
         focus_step(shift ? -1 : 1);
         return true;
     }
-    if (field->kind != FIELD_TEXT && field->kind != FIELD_PASSWORD
-        && field->kind != FIELD_TEXTAREA) {
+    if (!is_text_field(field)) {
         /* Buttons, boxes and lists: Space presses, Enter submits. */
         if (key == ' ' || (key == '\n' && field->kind == FIELD_SUBMIT)) {
             click_control(node);
@@ -1399,19 +1541,29 @@ static bool field_key(uint32_t key, bool ctrl, bool shift) {
         submit_form(node, NULL);
         return true;
     }
-    char *value = field->value;
-    size_t length = field->length;
-    char *grown = NULL;
-    if (key == '\b') {
-        if (length == 0) {
+    size_t low = field_selection_start(field);
+    size_t high = field_selection_end(field);
+    bool changed = false;
+    bool read_only = opos_html_attribute(node, "readonly") != NULL;
+    if (ctrl && (key == 'a' || key == 'A')) {
+        field->selection_anchor = 0;
+        field->selection_cursor = field->length;
+    } else if (ctrl && (key == 'c' || key == 'C')) {
+        if (field->kind != FIELD_PASSWORD && high > low) {
+            opos_clipboard_set(field->value + low, high - low);
+        }
+        return true;
+    } else if (ctrl && (key == 'x' || key == 'X')) {
+        if (!read_only && high > low) {
+            if (field->kind != FIELD_PASSWORD) {
+                opos_clipboard_set(field->value + low, high - low);
+            }
+            changed = field_replace_range(field, node, low, high, "", 0);
+        }
+    } else if (ctrl && (key == 'v' || key == 'V')) {
+        if (read_only) {
             return true;
         }
-        do {
-            length--;
-        } while (length > 0 && (value[length] & 0xc0) == 0x80);
-        field->length = length;
-        value[length] = '\0';
-    } else if (ctrl && (key == 'v' || key == 'V')) {
         char pasted[4096];
         long got = opos_clipboard_get(pasted, sizeof(pasted));
         if (got <= 0) {
@@ -1420,12 +1572,8 @@ static bool field_key(uint32_t key, bool ctrl, bool shift) {
         if (got > (long)sizeof(pasted)) {
             got = sizeof(pasted);
         }
-        grown = malloc(length + (size_t)got + 1);
-        if (grown == NULL) {
-            return true;
-        }
-        memcpy(grown, value, length);
-        size_t used = length;
+        char clean[4096];
+        size_t used = 0;
         for (long i = 0; i < got; i++) {
             char ch = pasted[i];
             if (ch == '\r') {
@@ -1435,40 +1583,63 @@ static bool field_key(uint32_t key, bool ctrl, bool shift) {
                 ch = ' ';
             }
             if ((unsigned char)ch >= 32 || ch == '\n') {
-                grown[used++] = ch;
+                clean[used++] = ch;
             }
         }
-        if (!field_set(field, grown, used)) {
-            free(grown);
+        changed = field_replace_range(field, node, low, high, clean, used);
+    } else if (key == '\b') {
+        if (read_only) {
             return true;
         }
-        free(grown);
-    } else if (ctrl && (key == 'c' || key == 'C')) {
-        if (field->kind != FIELD_PASSWORD) {
-            opos_clipboard_set(field->value, field->length);
+        if (low == high && low > 0) {
+            low = browser_utf8_previous(field->value, low);
         }
-        return true;
+        if (high > low) {
+            changed = field_replace_range(field, node, low, high, "", 0);
+        }
+    } else if (key == OPOS_KEY_DELETE) {
+        if (read_only) {
+            return true;
+        }
+        if (low == high && high < field->length) {
+            high = browser_utf8_next(field->value, field->length, high);
+        }
+        if (high > low) {
+            changed = field_replace_range(field, node, low, high, "", 0);
+        }
+    } else if (key == OPOS_KEY_LEFT || key == OPOS_KEY_RIGHT) {
+        size_t position;
+        if (!shift && low != high) {
+            position = key == OPOS_KEY_LEFT ? low : high;
+        } else if (key == OPOS_KEY_LEFT) {
+            position = browser_utf8_previous(field->value,
+                                             field->selection_cursor);
+        } else {
+            position = browser_utf8_next(field->value, field->length,
+                                         field->selection_cursor);
+        }
+        field_move(field, position, shift);
+    } else if (key == OPOS_KEY_HOME || key == OPOS_KEY_END) {
+        size_t position = field->kind == FIELD_TEXTAREA
+            ? (key == OPOS_KEY_HOME
+                ? field_line_start(field, field->selection_cursor)
+                : field_line_end(field, field->selection_cursor))
+            : (key == OPOS_KEY_HOME ? 0 : field->length);
+        field_move(field, position, shift);
+    } else if (field->kind == FIELD_TEXTAREA
+               && (key == OPOS_KEY_UP || key == OPOS_KEY_DOWN)) {
+        field_move(field, field_vertical_position(
+            field, key == OPOS_KEY_UP ? -1 : 1), shift);
     } else if ((key >= 32 && key < 127 && !ctrl) || key == '\n') {
-        const char *max = opos_html_attribute(node, "maxlength");
-        if (max != NULL && (long)field->length >= strtol(max, NULL, 10)
-            && strtol(max, NULL, 10) >= 0) {
+        if (read_only) {
             return true;
         }
         char ch = (char)key;
-        grown = malloc(length + 2);
-        if (grown == NULL) {
-            return true;
-        }
-        memcpy(grown, value, length);
-        grown[length] = ch;
-        if (!field_set(field, grown, length + 1)) {
-            free(grown);
-            return true;
-        }
-        free(grown);
+        changed = field_replace_range(field, node, low, high, &ch, 1);
     } else {
         return false;
     }
+    (void)changed;
     refresh_controls();
     return true;
 }
@@ -1578,6 +1749,61 @@ static bool link_target(const struct display_item *item, char *out,
     return opos_url_resolve(b.page.url, href, out, capacity);
 }
 
+/* Maps a click in a rendered text control back to a byte offset in its
+   value. For a password, each displayed star maps to one UTF-8 character. */
+static size_t field_offset_at(const struct opos_html_node *node, int x, int y) {
+    struct form_field *field = form_field(&b.page, node);
+    if (!is_text_field(field)) {
+        return 0;
+    }
+    const struct display_item *best = NULL;
+    int best_distance = 0x7fffffff;
+    for (size_t i = 0; i < b.page.item_count; i++) {
+        const struct display_item *item = &b.page.items[i];
+        if (item->kind != ITEM_TEXT || item->control != node) {
+            continue;
+        }
+        int distance = y < item->y ? item->y - y
+                     : y >= item->y + item->height
+                         ? y - (item->y + item->height - 1) : 0;
+        if (best == NULL || distance < best_distance) {
+            best = item;
+            best_distance = distance;
+        }
+    }
+    if (best == NULL) {
+        return field->length;
+    }
+    if (best->length == 0) {
+        return best->field_offset < field->length ? best->field_offset
+                                                   : field->length;
+    }
+    int relative = x - best->x;
+    size_t display = 0;
+    if (relative > 0) {
+        while (display < best->length) {
+            size_t next = browser_utf8_next(best->text, best->length,
+                                            display);
+            int left = item_prefix_width(best, display);
+            int right = item_prefix_width(best, next);
+            if (relative < (left + right) / 2) {
+                break;
+            }
+            display = next;
+        }
+    }
+    size_t offset = best->field_offset;
+    if (field->kind == FIELD_PASSWORD) {
+        offset += browser_utf8_offset(field->value + offset,
+                                      field->length - offset,
+                                      browser_utf8_count(best->text,
+                                                         display));
+    } else {
+        offset += display;
+    }
+    return offset < field->length ? offset : field->length;
+}
+
 static void on_click(int x, int y) {
     if (b.dropdown != NULL) {
         dropdown_click(x, y);
@@ -1617,7 +1843,24 @@ static void on_click(int x, int y) {
     const struct opos_html_node *control = page_control_at(
         &b.page, x - MARGIN, y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
     if (control != NULL) {
+        struct form_field *field = form_field(&b.page, control);
+        bool select_field = is_text_field(field)
+            && opos_html_attribute(control, "readonly") == NULL
+            && opos_html_attribute(control, "disabled") == NULL;
+        if (select_field) {
+            clear_selection();
+            b.have_match = false;
+            size_t offset = field_offset_at(
+                control, x - MARGIN,
+                y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+            field->selection_anchor = field->selection_cursor = offset;
+            b.field_selecting = true;
+            b.field_selection = control;
+        }
         click_control(control);
+        if (select_field) {
+            refresh_controls();
+        }
         return;
     }
     set_focus(NULL);
@@ -1633,6 +1876,8 @@ static void on_click(int x, int y) {
 
 static void on_release(void) {
     b.dragging_scrollbar = false;
+    b.field_selecting = false;
+    b.field_selection = NULL;
     if (!b.selecting) {
         return;
     }
@@ -1653,6 +1898,16 @@ static void on_release(void) {
 
 static void on_move(int x, int y) {
     char url[OPOS_HTTP_URL_MAX];
+    if (b.field_selecting && b.field_selection != NULL) {
+        struct form_field *field = form_field(&b.page, b.field_selection);
+        if (field != NULL) {
+            field->selection_cursor = field_offset_at(
+                b.field_selection, x - MARGIN,
+                y - TOOLBAR_HEIGHT - MARGIN + b.scroll);
+            refresh_controls();
+        }
+        return;
+    }
     if (b.selecting) {
         int dx = x - b.press_x, dy = y - b.press_y;
         if (!b.pressed_moved && dx * dx + dy * dy < 16) {

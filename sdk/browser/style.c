@@ -1265,6 +1265,16 @@ void apply_declaration(struct style *style, const char *name,
     } else if (word_is(name, name_length, "position")) {
         style->out_of_flow = word_is(text, strlen(text), "absolute")
                           || word_is(text, strlen(text), "fixed");
+    } else if (word_is(name, name_length, "align-items")
+               || word_is(name, name_length, "align-self")) {
+        uint8_t value = strstr(text, "center") != NULL ? 2
+                      : strstr(text, "end") != NULL ? 3
+                      : strstr(text, "start") != NULL ? 1 : 0;
+        if (word_is(name, name_length, "align-items")) {
+            style->align_items = value;
+        } else {
+            style->align_self = value;
+        }
     } else if (word_is(name, name_length, "opacity")) {
         /* Only exactly zero ("0", "0.0", ".0", "0%") counts. */
         const char *t = text;

@@ -2327,6 +2327,8 @@ static void layout_flex_children(struct ctx *c,
         }
 #endif
         int x = c->bx + shift;
+        size_t first_item[MAX_FLEX_ITEMS]; /* each item's first display item */
+        int item_bottoms[MAX_FLEX_ITEMS];
         int top = c->y;
         int bottom = top;
         int auto_extra = 0;
@@ -2351,14 +2353,27 @@ static void layout_flex_children(struct ctx *c,
             item_style.margin[LEFT] = ml;
             item_style.margin[RIGHT] = mr;
             c->float_count = 0;
+            first_item[i] = c->page->item_count;
             int item_bottom = layout_boxed(c, it->node, &item_style, x,
                                            clamp_min(it->width, 1), top);
+            item_bottoms[i] = item_bottom;
             if (item_bottom > bottom) {
                 bottom = item_bottom;
             }
             x += it->width + it->frame + gap + extra_gap;
             if (s->margin_auto_right && auto_extra > 0) {
                 x += auto_extra;
+            }
+        }
+        /* align-items / align-self: move shorter items down. */
+        for (int i = 0; i < n && !c->measuring; i++) {
+            int align = line[i].style->align_self != 0
+                      ? line[i].style->align_self : st->align_items;
+            int room = bottom - item_bottoms[i];
+            int down = align == 2 ? room / 2 : align == 3 ? room : 0;
+            size_t end = i + 1 < n ? first_item[i + 1] : c->page->item_count;
+            for (size_t k = first_item[i]; k < end && down > 0; k++) {
+                c->page->items[k].y += down;
             }
         }
         c->y = bottom;

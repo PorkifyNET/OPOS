@@ -1,5 +1,6 @@
-OPOS 0.1.1: the first release with the OPOS Updater.
+OPOS 0.1.2: the first release with a web browser.
 
-- OPOS can update itself from GitHub Releases (Settings > UPDATES, or the update command).
-- Updates can also come from a CD/DVD or USB stick, or from a VM host (tools/serve-release.ps1).
-- Fix: file reads larger than 4 KB now return fewer bytes instead of failing.
+- New web browser (run /bin/browser URL): HTTP and HTTPS, HTML, CSS layout (flex, grid, media queries, custom properties) and TrueType text.
+- Browser: text selection and copy, find in page (Ctrl+F), a certificate error page.
+- Browser forms: text fields, multi-line text areas, check boxes, radio buttons, drop-down lists, and GET and POST submission.
+- Terminal: 1000 lines of scrollback and text selection with the mouse.

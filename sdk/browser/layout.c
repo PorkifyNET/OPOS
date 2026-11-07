@@ -491,7 +491,10 @@ static void add_control(struct ctx *c, const struct opos_html_node *node,
     case FIELD_CHECKBOX:
     case FIELD_RADIO:
         box = kind == FIELD_CHECKBOX ? BOX_CHECKBOX : BOX_RADIO;
-        width = height = 14;
+        /* About the height of a capital letter, like other browsers. */
+        width = height = style->font_size * 13 / 16 < 13 ? 13
+                       : style->font_size * 13 / 16 > 24 ? 24
+                       : style->font_size * 13 / 16;
         break;
     case FIELD_SUBMIT:
     case FIELD_BUTTON:
@@ -778,8 +781,10 @@ static void emit_line(struct ctx *c, size_t count, int used,
             ascent = item->height;
             descent = 0;
         } else if (item->kind == IT_BOX) {
-            ascent = item->height - 4;
-            descent = 4;
+            /* Keep in step with the box_top rule where boxes are drawn. */
+            descent = item->box == BOX_CHECKBOX || item->box == BOX_RADIO
+                    ? 1 : 4;
+            ascent = item->height - descent;
         } else {
             line_metrics(c, item->style, &ascent, &descent);
         }
@@ -866,7 +871,10 @@ static void emit_line(struct ctx *c, size_t count, int used,
             break;
         }
         case IT_BOX: {
-            int box_top = baseline - (item->height - 4);
+            bool tick = item->box == BOX_CHECKBOX || item->box == BOX_RADIO;
+            /* Text boxes hang 4px below the baseline; a check box sits
+               on it like a capital letter. */
+            int box_top = baseline - (item->height - (tick ? 1 : 4));
             bool field = item->box == BOX_TEXT || item->box == BOX_TEXTAREA
                       || item->box == BOX_CHECKBOX || item->box == BOX_RADIO;
             struct display_item *fill = add_item(c, ITEM_RECT, x, box_top,

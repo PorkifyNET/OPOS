@@ -734,8 +734,8 @@ static const struct terminal_help_entry terminal_help_entries[] = {
 };
 
 static bool terminal_bin_program(const char *name, size_t length) {
-    char path[48] = "bin/";
-    if (length == 0 || length + 5 > sizeof(path)) {
+    char path[48] = "/bin/";
+    if (length == 0 || length + 6 > sizeof(path)) {
         return false;
     }
     for (size_t i = 0; i < length; i++) {
@@ -744,11 +744,12 @@ static bool terminal_bin_program(const char *name, size_t length) {
               || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
             return false;
         }
-        path[4 + i] = c;
+        path[5 + i] = c;
     }
-    path[4 + length] = '\0';
-    struct initramfs_file file;
-    return initramfs_find_file(path, &file);
+    path[5 + length] = '\0';
+    struct vfs_metadata metadata;
+    return vfs_stat(path, 5 + length, &metadata)
+        && metadata.type == VFS_NODE_FILE;
 }
 
 static void terminal_command_help(const char *name, size_t length) {
@@ -930,10 +931,11 @@ static bool terminal_execute(void) {
             i++;
         }
         path[length] = '\0';
-        struct initramfs_file file;
+        struct vfs_metadata metadata;
         bool program = length > 5
             && (i == terminal_length || terminal_line[i] == ' ')
-            && initramfs_find_file(path + 1, &file);
+            && vfs_stat(path, length, &metadata)
+            && metadata.type == VFS_NODE_FILE;
         if (!program) {
             terminal_print("UNKNOWN COMMAND - TYPE HELP");
         } else {
@@ -2916,13 +2918,14 @@ static size_t files_entry_path(size_t index, char *path, size_t capacity) {
 /*
  * Opens Notepad (/bin/notepad, an ordinary SDK program from sdk/) on a
  * file, or empty without one. Returns false when it cannot start: too many
- * programs run, or the initramfs has no Notepad. If it starts but cannot
+ * programs run, or the active system root has no Notepad. If it starts but cannot
  * run, the built-in editor opens instead (see apps_poll).
  */
 static bool notepad_launch(const char *path, size_t length) {
     static const char notepad[] = "/bin/notepad";
-    struct initramfs_file file;
-    if (!initramfs_find_file(notepad + 1, &file)) {
+    struct vfs_metadata metadata;
+    if (!vfs_stat(notepad, sizeof(notepad) - 1, &metadata)
+        || metadata.type != VFS_NODE_FILE) {
         return false;
     }
     char arguments[FILES_PATH_CAPACITY + 3];

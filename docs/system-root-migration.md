@@ -130,7 +130,9 @@ allowed to remove the only recovery path during this migration.
 | Power loss | Cut power during each stage, marker write, boot-menu write and update resume. Every resulting state boots the old or new complete generation, or enters recovery with a clear error. |
 | Hardware | BIOS/MBR and UEFI/GPT installs in QEMU, VMware and VirtualBox; boot disk chosen correctly with multiple disks, removable media and a missing or damaged system volume. |
 
-The next implementation slice is to replace initramfs-only program discovery
-and child-spawn lookups with VFS-aware paths, while retaining the legacy
-initramfs boot. Installer changes, activation and payload removal follow only
-after the namespace and permission gates pass.
+Program discovery in Terminal, Notepad and the kernel shell, plus child-spawn
+executable loading, now use VFS paths under both the legacy initramfs root and
+the optional disk root. The next slice is to replace the remaining initramfs
+directory listings and root-specific read-only/UI paths, then prove namespace
+and permission equivalence. Installer changes, activation and payload removal
+follow only after those gates pass.

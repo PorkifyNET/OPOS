@@ -507,8 +507,8 @@ static void shell_net_wait(bool started) {
 
 /* Whether /bin/NAME exists, for a NAME of letters, digits, '-' and '_'. */
 static bool bin_program_exists(const char *name, size_t length) {
-    char path[48] = "bin/";
-    if (length == 0 || length + 5 > sizeof(path)) {
+    char path[48] = "/bin/";
+    if (length == 0 || length + 6 > sizeof(path)) {
         return false;
     }
     for (size_t i = 0; i < length; i++) {
@@ -517,11 +517,12 @@ static bool bin_program_exists(const char *name, size_t length) {
               || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
             return false;
         }
-        path[4 + i] = c;
+        path[5 + i] = c;
     }
-    path[4 + length] = '\0';
-    struct initramfs_file file;
-    return initramfs_find_file(path, &file);
+    path[5 + length] = '\0';
+    struct vfs_metadata metadata;
+    return vfs_stat(path, 5 + length, &metadata)
+        && metadata.type == VFS_NODE_FILE;
 }
 
 struct shell_help_entry {
@@ -1059,7 +1060,6 @@ static void execute_command(void) {
         }
     } else if (command_matches(command, command_length, "run")) {
         enum user_program program;
-        struct initramfs_file file;
         bool run_file = false;
         const char *program_arguments = "";
         size_t program_arguments_length = 0;
@@ -1107,14 +1107,15 @@ static void execute_command(void) {
                 console_write_error("Application path is too long.\n");
                 return;
             }
-            /* path keeps the absolute form used for argv[0]/AT_EXECFN;
-               the initramfs lookup takes it without the leading slash. */
+            /* path keeps the absolute form used for argv[0]/AT_EXECFN. */
             path[0] = '/';
             for (size_t i = 0; i < path_length; i++) {
                 path[1 + i] = arguments[path_start + i];
             }
             path[1 + path_length] = '\0';
-            if (!initramfs_find_file(path + 1, &file)) {
+            struct vfs_metadata metadata;
+            if (!vfs_stat(path, path_length + 1, &metadata)
+                || metadata.type != VFS_NODE_FILE) {
                 console_write_error("Application file not found.\n");
                 return;
             }
@@ -1128,13 +1129,18 @@ static void execute_command(void) {
         uint64_t process_id;
         uint64_t exit_status;
         console_write_string("Starting user process...\n");
-        bool started = run_file
-            ? user_process_run_elf_args(file.data, file.size,
-                                        path, path_length + 1,
-                                        program_arguments,
-                                        program_arguments_length,
-                                        &process_id, &exit_status)
-            : user_process_run(program, &process_id, &exit_status);
+        enum user_run_result file_result = USER_RUN_FAILED;
+        bool started;
+        if (run_file) {
+            file_result = user_process_run_file(path, path_length + 1,
+                                                program_arguments,
+                                                program_arguments_length,
+                                                NULL, &process_id,
+                                                &exit_status);
+            started = file_result == USER_RUN_STARTED;
+        } else {
+            started = user_process_run(program, &process_id, &exit_status);
+        }
         if (!started) {
             console_write_error("Process could not start or clean up.\n");
         } else {

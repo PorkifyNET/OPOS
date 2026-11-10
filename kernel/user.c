@@ -385,8 +385,8 @@ struct user_child_job {
     uint64_t parent_process_id;
     uint64_t task_id;
     enum user_program program;
-    const uint8_t *image_data;
-    size_t image_size;
+    size_t path_length;
+    char path[USER_FILE_PATH_CAPACITY];
     bool elf_image;
     bool forked;
     uintptr_t fork_stack_pointer;
@@ -6608,14 +6608,24 @@ static void user_child_worker(void *argument) {
                                            &job->exit_status);
         }
     } else {
-        started = user_process_run_image(
-            job->elf_image ? USER_PROGRAM_MODULE_ELF : job->program,
-            job->elf_image ? job->image_data : NULL,
-            job->elf_image ? job->image_size : 0,
-            job->cwd, job->cwd_length,
-            job->elf_image ? "/tests/elf-test" : NULL,
-            job->elf_image ? sizeof("/tests/elf-test") - 1 : 0,
-            &job->identity, NULL, 0, &job->process_id, &job->exit_status);
+        uint8_t *image = NULL;
+        size_t image_size = 0;
+        if (job->elf_image) {
+            image = user_exec_image_buffer(scheduler_current_slot());
+        }
+        if (job->elf_image && (image == NULL
+            || !vfs_read_file(job->path, job->path_length, image,
+                              USER_EXEC_IMAGE_MAX, &image_size))) {
+            started = false;
+        } else {
+            started = user_process_run_image(
+                job->elf_image ? USER_PROGRAM_MODULE_ELF : job->program,
+                image, image_size, job->cwd, job->cwd_length,
+                job->elf_image ? job->path : NULL,
+                job->elf_image ? job->path_length : 0,
+                &job->identity, NULL, 0, &job->process_id,
+                &job->exit_status);
+        }
     }
 
     uint64_t flags;
@@ -6688,21 +6698,40 @@ static int64_t user_spawn_child(struct user_process *parent,
         return -22;
     }
 
-    struct initramfs_file file = {0};
     bool elf_image = program_selector == 1;
+    char canonical_path[USER_FILE_PATH_CAPACITY];
+    size_t canonical_length = 0;
     if (elf_image) {
-        char kernel_path[256];
+        char absolute_path[USER_FILE_PATH_CAPACITY];
         size_t source_offset = path[0] == '/' ? 1 : 0;
         if (source_offset == path_length) {
             return -2;
         }
-        size_t kernel_path_length = path_length - source_offset;
-        for (size_t i = 0; i < kernel_path_length; i++) {
-            kernel_path[i] = path[source_offset + i];
+        size_t name_length = path_length - source_offset;
+        if (name_length + 2 > sizeof(absolute_path)) {
+            return -36;
         }
-        kernel_path[kernel_path_length] = '\0';
-        if (!initramfs_find_file(kernel_path, &file)) {
+        absolute_path[0] = '/';
+        for (size_t i = 0; i < name_length; i++) {
+            absolute_path[i + 1] = path[source_offset + i];
+        }
+        canonical_length = permission_canonicalize(
+            absolute_path, name_length + 1, canonical_path,
+            sizeof(canonical_path));
+        if (canonical_length == 0) {
+            return -36;
+        }
+        if (!user_path_allowed(parent, canonical_path, canonical_length,
+                               PERMISSION_READ)) {
+            return -13;
+        }
+        struct vfs_metadata metadata;
+        if (!vfs_stat(canonical_path, canonical_length, &metadata)
+            || metadata.type != VFS_NODE_FILE) {
             return -2;
+        }
+        if (metadata.size > USER_EXEC_IMAGE_MAX) {
+            return -7;
         }
     }
 
@@ -6721,8 +6750,7 @@ static int64_t user_spawn_child(struct user_process *parent,
         .handle = __atomic_fetch_add(&next_child_handle, 1, __ATOMIC_RELAXED),
         .parent_process_id = parent->id,
         .program = USER_PROGRAM_PREEMPT_TEST,
-        .image_data = file.data,
-        .image_size = file.size,
+        .path_length = canonical_length,
         .elf_image = elf_image,
         .cwd_length = parent->cwd_length,
         .identity = parent->identity,
@@ -6730,6 +6758,11 @@ static int64_t user_spawn_child(struct user_process *parent,
     };
     for (size_t i = 0; i < parent->cwd_length; i++) {
         job->cwd[i] = parent->cwd[i];
+    }
+    if (elf_image) {
+        for (size_t i = 0; i <= canonical_length; i++) {
+            job->path[i] = canonical_path[i];
+        }
     }
     if (!scheduler_spawn(user_child_worker, job, &job->task_id)) {
         job->state = USER_CHILD_UNUSED;

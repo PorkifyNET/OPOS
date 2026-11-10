@@ -4,6 +4,7 @@
  *   update                    same as "update check"
  *   update check              shows whether a newer version is out
  *   update install            downloads and installs it (administrators)
+ *   update install -y         installs without asking to type YES (--y also works)
  *   update install --ignoreversion  permits same/older versions
  *   update install --force    bypasses signature and file hash checks
  *   update install --no-prev-version  skips the rollback copy
@@ -570,7 +571,7 @@ static bool file_write(void *context, const uint8_t *data, size_t length) {
 /* ---------------------------------------------------------------- main */
 
 static void usage(void) {
-    printf("Usage: update [check|install] [--ignoreversion] [--force] "
+    printf("Usage: update [check|install] [-y|--y] [--ignoreversion] [--force] "
            "[--no-prev-version] "
            "[--source URL|FOLDER]\n");
 }
@@ -700,7 +701,7 @@ static const char *configured_source(void) {
 static bool confirm_install(const char *source, const char *installed,
                             const char *version, long needed, long count,
                             bool ignore_version, bool force,
-                            bool no_previous) {
+                            bool no_previous, bool yes) {
     printf("\nINSTALL SUMMARY\n");
     printf("  Source: %s\n", source);
     printf("  Version: OPOS %s -> OPOS %s\n", installed, version);
@@ -709,8 +710,11 @@ static bool confirm_install(const char *source, const char *installed,
     printf("  Previous version backup: %s\n",
            no_previous ? "DISABLED" : "enabled");
     printf("  Flags:\n");
-    if (!ignore_version && !force && !no_previous) {
+    if (!ignore_version && !force && !no_previous && !yes) {
         printf("    (none) - signature, version and file hashes are checked\n");
+    }
+    if (yes) {
+        printf("    -y/--y - skips the YES prompt\n");
     }
     if (ignore_version) {
         printf("    --ignoreversion - permits same-version installs and "
@@ -737,6 +741,10 @@ static bool confirm_install(const char *source, const char *installed,
     if (no_previous) {
         printf("    This install will not create a bootable rollback copy.\n");
     }
+    if (yes) {
+        printf("\nConfirmed by -y/--y. Downloading and installing.\n");
+        return true;
+    }
     printf("\nType YES to download and install, or anything else to cancel: ");
     char answer[16];
     long length = opos_read(OPOS_STDIN, answer, sizeof(answer));
@@ -754,6 +762,7 @@ int main(int argc, char **argv) {
     bool ignore_version = false;
     bool force = false;
     bool no_previous = false;
+    bool yes = false;
     /* --source, else update media, else SOURCE_FILE, else GitHub. */
     const char *source = NULL;
     for (int i = 1; i < argc; i++) {
@@ -767,6 +776,9 @@ int main(int argc, char **argv) {
             force = true;
         } else if (strcmp(argv[i], "--no-prev-version") == 0) {
             no_previous = true;
+        } else if (strcmp(argv[i], "-y") == 0
+                   || strcmp(argv[i], "--y") == 0) {
+            yes = true;
         } else if (strcmp(argv[i], "--gui") == 0) {
             gui = true;
         } else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
@@ -776,7 +788,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    bool install_option = ignore_version || force || no_previous;
+    bool install_option = ignore_version || force || no_previous || yes;
     if (install_option && gui) {
         usage();
         return 2;
@@ -913,7 +925,7 @@ int main(int argc, char **argv) {
     }
 
     if (!confirm_install(source, current_version(), version, needed, count,
-                         ignore_version, force, no_previous)) {
+                         ignore_version, force, no_previous, yes)) {
         printf("Update cancelled.\n");
         opos_update_cancel();
         return 0;

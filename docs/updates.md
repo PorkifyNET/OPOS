@@ -6,7 +6,10 @@ release notes, an UPDATE button, progress, and the updater's log under
 SHOW DETAILS. In the Terminal or kernel shell, `update` checks and
 `update install` installs. Only an administrator can install updates.
 Terminal installs show a summary and require typing `YES` before payload files
-are downloaded. Development-only flags are available:
+are downloaded. `update install -y` (or `--y`) shows the summary and starts
+downloading without the `YES` prompt. It still requires an administrator and
+checks the update normally. `update -y` and `update --y` also imply `install`.
+Development-only flags are available:
 
 - `--ignoreversion` permits same-version installs and downgrades.
 - `--force` bypasses signature and file SHA-256 checks. It does not bypass

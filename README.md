@@ -174,7 +174,7 @@ computer with accounts the kernel shell first asks for an administrator.
 | `kernel/accounts.c`, `permissions.c`, `cmos.c` | Accounts, file access rules, settings |
 | `sdk/` | Application SDK: header, start-up code, linker script, examples |
 | `tools/` | Host tools and QEMU test scripts |
-| `docs/` | Technical notes |
+| `docs/` | Technical notes, including the [installed-disk root migration plan](docs/system-root-migration.md) |
 
 ## Contributing
 

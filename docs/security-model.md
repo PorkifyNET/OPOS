@@ -62,10 +62,21 @@ kernel resolves them before asking.
 | `/disk/Users/<other name>` | no access | no access | full |
 | everything else (`/disk`, `/disk2`..., the initramfs) | full (initramfs is read-only) | full | full |
 
+`/disk/OPOS.CFG` is a binary settings file. Administrators can change its
+contents through Settings; the built-in text editor opens binary files
+read-only. For a direct confirmation check in Files, create a text file inside
+`/disk/OPOS` while logged in as an administrator.
+
 The protected folders themselves (`/disk/OPOS`, `/disk/Users`, a home
 folder, `/disk` itself) cannot be deleted or renamed by anyone, programs
 or windows. Homes go away with their account (and are kept on deletion).
 `ACCOUNTS.DAT` is only touched by the account code in the kernel.
+
+When an administrator uses the built-in Files or editor to write, create,
+rename, delete or move something in a protected system location, the desktop
+shows a warning first. It checks the logged-in administrator's password when
+one is configured. A successful confirmation authorizes only that queued
+action; it does not unlock the location for later actions or for programs.
 
 Programs run as the account that started them, and child processes
 (`fork`, `execve`, spawn) keep that identity. Without an account logged

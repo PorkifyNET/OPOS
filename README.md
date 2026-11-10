@@ -41,7 +41,9 @@ hardware support remain future work.
 - Start > Programs lists the programs in `/bin`.
 - Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
   selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
-  editor remains for administrators editing system files and as a fallback.
+  editor remains for administrators editing system files and as a fallback;
+  protected changes show a warning and require the administrator password
+  when one is configured.
 - Programs run side by side, each on its own task, with up to four program
   windows open at once; the desktop stays responsive while they compute. The
   Task Manager (Ctrl+Shift+Esc) shows their CPU and memory use and ends them;

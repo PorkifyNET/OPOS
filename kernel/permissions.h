@@ -62,4 +62,9 @@ size_t permission_canonicalize(const char *path, size_t length, char *out,
 bool permission_ui_allows(const char *path, size_t length,
                           enum permission_access access);
 
+/* True when an allowed built-in UI mutation touches protected system files
+   and therefore needs an explicit one-shot administrator confirmation. */
+bool permission_ui_requires_confirmation(const char *path, size_t length,
+                                         enum permission_access access);
+
 #endif

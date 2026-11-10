@@ -36,6 +36,8 @@ size_t accounts_count(void);
 const char *accounts_name(size_t index);
 bool accounts_has_password(size_t index);
 bool accounts_is_admin(size_t index);
+/* Checks a password without changing the logged-in account. */
+bool accounts_password_matches(size_t index, const char *password);
 /* Index of the account with this name (case-insensitive), or ACCOUNT_NONE. */
 size_t accounts_find(const char *name);
 

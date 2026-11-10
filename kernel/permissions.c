@@ -291,9 +291,10 @@ bool permission_ui_allows(const char *path, size_t length,
         if (access == PERMISSION_READ) {
             return true;
         }
-        /* Administrators may edit boot files, but the protected folders
-           themselves stay where OPOS expects them. */
-        return identity.admin && !info.anchor;
+        /* Writing an anchor folder means creating inside it; removing the
+           anchor itself remains forbidden. OPOS.CFG can be edited likewise. */
+        return identity.admin
+            && (access == PERMISSION_WRITE || !info.anchor);
     case CLASS_SECRET:
         return false;
     case CLASS_USERS:
@@ -307,4 +308,16 @@ bool permission_ui_allows(const char *path, size_t length,
             : identity.admin;
     }
     return false;
+}
+
+bool permission_ui_requires_confirmation(const char *path, size_t length,
+                                          enum permission_access access) {
+    if (path == NULL || access == PERMISSION_READ
+        || !canonical(path, length)) {
+        return false;
+    }
+    struct permission_identity identity = permission_session_identity();
+    struct path_info info = classify(path, length);
+    return identity.admin && info.class == CLASS_SYSTEM
+        && (access == PERMISSION_WRITE || !info.anchor);
 }

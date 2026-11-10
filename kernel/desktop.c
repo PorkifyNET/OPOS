@@ -591,6 +591,7 @@ static size_t terminal_output_length;
 static void draw_scene(void);
 static void window_open(enum window_kind kind);
 static void window_raise(enum window_kind kind);
+static void files_picker_cancel(void);
 static bool desktop_active;
 /* Programs waiting to read a line typed into the Terminal. */
 static size_t app_input_readers;
@@ -1151,6 +1152,9 @@ static void window_open(enum window_kind kind) {
 }
 
 static void window_close(enum window_kind kind) {
+    if (kind == WINDOW_FILES) {
+        files_picker_cancel();
+    }
     if (window_is_app(kind)) {
         app_window_closed(kind - WINDOW_APP);
     }
@@ -2164,6 +2168,24 @@ static size_t files_scroll;
 static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
 
+/* One outstanding file request. Only Files can complete it; the process
+   waiting in the syscall receives the selected path afterward. */
+static struct {
+    uint64_t owner;
+    volatile int result; /* 0: waiting, 1: selected, 2: cancelled */
+    bool open_pending;
+    char name[32];
+    char path[FILES_PATH_CAPACITY];
+    struct permission_identity identity;
+} files_picker;
+
+static void files_picker_cancel(void) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        files_picker.result = 2;
+        scheduler_wake_event(&files_picker);
+    }
+}
+
 /*
  * Multi-selection: entries marked with Ctrl+click, Shift+click,
  * Shift+arrows or Ctrl+A. With nothing marked, the cursor row
@@ -3011,6 +3033,19 @@ static void files_open_row(size_t row) {
     size_t length = files_entry_path(row, path, sizeof(path));
     if (files_entries[row].directory) {
         (void)files_visit(path, length);
+    } else if (files_picker.owner != 0 && files_picker.result == 0) {
+        struct permission_identity baseline = files_picker.identity;
+        baseline.confined = false;
+        if (!permission_program_allows(&baseline, path, length,
+                                       PERMISSION_READ)) {
+            set_status("PROGRAM CANNOT READ THIS FILE");
+            return;
+        }
+        for (size_t i = 0; i <= length; i++) {
+            files_picker.path[i] = path[i];
+        }
+        files_picker.result = 1;
+        scheduler_wake_event(&files_picker);
     } else if (appearance_is_image_name(files_entries[row].name,
                                         text_length(files_entries[row].name))) {
         viewer_open(path, length);
@@ -3587,6 +3622,20 @@ static void draw_files(struct rect area, bool focused) {
     }
     if (files_prompt_kind != FILES_PROMPT_NONE) {
         files_draw_prompt(list);
+        return;
+    }
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        struct rect line = {list.x + 6,
+                            list.y + list.height - LINE_HEIGHT - 1,
+                            list.width - 12, LINE_HEIGHT};
+        fill(line, 54, 73, 108);
+        char message[128];
+        size_t used = append_text(message, sizeof(message), 0,
+                                  files_picker.name);
+        append_text(message, sizeof(message), used,
+                    ": CHOOSE FILE TO READ (ENTER); ESC CANCELS");
+        draw_text_clipped(line.x + 6, line.y + 3, line.width - 12,
+                          message, 240, 245, 255);
         return;
     }
     /* THIS PC: the selected drive's disk, e.g. "DISK 2 PARTITION 1:
@@ -9051,6 +9100,9 @@ static void files_use_picture(bool account_picture) {
 
 /* Opens the right-click menu for the Files content area at (x, y). */
 static void files_context(struct rect area, int32_t x, int32_t y) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        return;
+    }
     files_prompt_kind = FILES_PROMPT_NONE;
     struct rect list = files_list_area(area);
     if (x < list.x) {
@@ -9211,6 +9263,19 @@ static void draw_files_menu(void) {
 }
 
 static void files_key(char character) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        if (character == KEY_ESCAPE) {
+            files_picker_cancel();
+        } else if (files_address_editing) {
+            files_address_key(character);
+        } else if (keyboard_last_ctrl()
+                   && (character == 'l' || character == 'L')) {
+            files_address_start();
+        } else if (!keyboard_last_ctrl()) {
+            files_key_navigate(character);
+        }
+        return;
+    }
     if (files_menu_open && files_menu_key(character)) {
         return;
     }
@@ -9617,7 +9682,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
             drag->offset_y = y - (int32_t)frame.y;
         }
     } else if (kind == WINDOW_FILES) {
-        if (files_click(content_rect(frame), x, y)) {
+        if (files_click(content_rect(frame), x, y)
+            && files_picker.owner == 0) {
             files_drag_start(x, y);
             drag->active = true;
             drag->mode = DRAG_FILES;
@@ -10480,6 +10546,50 @@ int64_t desktop_app_window_event(uint64_t owner,
     return result;
 }
 
+int64_t desktop_app_pick_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              char *path, size_t capacity) {
+    if (owner == 0 || name == NULL || identity == NULL || path == NULL) {
+        return -22;
+    }
+    if (!desktop_active || login_active) {
+        return -38;
+    }
+    if (files_picker.owner != 0) {
+        return -16;
+    }
+    files_picker.owner = owner;
+    files_picker.result = 0;
+    files_picker.open_pending = true;
+    files_picker.path[0] = '\0';
+    files_picker.identity = *identity;
+    text_copy(files_picker.name, sizeof(files_picker.name), name);
+    while (files_picker.result == 0) {
+        if (user_current_killed() || !desktop_active) {
+            files_picker_cancel();
+            break;
+        }
+        (void)scheduler_block_current_until_locked(
+            &files_picker, timer_ticks() + APP_WAIT_RECHECK_TICKS);
+    }
+    int64_t result = -125;
+    if (files_picker.result == 1 && !user_current_killed()) {
+        size_t length = text_length(files_picker.path);
+        if (length + 1 > capacity) {
+            result = -36;
+        } else {
+            for (size_t i = 0; i <= length; i++) {
+                path[i] = files_picker.path[i];
+            }
+            result = (int64_t)length;
+        }
+    }
+    files_picker.owner = 0;
+    files_picker.result = 0;
+    files_picker.open_pending = false;
+    return result;
+}
+
 void desktop_app_process_exited(uint64_t process_id) {
     for (size_t i = 0; i < APP_WINDOW_COUNT; i++) {
         if (process_id != 0 && app_windows[i].owner == process_id) {
@@ -11061,6 +11171,20 @@ static void tasks_key(char character) {
 static bool apps_poll(void) {
     bool redraw = false;
     uint64_t now = timer_ticks();
+    if (files_picker.owner != 0 && files_picker.result == 0
+        && files_picker.open_pending) {
+        files_picker.open_pending = false;
+        window_open(WINDOW_FILES);
+        char home[FILES_PATH_CAPACITY];
+        size_t length = accounts_home_path(NULL, home, sizeof(home));
+        if (length != 0) {
+            (void)files_visit(home, length);
+        }
+        files_menu_open = false;
+        files_prompt_kind = FILES_PROMPT_NONE;
+        files_marks_clear();
+        redraw = true;
+    }
     for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
         struct app_window *window = &app_windows[slot];
         if (window->owner == 0) {

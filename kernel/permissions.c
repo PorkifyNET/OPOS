@@ -4,6 +4,7 @@
 
 #include "accounts.h"
 #include "permissions.h"
+#include "sha256.h"
 #include "vfs.h"
 
 /*
@@ -54,6 +55,90 @@ static size_t text_length(const char *text) {
         length++;
     }
     return length;
+}
+
+static size_t join(char buffer[PATH_CAPACITY], const char *prefix,
+                   size_t prefix_length, const char *name,
+                   size_t name_length);
+
+static bool begins_component(const char *path, size_t length,
+                             const char *prefix) {
+    size_t count = text_length(prefix);
+    if (length < count) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (lower(path[i]) != lower(prefix[i])) {
+            return false;
+        }
+    }
+    return length == count || path[count] == '/';
+}
+
+static bool ensure_directory(const char *path) {
+    size_t length = text_length(path);
+    struct vfs_metadata metadata;
+    if (vfs_stat(path, length, &metadata)) {
+        return metadata.type == VFS_NODE_DIRECTORY;
+    }
+    return vfs_create_directory(path, length);
+}
+
+void permission_confine_disk_program(struct permission_identity *identity,
+                                     const char *path, size_t length) {
+    if (identity == NULL || identity->confined || path == NULL
+        || length < 5 || lower(path[0]) != '/'
+        || lower(path[1]) != 'd' || lower(path[2]) != 'i'
+        || lower(path[3]) != 's' || lower(path[4]) != 'k'
+        || (length > 5 && path[5] != '/' && (path[5] < '0' || path[5] > '9'))) {
+        return;
+    }
+    identity->confined = true;
+    identity->private_path[0] = '\0';
+    if (identity->account == PERMISSION_NO_ACCOUNT
+        || identity->account >= accounts_count()) {
+        return;
+    }
+    const char *name = accounts_name(identity->account);
+    char folder[PATH_CAPACITY];
+    size_t used = join(folder, ACCOUNT_HOME_ROOT,
+                       sizeof(ACCOUNT_HOME_ROOT) - 1,
+                       name, text_length(name));
+    if (used == 0 || used >= sizeof(identity->private_path)
+        || !ensure_directory(folder)) {
+        return;
+    }
+    used = join(folder, folder, used, "AppData", 7);
+    if (used == 0 || !ensure_directory(folder)) {
+        return;
+    }
+    used = join(folder, folder, used, "Programs", 8);
+    if (used == 0 || !ensure_directory(folder)) {
+        return;
+    }
+    struct sha256_context hash;
+    uint8_t digest[SHA256_DIGEST_SIZE];
+    sha256_init(&hash);
+    for (size_t i = 0; i < length; i++) {
+        char c = lower(path[i]);
+        sha256_update(&hash, &c, 1);
+    }
+    sha256_final(&hash, digest);
+    static const char hex[] = "0123456789abcdef";
+    char directory[17];
+    for (size_t i = 0; i < 8; i++) {
+        directory[i * 2] = hex[digest[i] >> 4];
+        directory[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    directory[16] = '\0';
+    used = join(folder, folder, used, directory, 16);
+    if (used == 0 || used >= sizeof(identity->private_path)
+        || !ensure_directory(folder)) {
+        return;
+    }
+    for (size_t i = 0; i <= used; i++) {
+        identity->private_path[i] = folder[i];
+    }
 }
 
 /* Builds "<prefix>/<name>" into buffer; returns its length or 0. */
@@ -242,12 +327,14 @@ size_t permission_canonicalize(const char *path, size_t length, char *out,
 struct permission_identity permission_session_identity(void) {
     size_t current = accounts_current();
     if (current != ACCOUNT_NONE) {
-        return (struct permission_identity){current, accounts_is_admin(current)};
+        return (struct permission_identity){
+            .account = current, .admin = accounts_is_admin(current)
+        };
     }
     /* No accounts at all (live media, or a disk set up without any): the
        person at the keyboard owns the machine. */
     return (struct permission_identity){
-        PERMISSION_NO_ACCOUNT, accounts_count() == 0
+        .account = PERMISSION_NO_ACCOUNT, .admin = accounts_count() == 0
     };
 }
 
@@ -258,6 +345,13 @@ bool permission_program_allows(const struct permission_identity *identity,
         return false;
     }
     struct path_info info = classify(path, length);
+    if (identity->confined && access != PERMISSION_READ
+        && (identity->private_path[0] == '\0'
+            || !begins_component(path, length, identity->private_path)
+            || (access == PERMISSION_REMOVE
+                && length == text_length(identity->private_path)))) {
+        return false;
+    }
     switch (info.class) {
     case CLASS_SHARED:
         return access != PERMISSION_REMOVE || !info.anchor;
@@ -272,9 +366,49 @@ bool permission_program_allows(const struct permission_identity *identity,
             || info.owner != identity->account) {
             return false;
         }
+        if (identity->confined && access == PERMISSION_READ) {
+            if (identity->private_path[0] != '\0'
+                && begins_component(path, length, identity->private_path)) {
+                return true;
+            }
+            if (identity->read_grant[0] != '\0'
+                && equal_ignore_case(path, length, identity->read_grant)) {
+                struct vfs_metadata metadata;
+                return vfs_stat(path, length, &metadata)
+                    && metadata.type == VFS_NODE_FILE
+                    && metadata.device == identity->read_grant_device
+                    && metadata.inode == identity->read_grant_inode;
+            }
+            return false;
+        }
         return access != PERMISSION_REMOVE || !info.anchor;
     }
     return false;
+}
+
+bool permission_grant_read_file(struct permission_identity *identity,
+                                const char *path, size_t length) {
+    if (identity == NULL || !identity->confined || path == NULL
+        || length == 0 || length >= sizeof(identity->read_grant)) {
+        return false;
+    }
+    struct permission_identity baseline = *identity;
+    baseline.confined = false;
+    if (!permission_program_allows(&baseline, path, length, PERMISSION_READ)) {
+        return false;
+    }
+    struct vfs_metadata metadata;
+    if (!vfs_stat(path, length, &metadata)
+        || metadata.type != VFS_NODE_FILE) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        identity->read_grant[i] = path[i];
+    }
+    identity->read_grant[length] = '\0';
+    identity->read_grant_device = metadata.device;
+    identity->read_grant_inode = metadata.inode;
+    return true;
 }
 
 bool permission_ui_allows(const char *path, size_t length,

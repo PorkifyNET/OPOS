@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * File access policy. FAT has no owners or permission bits, so access is
@@ -14,9 +15,10 @@
  *   /disk/Users/<name>                                  one account's home
  *   anything else (/disk/..., /disk2..., /)              shared
  *
- * Programs ("applications are guests") may read system files but never
- * change them, never see ACCOUNTS.DAT, and only reach their own account's
- * home. OPOS's own windows (Files, editor) act for the person at the
+ * Programs may read system files but never change them, never see
+ * ACCOUNTS.DAT, and only reach their own account's home. Disk-launched
+ * programs are further limited to writing in their own app directory.
+ * OPOS's own windows (Files, editor) act for the person at the
  * keyboard: an administrator may change system files and open other
  * homes there; a standard account may not. ACCOUNTS.DAT is only ever
  * touched by the kernel's account code.
@@ -28,6 +30,15 @@ struct permission_identity {
     /* Account index, or PERMISSION_NO_ACCOUNT. */
     size_t account;
     bool admin;
+    /* Disk-launched programs may write only below this directory. Empty
+       means the directory could not be prepared, so writes are denied. */
+    bool confined;
+    char private_path[128];
+    /* One user-selected document. A replacement at the same path does not
+       inherit the grant: device and inode must still match. */
+    char read_grant[256];
+    uint64_t read_grant_device;
+    uint64_t read_grant_inode;
 };
 
 enum permission_access {
@@ -45,6 +56,15 @@ enum permission_access {
  * a machine with accounts gives a standard identity without a home.
  */
 struct permission_identity permission_session_identity(void);
+
+/* Narrow a process identity when it runs an executable from a disk. Never
+   widens an identity already inherited from a confined parent. */
+void permission_confine_disk_program(struct permission_identity *identity,
+                                     const char *path, size_t length);
+
+/* Called only after the desktop picker chooses a file. */
+bool permission_grant_read_file(struct permission_identity *identity,
+                                const char *path, size_t length);
 
 /* Programs. path is absolute and canonical (no ".", "..", or "//"). */
 bool permission_program_allows(const struct permission_identity *identity,

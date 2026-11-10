@@ -10,8 +10,7 @@
  * Each account has a name, an optional password (salted, iterated
  * SHA-256), an administrator flag, its personal settings, and a home
  * folder /disk/Users/<name> with Documents, Pictures, Music, Videos and
- * Downloads. There are no file permissions yet: every account can read
- * every file.
+ * Downloads. The kernel enforces location-based access to home folders.
  */
 
 #define ACCOUNT_MAX 8

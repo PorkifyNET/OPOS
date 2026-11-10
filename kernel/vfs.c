@@ -26,6 +26,7 @@ struct vfs_open_object {
     bool used;
     bool linked;
     bool root;
+    bool disk_root_alias;
     uint32_t references;
     uint64_t inode;
     enum vfs_backend backend;
@@ -48,6 +49,8 @@ struct vfs_open_object {
 };
 
 static struct vfs_open_object open_objects[VFS_OPEN_OBJECT_CAPACITY];
+static char disk_root_path[128];
+static size_t disk_root_path_length;
 
 static uint64_t node_inode(const struct fat16_node *node) {
     return ((uint64_t)node->entry_sector << 5)
@@ -94,6 +97,9 @@ static struct vfs_open_object *open_object_for_node(
 static bool path_character_equal(char left, char right) {
     if (left >= 'A' && left <= 'Z') {
         left += 'a' - 'A';
+    }
+    if (right >= 'A' && right <= 'Z') {
+        right += 'a' - 'A';
     }
     return left == right;
 }
@@ -205,6 +211,55 @@ static bool disk_prefix(const char *path, size_t path_length) {
     return disk_prefix_length(path, path_length, NULL) != 0;
 }
 
+static size_t cdrom_prefix_length(const char *path, size_t path_length,
+                                  size_t *volume);
+
+static bool path_is_disk_root_alias(const char *path, size_t path_length) {
+    return disk_root_path_length != 0 && path != NULL && path_length != 0
+        && path[0] == '/' && !disk_prefix(path, path_length)
+        && cdrom_prefix_length(path, path_length, NULL) == 0;
+}
+
+bool vfs_disk_root_backing_path(const char *path, size_t path_length,
+                                char *backing, size_t capacity,
+                                size_t *backing_length) {
+    if (!path_is_disk_root_alias(path, path_length) || backing == NULL
+        || backing_length == NULL) {
+        return false;
+    }
+    size_t suffix = path_length == 1 ? 0 : path_length;
+    size_t total = disk_root_path_length + suffix;
+    if (total >= capacity) {
+        return false;
+    }
+    for (size_t i = 0; i < disk_root_path_length; i++) {
+        backing[i] = disk_root_path[i];
+    }
+    for (size_t i = 0; i < suffix; i++) {
+        backing[disk_root_path_length + i] = path[i];
+    }
+    backing[total] = '\0';
+    *backing_length = total;
+    return true;
+}
+
+bool vfs_disk_root_contains(const char *path, size_t path_length) {
+    if (disk_root_path_length == 0) {
+        return false;
+    }
+    if (path_is_disk_root_alias(path, path_length)) {
+        return true;
+    }
+    return namespace_prefix(path, path_length, disk_root_path,
+                            disk_root_path_length);
+}
+
+bool vfs_disk_root_ancestor(const char *path, size_t path_length) {
+    return disk_root_path_length != 0 && path != NULL
+        && namespace_prefix(disk_root_path, disk_root_path_length,
+                            path, path_length);
+}
+
 /* ------------------------------------------------- CD/DVD (ISO 9660) */
 
 #define VFS_ISO_DEVICE_BASE 16
@@ -285,6 +340,7 @@ static bool initramfs_mount_path(const char *path, size_t path_length,
                                  size_t *relative_length) {
     if (path == NULL || relative == NULL || relative_length == NULL
         || path_length == 0 || path[0] != '/'
+        || path_is_disk_root_alias(path, path_length)
         || disk_prefix(path, path_length)
         || cdrom_prefix_length(path, path_length, NULL) != 0) {
         return false;
@@ -352,6 +408,66 @@ static bool root_disk_entry(size_t index, struct vfs_directory_entry *entry) {
     return false;
 }
 
+static bool root_mount_name(const char *name, size_t length) {
+    char path[10];
+    if (length + 1 >= sizeof(path)) {
+        return false;
+    }
+    path[0] = '/';
+    for (size_t i = 0; i < length; i++) {
+        path[i + 1] = name[i];
+    }
+    return disk_prefix(path, length + 1)
+        || cdrom_prefix_length(path, length + 1, NULL) != 0;
+}
+
+bool vfs_select_disk_root(const char *path, size_t path_length) {
+    static const char prefix[] = "/disk/OPOS/roots/";
+    if (disk_root_path_length != 0 || path == NULL
+        || path_length <= sizeof(prefix) - 1
+        || path_length >= sizeof(disk_root_path)) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(prefix) - 1; i++) {
+        if (!path_character_equal(path[i], prefix[i])) {
+            return false;
+        }
+    }
+    for (size_t i = sizeof(prefix) - 1; i < path_length; i++) {
+        char c = path[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+              || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < VFS_OPEN_OBJECT_CAPACITY; i++) {
+        if (open_objects[i].used) {
+            return false;
+        }
+    }
+    struct vfs_metadata metadata;
+    size_t count;
+    if (!vfs_stat(path, path_length, &metadata)
+        || metadata.type != VFS_NODE_DIRECTORY
+        || metadata.device != 2
+        || !vfs_directory_count(path, path_length, &count)) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at(path, path_length, i, &entry)
+            || root_mount_name(entry.name, entry.name_length)) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < path_length; i++) {
+        disk_root_path[i] = path[i];
+    }
+    disk_root_path[path_length] = '\0';
+    disk_root_path_length = path_length;
+    return true;
+}
+
 bool vfs_disk_objects_open(void) {
     for (size_t i = 0; i < VFS_OPEN_OBJECT_CAPACITY; i++) {
         if (open_objects[i].used
@@ -365,7 +481,8 @@ bool vfs_disk_objects_open(void) {
 bool vfs_path_read_only(const char *path, size_t path_length) {
     const char *relative;
     size_t relative_length;
-    return initramfs_mount_path(path, path_length, &relative,
+    return path_is_disk_root_alias(path, path_length)
+        || initramfs_mount_path(path, path_length, &relative,
                                 &relative_length)
         || cdrom_prefix_length(path, path_length, NULL) != 0;
 }
@@ -507,11 +624,13 @@ static void open_object_metadata(const struct vfs_open_object *object,
     };
 }
 
-bool vfs_open_object(const char *path, size_t path_length,
-                     vfs_object_handle *handle,
-                     struct vfs_metadata *metadata) {
+static bool vfs_open_object_at(const char *path, size_t path_length,
+                               vfs_object_handle *handle,
+                               struct vfs_metadata *metadata,
+                               bool disk_root_alias) {
     if (handle == NULL || metadata == NULL || path == NULL
-        || path_length >= sizeof(open_objects[0].namespace_path)) {
+        || (!disk_root_alias
+            && path_length >= sizeof(open_objects[0].namespace_path))) {
         return false;
     }
     size_t iso_volume;
@@ -626,6 +745,7 @@ bool vfs_open_object(const char *path, size_t path_length,
     for (size_t i = 0; i < VFS_OPEN_OBJECT_CAPACITY; i++) {
         bool same = open_objects[i].used && open_objects[i].linked
             && open_objects[i].backend == VFS_BACKEND_FAT16
+            && open_objects[i].disk_root_alias == disk_root_alias
             && open_objects[i].volume == fat16_current_volume()
             && open_objects[i].fat_generation
                 == fat16_volume_generation(fat16_current_volume())
@@ -648,6 +768,7 @@ bool vfs_open_object(const char *path, size_t path_length,
                     .used = true,
                     .linked = true,
                     .root = resolved.root,
+                    .disk_root_alias = disk_root_alias,
                     .references = 0,
                     .inode = resolved.root ? 1 : node_inode(&resolved.node),
                     .backend = VFS_BACKEND_FAT16,
@@ -667,7 +788,31 @@ bool vfs_open_object(const char *path, size_t path_length,
     object->references++;
     *handle = (vfs_object_handle)(object - open_objects + 1);
     open_object_metadata(object, metadata);
+    if (disk_root_alias) {
+        metadata->read_only = true;
+    }
     return true;
+}
+
+bool vfs_open_object(const char *path, size_t path_length,
+                     vfs_object_handle *handle,
+                     struct vfs_metadata *metadata) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        if (!vfs_open_object_at(backing, backing_length, handle, metadata,
+                                true)) {
+            return false;
+        }
+        struct vfs_open_object *object = open_object(*handle);
+        if (object == NULL || !set_namespace_path(object, path, path_length)) {
+            (void)vfs_close_object(*handle);
+            return false;
+        }
+        return true;
+    }
+    return vfs_open_object_at(path, path_length, handle, metadata, false);
 }
 
 bool vfs_close_object(vfs_object_handle handle) {
@@ -711,6 +856,9 @@ bool vfs_object_metadata(vfs_object_handle handle,
         return false;
     }
     open_object_metadata(object, metadata);
+    if (object->disk_root_alias) {
+        metadata->read_only = true;
+    }
     return true;
 }
 
@@ -732,6 +880,9 @@ bool vfs_object_namespace_path(vfs_object_handle handle, char *path,
 
 bool vfs_object_resize(vfs_object_handle handle, uint32_t new_size) {
     struct vfs_open_object *object = open_object(handle);
+    if (object != NULL && object->disk_root_alias) {
+        return false;
+    }
     return object != NULL && object->backend == VFS_BACKEND_FAT16
         && !object->root
         && (object->node.attributes & FAT16_ATTRIBUTE_DIRECTORY) == 0
@@ -765,6 +916,9 @@ bool vfs_object_write_at(vfs_object_handle handle, size_t offset,
                          const uint8_t *buffer, size_t length,
                          size_t *bytes_written) {
     struct vfs_open_object *object = open_object(handle);
+    if (object != NULL && object->disk_root_alias) {
+        return false;
+    }
     return object != NULL && object->backend == VFS_BACKEND_FAT16
         && !object->root
         && (object->linked
@@ -776,6 +930,13 @@ bool vfs_object_write_at(vfs_object_handle handle, size_t offset,
 
 bool vfs_read_file(const char *path, size_t path_length, uint8_t *buffer,
                    size_t buffer_capacity, size_t *file_size) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        return vfs_read_file(backing, backing_length, buffer,
+                             buffer_capacity, file_size);
+    }
     if (file_size == NULL) {
         return false;
     }
@@ -828,6 +989,9 @@ bool vfs_read_file(const char *path, size_t path_length, uint8_t *buffer,
 
 bool vfs_write_file(const char *path, size_t path_length,
                     const uint8_t *buffer, size_t file_size) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        return false;
+    }
     if (!vfs_create_file(path, path_length, true)) {
         return false;
     }
@@ -843,6 +1007,12 @@ bool vfs_write_file(const char *path, size_t path_length,
 }
 
 bool vfs_file_size(const char *path, size_t path_length, size_t *file_size) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        return vfs_file_size(backing, backing_length, file_size);
+    }
     size_t iso_volume;
     struct iso_node iso_node;
     if (cdrom_prefix_length(path, path_length, NULL) != 0) {
@@ -877,6 +1047,9 @@ bool vfs_file_size(const char *path, size_t path_length, size_t *file_size) {
 }
 
 bool vfs_create_file(const char *path, size_t path_length, bool truncate) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        return false;
+    }
     struct vfs_resolved_node resolved;
     if (vfs_resolve(path, path_length, &resolved)) {
         if (resolved.root
@@ -898,6 +1071,9 @@ bool vfs_create_file(const char *path, size_t path_length, bool truncate) {
 }
 
 bool vfs_resize_file(const char *path, size_t path_length, uint32_t new_size) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        return false;
+    }
     struct fat16_node node;
     if (!resolved_file(path, path_length, &node)) {
         return false;
@@ -910,6 +1086,9 @@ bool vfs_resize_file(const char *path, size_t path_length, uint32_t new_size) {
 }
 
 bool vfs_create_directory(const char *path, size_t path_length) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        return false;
+    }
     struct vfs_resolved_node existing;
     if (vfs_resolve(path, path_length, &existing)) {
         return false;
@@ -925,6 +1104,12 @@ bool vfs_create_directory(const char *path, size_t path_length) {
 
 bool vfs_remove(const char *path, size_t path_length, bool directory,
                 bool *not_empty) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        if (not_empty != NULL) {
+            *not_empty = false;
+        }
+        return false;
+    }
     if (not_empty == NULL) {
         return false;
     }
@@ -983,6 +1168,10 @@ enum vfs_rename_result vfs_rename(const char *old_path,
                                   size_t old_path_length,
                                   const char *new_path,
                                   size_t new_path_length) {
+    if (path_is_disk_root_alias(old_path, old_path_length)
+        || path_is_disk_root_alias(new_path, new_path_length)) {
+        return VFS_RENAME_READ_ONLY;
+    }
     if (vfs_path_read_only(old_path, old_path_length)
         || vfs_path_read_only(new_path, new_path_length)) {
         return VFS_RENAME_READ_ONLY;
@@ -1093,6 +1282,13 @@ enum vfs_rename_result vfs_rename(const char *old_path,
 
 bool vfs_read_at(const char *path, size_t path_length, size_t offset,
                  uint8_t *buffer, size_t length, size_t *bytes_read) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        return vfs_read_at(backing, backing_length, offset, buffer,
+                           length, bytes_read);
+    }
     size_t iso_volume;
     struct iso_node iso_node;
     if (cdrom_prefix_length(path, path_length, NULL) != 0) {
@@ -1119,6 +1315,9 @@ bool vfs_read_at(const char *path, size_t path_length, size_t offset,
 bool vfs_write_at(const char *path, size_t path_length, size_t offset,
                   const uint8_t *buffer, size_t length,
                   size_t *bytes_written) {
+    if (path_is_disk_root_alias(path, path_length)) {
+        return false;
+    }
     struct fat16_node node;
     if (!resolved_file(path, path_length, &node)) {
         return false;
@@ -1130,6 +1329,16 @@ bool vfs_write_at(const char *path, size_t path_length, size_t offset,
 
 bool vfs_stat(const char *path, size_t path_length,
               struct vfs_metadata *metadata) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        if (!vfs_stat(backing, backing_length, metadata)) {
+            return false;
+        }
+        metadata->read_only = true;
+        return true;
+    }
     size_t iso_volume;
     struct iso_node iso_node;
     if (cdrom_prefix_length(path, path_length, NULL) != 0) {
@@ -1235,6 +1444,18 @@ static bool directory_count(uint32_t directory_cluster, size_t *count) {
 }
 
 bool vfs_directory_count(const char *path, size_t path_length, size_t *count) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        if (!vfs_directory_count(backing, backing_length, count)) {
+            return false;
+        }
+        if (path_length == 1) {
+            *count += root_disk_count();
+        }
+        return true;
+    }
     size_t iso_volume;
     struct iso_node iso_node;
     if (cdrom_prefix_length(path, path_length, NULL) != 0) {
@@ -1280,8 +1501,15 @@ bool vfs_object_directory_count(vfs_object_handle handle, size_t *count) {
             && (object->node.attributes & FAT16_ATTRIBUTE_DIRECTORY) == 0)) {
         return false;
     }
-    return directory_count(object->root ? 0 : object->node.first_cluster,
-                           count);
+    if (!directory_count(object->root ? 0 : object->node.first_cluster,
+                         count)) {
+        return false;
+    }
+    if (object->disk_root_alias && object->namespace_path_length == 1
+        && object->namespace_path[0] == '/') {
+        *count += root_disk_count();
+    }
+    return true;
 }
 
 static bool directory_entry_at(uint32_t directory_cluster, size_t index,
@@ -1316,6 +1544,17 @@ static bool directory_entry_at(uint32_t directory_cluster, size_t index,
 
 bool vfs_directory_entry_at(const char *path, size_t path_length, size_t index,
                             struct vfs_directory_entry *entry) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, path_length, backing,
+                                   sizeof(backing), &backing_length)) {
+        size_t mounts = path_length == 1 ? root_disk_count() : 0;
+        if (index < mounts) {
+            return root_disk_entry(index, entry);
+        }
+        return vfs_directory_entry_at(backing, backing_length,
+                                      index - mounts, entry);
+    }
     size_t iso_volume;
     struct iso_node iso_node;
     if (cdrom_prefix_length(path, path_length, NULL) != 0) {
@@ -1393,6 +1632,14 @@ bool vfs_object_directory_entry_at(vfs_object_handle handle, size_t index,
         || (!object->root
             && (object->node.attributes & FAT16_ATTRIBUTE_DIRECTORY) == 0)) {
         return false;
+    }
+    if (object->disk_root_alias && object->namespace_path_length == 1
+        && object->namespace_path[0] == '/') {
+        size_t mounts = root_disk_count();
+        if (index < mounts) {
+            return root_disk_entry(index, entry);
+        }
+        index -= mounts;
     }
     return directory_entry_at(object->root ? 0 : object->node.first_cluster,
                               index, entry);

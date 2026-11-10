@@ -286,6 +286,16 @@ static struct path_info classify(const char *path, size_t length) {
     return info;
 }
 
+static struct path_info classify_visible(const char *path, size_t length) {
+    char backing[512];
+    size_t backing_length;
+    if (vfs_disk_root_backing_path(path, length, backing,
+                                   sizeof(backing), &backing_length)) {
+        return classify(backing, backing_length);
+    }
+    return classify(path, length);
+}
+
 size_t permission_canonicalize(const char *path, size_t length, char *out,
                                size_t capacity) {
     if (path == NULL || out == NULL || capacity < 2 || length == 0
@@ -344,7 +354,7 @@ bool permission_program_allows(const struct permission_identity *identity,
     if (identity == NULL || path == NULL || !canonical(path, length)) {
         return false;
     }
-    struct path_info info = classify(path, length);
+    struct path_info info = classify_visible(path, length);
     if (identity->confined && access != PERMISSION_READ
         && (identity->private_path[0] == '\0'
             || !begins_component(path, length, identity->private_path)
@@ -417,7 +427,13 @@ bool permission_ui_allows(const char *path, size_t length,
         return false;
     }
     struct permission_identity identity = permission_session_identity();
-    struct path_info info = classify(path, length);
+    struct path_info info = classify_visible(path, length);
+    if (access != PERMISSION_READ
+        && (vfs_disk_root_contains(path, length)
+            || (access == PERMISSION_REMOVE
+                && vfs_disk_root_ancestor(path, length)))) {
+        return false;
+    }
     switch (info.class) {
     case CLASS_SHARED:
         return access != PERMISSION_REMOVE || !info.anchor;
@@ -451,7 +467,11 @@ bool permission_ui_requires_confirmation(const char *path, size_t length,
         return false;
     }
     struct permission_identity identity = permission_session_identity();
-    struct path_info info = classify(path, length);
+    struct path_info info = classify_visible(path, length);
+    if (vfs_disk_root_contains(path, length)
+        || vfs_disk_root_ancestor(path, length)) {
+        return false;
+    }
     return identity.admin && info.class == CLASS_SYSTEM
         && (access == PERMISSION_WRITE || !info.anchor);
 }

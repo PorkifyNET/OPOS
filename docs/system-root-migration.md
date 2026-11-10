@@ -6,6 +6,21 @@ small initramfs for boot and recovery. The live ISO must continue to run from
 its initramfs. The migration must preserve existing installations and user
 files, and a failed update must leave a bootable previous system.
 
+## Implementation status
+
+The first VFS seam is present but is not selected by normal boot. After the
+boot FAT volume is mounted, `vfs_select_disk_root()` can map `/` onto a
+protected `/disk/OPOS/roots/<generation>` directory. It rejects missing roots,
+other volumes, reserved mount-point names and a switch after file objects
+have opened. The root alias is read-only; `/disk` still exposes the physical
+volume. Permission checks classify both spellings as system files and block
+changes to the selected tree, including through its physical path. A QEMU
+smoke boot with a temporary selector call confirmed matching device/inode for
+`/bin/notepad` and its backing file, and the focused permission test passes.
+Normal builds still use the initramfs root. Installer population, signed
+generation selection, boot activation, program-discovery changes and updates
+remain future stages.
+
 ## Current contracts to preserve
 
 | Area | Current reader or writer | Migration consequence |
@@ -115,6 +130,7 @@ allowed to remove the only recovery path during this migration.
 | Power loss | Cut power during each stage, marker write, boot-menu write and update resume. Every resulting state boots the old or new complete generation, or enters recovery with a clear error. |
 | Hardware | BIOS/MBR and UEFI/GPT installs in QEMU, VMware and VirtualBox; boot disk chosen correctly with multiple disks, removable media and a missing or damaged system volume. |
 
-The first implementation slice should be the optional VFS root provider and
-its permission/alias tests, with the legacy initramfs root still the default.
-Installer changes, activation and payload removal follow only after that gate.
+The next implementation slice is to replace initramfs-only program discovery
+and child-spawn lookups with VFS-aware paths, while retaining the legacy
+initramfs boot. Installer changes, activation and payload removal follow only
+after the namespace and permission gates pass.

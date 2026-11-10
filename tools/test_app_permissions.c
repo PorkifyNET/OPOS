@@ -11,6 +11,39 @@
 static char directories[8][128];
 static size_t directory_count;
 static uint64_t document_inode = 7;
+static bool disk_root_selected;
+static const char root_backing[] = "/disk/OPOS/roots/test";
+
+bool vfs_disk_root_backing_path(const char *path, size_t length, char *backing,
+                                size_t capacity, size_t *backing_length) {
+    if (!disk_root_selected || length == 0 || path[0] != '/'
+        || strncmp(path, "/disk", 5) == 0
+        || strncmp(path, "/cdrom", 6) == 0) {
+        return false;
+    }
+    size_t prefix = strlen(root_backing);
+    size_t suffix = length == 1 ? 0 : length;
+    if (prefix + suffix >= capacity) {
+        return false;
+    }
+    memcpy(backing, root_backing, prefix);
+    memcpy(backing + prefix, path, suffix);
+    backing[prefix + suffix] = '\0';
+    *backing_length = prefix + suffix;
+    return true;
+}
+
+bool vfs_disk_root_contains(const char *path, size_t length) {
+    return disk_root_selected
+        && ((length > 0 && path[0] == '/' && strncmp(path, "/disk", 5) != 0)
+            || (length >= strlen(root_backing)
+                && strncmp(path, root_backing, strlen(root_backing)) == 0));
+}
+
+bool vfs_disk_root_ancestor(const char *path, size_t length) {
+    return disk_root_selected && length <= strlen(root_backing)
+        && strncmp(path, root_backing, length) == 0;
+}
 
 size_t accounts_count(void) { return 2; }
 size_t accounts_current(void) { return 0; }
@@ -103,6 +136,20 @@ int main(void) {
     permission_confine_disk_program(&guest, "/disk/guest", 11);
     assert(guest.confined && guest.private_path[0] == '\0');
     assert(!allows(&guest, "/disk/shared.txt", PERMISSION_WRITE));
+
+    disk_root_selected = true;
+    assert(allows(&built_in, "/bin/notepad", PERMISSION_READ));
+    assert(!allows(&built_in, "/bin/notepad", PERMISSION_WRITE));
+    assert(!allows(&app, "/bin/notepad", PERMISSION_WRITE));
+    assert(!permission_ui_allows("/bin/notepad", 12, PERMISSION_WRITE));
+    assert(!permission_ui_allows(root_backing, strlen(root_backing),
+                                 PERMISSION_REMOVE));
+    assert(!permission_ui_allows("/disk/OPOS/roots",
+                                 strlen("/disk/OPOS/roots"),
+                                 PERMISSION_REMOVE));
+    assert(permission_ui_allows("/disk/Programs/new",
+                                strlen("/disk/Programs/new"),
+                                PERMISSION_WRITE));
     puts("app permissions: passed");
     return 0;
 }

@@ -38,7 +38,8 @@ hardware support remain future work.
   sidebar place to move them (copied when they come from a read-only place
   or another volume); a sidebar grouped into your folders and This PC;
   back/forward/up buttons and an address bar (Ctrl+L).
-- Start > Programs lists the programs in `/bin`.
+- Start > Programs lists built-in programs from `/bin` and ELF programs
+  placed in writable `/disk/Programs`. Built-in names take precedence.
 - Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
   selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
   editor remains for administrators editing system files and as a fallback;

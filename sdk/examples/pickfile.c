@@ -1,5 +1,5 @@
-/* Copy this program to a disk and run it from the Terminal. Files asks the
-   user to select one document in their home folder. */
+/* Copy this program to /disk/Programs and launch it from Start > Programs.
+   Files asks the user to select one document in their home folder. */
 #include <opos.h>
 
 int main(void) {

@@ -212,8 +212,10 @@ the file in Files; Esc or closing Files cancels the request. Built-in
 programs from the ISO retain the broader shared-disk
 access described in the security model.
 
-`sdk/build/pickfile` is a small example. Copy it to `/disk`, run
-`run /disk/pickfile` in the Terminal, and select a document in Files.
+`sdk/build/pickfile` is a small example. Copy it to `/disk/Programs`, launch
+it from Start > Programs, and select a document in Files. OPOS creates the
+folder when Start > Programs opens. A disk app with the same name as a
+built-in `/bin` app does not replace the built-in menu entry.
 See `docs/security-model.md`.
 
 ## Limits

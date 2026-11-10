@@ -7604,16 +7604,18 @@ static void draw_taskbar_menu(void) {
 }
 
 /*
- * Start > PROGRAMS: the programs in /bin, in a submenu beside the Start
- * menu (Windows XP style). It opens when the pointer rests on PROGRAMS,
- * or with Right/Enter; the list is read each time it opens.
+ * Start > PROGRAMS: built-in /bin and installed /disk/Programs files in a
+ * submenu beside Start. Built-in names take precedence over disk names.
+ * The list is read each time it opens.
  */
 #define PROGRAMS_MAX 32
 #define PROGRAMS_NAME_CAPACITY 32
 #define PROGRAMS_DIRECTORY "/bin"
+#define PROGRAMS_DISK_DIRECTORY "/disk/Programs"
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
 
 static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
+static bool programs_disk[PROGRAMS_MAX];
 static size_t programs_count;
 static bool programs_focus;  /* the keyboard is in the submenu */
 static size_t programs_selection;
@@ -7629,22 +7631,58 @@ static char ascii_upper(char character) {
                                                 : character;
 }
 
-static void programs_load(void) {
-    static const char directory[] = PROGRAMS_DIRECTORY;
-    programs_count = 0;
+static bool programs_name_equal(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (ascii_upper(a[i]) != ascii_upper(b[i])) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static void programs_load_directory(const char *directory, bool disk) {
+    size_t directory_length = text_length(directory);
     size_t count;
-    if (!vfs_directory_count(directory, sizeof(directory) - 1, &count)) {
+    if (!vfs_directory_count(directory, directory_length, &count)) {
         return;
     }
     for (size_t i = 0; i < count && programs_count < PROGRAMS_MAX; i++) {
         struct vfs_directory_entry entry;
-        if (!vfs_directory_entry_at(directory, sizeof(directory) - 1, i,
+        if (!vfs_directory_entry_at(directory, directory_length, i,
                                     &entry)) {
             break;
         }
         if (entry.type != VFS_NODE_FILE
             || entry.name_length >= PROGRAMS_NAME_CAPACITY) {
             continue;
+        }
+        if (disk) {
+            bool duplicate = false;
+            for (size_t j = 0; j < programs_count; j++) {
+                if (programs_name_equal(entry.name, programs_names[j])) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            char path[64];
+            size_t path_length = append_text(path, sizeof(path), 0,
+                                             directory);
+            path_length = append_text(path, sizeof(path), path_length, "/");
+            path_length = append_text(path, sizeof(path), path_length,
+                                      entry.name);
+            uint8_t magic[4];
+            size_t bytes = 0;
+            if (!vfs_read_at(path, path_length, 0, magic,
+                                sizeof(magic), &bytes)
+                || bytes != sizeof(magic) || magic[0] != 0x7f
+                || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+                continue;
+            }
         }
         /* Sorted by name, case ignored. */
         size_t at = programs_count++;
@@ -7660,13 +7698,27 @@ static void programs_load(void) {
                 break;
             }
             text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
+            programs_disk[at] = programs_disk[at - 1];
             at--;
         }
         for (size_t j = 0; j < entry.name_length; j++) {
             programs_names[at][j] = entry.name[j];
         }
         programs_names[at][entry.name_length] = '\0';
+        programs_disk[at] = disk;
     }
+}
+
+static void programs_load(void) {
+    static const char disk_directory[] = PROGRAMS_DISK_DIRECTORY;
+    struct vfs_metadata metadata;
+    programs_count = 0;
+    programs_load_directory(PROGRAMS_DIRECTORY, false);
+    if (!vfs_stat(disk_directory, sizeof(disk_directory) - 1, &metadata)) {
+        (void)vfs_create_directory(disk_directory,
+                                   sizeof(disk_directory) - 1);
+    }
+    programs_load_directory(disk_directory, true);
 }
 
 static void programs_show(bool focus) {
@@ -7731,7 +7783,10 @@ static void programs_launch(size_t index) {
     start_menu_open = false;
     programs_open = false;
     char path[64];
-    size_t length = append_text(path, sizeof(path), 0, PROGRAMS_DIRECTORY "/");
+    size_t length = append_text(path, sizeof(path), 0,
+                                programs_disk[index]
+                                    ? PROGRAMS_DISK_DIRECTORY "/"
+                                    : PROGRAMS_DIRECTORY "/");
     length = append_text(path, sizeof(path), length, programs_names[index]);
     files_run_program(path, length);
 }

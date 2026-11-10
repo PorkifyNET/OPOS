@@ -398,8 +398,9 @@ static bool line_ctrl_key(char *text, size_t *length, size_t limit,
 
 #define TERMINAL_HISTORY 1000
 #define TERMINAL_COLUMNS 96
+#define TERMINAL_INPUT_CAPACITY 512
 
-static char terminal_line[64];
+static char terminal_line[TERMINAL_INPUT_CAPACITY];
 static size_t terminal_length;
 /* Scrollback is a ring: terminal_line_at(0) is the oldest kept line. Every
    line has an absolute number (terminal_dropped + index) so a selection
@@ -809,9 +810,19 @@ static bool terminal_net_output(void) {
 }
 
 static bool terminal_execute(void) {
-    char echo[TERMINAL_COLUMNS] = "OPOS> ";
-    append_text(echo, sizeof(echo), 6, terminal_line);
-    terminal_print(echo);
+    size_t echoed = 0;
+    do {
+        char echo[TERMINAL_COLUMNS] = "OPOS> ";
+        if (echoed != 0) {
+            text_copy(echo, sizeof(echo), "      ");
+        }
+        size_t used = 6;
+        while (echoed < terminal_length && used + 1 < sizeof(echo)) {
+            echo[used++] = terminal_line[echoed++];
+        }
+        echo[used] = '\0';
+        terminal_print(echo);
+    } while (echoed < terminal_length);
 
     if (text_equals(terminal_line, terminal_length, "help")) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
@@ -1277,10 +1288,15 @@ static void draw_terminal(struct rect area, bool focused) {
     }
     draw_text_clipped(text_x, prompt_y, text_width, "OPOS>", 120, 210, 170);
     int64_t line_x = text_x + 6 * CHAR_WIDTH;
+    size_t visible_columns = text_width > 7 * CHAR_WIDTH
+        ? (size_t)(text_width / CHAR_WIDTH) - 7 : 1;
+    size_t input_start = terminal_length > visible_columns
+        ? terminal_length - visible_columns : 0;
     draw_text_clipped(line_x, prompt_y, text_width - 6 * CHAR_WIDTH,
-                      terminal_line, 240, 245, 255);
+                      terminal_line + input_start, 240, 245, 255);
     if (focused) {
-        int64_t caret_x = line_x + (int64_t)terminal_length * CHAR_WIDTH;
+        int64_t caret_x = line_x
+            + (int64_t)(terminal_length - input_start) * CHAR_WIDTH;
         if (caret_x + CHAR_WIDTH < area.x + area.width
             && (timer_ticks() / 50) % 2 == 0) {
             fill((struct rect){caret_x, prompt_y, CHAR_WIDTH - 2, CHAR_HEIGHT},

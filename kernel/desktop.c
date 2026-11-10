@@ -7606,7 +7606,8 @@ static void draw_taskbar_menu(void) {
 /*
  * Start > PROGRAMS: built-in /bin and installed /disk/Programs files in a
  * submenu beside Start. Built-in names take precedence over disk names.
- * The list is read each time it opens.
+ * Terminal-only tools stay in /bin but are omitted from the menu, including
+ * disk files with those names. The list is read each time it opens.
  */
 #define PROGRAMS_MAX 32
 #define PROGRAMS_NAME_CAPACITY 32
@@ -7642,6 +7643,11 @@ static bool programs_name_equal(const char *a, const char *b) {
     return a[i] == b[i];
 }
 
+static bool programs_terminal_only(const char *name) {
+    return programs_name_equal(name, "fetch")
+        || programs_name_equal(name, "update");
+}
+
 static void programs_load_directory(const char *directory, bool disk) {
     size_t directory_length = text_length(directory);
     size_t count;
@@ -7655,7 +7661,8 @@ static void programs_load_directory(const char *directory, bool disk) {
             break;
         }
         if (entry.type != VFS_NODE_FILE
-            || entry.name_length >= PROGRAMS_NAME_CAPACITY) {
+            || entry.name_length >= PROGRAMS_NAME_CAPACITY
+            || programs_terminal_only(entry.name)) {
             continue;
         }
         if (disk) {

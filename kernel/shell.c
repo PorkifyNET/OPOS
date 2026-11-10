@@ -10,7 +10,6 @@
 #include "ahci.h"
 #include "block.h"
 #include "fat16.h"
-#include "initramfs.h"
 #include "installer.h"
 #include "nvme.h"
 #include "mouse.h"
@@ -545,7 +544,7 @@ static const struct shell_help_entry shell_help_entries[] = {
     {"drives", "drives", "Lists mounted and detected storage volumes."},
     {"disk", "disk [format|read LBA|ls [PATH]|mkdir PATH|cat PATH|write PATH TEXT|run PATH]",
      "Inspects or changes the primary FAT disk."},
-    {"ls", "ls [PATH]", "Lists initramfs files or a VFS directory."},
+    {"ls", "ls [PATH]", "Lists the system root or a VFS directory."},
     {"sum", "sum PATH", "Shows file size, bytes read and an FNV-1a hash."},
     {"install", "install [DISK] erase-all-data",
      "Lists install targets or installs OPOS from live media."},
@@ -1001,19 +1000,20 @@ static void execute_command(void) {
             console_write_hex(hash);
             console_write_string("\n");
         }
-    } else if (command_matches(command, command_length, "ls")
-               && arguments_length != 0) {
-        /* ls PATH: any VFS folder (/disk2, /cdrom, ...). */
+    } else if (command_matches(command, command_length, "ls")) {
+        /* ls defaults to the active system root; PATH can name any VFS folder. */
+        const char *folder = arguments_length == 0 ? "/" : arguments;
+        size_t folder_length = arguments_length == 0 ? 1 : arguments_length;
         size_t count = 0;
-        if (!vfs_directory_count(arguments, arguments_length, &count)) {
+        if (!vfs_directory_count(folder, folder_length, &count)) {
             console_write_error("Folder not found.\n");
             return;
         }
         for (size_t i = 0; i < count; i++) {
             struct vfs_directory_entry entry;
-            if (!vfs_directory_entry_at(arguments, arguments_length, i,
-                                        &entry)) {
-                break;
+            if (!vfs_directory_entry_at(folder, folder_length, i, &entry)) {
+                console_write_error("Folder listing changed.\n");
+                return;
             }
             console_write_string(entry.name);
             if (entry.type == VFS_NODE_DIRECTORY) {
@@ -1021,25 +1021,6 @@ static void execute_command(void) {
             } else {
                 console_write_string(" (");
                 write_decimal(entry.size);
-                console_write_string(" bytes)\n");
-            }
-        }
-    } else if (command_matches(command, command_length, "ls")) {
-        if (arguments_length != 0) {
-            console_write_warning("Usage: ls [PATH]\n");
-        } else {
-            char path[256];
-            size_t file_size;
-            size_t count = initramfs_file_count();
-            for (size_t i = 0; i < count; i++) {
-                if (!initramfs_file_at(i, path, sizeof(path), &file_size)) {
-                    console_write_error("Initramfs directory entry is invalid.\n");
-                    return;
-                }
-                console_write_string("/");
-                console_write_string(path);
-                console_write_string(" (");
-                write_decimal(file_size);
                 console_write_string(" bytes)\n");
             }
         }

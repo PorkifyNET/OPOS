@@ -11,7 +11,6 @@
 #include "i2c_hid.h"
 #include "fat16.h"
 #include "font.h"
-#include "initramfs.h"
 #include "installer.h"
 #include "iso9660.h"
 #include "keyboard.h"
@@ -682,23 +681,30 @@ static const char *run_result_text(enum run_result result) {
 }
 
 static void terminal_list_files(void) {
-    size_t count = initramfs_file_count();
+    size_t count;
+    if (!vfs_directory_count("/", 1, &count)) {
+        terminal_print("ROOT LIST UNAVAILABLE");
+        return;
+    }
     if (count == 0) {
-        terminal_print("NO FILES");
+        terminal_print("ROOT IS EMPTY");
         return;
     }
     for (size_t i = 0; i < count; i++) {
-        char path[128];
-        size_t file_size;
-        if (!initramfs_file_at(i, path, sizeof(path), &file_size)) {
-            terminal_print("FILE LIST UNAVAILABLE");
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at("/", 1, i, &entry)) {
+            terminal_print("ROOT LIST UNAVAILABLE");
             return;
         }
-        char line[TERMINAL_COLUMNS] = "/";
-        size_t length = append_text(line, sizeof(line), 1, path);
-        length = append_text(line, sizeof(line), length, "  ");
-        length = append_decimal(line, sizeof(line), length, file_size);
-        append_text(line, sizeof(line), length, " BYTES");
+        char line[TERMINAL_COLUMNS] = "";
+        size_t length = append_text(line, sizeof(line), 0, entry.name);
+        if (entry.type == VFS_NODE_DIRECTORY) {
+            append_text(line, sizeof(line), length, "/");
+        } else {
+            length = append_text(line, sizeof(line), length, "  ");
+            length = append_decimal(line, sizeof(line), length, entry.size);
+            append_text(line, sizeof(line), length, " BYTES");
+        }
         terminal_print(line);
     }
 }
@@ -711,7 +717,7 @@ struct terminal_help_entry {
 
 static const struct terminal_help_entry terminal_help_entries[] = {
     {"help", "help [COMMAND]", "Lists commands or explains one command."},
-    {"ls", "ls", "Lists files shipped in the OPOS initramfs."},
+    {"ls", "ls", "Lists folders and files at the system root."},
     {"clear", "clear", "Clears Terminal scrollback."},
     {"uptime", "uptime", "Shows time since OPOS started."},
     {"elf", "elf", "Runs the built-in ELF loader test."},
@@ -1288,8 +1294,8 @@ static void draw_terminal(struct rect area, bool focused) {
 /*
  * Plain-text editor window. The whole file lives in one buffer (64 KiB,
  * like the program load limit). CRLF files are edited as LF and written back
- * as CRLF. Files that cannot be written (initramfs) or that look binary open
- * read-only; Ctrl+S then asks for a new name on the disk.
+ * as CRLF. Files that cannot be written or that look binary open
+ * read-only; Ctrl+S then asks for a writable destination.
  */
 #define EDITOR_CAPACITY (64 * 1024)
 #define EDITOR_PATH_CAPACITY 256
@@ -1447,7 +1453,7 @@ static bool editor_open(const char *path, size_t length) {
     if (binary) {
         set_status("BINARY FILE - OPENED READ-ONLY");
     } else if (editor_read_only) {
-        set_status("READ-ONLY - CTRL+S SAVES A COPY ON THE DISK");
+        set_status("READ-ONLY - CTRL+S SAVES A COPY");
     }
     return true;
 }
@@ -2142,7 +2148,7 @@ static void editor_click(struct rect area, int32_t x, int32_t y) {
 }
 
 /*
- * Files window: browses the whole VFS (initramfs at /, FAT disk at /disk).
+ * Files window: browses the whole VFS (system root at /, disk at /disk).
  * The listing of the current folder is cached and only reloaded when the
  * folder changes or the window opens, so redraws do not touch the disk.
  */
@@ -8348,7 +8354,7 @@ static void files_start_prompt(enum files_prompt_kind kind) {
         return;
     }
     if (files_location_read_only()) {
-        set_status("THIS LOCATION IS READ-ONLY - USE THE DISK");
+        set_status("THIS LOCATION IS READ-ONLY - CHOOSE A WRITABLE FOLDER");
         return;
     }
     files_prompt_kind = kind;
@@ -8537,7 +8543,7 @@ static void files_editor_follow(const char *old_path, size_t old_length,
 /*
  * Moves the selection into the folder target. Within one volume this is
  * a rename; across volumes the items are copied and then deleted. From a
- * read-only place (the initramfs, a CD) they are copied.
+ * read-only place (the system root, a CD) they are copied.
  */
 static bool files_move_is_protected(const char *target, size_t target_length,
                                     const size_t *indices, size_t count,
@@ -10841,7 +10847,7 @@ static enum run_result app_job_start(struct app_job *job) {
 }
 
 /*
- * Starts an ELF program from the initramfs (/bin, /lib) or a disk
+ * Starts an ELF program from the system root (/bin, /lib) or a disk
  * (/disk...) as the logged-in account, after the same permission check
  * Files uses. RUN_STARTED means it is on its way: whether the file was
  * a program at all is known when its job ends.

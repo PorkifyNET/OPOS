@@ -106,11 +106,16 @@ and a timestamp. Two accounts never share grants.
 
 All checks run in the kernel, in the path every syscall already uses.
 
-- `files.shared`: in `permission_program_allows`, the `CLASS_SHARED` case
-  returns true for a confined program only when it holds `files.shared`,
-  or the path is under the program's own executable directory, or it is
-  the single picked file. The executable directory is needed so a program
-  can read its own data files next to it.
+- `files.shared` (implemented): in `permission_program_allows`, the
+  `CLASS_SHARED` case lets a confined program read a path on `/disk..` or
+  `/cdrom..` only when it holds `files.shared`, the path is in its own
+  program folder, or it is the single picked file. The boot image (`/bin`,
+  `/lib`, fonts, certificates) stays readable. The program folder is
+  `<volume>/Programs/<folder>` for an executable anywhere below such a
+  folder. An executable directly in `/disk/Programs`, or elsewhere, has no
+  folder, because its directory is shared with other programs. Running a
+  disk program (`execve`, spawn) needs no `files.shared`: running confers
+  no data to the caller.
 - `net`: check in the socket-creating syscalls in `kernel/user.c`. A
   denied call returns `EACCES`.
 - `clipboard.read`: check in `OPOS_SYSCALL_CLIPBOARD_GET`.
@@ -127,6 +132,14 @@ program receives `EACCES` on deny. The prompt belongs to the desktop, a
 program cannot draw over or click it, and while it is open the requesting
 program gets no input. If no desktop runs (kernel shell, ISO with no
 account), the answer is deny.
+
+As built in step 2 (`desktop_app_ask_permission`): the prompt has "Deny"
+and "Allow" only, and both are stored. "Allow once" is left for later.
+A process asks at most once per capability. Escape and Enter deny;
+allowing takes a click, and clicks in the first half second are ignored
+so a click meant for something else cannot answer it. No desktop, a
+prompt already open, or the program ending all deny without storing
+anything.
 
 Programs that only run in the Terminal use the same prompt. The Terminal
 window shows that a request is pending.
@@ -153,18 +166,24 @@ lower than a third-party program.
 Disk programs installed before step 2 read shared files freely. They keep
 that ability through a prompt, not silently and not by removal.
 
-- The first time such a program runs after the update, and it has no
-  record in the grants store, the desktop asks once: program name, "reads
-  every file on this disk that is not private", "Allow", "Deny".
+- At an account's first login with step 2, the kernel records every ELF
+  executable below `/disk/Programs` (three levels deep) by hash, marked
+  as allowed to ask for `files.shared`. A marker in the grants store says
+  this ran, so it runs once per account.
+- The first time such a program tries to read a shared file, the desktop
+  asks once: program name, "read every file on your disks that is not
+  private", "Deny", "Allow". It asks on first use, not at launch, so a
+  program that never reads shared files never asks.
 - Allow stores `files.shared` for that executable hash. Deny stores the
-  absence. Neither asks again until the user changes it in the Security
+  refusal. Neither asks again until the user changes it in the Security
   Center.
-- A program installed after the update starts with the defaults in the
-  table above and gets no migration prompt. It asks like any new program.
-- With no desktop (kernel shell, no account), the answer is deny and
-  nothing is stored.
-- Migration happens once per account. A marker in the grants store says it
-  ran, so a later new program is not treated as "existing".
+- A program installed after that login has no record, gets no prompt and
+  is refused shared files. It can still use the picker and its program
+  folder.
+- Programs outside `/disk/Programs` were never listed in Start, so they
+  are not recorded. They are refused like new programs.
+- Changing an executable changes its hash, so an updated older program
+  loses its record and is treated as new.
 
 ## Order of work
 
@@ -173,10 +192,9 @@ that ability through a prompt, not silently and not by removal.
    `tools/test_app_permissions.c` and `tools/test_permission_grants.c`.
    No behavior change yet, except that programs cannot reach
    `Permissions.dat`.
-2. Enforce `files.shared`, with the migration prompt above. This closes
-   the largest current gap. Check that the examples in `sdk/examples`
-   still work, and add a test with a program that reads a file in `/disk`
-   without the capability.
+2. Done. Enforce `files.shared`, with the migration prompt above.
+   `sdk/examples/sharedread.c` reports which paths a disk program may
+   read.
 3. Enforce `net` and `clipboard.read` with the desktop prompt.
 4. Manifest note and SDK support.
 5. Security Center window.

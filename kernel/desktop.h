@@ -42,6 +42,12 @@ int64_t desktop_app_window_event(uint64_t owner,
 int64_t desktop_app_pick_file(uint64_t owner, const char *name,
                               const struct permission_identity *identity,
                               char *path, size_t capacity);
+/* Asks the person at the desktop whether the program may have one
+   PERMISSION_CAP_* capability. Returns 1 for allow, 0 for deny, -38 with
+   no desktop or at the login screen, -16 while another prompt is open,
+   or -4 when the program is being ended. Call only from a program's task. */
+int64_t desktop_app_ask_permission(uint64_t owner, const char *name,
+                                   uint32_t capability);
 /* Content size as width << 32 | height, or 0 without a window. */
 uint64_t desktop_app_window_size(uint64_t owner);
 /* The shared clipboard for programs. Set keeps at most 64 KiB. Get copies

@@ -8,7 +8,7 @@
 #include "permissions.h"
 #include "vfs.h"
 
-static char directories[8][128];
+static char directories[32][128];
 static size_t directory_count;
 static uint64_t document_inode = 7;
 static bool disk_root_selected;
@@ -56,7 +56,9 @@ bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
     if ((length == strlen("/disk/Users/Alice/note.txt")
          && strncmp(path, "/disk/Users/Alice/note.txt", length) == 0)
         || (length == strlen("/disk/Users/Alice/other.txt")
-            && strncmp(path, "/disk/Users/Alice/other.txt", length) == 0)) {
+            && strncmp(path, "/disk/Users/Alice/other.txt", length) == 0)
+        || (length == strlen("/disk/picked.txt")
+            && strncmp(path, "/disk/picked.txt", length) == 0)) {
         *metadata = (struct vfs_metadata){
             .type = VFS_NODE_FILE, .device = 1,
             .inode = document_inode
@@ -74,7 +76,7 @@ bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
 }
 
 bool vfs_create_directory(const char *path, size_t length) {
-    assert(directory_count < 8 && length < sizeof(directories[0]));
+    assert(directory_count < 32 && length < sizeof(directories[0]));
     memcpy(directories[directory_count], path, length);
     directories[directory_count++][length] = '\0';
     return true;
@@ -228,6 +230,103 @@ int main(void) {
                   PERMISSION_WRITE));
     assert(allows(&built_in, "/disk/Users/Alice/Permissions.dat",
                   PERMISSION_WRITE));
+
+    /* files.shared: a confined program reads the person's volumes only
+       with it, or inside its own program folder. */
+    assert(allows(&built_in, "/disk/shared.txt", PERMISSION_READ));
+    struct permission_identity reader = built_in;
+    permission_confine_disk_program(&reader, "/disk/Programs/editor", 21);
+    assert(reader.program_folder[0] == '\0');
+    assert(!allows(&reader, "/disk/shared.txt", PERMISSION_READ));
+    assert(!allows(&reader, "/disk", PERMISSION_READ));
+    assert(!allows(&reader, "/disk/Programs", PERMISSION_READ));
+    assert(!allows(&reader, "/disk2/photo.png", PERMISSION_READ));
+    assert(!allows(&reader, "/cdrom/setup.txt", PERMISSION_READ));
+    assert(!allows(&reader, "/cdrom3/setup.txt", PERMISSION_READ));
+    assert(permission_program_missing(&reader, "/disk/shared.txt", 16,
+                                      PERMISSION_READ)
+           == PERMISSION_CAP_FILES_SHARED);
+    assert(permission_program_missing(&reader, "/disk/shared.txt", 16,
+                                      PERMISSION_WRITE) == 0);
+    assert(permission_program_missing(&reader, "/disk/OPOS/ACCOUNTS.DAT",
+                                      23, PERMISSION_READ) == 0);
+    assert(permission_program_missing(&reader, "/disk/Users/Bob/note.txt",
+                                      24, PERMISSION_READ) == 0);
+    /* Still readable without it: the boot image, system files, the list
+       of homes, its own storage. */
+    assert(allows(&reader, "/bin/hello", PERMISSION_READ));
+    assert(allows(&reader, "/fonts/default.psf", PERMISSION_READ));
+    assert(allows(&reader, "/diskette", PERMISSION_READ));
+    assert(allows(&reader, "/disk/OPOS.CFG", PERMISSION_READ));
+    assert(allows(&reader, "/disk/Users", PERMISSION_READ));
+    snprintf(file, sizeof(file), "%s/settings.dat", reader.private_path);
+    assert(allows(&reader, file, PERMISSION_READ));
+    assert(permission_program_missing(&reader, "/bin/hello", 10,
+                                      PERMISSION_READ) == 0);
+    /* Running another disk program needs no files.shared. */
+    assert(permission_program_may_run(&reader, "/disk/Programs/other", 20));
+    assert(!permission_program_may_run(&reader, "/disk/Users/Bob/x", 17));
+    assert(!permission_program_may_run(&reader, "/disk/OPOS/ACCOUNTS.DAT",
+                                       23));
+    /* A picked shared file is readable; nothing else is. */
+    assert(permission_grant_read_file(&reader, "/disk/picked.txt", 16));
+    assert(allows(&reader, "/disk/picked.txt", PERMISSION_READ));
+    assert(!allows(&reader, "/disk/shared.txt", PERMISSION_READ));
+    assert(!allows(&reader, "/disk/picked.txt", PERMISSION_WRITE));
+    /* With the capability, everything shared reads again. */
+    reader.capabilities |= PERMISSION_CAP_FILES_SHARED;
+    assert(allows(&reader, "/disk/shared.txt", PERMISSION_READ));
+    assert(allows(&reader, "/disk2/photo.png", PERMISSION_READ));
+    assert(!allows(&reader, "/disk/shared.txt", PERMISSION_WRITE));
+    assert(!allows(&reader, "/disk/Users/Bob/note.txt", PERMISSION_READ));
+    assert(permission_program_missing(&reader, "/disk/Users/Bob/note.txt",
+                                      24, PERMISSION_READ) == 0);
+
+    /* Program folders. */
+    struct permission_identity suite = built_in;
+    permission_confine_disk_program(&suite, "/disk/Programs/Suite/bin/tool",
+                                    strlen("/disk/Programs/Suite/bin/tool"));
+    assert(strcmp(suite.program_folder, "/disk/Programs/Suite") == 0);
+    assert(allows(&suite, "/disk/Programs/Suite/data/levels.dat",
+                  PERMISSION_READ));
+    assert(allows(&suite, "/disk/programs/suite/readme.txt",
+                  PERMISSION_READ));
+    assert(allows(&suite, "/disk/Programs/Suite", PERMISSION_READ));
+    assert(!allows(&suite, "/disk/Programs/SuiteX/data", PERMISSION_READ));
+    assert(!allows(&suite, "/disk/Programs/Other/data", PERMISSION_READ));
+    assert(!allows(&suite, "/disk/Programs", PERMISSION_READ));
+    assert(!allows(&suite, "/disk/Programs/Suite/data/levels.dat",
+                   PERMISSION_WRITE));
+    struct permission_identity d2 = built_in;
+    permission_confine_disk_program(&d2, "/disk2/programs/Game/game",
+                                    strlen("/disk2/programs/Game/game"));
+    assert(strcmp(d2.program_folder, "/disk2/programs/Game") == 0);
+    struct permission_identity loose = built_in;
+    permission_confine_disk_program(&loose, "/disk/Games/game",
+                                    strlen("/disk/Games/game"));
+    assert(loose.program_folder[0] == '\0');
+    assert(!allows(&loose, "/disk/Games/save.dat", PERMISSION_READ));
+    /* Running a program from the same folder keeps it; another drops it. */
+    struct permission_identity same = suite;
+    permission_confine_disk_program(&same, "/disk/Programs/Suite/helper",
+                                    strlen("/disk/Programs/Suite/helper"));
+    assert(strcmp(same.program_folder, suite.program_folder) == 0);
+    struct permission_identity moved = suite;
+    permission_confine_disk_program(&moved, "/disk/Programs/Other/helper",
+                                    strlen("/disk/Programs/Other/helper"));
+    assert(moved.program_folder[0] == '\0');
+    assert(!allows(&moved, "/disk/Programs/Other/data", PERMISSION_READ));
+    assert(!allows(&moved, "/disk/Programs/Suite/data", PERMISSION_READ));
+    /* An unconfined parent running a loose program never gains a folder. */
+    struct permission_identity parent_suite = suite;
+    permission_confine_disk_program(&parent_suite, "/bin/hello", 10);
+    assert(strcmp(parent_suite.program_folder, "/disk/Programs/Suite") == 0);
+
+    assert(permission_is_disk_program("/disk/x", 7));
+    assert(permission_is_disk_program("/disk3/x", 8));
+    assert(!permission_is_disk_program("/diskette/x", 11));
+    assert(!permission_is_disk_program("/bin/x", 6));
+    assert(!permission_is_disk_program(NULL, 0));
     puts("app permissions: passed");
     return 0;
 }

@@ -86,21 +86,58 @@ static bool ensure_directory(const char *path) {
     return vfs_create_directory(path, length);
 }
 
+bool permission_is_disk_program(const char *path, size_t length) {
+    return path != NULL && length >= 5 && path[0] == '/'
+        && lower(path[1]) == 'd' && lower(path[2]) == 'i'
+        && lower(path[3]) == 's' && lower(path[4]) == 'k'
+        && (length == 5 || path[5] == '/'
+            || (path[5] >= '0' && path[5] <= '9'));
+}
+
+static size_t next_component(const char *path, size_t length, size_t *offset,
+                             const char **component);
+
+/* Length of "<volume>/Programs/<folder>" when path is an executable
+   somewhere below such a folder, else 0. */
+static size_t program_folder_length(const char *path, size_t length) {
+    size_t offset = 0;
+    const char *part;
+    (void)next_component(path, length, &offset, &part); /* volume */
+    size_t programs = next_component(path, length, &offset, &part);
+    if (!equal_ignore_case(part, programs, "Programs")) {
+        return 0;
+    }
+    size_t folder = next_component(path, length, &offset, &part);
+    size_t end = offset;
+    size_t rest = next_component(path, length, &offset, &part);
+    return folder != 0 && rest != 0 ? end : 0;
+}
+
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length) {
-    if (identity == NULL || path == NULL
-        || length < 5 || lower(path[0]) != '/'
-        || lower(path[1]) != 'd' || lower(path[2]) != 'i'
-        || lower(path[3]) != 's' || lower(path[4]) != 'k'
-        || (length > 5 && path[5] != '/' && (path[5] < '0' || path[5] > '9'))) {
+    if (identity == NULL || !permission_is_disk_program(path, length)) {
         return;
     }
     /* A confined parent running another disk program keeps the
-       intersection of both sets. Per-program grants join in later. */
+       intersection of both sets (permission_apply_program adds grants). */
     identity->capabilities &= PERMISSION_CAPS_DISK_DEFAULT;
+    size_t own = program_folder_length(path, length);
+    if (own >= sizeof(identity->program_folder)) {
+        own = 0;
+    }
     if (identity->confined) {
+        /* Never widen: keep the folder only when it is the same one. */
+        if (own == 0
+            || text_length(identity->program_folder) != own
+            || !begins_component(path, length, identity->program_folder)) {
+            identity->program_folder[0] = '\0';
+        }
         return;
     }
+    for (size_t i = 0; i < own; i++) {
+        identity->program_folder[i] = path[i];
+    }
+    identity->program_folder[own] = '\0';
     identity->confined = true;
     identity->private_path[0] = '\0';
     if (identity->account == PERMISSION_NO_ACCOUNT
@@ -377,6 +414,56 @@ bool permission_has(const struct permission_identity *identity,
         && (identity->capabilities & capabilities) == capabilities;
 }
 
+/* /disk, /disk2.., /cdrom, /cdrom2..: the person's volumes, as opposed to
+   the boot image (/bin, /lib, fonts, certificates). */
+static bool on_person_volume(const char *path, size_t length) {
+    size_t offset = 0;
+    const char *first;
+    size_t first_length = next_component(path, length, &offset, &first);
+    size_t base;
+    if (first_length >= 4 && lower(first[0]) == 'd' && lower(first[1]) == 'i'
+        && lower(first[2]) == 's' && lower(first[3]) == 'k') {
+        base = 4;
+    } else if (first_length >= 5 && lower(first[0]) == 'c'
+               && lower(first[1]) == 'd' && lower(first[2]) == 'r'
+               && lower(first[3]) == 'o' && lower(first[4]) == 'm') {
+        base = 5;
+    } else {
+        return false;
+    }
+    for (size_t i = base; i < first_length; i++) {
+        if (first[i] < '0' || first[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* path is the file the person chose in the picker, still the same node. */
+static bool picked(const struct permission_identity *identity,
+                   const char *path, size_t length) {
+    if (identity->read_grant[0] == '\0'
+        || !equal_ignore_case(path, length, identity->read_grant)) {
+        return false;
+    }
+    struct vfs_metadata metadata;
+    return vfs_stat(path, length, &metadata)
+        && metadata.type == VFS_NODE_FILE
+        && metadata.device == identity->read_grant_device
+        && metadata.inode == identity->read_grant_inode;
+}
+
+/* A read of a shared-class path that needs files.shared. */
+static bool shared_read_needs_capability(
+    const struct permission_identity *identity, const char *path,
+    size_t length) {
+    return identity->confined
+        && !permission_has(identity, PERMISSION_CAP_FILES_SHARED)
+        && on_person_volume(path, length)
+        && !(identity->program_folder[0] != '\0'
+             && begins_component(path, length, identity->program_folder));
+}
+
 bool permission_program_allows(const struct permission_identity *identity,
                                const char *path, size_t length,
                                enum permission_access access) {
@@ -393,6 +480,10 @@ bool permission_program_allows(const struct permission_identity *identity,
     }
     switch (info.class) {
     case CLASS_SHARED:
+        if (access == PERMISSION_READ
+            && shared_read_needs_capability(identity, path, length)) {
+            return picked(identity, path, length);
+        }
         return access != PERMISSION_REMOVE || !info.anchor;
     case CLASS_SYSTEM:
         return access == PERMISSION_READ;
@@ -411,19 +502,31 @@ bool permission_program_allows(const struct permission_identity *identity,
                 && begins_component(path, length, identity->private_path)) {
                 return true;
             }
-            if (identity->read_grant[0] != '\0'
-                && equal_ignore_case(path, length, identity->read_grant)) {
-                struct vfs_metadata metadata;
-                return vfs_stat(path, length, &metadata)
-                    && metadata.type == VFS_NODE_FILE
-                    && metadata.device == identity->read_grant_device
-                    && metadata.inode == identity->read_grant_inode;
-            }
-            return false;
+            return picked(identity, path, length);
         }
         return access != PERMISSION_REMOVE || !info.anchor;
     }
     return false;
+}
+
+uint32_t permission_program_missing(const struct permission_identity *identity,
+                                    const char *path, size_t length,
+                                    enum permission_access access) {
+    if (identity == NULL || path == NULL || access != PERMISSION_READ
+        || !canonical(path, length)
+        || permission_program_allows(identity, path, length, access)
+        || classify_visible(path, length).class != CLASS_SHARED
+        || !shared_read_needs_capability(identity, path, length)) {
+        return 0;
+    }
+    return PERMISSION_CAP_FILES_SHARED;
+}
+
+bool permission_program_may_run(const struct permission_identity *identity,
+                                const char *path, size_t length) {
+    return permission_program_allows(identity, path, length, PERMISSION_READ)
+        || permission_program_missing(identity, path, length, PERMISSION_READ)
+               == PERMISSION_CAP_FILES_SHARED;
 }
 
 bool permission_grant_read_file(struct permission_identity *identity,

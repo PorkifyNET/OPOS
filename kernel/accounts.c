@@ -4,6 +4,7 @@
 
 #include "accounts.h"
 #include "fat16.h"
+#include "permission_grants.h"
 #include "sha256.h"
 #include "vfs.h"
 
@@ -311,6 +312,9 @@ bool accounts_login(size_t index, const char *password) {
     current_account = index;
     /* Recreates missing home folders (deleted, or an older install). */
     (void)create_home(accounts[index].name);
+    /* Programs installed before files.shared was enforced may ask for it.
+       Their records carry no decision yet, so no time either. */
+    (void)permission_grants_migrate(index, 0);
     return true;
 }
 

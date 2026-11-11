@@ -139,7 +139,25 @@ enum protected_action {
     PROTECTED_ACTION_EDITOR_SAVE,
     PROTECTED_ACTION_FILES_PROMPT,
     PROTECTED_ACTION_FILES_MOVE,
+    /* Not a protected file: a program asks for a capability. The same
+       modal panel keeps the program and everything else from input. */
+    PROTECTED_ACTION_APP_PERMISSION,
 };
+
+/* A program waiting in desktop_app_ask_permission. */
+static struct {
+    uint64_t owner;
+    uint32_t capability;
+    /* 0 waiting, 1 allowed, 2 denied. */
+    int result;
+    bool open_pending;
+    /* The program stopped waiting; only the desktop frees the slot. */
+    bool withdrawn;
+    /* Clicks this soon after the panel opens are ignored, so a click
+       meant for something else cannot answer it. */
+    uint64_t opened_tick;
+    char name[32];
+} app_permission;
 
 static bool protected_active;
 static enum protected_action protected_action;
@@ -4648,8 +4666,28 @@ static void protected_request(enum protected_action action,
     programs_open = false;
 }
 
+/* Closes the capability panel with result (see app_permission). */
+static void app_permission_answer(int result) {
+    protected_active = false;
+    protected_action = PROTECTED_ACTION_NONE;
+    protected_grant = PROTECTED_ACTION_NONE;
+    if (app_permission.owner != 0 && app_permission.result == 0) {
+        app_permission.result = result;
+        scheduler_wake_event(&app_permission);
+    }
+    if (result == 1) {
+        set_status("PERMISSION ALLOWED");
+    } else if (result == 2) {
+        set_status("PERMISSION DENIED");
+    }
+}
+
 static void protected_cancel(void) {
     enum protected_action action = protected_action;
+    if (action == PROTECTED_ACTION_APP_PERMISSION) {
+        app_permission_answer(2);
+        return;
+    }
     protected_active = false;
     protected_action = PROTECTED_ACTION_NONE;
     protected_grant = PROTECTED_ACTION_NONE;
@@ -4684,6 +4722,11 @@ static void protected_continue(void) {
 }
 
 static void protected_attempt(void) {
+    if (protected_action == PROTECTED_ACTION_APP_PERMISSION) {
+        /* Enter answers with the safe choice; allowing takes a click. */
+        app_permission_answer(2);
+        return;
+    }
     struct permission_identity identity = permission_session_identity();
     if (!identity.admin) {
         protected_cancel();
@@ -4702,7 +4745,8 @@ static void protected_attempt(void) {
 
 static struct rect protected_panel_rect(void) {
     int64_t width = screen_width() - 40 < 620 ? screen_width() - 40 : 620;
-    int64_t height = protected_needs_password() ? 270 : 220;
+    int64_t height = protected_action != PROTECTED_ACTION_APP_PERMISSION
+        && protected_needs_password() ? 270 : 220;
     return (struct rect){(screen_width() - width) / 2,
                          (screen_height() - height) / 2, width, height};
 }
@@ -4714,8 +4758,69 @@ static struct rect protected_button_rect(size_t index) {
                          panel.y + panel.height - 54, width, 34};
 }
 
+/* What a capability lets a program do, in the person's words. */
+static void capability_text(uint32_t capability, const char **what,
+                            const char **detail) {
+    switch (capability) {
+    case PERMISSION_CAP_FILES_SHARED:
+        *what = "READ EVERY FILE ON YOUR DISKS THAT IS NOT PRIVATE";
+        *detail = "ALL FILES OUTSIDE HOME FOLDERS AND SYSTEM FILES.";
+        return;
+    case PERMISSION_CAP_NET:
+        *what = "USE THE NETWORK";
+        *detail = "IT COULD SEND WHAT IT CAN READ TO THE INTERNET.";
+        return;
+    case PERMISSION_CAP_CLIPBOARD_READ:
+        *what = "READ THE CLIPBOARD";
+        *detail = "WHATEVER YOU COPY, IN ANY PROGRAM.";
+        return;
+    default:
+        *what = "USE A RESTRICTED FEATURE";
+        *detail = "";
+        return;
+    }
+}
+
+static void draw_app_permission(void) {
+    struct rect panel = protected_panel_rect();
+    fill(panel, 120, 170, 255);
+    fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
+                       panel.height - 4}, 31, 33, 42);
+    const char *what;
+    const char *detail;
+    capability_text(app_permission.capability, &what, &detail);
+    char title[64];
+    size_t used = 0;
+    for (const char *p = "ALLOW "; *p != '\0'; p++) {
+        title[used++] = *p;
+    }
+    for (size_t i = 0; app_permission.name[i] != '\0'
+                       && used + 2 < sizeof(title); i++) {
+        char c = app_permission.name[i];
+        title[used++] = c >= 'a' && c <= 'z' ? (char)(c - 32) : c;
+    }
+    title[used++] = '?';
+    title[used] = '\0';
+    draw_text_clipped(panel.x + 24, panel.y + 20, panel.width - 48,
+                      title, 150, 195, 255);
+    draw_text_clipped(panel.x + 24, panel.y + 50, panel.width - 48,
+                      "THIS PROGRAM WANTS TO:", 220, 225, 238);
+    draw_text_clipped(panel.x + 24, panel.y + 78, panel.width - 48,
+                      what, 245, 245, 250);
+    draw_text_clipped(panel.x + 24, panel.y + 106, panel.width - 48,
+                      detail, 175, 190, 220);
+    draw_text_clipped(panel.x + 24, panel.y + 134, panel.width - 48,
+                      "YOU CAN CHANGE THIS LATER.", 150, 160, 180);
+    draw_button(protected_button_rect(0), "DENY", true);
+    draw_button(protected_button_rect(1), "ALLOW", false);
+}
+
 static void draw_protected_confirmation(void) {
     if (!protected_active) {
+        return;
+    }
+    if (protected_action == PROTECTED_ACTION_APP_PERMISSION) {
+        draw_app_permission();
         return;
     }
     struct rect panel = protected_panel_rect();
@@ -4751,13 +4856,25 @@ static void protected_key(char character) {
         protected_cancel();
     } else if (character == '\n') {
         protected_attempt();
-    } else if (protected_needs_password()) {
+    } else if (protected_action != PROTECTED_ACTION_APP_PERMISSION
+               && protected_needs_password()) {
         protected_feedback = "";
         (void)field_key(&protected_password, character);
     }
 }
 
 static void protected_press(int32_t x, int32_t y) {
+    if (protected_action == PROTECTED_ACTION_APP_PERMISSION) {
+        if (timer_ticks() - app_permission.opened_tick < 50) {
+            return;
+        }
+        if (rect_contains(protected_button_rect(0), x, y)) {
+            app_permission_answer(2);
+        } else if (rect_contains(protected_button_rect(1), x, y)) {
+            app_permission_answer(1);
+        }
+        return;
+    }
     if (rect_contains(protected_button_rect(0), x, y)) {
         protected_cancel();
     } else if (rect_contains(protected_button_rect(1), x, y)) {
@@ -10677,6 +10794,39 @@ int64_t desktop_app_pick_file(uint64_t owner, const char *name,
     return result;
 }
 
+int64_t desktop_app_ask_permission(uint64_t owner, const char *name,
+                                   uint32_t capability) {
+    if (owner == 0 || name == NULL || capability == 0) {
+        return -22;
+    }
+    if (!desktop_active || login_active) {
+        return -38;
+    }
+    if (app_permission.owner != 0) {
+        return -16;
+    }
+    app_permission.owner = owner;
+    app_permission.capability = capability;
+    app_permission.result = 0;
+    app_permission.open_pending = true;
+    text_copy(app_permission.name, sizeof(app_permission.name), name);
+    while (app_permission.result == 0 && !user_current_killed()
+           && desktop_active) {
+        (void)scheduler_block_current_until_locked(
+            &app_permission, timer_ticks() + APP_WAIT_RECHECK_TICKS);
+    }
+    int result = app_permission.result;
+    if (result == 0) {
+        /* Ending, or the desktop is going away: apps_poll closes the
+           panel and frees the slot. Nothing is decided. */
+        app_permission.withdrawn = true;
+        return user_current_killed() ? -4 : -38;
+    }
+    app_permission.owner = 0;
+    app_permission.open_pending = false;
+    return result == 1 ? 1 : 0;
+}
+
 void desktop_app_process_exited(uint64_t process_id) {
     for (size_t i = 0; i < APP_WINDOW_COUNT; i++) {
         if (process_id != 0 && app_windows[i].owner == process_id) {
@@ -11258,6 +11408,29 @@ static void tasks_key(char character) {
 static bool apps_poll(void) {
     bool redraw = false;
     uint64_t now = timer_ticks();
+    if (app_permission.owner != 0 && app_permission.withdrawn) {
+        if (protected_active
+            && protected_action == PROTECTED_ACTION_APP_PERMISSION) {
+            protected_active = false;
+            protected_action = PROTECTED_ACTION_NONE;
+        }
+        app_permission.owner = 0;
+        app_permission.result = 0;
+        app_permission.open_pending = false;
+        app_permission.withdrawn = false;
+        redraw = true;
+    } else if (app_permission.owner != 0 && app_permission.open_pending
+               && app_permission.result == 0 && !protected_active
+               && !login_active) {
+        app_permission.open_pending = false;
+        app_permission.opened_tick = now;
+        protected_action = PROTECTED_ACTION_APP_PERMISSION;
+        protected_grant = PROTECTED_ACTION_NONE;
+        protected_active = true;
+        start_menu_open = false;
+        programs_open = false;
+        redraw = true;
+    }
     if (files_picker.owner != 0 && files_picker.result == 0
         && files_picker.open_pending) {
         files_picker.open_pending = false;
@@ -11638,6 +11811,11 @@ void desktop_run(void) {
     protected_active = false;
     protected_action = PROTECTED_ACTION_NONE;
     protected_grant = PROTECTED_ACTION_NONE;
+    /* Programs from an earlier desktop run have all ended. */
+    app_permission.owner = 0;
+    app_permission.result = 0;
+    app_permission.open_pending = false;
+    app_permission.withdrawn = false;
     if (installer_available()) {
         /* Live session: no accounts, the installer opens. */
         accounts_logout();

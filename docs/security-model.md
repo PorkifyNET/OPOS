@@ -72,9 +72,8 @@ The protected folders themselves (`/disk/OPOS`, `/disk/Users`, a home
 folder, `/disk` itself) cannot be deleted or renamed by anyone, programs
 or windows. Homes go away with their account (and are kept on deletion).
 `ACCOUNTS.DAT` is only touched by the account code in the kernel.
-`Permissions.dat` holds per-program capability grants for the planned
-application sandbox (`docs/app-sandbox.md`). Only the kernel writes it.
-Nothing reads or enforces those grants yet.
+`Permissions.dat` holds per-program capability grants for the application
+sandbox (`docs/app-sandbox.md`). Only the kernel writes it.
 
 When an administrator uses the built-in Files or editor to write, create,
 rename, delete or move something in a protected system location, the desktop
@@ -100,8 +99,11 @@ filesystem handles are closed before it starts. Disk apps cannot call the
 administrator update API. Built-in programs from the read-only initramfs
 keep the location-based permissions in the table above.
 
-Disk apps can read their own app storage and shared/system files allowed
-by the table. To read another file in their account home, they call
+Disk apps can read their own app storage, system files, and the boot
+image (`/bin`, `/lib`, fonts, certificates). Shared files on `/disk..`
+and `/cdrom..` need the `files.shared` capability, except inside the
+app's own program folder (`<volume>/Programs/<folder>`, when the
+executable is below such a folder). To read any other file, they call
 `opos_pick_file()`. Files shows the requesting program and lets the user
 choose a file or cancel. The selected file gets one read grant, checked
 against its device and inode so replacing the file at that path does not
@@ -109,14 +111,17 @@ extend the grant. A new selection replaces the path grant for future opens;
 file handles already opened remain valid. Grants follow `fork` and
 `execve` but never allow writing outside app storage.
 The picker cannot grant access to another account's home or to the
-password file. Disk apps still have network and shared clipboard access;
-shared disk files are readable without a picker.
+password file. Disk apps still have network and shared clipboard access.
 
 Each process also carries a capability set. Built-in programs hold every
-capability. A disk app holds only `storage`, `files.pick`,
-`clipboard.write` and `window`. Children inherit the set and can only
-narrow it. The kernel records the set but does not check it yet, so it
-changes no access decision today.
+capability. A disk app holds `storage`, `files.pick`, `clipboard.write`
+and `window`, plus what the account granted that executable (keyed by its
+SHA-256) in `Permissions.dat`, minus what was refused. Children inherit
+the set and can only narrow it. Today the kernel checks only
+`files.shared`. Disk apps that were in `/disk/Programs` at an account's
+first login with this rule may ask for it once, through a desktop prompt
+the program cannot draw over or click. Other disk apps are refused
+without a prompt.
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none

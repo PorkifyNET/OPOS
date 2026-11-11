@@ -20,7 +20,7 @@ CFLAGS := -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
-EXAMPLES := hello permtest sketch notepad fetch update fonttest pickfile
+EXAMPLES := hello permtest sketch notepad fetch update fonttest pickfile sharedread
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)

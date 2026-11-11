@@ -172,6 +172,62 @@ int main(void) {
     assert(!allows(&copied, "/disk/OPOS/ACCOUNTS.DAT", PERMISSION_READ));
     assert(!allows(&copied, "/disk/OPOS/roots/test/bin/notepad",
                    PERMISSION_WRITE));
+    disk_root_selected = false;
+
+    /* Capabilities: recorded, inherited, only narrowed. */
+    assert(built_in.capabilities == PERMISSION_CAPS_ALL);
+    assert(permission_has(&built_in, PERMISSION_CAP_NET
+                                         | PERMISSION_CAP_FILES_SHARED));
+    assert(app.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
+    assert(permission_has(&app, PERMISSION_CAP_STORAGE
+                                    | PERMISSION_CAP_WINDOW));
+    assert(!permission_has(&app, PERMISSION_CAP_NET));
+    assert(!permission_has(&app, PERMISSION_CAP_FILES_SHARED));
+    assert(!permission_has(&app, PERMISSION_CAP_CLIPBOARD_READ));
+    assert(!permission_has(&app, PERMISSION_CAP_WINDOW
+                                     | PERMISSION_CAP_NET));
+    assert(!permission_has(NULL, 0));
+    struct permission_identity narrowed = app;
+    narrowed.capabilities &= ~PERMISSION_CAP_WINDOW;
+    permission_confine_disk_program(&narrowed, "/disk/Programs/other", 20);
+    assert(narrowed.capabilities
+           == (PERMISSION_CAPS_DISK_DEFAULT & ~PERMISSION_CAP_WINDOW));
+    assert(strcmp(narrowed.private_path, app.private_path) == 0);
+    struct permission_identity tool = built_in;
+    permission_confine_disk_program(&tool, "/bin/hello", 10);
+    assert(!tool.confined && tool.capabilities == PERMISSION_CAPS_ALL);
+    struct permission_identity second_disk = built_in;
+    permission_confine_disk_program(&second_disk, "/disk2/app", 10);
+    assert(second_disk.confined
+           && second_disk.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
+
+    /* The grants store is the kernel's alone. */
+    static const char grants[] = "/disk/Users/Alice/AppData/Permissions.dat";
+    static const char bob_grants[] = "/disk/Users/Bob/AppData/Permissions.dat";
+    static const char upper[] = "/disk/Users/Alice/APPDATA/PERMISSIONS.DAT";
+    static const char below[] =
+        "/disk/Users/Alice/AppData/Permissions.dat/inner";
+    for (int access = PERMISSION_READ; access <= PERMISSION_REMOVE;
+         access++) {
+        assert(!allows(&built_in, grants, (enum permission_access)access));
+        assert(!allows(&built_in, upper, (enum permission_access)access));
+        assert(!allows(&built_in, below, (enum permission_access)access));
+        assert(!allows(&app, grants, (enum permission_access)access));
+    }
+    assert(permission_ui_allows(grants, strlen(grants), PERMISSION_READ));
+    assert(!permission_ui_allows(grants, strlen(grants), PERMISSION_WRITE));
+    assert(!permission_ui_allows(grants, strlen(grants), PERMISSION_REMOVE));
+    assert(!permission_ui_allows(below, strlen(below), PERMISSION_WRITE));
+    /* Alice is the admin here, so she may look at Bob's. */
+    assert(permission_ui_allows(bob_grants, strlen(bob_grants),
+                                PERMISSION_READ));
+    assert(!permission_ui_allows(bob_grants, strlen(bob_grants),
+                                 PERMISSION_WRITE));
+    /* Neighbours stay ordinary home files. */
+    assert(allows(&built_in, "/disk/Users/Alice/AppData/Other.dat",
+                  PERMISSION_WRITE));
+    assert(allows(&built_in, "/disk/Users/Alice/Permissions.dat",
+                  PERMISSION_WRITE));
     puts("app permissions: passed");
     return 0;
 }

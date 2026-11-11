@@ -13,6 +13,7 @@
  *   /disk/OPOS/ACCOUNTS.DAT                             password hashes
  *   /disk/Users                                         list of homes
  *   /disk/Users/<name>                                  one account's home
+ *   /disk/Users/<name>/AppData/Permissions.dat          capability grants
  *   anything else (/disk/..., /disk2..., /)              shared
  *
  * Programs may read system files but never change them, never see
@@ -21,15 +22,38 @@
  * OPOS's own windows (Files, editor) act for the person at the
  * keyboard: an administrator may change system files and open other
  * homes there; a standard account may not. ACCOUNTS.DAT is only ever
- * touched by the kernel's account code.
+ * touched by the kernel's account code. Permissions.dat is written only by
+ * the kernel (permission_grants.c); programs never see it and OPOS's
+ * windows may only read it.
  */
 
 #define PERMISSION_NO_ACCOUNT ((size_t)-1)
+
+/*
+ * Capabilities: named rights a process holds (docs/app-sandbox.md). They
+ * are recorded on every identity and inherited by children, which can
+ * only narrow them. Nothing enforces them yet; the confined/private_path
+ * rules below still decide file access.
+ */
+#define PERMISSION_CAP_STORAGE         (1u << 0) /* own app storage */
+#define PERMISSION_CAP_FILES_PICK      (1u << 1) /* picker-granted files */
+#define PERMISSION_CAP_FILES_SHARED    (1u << 2) /* shared class */
+#define PERMISSION_CAP_NET             (1u << 3) /* sockets */
+#define PERMISSION_CAP_CLIPBOARD_READ  (1u << 4)
+#define PERMISSION_CAP_CLIPBOARD_WRITE (1u << 5)
+#define PERMISSION_CAP_WINDOW          (1u << 6)
+#define PERMISSION_CAPS_ALL            0x7Fu
+/* What a disk program holds before the user grants it anything. */
+#define PERMISSION_CAPS_DISK_DEFAULT                                       \
+    (PERMISSION_CAP_STORAGE | PERMISSION_CAP_FILES_PICK                    \
+     | PERMISSION_CAP_CLIPBOARD_WRITE | PERMISSION_CAP_WINDOW)
 
 struct permission_identity {
     /* Account index, or PERMISSION_NO_ACCOUNT. */
     size_t account;
     bool admin;
+    /* PERMISSION_CAP_* bits. */
+    uint32_t capabilities;
     /* Disk-launched programs may write only below this directory. Empty
        means the directory could not be prepared, so writes are denied. */
     bool confined;
@@ -58,9 +82,14 @@ enum permission_access {
 struct permission_identity permission_session_identity(void);
 
 /* Narrow a process identity when it runs an executable from a disk. Never
-   widens an identity already inherited from a confined parent. */
+   widens an identity already inherited from a confined parent. Every disk
+   executable narrows capabilities to PERMISSION_CAPS_DISK_DEFAULT. */
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length);
+
+/* True when identity holds every bit in capabilities. */
+bool permission_has(const struct permission_identity *identity,
+                    uint32_t capabilities);
 
 /* Called only after the desktop picker chooses a file. */
 bool permission_grant_read_file(struct permission_identity *identity,

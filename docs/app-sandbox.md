@@ -177,6 +177,26 @@ the identity of the running process, which the desktop updates.
 It also shows a short log of blocked actions, kept locally and never sent
 anywhere.
 
+As built in step 5 (Start > SECURITY CENTER, `security_*` in
+`kernel/desktop.c`):
+
+- One row per record in the logged-in account's `Permissions.dat`. Each
+  row shows the program's name, the first 4 hex digits of its hash, and
+  Network, Clipboard (read) and Shared files as ALLOWED, DENIED or
+  NOT ASKED. It also shows the date of the last change. The window
+  reloads every two seconds, so answers given in a prompt appear.
+- Clicking a setting, or pressing 1, 2 or 3, changes it. DENIED becomes
+  ALLOWED, and anything else becomes DENIED. A grant counts from the
+  program's next start, even for a capability its manifest does not
+  list, because the person chose it here. A denial also reaches running
+  copies at once through `user_revoke_capabilities`. Sockets already
+  open stay open.
+- FORGET PROGRAM (Delete) removes the record, so the program asks again.
+  Running copies lose everything beyond the defaults.
+- Not done: "last used" and the log of blocked actions. Without an
+  account the window says to log in. With a damaged store it says that
+  programs are refused everything extra.
+
 ### Built-in programs
 
 Programs from the initramfs keep their account-wide read today. Later
@@ -221,7 +241,7 @@ that ability through a prompt, not silently and not by removal.
    read.
 3. Done. Enforce `net` and `clipboard.read` with the desktop prompt.
 4. Done. Manifest note and SDK support.
-5. Security Center window.
+5. Done. Security Center window.
 6. Built-in programs.
 
 Each step must keep ABI version 1 working. New calls and fields are

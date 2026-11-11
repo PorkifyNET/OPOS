@@ -232,7 +232,7 @@ Anything else fails with `OPOS_EACCES` until the person allows it:
 
 The first time a program needs one, OPOS shows a Deny/Allow prompt. The
 answer is remembered for that exact executable, so rebuilding it asks
-again. A file in `<disk>/Programs/<folder>/` may read its own folder
+again. Start > SECURITY CENTER shows and changes the answers. A file in `<disk>/Programs/<folder>/` may read its own folder
 without `OPOS_CAP_FILES_SHARED`.
 
 Declare what the program may ask for once, at file scope:

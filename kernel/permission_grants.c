@@ -426,6 +426,13 @@ bool permission_grants_decide(size_t account,
         && permission_grants_save(account, &scratch);
 }
 
+bool permission_grants_forget(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE]) {
+    return program != NULL && permission_grants_load(account, &scratch)
+        && permission_grants_remove(&scratch, program)
+        && permission_grants_save(account, &scratch);
+}
+
 static bool is_elf(const char *path, size_t length) {
     uint8_t magic[4];
     size_t got = 0;

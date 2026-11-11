@@ -1442,7 +1442,7 @@ static int64_t user_resolve_file_path(struct user_process *process,
 }
 
 /* Real-time clock as decimal YYYYMMDDhhmmss, or 0 when unreadable. */
-static uint64_t user_clock_stamp(void) {
+uint64_t user_clock_stamp(void) {
     struct rtc_time time;
     if (!rtc_read(&time)) {
         return 0;
@@ -6583,6 +6583,29 @@ bool user_process_kill(uint64_t process_id) {
         }
     }
     return false;
+}
+
+size_t user_revoke_capabilities(size_t account,
+                                const uint8_t program[32],
+                                uint32_t capabilities) {
+    size_t changed = 0;
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        struct permission_identity *identity = &process_slots[i].identity;
+        if (process_slots[i].state != USER_PROCESS_RUNNING
+            || !identity->program_known || identity->account != account) {
+            continue;
+        }
+        bool same = true;
+        for (size_t j = 0; j < 32; j++) {
+            same = same && identity->program[j] == program[j];
+        }
+        if (same) {
+            identity->capabilities &= ~capabilities;
+            identity->askable &= ~capabilities;
+            changed++;
+        }
+    }
+    return changed;
 }
 
 size_t user_process_kill_all(void) {

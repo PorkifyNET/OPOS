@@ -138,6 +138,15 @@ bool permission_grants_decide(size_t account,
                               bool allow, uint64_t now);
 
 /*
+ * Removes a program's record, as the Security Center's "forget" does:
+ * it is a new program again, so it may ask again for what any program or
+ * its manifest may ask for. Returns false when the store could not be
+ * read or written, or the program had no record.
+ */
+bool permission_grants_forget(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE]);
+
+/*
  * Once per account: every ELF executable below /disk/Programs without a
  * record gets one that may ask for files.shared, so programs installed
  * before files.shared was enforced can ask instead of failing silently.

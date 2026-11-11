@@ -622,11 +622,26 @@ static void test_manifest_launch(void) {
     assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
 }
 
+static void test_forget(void) {
+    uint8_t program[SHA256_DIGEST_SIZE];
+    memset(program, 0x5A, sizeof(program));
+    assert(!permission_grants_forget(0, program));
+    assert(permission_grants_decide(0, program, "Gone", PERMISSION_CAP_NET,
+                                    false, 7));
+    assert(permission_grants_forget(0, program));
+    struct permission_grants grants;
+    assert(permission_grants_load(0, &grants));
+    assert(permission_grants_find(&grants, program) == NULL);
+    assert(!permission_grants_forget(0, program));
+    assert(!permission_grants_forget(0, NULL));
+}
+
 int main(void) {
     test_records();
     test_storage();
     test_migration_and_launch();
     test_manifest_launch();
+    test_forget();
     puts("permission grants: passed");
     return 0;
 }

@@ -14,6 +14,7 @@
 #include "installer.h"
 #include "iso9660.h"
 #include "keyboard.h"
+#include "permission_grants.h"
 #include "permissions.h"
 #include "memory.h"
 #include "mouse.h"
@@ -71,6 +72,7 @@ enum window_kind {
     WINDOW_INSTALLER,
     WINDOW_TASKS,
     WINDOW_IMAGE,
+    WINDOW_SECURITY,
     /* Program windows: one kind per slot (see "program windows"). */
     WINDOW_APP,
     WINDOW_APP_LAST = WINDOW_APP + 3,
@@ -84,7 +86,8 @@ static bool window_is_app(enum window_kind kind) {
 
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "WELCOME", "SETTINGS", "TEXT EDITOR",
-    "INSTALL OPOS", "TASK MANAGER", "IMAGE VIEWER", "PROGRAM"
+    "INSTALL OPOS", "TASK MANAGER", "IMAGE VIEWER", "SECURITY CENTER",
+    "PROGRAM"
 };
 
 static const char *app_window_title(size_t slot);
@@ -177,6 +180,7 @@ enum menu_action {
     MENU_FILES,
     MENU_TEXT_EDITOR,
     MENU_TASK_MANAGER,
+    MENU_SECURITY,
     MENU_PROGRAMS,
     MENU_SETTINGS,
     MENU_INSTALL,
@@ -187,7 +191,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "PROGRAMS", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "SECURITY CENTER", "PROGRAMS", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -622,6 +626,11 @@ static void tasks_open(void);
 static void draw_tasks(struct rect area, bool focused);
 static void tasks_click(struct rect area, int32_t x, int32_t y);
 static void tasks_key(char character);
+static void security_open(void);
+static void security_reload(void);
+static void draw_security(struct rect area, bool focused);
+static void security_click(struct rect area, int32_t x, int32_t y);
+static void security_key(char character);
 static const char *window_title(enum window_kind kind);
 
 static void terminal_output_flush(void) {
@@ -7293,6 +7302,9 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_TASKS:
         draw_tasks(content, focused);
         break;
+    case WINDOW_SECURITY:
+        draw_security(content, focused);
+        break;
     case WINDOW_IMAGE:
         draw_viewer(content);
         break;
@@ -8261,6 +8273,9 @@ static enum desktop_result menu_activate(enum menu_action action) {
         break;
     case MENU_TASK_MANAGER:
         tasks_open();
+        break;
+    case MENU_SECURITY:
+        security_open();
         break;
     case MENU_SETTINGS:
         window_open(WINDOW_SETTINGS);
@@ -9903,6 +9918,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         installer_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_TASKS) {
         tasks_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_SECURITY) {
+        security_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_IMAGE) {
         viewer_click(content_rect(frame), x, y);
     } else if (window_is_app(kind)) {
@@ -10205,6 +10222,8 @@ static enum desktop_result handle_key(char character, bool super) {
         installer_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_TASKS) {
         tasks_key(character);
+    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SECURITY) {
+        security_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_IMAGE) {
         viewer_key(character);
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
@@ -11401,6 +11420,273 @@ static void tasks_key(char character) {
     }
 }
 
+/* ------------------------------------------------------ security center */
+
+/*
+ * What each disk program of the logged-in account may do
+ * (docs/app-sandbox.md): one row per program in Permissions.dat, with
+ * Network, Clipboard and Shared files. Clicking a setting (or 1, 2, 3)
+ * denies what was allowed and allows what was denied; an undecided one
+ * becomes denied. Denying takes effect in running copies at once.
+ * Forget (Delete) removes the program's record, so it asks again.
+ */
+#define SECURITY_ROW_HEIGHT 24
+#define SECURITY_COLUMNS 3
+
+static struct permission_grants security_store;
+static bool security_store_ok;
+static size_t security_selected;
+static char security_message[80];
+static uint64_t security_loaded_tick;
+
+static const uint32_t security_caps[SECURITY_COLUMNS] = {
+    PERMISSION_CAP_NET, PERMISSION_CAP_CLIPBOARD_READ,
+    PERMISSION_CAP_FILES_SHARED,
+};
+/* In characters; fits the half-width tile of a 1920-pixel screen. */
+static const int64_t security_column_x[SECURITY_COLUMNS + 2] = {
+    0, 22, 33, 44, 58
+};
+#define SECURITY_CELL_CHARS 10
+
+static void security_reload(void) {
+    size_t account = accounts_current();
+    security_store_ok = account != ACCOUNT_NONE
+        && permission_grants_load(account, &security_store);
+    if (!security_store_ok) {
+        security_store.count = 0;
+    }
+    if (security_selected >= security_store.count) {
+        security_selected = security_store.count == 0
+            ? 0 : security_store.count - 1;
+    }
+    security_loaded_tick = timer_ticks();
+}
+
+static void security_open(void) {
+    window_open(WINDOW_SECURITY);
+    security_message[0] = '\0';
+    security_reload();
+}
+
+static struct rect security_row_rect(struct rect area, size_t index) {
+    return (struct rect){area.x + 8,
+                         area.y + 72 + (int64_t)index * SECURITY_ROW_HEIGHT,
+                         area.width - 16, SECURITY_ROW_HEIGHT};
+}
+
+static struct rect security_cell_rect(struct rect area, size_t index,
+                                      size_t column) {
+    struct rect row = security_row_rect(area, index);
+    int64_t left = 16 + security_column_x[column + 1] * CHAR_WIDTH;
+    return (struct rect){area.x + left, row.y,
+                         SECURITY_CELL_CHARS * CHAR_WIDTH, row.height};
+}
+
+static struct rect security_forget_button(struct rect area) {
+    return (struct rect){area.x + area.width - 16 - 18 * CHAR_WIDTH,
+                         area.y + area.height - 40, 18 * CHAR_WIDTH, 28};
+}
+
+static void security_say(const char *first, const char *second) {
+    size_t used = append_text(security_message, sizeof(security_message), 0,
+                              first);
+    append_text(security_message, sizeof(security_message), used, second);
+}
+
+static void security_toggle(size_t index, size_t column) {
+    size_t account = accounts_current();
+    if (index >= security_store.count || column >= SECURITY_COLUMNS
+        || account == ACCOUNT_NONE) {
+        return;
+    }
+    const struct permission_grant *grant = &security_store.records[index];
+    uint32_t capability = security_caps[column];
+    bool allow = (grant->denied & capability) != 0;
+    uint8_t program[SHA256_DIGEST_SIZE];
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        program[i] = grant->program[i];
+    }
+    char name[PERMISSION_GRANT_NAME_MAX + 1];
+    text_copy(name, sizeof(name), grant->name);
+    if (!permission_grants_decide(account, program, NULL, capability, allow,
+                                  user_clock_stamp())) {
+        security_say("COULD NOT SAVE THE CHANGE FOR ", name);
+    } else if (allow) {
+        security_say("ALLOWED FROM NEXT START: ", name);
+    } else {
+        (void)user_revoke_capabilities(account, program, capability);
+        security_say("DENIED NOW: ", name);
+    }
+    security_reload();
+}
+
+static void security_forget(void) {
+    size_t account = accounts_current();
+    if (security_selected >= security_store.count
+        || account == ACCOUNT_NONE) {
+        return;
+    }
+    const struct permission_grant *grant =
+        &security_store.records[security_selected];
+    uint8_t program[SHA256_DIGEST_SIZE];
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        program[i] = grant->program[i];
+    }
+    char name[PERMISSION_GRANT_NAME_MAX + 1];
+    text_copy(name, sizeof(name), grant->name);
+    if (permission_grants_forget(account, program)) {
+        /* Running copies lose what was granted beyond the defaults. */
+        (void)user_revoke_capabilities(
+            account, program,
+            PERMISSION_CAPS_ALL & ~PERMISSION_CAPS_DISK_DEFAULT);
+        security_say("FORGOTTEN; IT WILL ASK AGAIN: ", name);
+    } else {
+        security_say("COULD NOT FORGET ", name);
+    }
+    security_reload();
+}
+
+/* "2026-11-11" from YYYYMMDDhhmmss, or "-". */
+static void security_format_date(uint64_t stamp, char out[11]) {
+    if (stamp == 0) {
+        text_copy(out, 11, "-");
+        return;
+    }
+    stamp /= 1000000;
+    for (int i = 9; i >= 0; i--) {
+        if (i == 4 || i == 7) {
+            out[i] = '-';
+        } else {
+            out[i] = (char)('0' + stamp % 10);
+            stamp /= 10;
+        }
+    }
+    out[10] = '\0';
+}
+
+static void draw_security(struct rect area, bool focused) {
+    fill(area, 24, 30, 46);
+    int64_t x = area.x + 16;
+    int64_t width = area.width - 32;
+    draw_text_clipped(x, area.y + 14, width,
+                      "WHAT YOUR DISK PROGRAMS MAY DO. CLICK A SETTING "
+                      "TO CHANGE IT.", 151, 190, 255);
+    static const char *const headings[SECURITY_COLUMNS + 2] = {
+        "PROGRAM", "NETWORK", "CLIPBOARD", "SHARED FILES", "CHANGED"
+    };
+    for (size_t i = 0; i < SECURITY_COLUMNS + 2; i++) {
+        draw_text_clipped(x + security_column_x[i] * CHAR_WIDTH,
+                          area.y + 46,
+                          width - security_column_x[i] * CHAR_WIDTH,
+                          headings[i], 150, 160, 185);
+    }
+    struct rect button = security_forget_button(area);
+    for (size_t i = 0; i < security_store.count; i++) {
+        struct rect row = security_row_rect(area, i);
+        if (row.y + row.height > button.y - 8) {
+            break;
+        }
+        const struct permission_grant *grant = &security_store.records[i];
+        if (i == security_selected) {
+            fill(row, focused ? 52 : 40, focused ? 82 : 52,
+                 focused ? 140 : 80);
+        }
+        /* The name the program chose, then the start of its hash, so two
+           programs with one name can be told apart. */
+        static const char hex[] = "0123456789abcdef";
+        char label[PERMISSION_GRANT_NAME_MAX + 12];
+        size_t used = append_text(label, 16, 0,
+                                  grant->name[0] != '\0' ? grant->name
+                                                         : "(NO NAME)");
+        label[used++] = ' ';
+        for (size_t b = 0; b < 2; b++) {
+            label[used++] = hex[grant->program[b] >> 4];
+            label[used++] = hex[grant->program[b] & 15];
+        }
+        label[used] = '\0';
+        draw_text_clipped(x, row.y + 5, security_column_x[1] * CHAR_WIDTH - 8,
+                          label, 230, 238, 255);
+        for (size_t c = 0; c < SECURITY_COLUMNS; c++) {
+            /* Undecided: whether it may ask depends on the manifest,
+               which is in the executable, not here. */
+            uint32_t capability = security_caps[c];
+            const char *state = "NOT ASKED";
+            uint8_t r = 150, g = 160, b = 185;
+            if (grant->granted & capability) {
+                state = "ALLOWED";
+                r = 120, g = 220, b = 140;
+            } else if (grant->denied & capability) {
+                state = "DENIED";
+                r = 255, g = 120, b = 120;
+            }
+            draw_text_clipped(x + security_column_x[c + 1] * CHAR_WIDTH,
+                              row.y + 5, SECURITY_CELL_CHARS * CHAR_WIDTH,
+                              state, r, g, b);
+        }
+        char when[11];
+        security_format_date(grant->updated, when);
+        draw_text_clipped(x + security_column_x[4] * CHAR_WIDTH, row.y + 5,
+                          width - security_column_x[4] * CHAR_WIDTH, when,
+                          200, 205, 220);
+    }
+    if (security_store.count == 0) {
+        draw_text_clipped(x, area.y + 77, width,
+                          accounts_current() == ACCOUNT_NONE
+                              ? "LOG IN TO SEE YOUR PROGRAMS' PERMISSIONS."
+                          : !security_store_ok
+                              ? "PERMISSIONS.DAT IS DAMAGED. PROGRAMS ARE "
+                                "REFUSED EVERYTHING EXTRA."
+                              : "NO PROGRAM HAS ASKED FOR ANYTHING YET.",
+                          200, 214, 255);
+    }
+    draw_text_clipped(x, button.y + 7, button.x - x - 16,
+                      security_message[0] != '\0' ? security_message
+                      : "1 2 3: CHANGE  DELETE: FORGET PROGRAM",
+                      security_message[0] != '\0' ? 240 : 150,
+                      security_message[0] != '\0' ? 205 : 160,
+                      security_message[0] != '\0' ? 100 : 185);
+    bool enabled = security_selected < security_store.count;
+    fill(button, enabled ? 150 : 50, enabled ? 60 : 56, enabled ? 70 : 72);
+    draw_text_clipped(button.x + 12, button.y + 7, button.width - 24,
+                      "FORGET PROGRAM", enabled ? 255 : 130,
+                      enabled ? 255 : 136, enabled ? 255 : 150);
+}
+
+static void security_click(struct rect area, int32_t x, int32_t y) {
+    if (rect_contains(security_forget_button(area), x, y)) {
+        security_forget();
+        return;
+    }
+    for (size_t i = 0; i < security_store.count; i++) {
+        if (!rect_contains(security_row_rect(area, i), x, y)) {
+            continue;
+        }
+        security_selected = i;
+        security_message[0] = '\0';
+        for (size_t c = 0; c < SECURITY_COLUMNS; c++) {
+            if (rect_contains(security_cell_rect(area, i, c), x, y)) {
+                security_toggle(i, c);
+            }
+        }
+    }
+}
+
+static void security_key(char character) {
+    if (character == KEY_UP && security_selected > 0) {
+        security_selected--;
+        security_message[0] = '\0';
+    } else if (character == KEY_DOWN
+               && security_selected + 1 < security_store.count) {
+        security_selected++;
+        security_message[0] = '\0';
+    } else if (character >= '1' && character <= '0' + SECURITY_COLUMNS) {
+        security_toggle(security_selected, (size_t)(character - '1'));
+    } else if (character == KEY_DELETE) {
+        security_forget();
+    }
+}
+
 /*
  * The desktop's side of programs, once per pass: opens and frees windows,
  * ends programs that ignore a close, shows output, reports ended jobs.
@@ -11489,6 +11775,12 @@ static bool apps_poll(void) {
     if (windows[WINDOW_TASKS].open
         && now - tasks_sample_tick >= TASKS_SAMPLE_TICKS) {
         tasks_sample();
+        redraw = true;
+    }
+    /* Answers given in a prompt meanwhile appear within two seconds. */
+    if (windows[WINDOW_SECURITY].open
+        && now - security_loaded_tick >= 200) {
+        security_reload();
         redraw = true;
     }
     if (app_input_readers != app_input_readers_drawn) {

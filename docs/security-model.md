@@ -121,10 +121,13 @@ the set and can only narrow it. The kernel checks `files.shared` (shared
 file reads), `net` (at `socket()`), `clipboard.read` and
 `clipboard.write`. Any disk app may ask once for `net` and
 `clipboard.read`, through a desktop prompt the program cannot draw over
-or click. Only disk apps that were in `/disk/Programs` at an account's
-first login with these rules may ask for `files.shared`. Answers are
-stored per executable hash; without an account they last for that
-process only.
+or click. A program with a manifest (`OPOS_MANIFEST`) may ask only for
+what the manifest lists, including `files.shared`. Without a manifest,
+only disk apps that were in `/disk/Programs` at an account's first login
+with these rules may ask for `files.shared`. Answers are stored per
+executable hash; without an account they last for that process only.
+Start > SECURITY CENTER lists the stored answers and changes them, or
+forgets a program. Denying there also applies to running copies at once.
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none

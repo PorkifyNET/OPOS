@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "manifest.h"
 #include "permission_grants.h"
 #include "permissions.h"
 #include "sha256.h"
@@ -337,13 +338,21 @@ static struct permission_grants scratch;
 void permission_apply_program(struct permission_identity *identity,
                               const char *path, size_t length,
                               const uint8_t *image, size_t size) {
-    if (identity == NULL || !permission_is_disk_program(path, length)) {
+    if (identity == NULL || path == NULL || length == 0) {
+        return; /* kernel-embedded test programs have no path */
+    }
+    if (!permission_is_disk_program(path, length)) {
+        /* Built-ins narrow too, never widen what the parent held. */
+        uint32_t allowed = permission_builtin_capabilities(path, length);
+        identity->capabilities &= allowed;
+        identity->askable &= allowed;
         return;
     }
     uint32_t parent = identity->capabilities;
     permission_confine_disk_program(identity, path, length);
     identity->askable = 0;
     identity->program_known = false;
+    identity->program_name[0] = '\0';
     if (image == NULL || size == 0) {
         return;
     }
@@ -352,7 +361,24 @@ void permission_apply_program(struct permission_identity *identity,
     sha256_update(&hash, image, size);
     sha256_final(&hash, identity->program);
     identity->program_known = true;
+    /* With a manifest, the program may ask only for what it declared
+       (files.shared included). Without one: net and clipboard.read, plus
+       what migration recorded. */
+    struct manifest manifest;
+    bool declared = manifest_read(image, size, &manifest);
+    for (size_t i = 0; i < sizeof(identity->program_name); i++) {
+        identity->program_name[i] = declared ? manifest.name[i] : '\0';
+    }
+    uint32_t requestable = declared
+        ? manifest.capabilities & ~PERMISSION_CAPS_DISK_DEFAULT
+        : PERMISSION_CAPS_ASK_ON_USE;
+    identity->askable = requestable & parent;
+    if (identity->account == PERMISSION_NO_ACCOUNT
+        || identity->account >= accounts_count()) {
+        return; /* nowhere to keep answers: ask, and remember per process */
+    }
     if (!permission_grants_load(identity->account, &scratch)) {
+        identity->askable = 0; /* damaged store: refuse, never guess */
         return;
     }
     const struct permission_grant *grant =
@@ -360,9 +386,13 @@ void permission_apply_program(struct permission_identity *identity,
     if (grant == NULL) {
         return;
     }
+    uint32_t decided = grant->granted | grant->denied;
+    if (!declared) {
+        requestable |= grant->ask;
+    }
     identity->capabilities = parent
         & (PERMISSION_CAPS_DISK_DEFAULT | grant->granted) & ~grant->denied;
-    identity->askable = grant->ask & parent;
+    identity->askable = requestable & ~decided & parent;
 }
 
 bool permission_grants_decide(size_t account,
@@ -400,6 +430,13 @@ bool permission_grants_decide(size_t account,
     return permission_grants_set(&scratch, program,
                                  name != NULL ? name : kept, granted, denied,
                                  ask, now)
+        && permission_grants_save(account, &scratch);
+}
+
+bool permission_grants_forget(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE]) {
+    return program != NULL && permission_grants_load(account, &scratch)
+        && permission_grants_remove(&scratch, program)
         && permission_grants_save(account, &scratch);
 }
 

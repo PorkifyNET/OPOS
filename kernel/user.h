@@ -56,6 +56,17 @@ enum user_run_result user_process_run_file(
 bool user_process_kill(uint64_t process_id);
 /* Asks every running process to end; returns how many still run. */
 size_t user_process_kill_all(void);
+/*
+ * Takes capabilities (PERMISSION_CAP_* bits) from every running process
+ * of account whose executable has this SHA-256, at once and without
+ * asking again. Sockets already open stay open. Returns how many
+ * processes changed. Granting never reaches running processes; it
+ * applies from the next launch.
+ */
+size_t user_revoke_capabilities(size_t account, const uint8_t program[32],
+                                uint32_t capabilities);
+/* Real-time clock as decimal YYYYMMDDhhmmss, or 0 when unreadable. */
+uint64_t user_clock_stamp(void);
 /* For code running inside a system call of the current process. */
 bool user_current_killed(void);
 uint64_t user_current_process_id(void);

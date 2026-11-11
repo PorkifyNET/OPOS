@@ -1442,7 +1442,7 @@ static int64_t user_resolve_file_path(struct user_process *process,
 }
 
 /* Real-time clock as decimal YYYYMMDDhhmmss, or 0 when unreadable. */
-static uint64_t user_clock_stamp(void) {
+uint64_t user_clock_stamp(void) {
     struct rtc_time time;
     if (!rtc_read(&time)) {
         return 0;
@@ -1461,19 +1461,63 @@ static uint64_t user_clock_stamp(void) {
 static bool user_ask_capability(struct user_process *process,
                                 uint32_t capability) {
     process->identity.askable &= ~capability;
-    int64_t answer = desktop_app_ask_permission(process->id, process->name,
+    /* A manifest name is the program's own claim: show the executable's
+       name beside it, so "Files" cannot pass for the real Files. */
+    const char *claimed = process->identity.program_name;
+    size_t same = 0;
+    while (claimed[same] != '\0' && process->name[same] != '\0'
+           && (claimed[same] | 0x20) == (process->name[same] | 0x20)) {
+        same++;
+    }
+    bool redundant = claimed[same] == '\0' && process->name[same] == '\0';
+    char label[72];
+    size_t used = 0;
+    for (size_t i = 0; !redundant && claimed[i] != '\0'
+                       && used + 1 < sizeof(label); i++) {
+        label[used++] = claimed[i];
+    }
+    if (used != 0) {
+        static const char open[] = " (";
+        for (size_t i = 0; open[i] != '\0' && used + 1 < sizeof(label); i++) {
+            label[used++] = open[i];
+        }
+    }
+    size_t file_start = used;
+    for (size_t i = 0; process->name[i] != '\0' && used + 2 < sizeof(label);
+         i++) {
+        label[used++] = process->name[i];
+    }
+    if (file_start != 0) {
+        label[used++] = ')';
+    }
+    label[used] = '\0';
+    int64_t answer = desktop_app_ask_permission(process->id, label,
                                                 capability);
     if (answer < 0) {
         return false;
     }
     (void)permission_grants_decide(process->identity.account,
-                                   process->identity.program, process->name,
+                                   process->identity.program,
+                                   claimed[0] != '\0' ? claimed
+                                                      : process->name,
                                    capability, answer == 1,
                                    user_clock_stamp());
     if (answer == 1) {
         process->identity.capabilities |= capability;
     }
     return answer == 1;
+}
+
+/* True when the process holds capability, after asking the person if the
+   program may still ask for it. */
+static bool user_capability_allowed(struct user_process *process,
+                                    uint32_t capability) {
+    if (permission_has(&process->identity, capability)) {
+        return true;
+    }
+    return process->identity.program_known
+        && (process->identity.askable & capability) == capability
+        && user_ask_capability(process, capability);
 }
 
 /* True when the process's identity may access the resolved path. A
@@ -1487,9 +1531,7 @@ static bool user_path_allowed(struct user_process *process,
     }
     uint32_t missing = permission_program_missing(&process->identity, path,
                                                   path_length, access);
-    return missing != 0 && process->identity.program_known
-        && (process->identity.askable & missing) == missing
-        && user_ask_capability(process, missing)
+    return missing != 0 && user_capability_allowed(process, missing)
         && permission_program_allows(&process->identity, path, path_length,
                                      access);
 }
@@ -3291,7 +3333,7 @@ static int64_t user_opos_update(const struct user_process *process,
 #define OPOS_WINDOW_PIXELS_MAX 4096
 
 /* Returns true when the process must end (frame->rax holds the status). */
-static bool user_opos_window(const struct user_process *process,
+static bool user_opos_window(struct user_process *process,
                              struct linux_syscall_frame *frame) {
     uint64_t number = frame->rax;
     int64_t result = -22;
@@ -3369,8 +3411,12 @@ static bool user_opos_window(const struct user_process *process,
         if (length > OPOS_CLIPBOARD_MAX) {
             length = OPOS_CLIPBOARD_MAX;
         }
-        if (length != 0
-            && !paging_user_range_valid(address, length, false, false)) {
+        if (!user_capability_allowed(process,
+                                     PERMISSION_CAP_CLIPBOARD_WRITE)) {
+            result = -13;
+        } else if (length != 0
+                   && !paging_user_range_valid(address, length, false,
+                                               false)) {
             result = -14;
         } else {
             desktop_clipboard_set((const char *)address, length);
@@ -3382,8 +3428,13 @@ static bool user_opos_window(const struct user_process *process,
         if (capacity > OPOS_CLIPBOARD_MAX) {
             capacity = OPOS_CLIPBOARD_MAX;
         }
-        if (capacity != 0
-            && !paging_user_range_valid(address, capacity, true, false)) {
+        if (!user_capability_allowed(process,
+                                     PERMISSION_CAP_CLIPBOARD_READ)) {
+            result = -13;
+        } else if (capacity != 0
+                   && !paging_user_range_valid(address, capacity, true,
+                                               false)) {
+            /* Checked after the prompt: the memory may have changed. */
             result = -14;
         } else {
             result = (int64_t)desktop_clipboard_get((char *)address, capacity);
@@ -3606,6 +3657,10 @@ static int64_t user_linux_socket(struct user_process *process,
     if (protocol != 0
         && protocol != (kind == LINUX_SOCK_STREAM ? 6u : 17u)) {
         return -93; /* EPROTONOSUPPORT */
+    }
+    /* Every network path (DNS included) starts here. */
+    if (!user_capability_allowed(process, PERMISSION_CAP_NET)) {
+        return -13;
     }
     struct user_file_descriptor file = {
         .kind = USER_OPEN_FILE_SOCKET,
@@ -6528,6 +6583,29 @@ bool user_process_kill(uint64_t process_id) {
         }
     }
     return false;
+}
+
+size_t user_revoke_capabilities(size_t account,
+                                const uint8_t program[32],
+                                uint32_t capabilities) {
+    size_t changed = 0;
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        struct permission_identity *identity = &process_slots[i].identity;
+        if (process_slots[i].state != USER_PROCESS_RUNNING
+            || !identity->program_known || identity->account != account) {
+            continue;
+        }
+        bool same = true;
+        for (size_t j = 0; j < 32; j++) {
+            same = same && identity->program[j] == program[j];
+        }
+        if (same) {
+            identity->capabilities &= ~capabilities;
+            identity->askable &= ~capabilities;
+            changed++;
+        }
+    }
+    return changed;
 }
 
 size_t user_process_kill_all(void) {

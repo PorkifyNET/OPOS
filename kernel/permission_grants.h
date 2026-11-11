@@ -117,8 +117,11 @@ struct permission_identity;
  * path, whose bytes are image. For a disk program: confines the identity,
  * records the program's hash, and sets capabilities to what the parent
  * held intersected with the defaults plus the account's grants. askable
- * becomes the stored ask bits the parent also held. Other programs are
- * left alone. A missing or malformed store grants nothing extra.
+ * becomes what the program's manifest declares (manifest.h), or without
+ * one PERMISSION_CAPS_ASK_ON_USE plus the stored ask bits; minus decided
+ * bits, within what the parent held. program_name takes the manifest's
+ * name. Other programs are left alone. A missing store grants nothing
+ * extra; a malformed one also makes nothing askable.
  */
 void permission_apply_program(struct permission_identity *identity,
                               const char *path, size_t length,
@@ -133,6 +136,15 @@ bool permission_grants_decide(size_t account,
                               const uint8_t program[SHA256_DIGEST_SIZE],
                               const char *name, uint32_t capability,
                               bool allow, uint64_t now);
+
+/*
+ * Removes a program's record, as the Security Center's "forget" does:
+ * it is a new program again, so it may ask again for what any program or
+ * its manifest may ask for. Returns false when the store could not be
+ * read or written, or the program had no record.
+ */
+bool permission_grants_forget(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE]);
 
 /*
  * Once per account: every ELF executable below /disk/Programs without a

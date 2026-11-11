@@ -21,6 +21,8 @@
  * home folder under /disk/Users. Programs launched from a disk can write
  * only to their private app storage; use opos_app_storage() to find it.
  * To read another file in the home folder, use opos_pick_file().
+ * Disk programs ask the person before using the network or reading the
+ * clipboard; declare what you need with OPOS_MANIFEST (below).
  */
 #ifndef OPOS_H
 #define OPOS_H
@@ -47,6 +49,56 @@
 #define OPOS_ECANCELED 125
 #define OPOS_ENOSYS 38
 #define OPOS_ENOTEMPTY 39
+
+/* ------------------------------------------------------ capabilities */
+
+/*
+ * Rights a program launched from a disk holds or may ask for (the same
+ * bits as the kernel's PERMISSION_CAP_*; see docs/app-sandbox.md).
+ * Every disk program holds STORAGE, FILES_PICK, CLIPBOARD_WRITE and
+ * WINDOW. The others are refused (EACCES) until the person allows them in
+ * a prompt, which appears the first time the program needs one.
+ */
+#define OPOS_CAP_STORAGE         (1u << 0)
+#define OPOS_CAP_FILES_PICK      (1u << 1)
+#define OPOS_CAP_FILES_SHARED    (1u << 2) /* every non-private disk file */
+#define OPOS_CAP_NET             (1u << 3) /* socket() */
+#define OPOS_CAP_CLIPBOARD_READ  (1u << 4)
+#define OPOS_CAP_CLIPBOARD_WRITE (1u << 5)
+#define OPOS_CAP_WINDOW          (1u << 6)
+
+/*
+ * The program's manifest: a display name, a version, and the capabilities
+ * it may ask for. Write it once, at file scope, in one source file:
+ *
+ *     OPOS_MANIFEST("Fetch", "1.0", OPOS_CAP_NET);
+ *
+ * With a manifest, a program can only ask for what it lists, and listing
+ * OPOS_CAP_FILES_SHARED lets it ask for that too. Without one, it may ask
+ * for OPOS_CAP_NET and OPOS_CAP_CLIPBOARD_READ. Listing a capability never
+ * grants it. name: 1-31 printable characters; version: up to 15. The
+ * prompt shows the name next to the executable's own file name.
+ */
+struct opos_manifest_note {
+    uint32_t name_size;       /* 5 */
+    uint32_t descriptor_size; /* 56 */
+    uint32_t type;            /* 2: manifest */
+    char owner[8];            /* "OPOS", padded */
+    uint32_t format;          /* 1 */
+    uint32_t capabilities;
+    char name[32];
+    char version[16];
+};
+
+#define OPOS_MANIFEST(name, version, capabilities)                         \
+    _Static_assert(sizeof(name) > 1 && sizeof(name) <= 32,                 \
+                   "OPOS_MANIFEST name: 1 to 31 characters");              \
+    _Static_assert(sizeof(version) <= 16,                                  \
+                   "OPOS_MANIFEST version: at most 15 characters");        \
+    __attribute__((used, section(".note.opos"), aligned(4)))               \
+    static const struct opos_manifest_note opos_manifest_note_ = {         \
+        5, 56, 2, "OPOS", 1, (capabilities), name, version                 \
+    }
 
 static inline size_t opos_strlen(const char *text) {
     size_t length = 0;

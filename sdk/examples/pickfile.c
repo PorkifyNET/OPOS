@@ -2,6 +2,9 @@
    Files asks the user to select one document in their home folder. */
 #include <opos.h>
 
+/* Needs nothing beyond the defaults, so it can never ask for more. */
+OPOS_MANIFEST("Pick File", "1.0", 0);
+
 int main(void) {
     char path[256];
     long picked = opos_pick_file(path, sizeof(path));

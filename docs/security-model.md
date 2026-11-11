@@ -111,17 +111,25 @@ extend the grant. A new selection replaces the path grant for future opens;
 file handles already opened remain valid. Grants follow `fork` and
 `execve` but never allow writing outside app storage.
 The picker cannot grant access to another account's home or to the
-password file. Disk apps still have network and shared clipboard access.
+password file.
 
-Each process also carries a capability set. Built-in programs hold every
-capability. A disk app holds `storage`, `files.pick`, `clipboard.write`
+Each process also carries a capability set. Built-in programs hold what
+their job needs (`docs/app-sandbox.md`): only fetch, update and the
+browser may use the network, and only the browser may read the
+clipboard. A disk app holds `storage`, `files.pick`, `clipboard.write`
 and `window`, plus what the account granted that executable (keyed by its
 SHA-256) in `Permissions.dat`, minus what was refused. Children inherit
-the set and can only narrow it. Today the kernel checks only
-`files.shared`. Disk apps that were in `/disk/Programs` at an account's
-first login with this rule may ask for it once, through a desktop prompt
-the program cannot draw over or click. Other disk apps are refused
-without a prompt.
+the set and can only narrow it. The kernel checks `files.shared` (shared
+file reads), `net` (at `socket()`), `clipboard.read` and
+`clipboard.write`. Any disk app may ask once for `net` and
+`clipboard.read`, through a desktop prompt the program cannot draw over
+or click. A program with a manifest (`OPOS_MANIFEST`) may ask only for
+what the manifest lists, including `files.shared`. Without a manifest,
+only disk apps that were in `/disk/Programs` at an account's first login
+with these rules may ask for `files.shared`. Answers are stored per
+executable hash; without an account they last for that process only.
+Start > SECURITY CENTER lists the stored answers and changes them, or
+forgets a program. Denying there also applies to running copies at once.
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none

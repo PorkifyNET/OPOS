@@ -34,7 +34,8 @@
  * are recorded on every identity and inherited by children, which can
  * only narrow them. Enforced so far: files.shared, which a confined
  * program needs to read the shared class on /disk.., /cdrom.. outside its
- * own program folder.
+ * own program folder; net, checked at socket(); clipboard.read and
+ * clipboard.write, checked by the clipboard calls.
  */
 #define PERMISSION_CAP_STORAGE         (1u << 0) /* own app storage */
 #define PERMISSION_CAP_FILES_PICK      (1u << 1) /* picker-granted files */
@@ -44,6 +45,9 @@
 #define PERMISSION_CAP_CLIPBOARD_WRITE (1u << 5)
 #define PERMISSION_CAP_WINDOW          (1u << 6)
 #define PERMISSION_CAPS_ALL            0x7Fu
+/* What any disk program may ask the person for on first use. */
+#define PERMISSION_CAPS_ASK_ON_USE                                         \
+    (PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ)
 /* What a disk program holds before the user grants it anything. */
 #define PERMISSION_CAPS_DISK_DEFAULT                                       \
     (PERMISSION_CAP_STORAGE | PERMISSION_CAP_FILES_PICK                    \
@@ -61,6 +65,9 @@ struct permission_identity {
     /* SHA-256 of the confined program's executable, when known. */
     bool program_known;
     uint8_t program[32];
+    /* Name from the program's manifest, or empty. Chosen by the program,
+       so never shown without the executable's own name beside it. */
+    char program_name[32];
     /* <volume>/Programs/<folder> when the executable lives in such a
        folder: readable without files.shared. Empty otherwise. */
     char program_folder[128];
@@ -104,6 +111,14 @@ bool permission_has(const struct permission_identity *identity,
 /* True for an executable on a disk volume (/disk, /disk2..): the programs
    permission_confine_disk_program confines. */
 bool permission_is_disk_program(const char *path, size_t length);
+
+/*
+ * The most a program that is not on a disk may hold: a fixed set per
+ * /bin program (notepad has no net, the browser may read the clipboard),
+ * everything for /tests and /lib, and PERMISSION_CAPS_DISK_DEFAULT for
+ * anything else (a CD, for example). Disk programs get the disk default.
+ */
+uint32_t permission_builtin_capabilities(const char *path, size_t length);
 
 /*
  * When permission_program_allows refuses, the one capability that would

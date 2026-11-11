@@ -141,7 +141,22 @@ int main(void) {
     assert(allows(&built_in, "/bin/notepad", PERMISSION_READ));
     assert(!allows(&built_in, "/bin/notepad", PERMISSION_WRITE));
     assert(!allows(&app, "/bin/notepad", PERMISSION_WRITE));
+    assert(!allows(&built_in, "/disk/OPOS/roots/test/bin/notepad",
+                   PERMISSION_WRITE));
+    struct permission_identity standard = {.account = 1};
+    assert(!allows(&standard, "/bin/notepad", PERMISSION_WRITE));
+    assert(!allows(&standard, "/disk/OPOS/roots/test/bin/notepad",
+                   PERMISSION_WRITE));
+    assert(!allows(&standard, "/disk/OPOS/ACCOUNTS.DAT", PERMISSION_READ));
+    assert(!allows(&app, "/disk/OPOS/roots/test/bin/notepad",
+                   PERMISSION_WRITE));
     assert(!permission_ui_allows("/bin/notepad", 12, PERMISSION_WRITE));
+    assert(!permission_ui_allows("/disk/OPOS/roots/test/bin/notepad",
+                                 strlen("/disk/OPOS/roots/test/bin/notepad"),
+                                 PERMISSION_WRITE));
+    assert(!permission_ui_requires_confirmation(
+        "/disk/OPOS/roots/test/bin/notepad",
+        strlen("/disk/OPOS/roots/test/bin/notepad"), PERMISSION_WRITE));
     assert(!permission_ui_allows(root_backing, strlen(root_backing),
                                  PERMISSION_REMOVE));
     assert(!permission_ui_allows("/disk/OPOS/roots",
@@ -150,6 +165,13 @@ int main(void) {
     assert(permission_ui_allows("/disk/Programs/new",
                                 strlen("/disk/Programs/new"),
                                 PERMISSION_WRITE));
+    struct permission_identity copied = built_in;
+    permission_confine_disk_program(&copied, "/disk/Programs/notepad",
+                                    strlen("/disk/Programs/notepad"));
+    assert(copied.confined);
+    assert(!allows(&copied, "/disk/OPOS/ACCOUNTS.DAT", PERMISSION_READ));
+    assert(!allows(&copied, "/disk/OPOS/roots/test/bin/notepad",
+                   PERMISSION_WRITE));
     puts("app permissions: passed");
     return 0;
 }

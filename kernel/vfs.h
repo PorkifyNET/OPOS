@@ -44,6 +44,18 @@ typedef uint32_t vfs_object_handle;
 
 #define VFS_INVALID_OBJECT_HANDLE 0
 
+/* Preparatory disk-root mount. Disabled by default; call only after the boot
+   FAT volume is mounted and before any files are opened. The selected tree
+   stays read-only through its root alias; /disk remains the physical volume. */
+bool vfs_select_disk_root(const char *path, size_t path_length);
+/* Maps a visible root path to its backing /disk path when selected. False for
+   legacy mode and for explicit disk/CD mount paths. */
+bool vfs_disk_root_backing_path(const char *path, size_t path_length,
+                                char *backing, size_t capacity,
+                                size_t *backing_length);
+bool vfs_disk_root_contains(const char *path, size_t path_length);
+bool vfs_disk_root_ancestor(const char *path, size_t path_length);
+
 bool vfs_read_file(const char *path, size_t path_length, uint8_t *buffer,
                    size_t buffer_capacity, size_t *file_size);
 bool vfs_path_read_only(const char *path, size_t path_length);

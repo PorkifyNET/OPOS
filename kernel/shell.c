@@ -10,7 +10,6 @@
 #include "ahci.h"
 #include "block.h"
 #include "fat16.h"
-#include "initramfs.h"
 #include "installer.h"
 #include "nvme.h"
 #include "mouse.h"
@@ -507,8 +506,8 @@ static void shell_net_wait(bool started) {
 
 /* Whether /bin/NAME exists, for a NAME of letters, digits, '-' and '_'. */
 static bool bin_program_exists(const char *name, size_t length) {
-    char path[48] = "bin/";
-    if (length == 0 || length + 5 > sizeof(path)) {
+    char path[48] = "/bin/";
+    if (length == 0 || length + 6 > sizeof(path)) {
         return false;
     }
     for (size_t i = 0; i < length; i++) {
@@ -517,11 +516,12 @@ static bool bin_program_exists(const char *name, size_t length) {
               || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
             return false;
         }
-        path[4 + i] = c;
+        path[5 + i] = c;
     }
-    path[4 + length] = '\0';
-    struct initramfs_file file;
-    return initramfs_find_file(path, &file);
+    path[5 + length] = '\0';
+    struct vfs_metadata metadata;
+    return vfs_stat(path, 5 + length, &metadata)
+        && metadata.type == VFS_NODE_FILE;
 }
 
 struct shell_help_entry {
@@ -544,7 +544,7 @@ static const struct shell_help_entry shell_help_entries[] = {
     {"drives", "drives", "Lists mounted and detected storage volumes."},
     {"disk", "disk [format|read LBA|ls [PATH]|mkdir PATH|cat PATH|write PATH TEXT|run PATH]",
      "Inspects or changes the primary FAT disk."},
-    {"ls", "ls [PATH]", "Lists initramfs files or a VFS directory."},
+    {"ls", "ls [PATH]", "Lists the system root or a VFS directory."},
     {"sum", "sum PATH", "Shows file size, bytes read and an FNV-1a hash."},
     {"install", "install [DISK] erase-all-data",
      "Lists install targets or installs OPOS from live media."},
@@ -1000,19 +1000,20 @@ static void execute_command(void) {
             console_write_hex(hash);
             console_write_string("\n");
         }
-    } else if (command_matches(command, command_length, "ls")
-               && arguments_length != 0) {
-        /* ls PATH: any VFS folder (/disk2, /cdrom, ...). */
+    } else if (command_matches(command, command_length, "ls")) {
+        /* ls defaults to the active system root; PATH can name any VFS folder. */
+        const char *folder = arguments_length == 0 ? "/" : arguments;
+        size_t folder_length = arguments_length == 0 ? 1 : arguments_length;
         size_t count = 0;
-        if (!vfs_directory_count(arguments, arguments_length, &count)) {
+        if (!vfs_directory_count(folder, folder_length, &count)) {
             console_write_error("Folder not found.\n");
             return;
         }
         for (size_t i = 0; i < count; i++) {
             struct vfs_directory_entry entry;
-            if (!vfs_directory_entry_at(arguments, arguments_length, i,
-                                        &entry)) {
-                break;
+            if (!vfs_directory_entry_at(folder, folder_length, i, &entry)) {
+                console_write_error("Folder listing changed.\n");
+                return;
             }
             console_write_string(entry.name);
             if (entry.type == VFS_NODE_DIRECTORY) {
@@ -1020,25 +1021,6 @@ static void execute_command(void) {
             } else {
                 console_write_string(" (");
                 write_decimal(entry.size);
-                console_write_string(" bytes)\n");
-            }
-        }
-    } else if (command_matches(command, command_length, "ls")) {
-        if (arguments_length != 0) {
-            console_write_warning("Usage: ls [PATH]\n");
-        } else {
-            char path[256];
-            size_t file_size;
-            size_t count = initramfs_file_count();
-            for (size_t i = 0; i < count; i++) {
-                if (!initramfs_file_at(i, path, sizeof(path), &file_size)) {
-                    console_write_error("Initramfs directory entry is invalid.\n");
-                    return;
-                }
-                console_write_string("/");
-                console_write_string(path);
-                console_write_string(" (");
-                write_decimal(file_size);
                 console_write_string(" bytes)\n");
             }
         }
@@ -1059,7 +1041,6 @@ static void execute_command(void) {
         }
     } else if (command_matches(command, command_length, "run")) {
         enum user_program program;
-        struct initramfs_file file;
         bool run_file = false;
         const char *program_arguments = "";
         size_t program_arguments_length = 0;
@@ -1107,14 +1088,15 @@ static void execute_command(void) {
                 console_write_error("Application path is too long.\n");
                 return;
             }
-            /* path keeps the absolute form used for argv[0]/AT_EXECFN;
-               the initramfs lookup takes it without the leading slash. */
+            /* path keeps the absolute form used for argv[0]/AT_EXECFN. */
             path[0] = '/';
             for (size_t i = 0; i < path_length; i++) {
                 path[1 + i] = arguments[path_start + i];
             }
             path[1 + path_length] = '\0';
-            if (!initramfs_find_file(path + 1, &file)) {
+            struct vfs_metadata metadata;
+            if (!vfs_stat(path, path_length + 1, &metadata)
+                || metadata.type != VFS_NODE_FILE) {
                 console_write_error("Application file not found.\n");
                 return;
             }
@@ -1128,13 +1110,18 @@ static void execute_command(void) {
         uint64_t process_id;
         uint64_t exit_status;
         console_write_string("Starting user process...\n");
-        bool started = run_file
-            ? user_process_run_elf_args(file.data, file.size,
-                                        path, path_length + 1,
-                                        program_arguments,
-                                        program_arguments_length,
-                                        &process_id, &exit_status)
-            : user_process_run(program, &process_id, &exit_status);
+        enum user_run_result file_result = USER_RUN_FAILED;
+        bool started;
+        if (run_file) {
+            file_result = user_process_run_file(path, path_length + 1,
+                                                program_arguments,
+                                                program_arguments_length,
+                                                NULL, &process_id,
+                                                &exit_status);
+            started = file_result == USER_RUN_STARTED;
+        } else {
+            started = user_process_run(program, &process_id, &exit_status);
+        }
         if (!started) {
             console_write_error("Process could not start or clean up.\n");
         } else {

@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct permission_identity;
+
 void desktop_run(void);
 
 /*
@@ -35,6 +37,11 @@ int64_t desktop_app_window_present(uint64_t owner, const uint32_t *pixels,
 int64_t desktop_app_window_event(uint64_t owner,
                                  struct desktop_app_event *event,
                                  int64_t timeout_ms, bool *terminate);
+/* Asks the person at the desktop to choose one readable file. Returns its
+   path length, -125 on cancellation, or another negative errno. */
+int64_t desktop_app_pick_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              char *path, size_t capacity);
 /* Content size as width << 32 | height, or 0 without a window. */
 uint64_t desktop_app_window_size(uint64_t owner);
 /* The shared clipboard for programs. Set keeps at most 64 KiB. Get copies

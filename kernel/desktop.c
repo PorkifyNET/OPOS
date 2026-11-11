@@ -11,7 +11,6 @@
 #include "i2c_hid.h"
 #include "fat16.h"
 #include "font.h"
-#include "initramfs.h"
 #include "installer.h"
 #include "iso9660.h"
 #include "keyboard.h"
@@ -133,6 +132,27 @@ static char status_text[64];
 /* When the status message was set; it disappears STATUS_TICKS later. */
 static uint64_t status_tick;
 #define STATUS_TICKS 1000
+
+/* A protected-file confirmation grants exactly one queued built-in action. */
+enum protected_action {
+    PROTECTED_ACTION_NONE,
+    PROTECTED_ACTION_EDITOR_SAVE,
+    PROTECTED_ACTION_FILES_PROMPT,
+    PROTECTED_ACTION_FILES_MOVE,
+};
+
+static bool protected_active;
+static enum protected_action protected_action;
+static enum protected_action protected_grant;
+#define PROTECTED_PATH_CAPACITY 256
+static char protected_path[PROTECTED_PATH_CAPACITY];
+static size_t protected_path_length;
+static const char *protected_message;
+
+static bool protected_take(enum protected_action action);
+static void protected_request(enum protected_action action,
+                              const char *path, size_t length,
+                              const char *message);
 
 enum menu_action {
     MENU_TERMINAL,
@@ -378,8 +398,9 @@ static bool line_ctrl_key(char *text, size_t *length, size_t limit,
 
 #define TERMINAL_HISTORY 1000
 #define TERMINAL_COLUMNS 96
+#define TERMINAL_INPUT_CAPACITY 512
 
-static char terminal_line[64];
+static char terminal_line[TERMINAL_INPUT_CAPACITY];
 static size_t terminal_length;
 /* Scrollback is a ring: terminal_line_at(0) is the oldest kept line. Every
    line has an absolute number (terminal_dropped + index) so a selection
@@ -570,6 +591,7 @@ static size_t terminal_output_length;
 static void draw_scene(void);
 static void window_open(enum window_kind kind);
 static void window_raise(enum window_kind kind);
+static void files_picker_cancel(void);
 static bool desktop_active;
 /* Programs waiting to read a line typed into the Terminal. */
 static size_t app_input_readers;
@@ -660,23 +682,30 @@ static const char *run_result_text(enum run_result result) {
 }
 
 static void terminal_list_files(void) {
-    size_t count = initramfs_file_count();
+    size_t count;
+    if (!vfs_directory_count("/", 1, &count)) {
+        terminal_print("ROOT LIST UNAVAILABLE");
+        return;
+    }
     if (count == 0) {
-        terminal_print("NO FILES");
+        terminal_print("ROOT IS EMPTY");
         return;
     }
     for (size_t i = 0; i < count; i++) {
-        char path[128];
-        size_t file_size;
-        if (!initramfs_file_at(i, path, sizeof(path), &file_size)) {
-            terminal_print("FILE LIST UNAVAILABLE");
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at("/", 1, i, &entry)) {
+            terminal_print("ROOT LIST UNAVAILABLE");
             return;
         }
-        char line[TERMINAL_COLUMNS] = "/";
-        size_t length = append_text(line, sizeof(line), 1, path);
-        length = append_text(line, sizeof(line), length, "  ");
-        length = append_decimal(line, sizeof(line), length, file_size);
-        append_text(line, sizeof(line), length, " BYTES");
+        char line[TERMINAL_COLUMNS] = "";
+        size_t length = append_text(line, sizeof(line), 0, entry.name);
+        if (entry.type == VFS_NODE_DIRECTORY) {
+            append_text(line, sizeof(line), length, "/");
+        } else {
+            length = append_text(line, sizeof(line), length, "  ");
+            length = append_decimal(line, sizeof(line), length, entry.size);
+            append_text(line, sizeof(line), length, " BYTES");
+        }
         terminal_print(line);
     }
 }
@@ -689,7 +718,7 @@ struct terminal_help_entry {
 
 static const struct terminal_help_entry terminal_help_entries[] = {
     {"help", "help [COMMAND]", "Lists commands or explains one command."},
-    {"ls", "ls", "Lists files shipped in the OPOS initramfs."},
+    {"ls", "ls", "Lists folders and files at the system root."},
     {"clear", "clear", "Clears Terminal scrollback."},
     {"uptime", "uptime", "Shows time since OPOS started."},
     {"elf", "elf", "Runs the built-in ELF loader test."},
@@ -712,8 +741,8 @@ static const struct terminal_help_entry terminal_help_entries[] = {
 };
 
 static bool terminal_bin_program(const char *name, size_t length) {
-    char path[48] = "bin/";
-    if (length == 0 || length + 5 > sizeof(path)) {
+    char path[48] = "/bin/";
+    if (length == 0 || length + 6 > sizeof(path)) {
         return false;
     }
     for (size_t i = 0; i < length; i++) {
@@ -722,11 +751,12 @@ static bool terminal_bin_program(const char *name, size_t length) {
               || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
             return false;
         }
-        path[4 + i] = c;
+        path[5 + i] = c;
     }
-    path[4 + length] = '\0';
-    struct initramfs_file file;
-    return initramfs_find_file(path, &file);
+    path[5 + length] = '\0';
+    struct vfs_metadata metadata;
+    return vfs_stat(path, 5 + length, &metadata)
+        && metadata.type == VFS_NODE_FILE;
 }
 
 static void terminal_command_help(const char *name, size_t length) {
@@ -780,9 +810,19 @@ static bool terminal_net_output(void) {
 }
 
 static bool terminal_execute(void) {
-    char echo[TERMINAL_COLUMNS] = "OPOS> ";
-    append_text(echo, sizeof(echo), 6, terminal_line);
-    terminal_print(echo);
+    size_t echoed = 0;
+    do {
+        char echo[TERMINAL_COLUMNS] = "OPOS> ";
+        if (echoed != 0) {
+            text_copy(echo, sizeof(echo), "      ");
+        }
+        size_t used = 6;
+        while (echoed < terminal_length && used + 1 < sizeof(echo)) {
+            echo[used++] = terminal_line[echoed++];
+        }
+        echo[used] = '\0';
+        terminal_print(echo);
+    } while (echoed < terminal_length);
 
     if (text_equals(terminal_line, terminal_length, "help")) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
@@ -908,10 +948,11 @@ static bool terminal_execute(void) {
             i++;
         }
         path[length] = '\0';
-        struct initramfs_file file;
+        struct vfs_metadata metadata;
         bool program = length > 5
             && (i == terminal_length || terminal_line[i] == ' ')
-            && initramfs_find_file(path + 1, &file);
+            && vfs_stat(path, length, &metadata)
+            && metadata.type == VFS_NODE_FILE;
         if (!program) {
             terminal_print("UNKNOWN COMMAND - TYPE HELP");
         } else {
@@ -1130,6 +1171,9 @@ static void window_open(enum window_kind kind) {
 }
 
 static void window_close(enum window_kind kind) {
+    if (kind == WINDOW_FILES) {
+        files_picker_cancel();
+    }
     if (window_is_app(kind)) {
         app_window_closed(kind - WINDOW_APP);
     }
@@ -1244,10 +1288,15 @@ static void draw_terminal(struct rect area, bool focused) {
     }
     draw_text_clipped(text_x, prompt_y, text_width, "OPOS>", 120, 210, 170);
     int64_t line_x = text_x + 6 * CHAR_WIDTH;
+    size_t visible_columns = text_width > 7 * CHAR_WIDTH
+        ? (size_t)(text_width / CHAR_WIDTH) - 7 : 1;
+    size_t input_start = terminal_length > visible_columns
+        ? terminal_length - visible_columns : 0;
     draw_text_clipped(line_x, prompt_y, text_width - 6 * CHAR_WIDTH,
-                      terminal_line, 240, 245, 255);
+                      terminal_line + input_start, 240, 245, 255);
     if (focused) {
-        int64_t caret_x = line_x + (int64_t)terminal_length * CHAR_WIDTH;
+        int64_t caret_x = line_x
+            + (int64_t)(terminal_length - input_start) * CHAR_WIDTH;
         if (caret_x + CHAR_WIDTH < area.x + area.width
             && (timer_ticks() / 50) % 2 == 0) {
             fill((struct rect){caret_x, prompt_y, CHAR_WIDTH - 2, CHAR_HEIGHT},
@@ -1261,8 +1310,8 @@ static void draw_terminal(struct rect area, bool focused) {
 /*
  * Plain-text editor window. The whole file lives in one buffer (64 KiB,
  * like the program load limit). CRLF files are edited as LF and written back
- * as CRLF. Files that cannot be written (initramfs) or that look binary open
- * read-only; Ctrl+S then asks for a new name on the disk.
+ * as CRLF. Files that cannot be written or that look binary open
+ * read-only; Ctrl+S then asks for a writable destination.
  */
 #define EDITOR_CAPACITY (64 * 1024)
 #define EDITOR_PATH_CAPACITY 256
@@ -1420,7 +1469,7 @@ static bool editor_open(const char *path, size_t length) {
     if (binary) {
         set_status("BINARY FILE - OPENED READ-ONLY");
     } else if (editor_read_only) {
-        set_status("READ-ONLY - CTRL+S SAVES A COPY ON THE DISK");
+        set_status("READ-ONLY - CTRL+S SAVES A COPY");
     }
     return true;
 }
@@ -1449,6 +1498,12 @@ static void editor_save_to(const char *typed, size_t typed_length) {
     }
     if (!editor_is_writable_path(path, length)) {
         set_status("THAT LOCATION IS READ-ONLY - USE /DISK/...");
+        return;
+    }
+    if (permission_ui_requires_confirmation(path, length, PERMISSION_WRITE)
+        && !protected_take(PROTECTED_ACTION_EDITOR_SAVE)) {
+        protected_request(PROTECTED_ACTION_EDITOR_SAVE, path, length,
+                          "SAVE CHANGES TO A PROTECTED SYSTEM FILE?");
         return;
     }
     const uint8_t *data = (const uint8_t *)editor_text;
@@ -2109,7 +2164,7 @@ static void editor_click(struct rect area, int32_t x, int32_t y) {
 }
 
 /*
- * Files window: browses the whole VFS (initramfs at /, FAT disk at /disk).
+ * Files window: browses the whole VFS (system root at /, disk at /disk).
  * The listing of the current folder is cached and only reloaded when the
  * folder changes or the window opens, so redraws do not touch the disk.
  */
@@ -2136,6 +2191,24 @@ static size_t files_selection;
 static size_t files_scroll;
 static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
+
+/* One outstanding file request. Only Files can complete it; the process
+   waiting in the syscall receives the selected path afterward. */
+static struct {
+    uint64_t owner;
+    volatile int result; /* 0: waiting, 1: selected, 2: cancelled */
+    bool open_pending;
+    char name[32];
+    char path[FILES_PATH_CAPACITY];
+    struct permission_identity identity;
+} files_picker;
+
+static void files_picker_cancel(void) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        files_picker.result = 2;
+        scheduler_wake_event(&files_picker);
+    }
+}
 
 /*
  * Multi-selection: entries marked with Ctrl+click, Shift+click,
@@ -2867,13 +2940,14 @@ static size_t files_entry_path(size_t index, char *path, size_t capacity) {
 /*
  * Opens Notepad (/bin/notepad, an ordinary SDK program from sdk/) on a
  * file, or empty without one. Returns false when it cannot start: too many
- * programs run, or the initramfs has no Notepad. If it starts but cannot
+ * programs run, or the active system root has no Notepad. If it starts but cannot
  * run, the built-in editor opens instead (see apps_poll).
  */
 static bool notepad_launch(const char *path, size_t length) {
     static const char notepad[] = "/bin/notepad";
-    struct initramfs_file file;
-    if (!initramfs_find_file(notepad + 1, &file)) {
+    struct vfs_metadata metadata;
+    if (!vfs_stat(notepad, sizeof(notepad) - 1, &metadata)
+        || metadata.type != VFS_NODE_FILE) {
         return false;
     }
     char arguments[FILES_PATH_CAPACITY + 3];
@@ -2984,6 +3058,19 @@ static void files_open_row(size_t row) {
     size_t length = files_entry_path(row, path, sizeof(path));
     if (files_entries[row].directory) {
         (void)files_visit(path, length);
+    } else if (files_picker.owner != 0 && files_picker.result == 0) {
+        struct permission_identity baseline = files_picker.identity;
+        baseline.confined = false;
+        if (!permission_program_allows(&baseline, path, length,
+                                       PERMISSION_READ)) {
+            set_status("PROGRAM CANNOT READ THIS FILE");
+            return;
+        }
+        for (size_t i = 0; i <= length; i++) {
+            files_picker.path[i] = path[i];
+        }
+        files_picker.result = 1;
+        scheduler_wake_event(&files_picker);
     } else if (appearance_is_image_name(files_entries[row].name,
                                         text_length(files_entries[row].name))) {
         viewer_open(path, length);
@@ -3560,6 +3647,20 @@ static void draw_files(struct rect area, bool focused) {
     }
     if (files_prompt_kind != FILES_PROMPT_NONE) {
         files_draw_prompt(list);
+        return;
+    }
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        struct rect line = {list.x + 6,
+                            list.y + list.height - LINE_HEIGHT - 1,
+                            list.width - 12, LINE_HEIGHT};
+        fill(line, 54, 73, 108);
+        char message[128];
+        size_t used = append_text(message, sizeof(message), 0,
+                                  files_picker.name);
+        append_text(message, sizeof(message), used,
+                    ": CHOOSE FILE TO READ (ENTER); ESC CANCELS");
+        draw_text_clipped(line.x + 6, line.y + 3, line.width - 12,
+                          message, 240, 245, 255);
         return;
     }
     /* THIS PC: the selected drive's disk, e.g. "DISK 2 PARTITION 1:
@@ -4503,6 +4604,165 @@ static void draw_text_button(struct rect area, const char *label,
     fill(area, 43, 48, 60);
     draw_text_clipped(area.x + 10, area.y + (area.height - CHAR_HEIGHT) / 2,
                       area.width - 20, label, 110, 118, 135);
+}
+
+/* --------------------------------------- protected system-file confirmation */
+
+static struct text_field protected_password;
+static const char *protected_feedback = "";
+
+static void files_prompt_commit(void);
+static void files_move_selection(const char *target, size_t target_length);
+
+static bool protected_needs_password(void) {
+    size_t account = accounts_current();
+    return account != ACCOUNT_NONE && accounts_has_password(account);
+}
+
+static bool protected_take(enum protected_action action) {
+    if (protected_grant != action) {
+        return false;
+    }
+    protected_grant = PROTECTED_ACTION_NONE;
+    return true;
+}
+
+static void protected_request(enum protected_action action,
+                              const char *path, size_t length,
+                              const char *message) {
+    if (length >= sizeof(protected_path)) {
+        set_status("PROTECTED PATH IS TOO LONG");
+        return;
+    }
+    for (size_t i = 0; i < length; i++) {
+        protected_path[i] = path[i];
+    }
+    protected_path[length] = '\0';
+    protected_path_length = length;
+    protected_action = action;
+    protected_message = message;
+    protected_feedback = "";
+    field_reset(&protected_password, ACCOUNT_PASSWORD_MAX, true);
+    protected_active = true;
+    start_menu_open = false;
+    programs_open = false;
+}
+
+static void protected_cancel(void) {
+    enum protected_action action = protected_action;
+    protected_active = false;
+    protected_action = PROTECTED_ACTION_NONE;
+    protected_grant = PROTECTED_ACTION_NONE;
+    field_reset(&protected_password, ACCOUNT_PASSWORD_MAX, true);
+    if (action == PROTECTED_ACTION_FILES_PROMPT) {
+        files_prompt_kind = FILES_PROMPT_NONE;
+    }
+    set_status("PROTECTED FILE ACTION CANCELLED");
+}
+
+static void protected_continue(void) {
+    enum protected_action action = protected_action;
+    protected_active = false;
+    protected_action = PROTECTED_ACTION_NONE;
+    protected_grant = action;
+    field_reset(&protected_password, ACCOUNT_PASSWORD_MAX, true);
+    switch (action) {
+    case PROTECTED_ACTION_EDITOR_SAVE:
+        editor_save_to(protected_path, protected_path_length);
+        break;
+    case PROTECTED_ACTION_FILES_PROMPT:
+        files_prompt_commit();
+        break;
+    case PROTECTED_ACTION_FILES_MOVE:
+        files_move_selection(protected_path, protected_path_length);
+        break;
+    default:
+        break;
+    }
+    /* A continuation must consume its grant. Never leave an unlock behind. */
+    protected_grant = PROTECTED_ACTION_NONE;
+}
+
+static void protected_attempt(void) {
+    struct permission_identity identity = permission_session_identity();
+    if (!identity.admin) {
+        protected_cancel();
+        set_status("ACCESS DENIED");
+        return;
+    }
+    size_t account = accounts_current();
+    if (protected_needs_password()
+        && !accounts_password_matches(account, protected_password.text)) {
+        field_reset(&protected_password, ACCOUNT_PASSWORD_MAX, true);
+        protected_feedback = "WRONG PASSWORD";
+        return;
+    }
+    protected_continue();
+}
+
+static struct rect protected_panel_rect(void) {
+    int64_t width = screen_width() - 40 < 620 ? screen_width() - 40 : 620;
+    int64_t height = protected_needs_password() ? 270 : 220;
+    return (struct rect){(screen_width() - width) / 2,
+                         (screen_height() - height) / 2, width, height};
+}
+
+static struct rect protected_button_rect(size_t index) {
+    struct rect panel = protected_panel_rect();
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         panel.y + panel.height - 54, width, 34};
+}
+
+static void draw_protected_confirmation(void) {
+    if (!protected_active) {
+        return;
+    }
+    struct rect panel = protected_panel_rect();
+    fill(panel, 255, 175, 75);
+    fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
+                       panel.height - 4}, 35, 31, 35);
+    draw_text_clipped(panel.x + 24, panel.y + 20, panel.width - 48,
+                      "PROTECTED SYSTEM FILE", 255, 190, 110);
+    draw_text_clipped(panel.x + 24, panel.y + 50, panel.width - 48,
+                      protected_message, 245, 245, 250);
+    draw_text_clipped(panel.x + 24, panel.y + 78, panel.width - 48,
+                      protected_path, 175, 190, 220);
+    if (protected_needs_password()) {
+        draw_text_clipped(panel.x + 24, panel.y + 112, panel.width - 48,
+                          "ENTER YOUR ADMINISTRATOR PASSWORD TO CONTINUE:",
+                          220, 225, 238);
+        struct rect field = {panel.x + 24, panel.y + 138,
+                             panel.width - 48, 34};
+        draw_field(field, &protected_password, true);
+        draw_text_clipped(panel.x + 24, panel.y + 180, panel.width - 48,
+                          protected_feedback, 255, 120, 120);
+    } else {
+        draw_text_clipped(panel.x + 24, panel.y + 116, panel.width - 48,
+                          "THIS MAY PREVENT OPOS FROM BOOTING OR WORKING.",
+                          255, 145, 120);
+    }
+    draw_button(protected_button_rect(0), "CANCEL", false);
+    draw_button(protected_button_rect(1), "CONTINUE", true);
+}
+
+static void protected_key(char character) {
+    if (character == KEY_ESCAPE) {
+        protected_cancel();
+    } else if (character == '\n') {
+        protected_attempt();
+    } else if (protected_needs_password()) {
+        protected_feedback = "";
+        (void)field_key(&protected_password, character);
+    }
+}
+
+static void protected_press(int32_t x, int32_t y) {
+    if (rect_contains(protected_button_rect(0), x, y)) {
+        protected_cancel();
+    } else if (rect_contains(protected_button_rect(1), x, y)) {
+        protected_attempt();
+    }
 }
 
 /* ---------------------------------------------------------- login screen */
@@ -7369,16 +7629,19 @@ static void draw_taskbar_menu(void) {
 }
 
 /*
- * Start > PROGRAMS: the programs in /bin, in a submenu beside the Start
- * menu (Windows XP style). It opens when the pointer rests on PROGRAMS,
- * or with Right/Enter; the list is read each time it opens.
+ * Start > PROGRAMS: built-in /bin and installed /disk/Programs files in a
+ * submenu beside Start. Built-in names take precedence over disk names.
+ * Terminal-only tools stay in /bin but are omitted from the menu, including
+ * disk files with those names. The list is read each time it opens.
  */
 #define PROGRAMS_MAX 32
 #define PROGRAMS_NAME_CAPACITY 32
 #define PROGRAMS_DIRECTORY "/bin"
+#define PROGRAMS_DISK_DIRECTORY "/disk/Programs"
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
 
 static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
+static bool programs_disk[PROGRAMS_MAX];
 static size_t programs_count;
 static bool programs_focus;  /* the keyboard is in the submenu */
 static size_t programs_selection;
@@ -7394,22 +7657,64 @@ static char ascii_upper(char character) {
                                                 : character;
 }
 
-static void programs_load(void) {
-    static const char directory[] = PROGRAMS_DIRECTORY;
-    programs_count = 0;
+static bool programs_name_equal(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0') {
+        if (ascii_upper(a[i]) != ascii_upper(b[i])) {
+            return false;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static bool programs_terminal_only(const char *name) {
+    return programs_name_equal(name, "fetch")
+        || programs_name_equal(name, "update");
+}
+
+static void programs_load_directory(const char *directory, bool disk) {
+    size_t directory_length = text_length(directory);
     size_t count;
-    if (!vfs_directory_count(directory, sizeof(directory) - 1, &count)) {
+    if (!vfs_directory_count(directory, directory_length, &count)) {
         return;
     }
     for (size_t i = 0; i < count && programs_count < PROGRAMS_MAX; i++) {
         struct vfs_directory_entry entry;
-        if (!vfs_directory_entry_at(directory, sizeof(directory) - 1, i,
+        if (!vfs_directory_entry_at(directory, directory_length, i,
                                     &entry)) {
             break;
         }
         if (entry.type != VFS_NODE_FILE
-            || entry.name_length >= PROGRAMS_NAME_CAPACITY) {
+            || entry.name_length >= PROGRAMS_NAME_CAPACITY
+            || programs_terminal_only(entry.name)) {
             continue;
+        }
+        if (disk) {
+            bool duplicate = false;
+            for (size_t j = 0; j < programs_count; j++) {
+                if (programs_name_equal(entry.name, programs_names[j])) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            char path[64];
+            size_t path_length = append_text(path, sizeof(path), 0,
+                                             directory);
+            path_length = append_text(path, sizeof(path), path_length, "/");
+            path_length = append_text(path, sizeof(path), path_length,
+                                      entry.name);
+            uint8_t magic[4];
+            size_t bytes = 0;
+            if (!vfs_read_at(path, path_length, 0, magic,
+                                sizeof(magic), &bytes)
+                || bytes != sizeof(magic) || magic[0] != 0x7f
+                || magic[1] != 'E' || magic[2] != 'L' || magic[3] != 'F') {
+                continue;
+            }
         }
         /* Sorted by name, case ignored. */
         size_t at = programs_count++;
@@ -7425,13 +7730,27 @@ static void programs_load(void) {
                 break;
             }
             text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
+            programs_disk[at] = programs_disk[at - 1];
             at--;
         }
         for (size_t j = 0; j < entry.name_length; j++) {
             programs_names[at][j] = entry.name[j];
         }
         programs_names[at][entry.name_length] = '\0';
+        programs_disk[at] = disk;
     }
+}
+
+static void programs_load(void) {
+    static const char disk_directory[] = PROGRAMS_DISK_DIRECTORY;
+    struct vfs_metadata metadata;
+    programs_count = 0;
+    programs_load_directory(PROGRAMS_DIRECTORY, false);
+    if (!vfs_stat(disk_directory, sizeof(disk_directory) - 1, &metadata)) {
+        (void)vfs_create_directory(disk_directory,
+                                   sizeof(disk_directory) - 1);
+    }
+    programs_load_directory(disk_directory, true);
 }
 
 static void programs_show(bool focus) {
@@ -7496,7 +7815,10 @@ static void programs_launch(size_t index) {
     start_menu_open = false;
     programs_open = false;
     char path[64];
-    size_t length = append_text(path, sizeof(path), 0, PROGRAMS_DIRECTORY "/");
+    size_t length = append_text(path, sizeof(path), 0,
+                                programs_disk[index]
+                                    ? PROGRAMS_DISK_DIRECTORY "/"
+                                    : PROGRAMS_DIRECTORY "/");
     length = append_text(path, sizeof(path), length, programs_names[index]);
     files_run_program(path, length);
 }
@@ -7707,6 +8029,7 @@ static void draw_scene(void) {
     }
     draw_taskbar_menu();
     draw_net_popup();
+    draw_protected_confirmation();
     if (buffered) {
         console_frame_present();
     } else {
@@ -8047,7 +8370,7 @@ static void files_start_prompt(enum files_prompt_kind kind) {
         return;
     }
     if (files_location_read_only()) {
-        set_status("THIS LOCATION IS READ-ONLY - USE THE DISK");
+        set_status("THIS LOCATION IS READ-ONLY - CHOOSE A WRITABLE FOLDER");
         return;
     }
     files_prompt_kind = kind;
@@ -8236,8 +8559,42 @@ static void files_editor_follow(const char *old_path, size_t old_length,
 /*
  * Moves the selection into the folder target. Within one volume this is
  * a rename; across volumes the items are copied and then deleted. From a
- * read-only place (the initramfs, a CD) they are copied.
+ * read-only place (the system root, a CD) they are copied.
  */
+static bool files_move_is_protected(const char *target, size_t target_length,
+                                    const size_t *indices, size_t count,
+                                    bool copy_only) {
+    for (size_t i = 0; i < count; i++) {
+        const struct files_entry *entry = &files_entries[indices[i]];
+        size_t name_length = text_length(entry->name);
+        char source[FILES_PATH_CAPACITY];
+        size_t source_length;
+        char destination[FILES_PATH_CAPACITY];
+        if (!files_child_path(entry->name, name_length, source,
+                              &source_length)
+            || target_length + 1 + name_length >= sizeof(destination)) {
+            continue;
+        }
+        size_t destination_length = append_text(destination,
+                                                 sizeof(destination), 0,
+                                                 target);
+        if (destination_length != 1) {
+            destination[destination_length++] = '/';
+        }
+        for (size_t j = 0; j < name_length; j++) {
+            destination[destination_length++] = entry->name[j];
+        }
+        destination[destination_length] = '\0';
+        if (permission_ui_requires_confirmation(
+                destination, destination_length, PERMISSION_WRITE)
+            || (!copy_only && permission_ui_requires_confirmation(
+                source, source_length, PERMISSION_REMOVE))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void files_move_selection(const char *target, size_t target_length) {
     static size_t indices[FILES_ENTRY_CAPACITY];
     size_t count = files_selected_entries(indices);
@@ -8257,6 +8614,13 @@ static void files_move_selection(const char *target, size_t target_length) {
         return;
     }
     bool copy_only = vfs_path_read_only(files_path, files_path_length);
+    if (files_move_is_protected(target, target_length, indices, count,
+                                copy_only)
+        && !protected_take(PROTECTED_ACTION_FILES_MOVE)) {
+        protected_request(PROTECTED_ACTION_FILES_MOVE, target, target_length,
+                          "MOVE ITEMS TO OR FROM PROTECTED SYSTEM FILES?");
+        return;
+    }
     set_status(copy_only ? "COPYING..." : "MOVING...");
     draw_scene();
     size_t done = 0;
@@ -8533,6 +8897,33 @@ static void files_prompt_commit(void) {
             indices[0] = files_prompt_target;
             count = 1;
         }
+        bool protected_needed = false;
+        char protected_target[FILES_PATH_CAPACITY];
+        size_t protected_length = 0;
+        for (size_t i = 0; i < count; i++) {
+            const struct files_entry *entry = &files_entries[indices[i]];
+            if (files_child_path(entry->name, text_length(entry->name), path,
+                                 &length)
+                && permission_ui_allows(path, length, PERMISSION_REMOVE)
+                && permission_ui_requires_confirmation(
+                    path, length, PERMISSION_REMOVE)) {
+                protected_needed = true;
+                if (protected_length == 0) {
+                    protected_length = append_text(
+                        protected_target, sizeof(protected_target), 0, path);
+                }
+            }
+        }
+        if (protected_needed
+            && !protected_take(PROTECTED_ACTION_FILES_PROMPT)) {
+            files_prompt_kind = kind;
+            protected_request(PROTECTED_ACTION_FILES_PROMPT,
+                              protected_target, protected_length,
+                              count == 1
+                                  ? "DELETE THIS PROTECTED SYSTEM ITEM?"
+                                  : "DELETE PROTECTED SYSTEM ITEMS?");
+            return;
+        }
         bool removed = true;
         bool denied = false;
         for (size_t i = 0; i < count; i++) {
@@ -8572,13 +8963,13 @@ static void files_prompt_commit(void) {
         set_status("ACCESS DENIED");
         return;
     }
+    char old_path[FILES_PATH_CAPACITY];
+    size_t old_length = 0;
     if (kind == FILES_PROMPT_RENAME) {
         if (files_prompt_target >= files_count) {
             return;
         }
         const struct files_entry *entry = &files_entries[files_prompt_target];
-        char old_path[FILES_PATH_CAPACITY];
-        size_t old_length;
         if (!files_child_path(entry->name, text_length(entry->name),
                               old_path, &old_length)) {
             return;
@@ -8587,6 +8978,29 @@ static void files_prompt_commit(void) {
             set_status("ACCESS DENIED");
             return;
         }
+    }
+    enum permission_access target_access = kind == FILES_PROMPT_RENAME
+        ? PERMISSION_REMOVE : PERMISSION_WRITE;
+    bool protected_needed = permission_ui_requires_confirmation(
+        path, length, target_access)
+        || (kind == FILES_PROMPT_RENAME
+            && permission_ui_requires_confirmation(
+                old_path, old_length, PERMISSION_REMOVE));
+    if (protected_needed && !protected_take(PROTECTED_ACTION_FILES_PROMPT)) {
+        const char *protected_target = kind == FILES_PROMPT_RENAME
+            && permission_ui_requires_confirmation(
+                old_path, old_length, PERMISSION_REMOVE) ? old_path : path;
+        size_t protected_length = protected_target == old_path
+            ? old_length : length;
+        files_prompt_kind = kind;
+        protected_request(PROTECTED_ACTION_FILES_PROMPT,
+                          protected_target, protected_length,
+                          kind == FILES_PROMPT_RENAME
+                              ? "RENAME THIS PROTECTED SYSTEM ITEM?"
+                              : "CREATE AN ITEM IN PROTECTED SYSTEM FILES?");
+        return;
+    }
+    if (kind == FILES_PROMPT_RENAME) {
         enum vfs_rename_result result =
             vfs_rename(old_path, old_length, path, length);
         if (result == VFS_RENAME_OK) {
@@ -8773,6 +9187,9 @@ static void files_use_picture(bool account_picture) {
 
 /* Opens the right-click menu for the Files content area at (x, y). */
 static void files_context(struct rect area, int32_t x, int32_t y) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        return;
+    }
     files_prompt_kind = FILES_PROMPT_NONE;
     struct rect list = files_list_area(area);
     if (x < list.x) {
@@ -8933,6 +9350,19 @@ static void draw_files_menu(void) {
 }
 
 static void files_key(char character) {
+    if (files_picker.owner != 0 && files_picker.result == 0) {
+        if (character == KEY_ESCAPE) {
+            files_picker_cancel();
+        } else if (files_address_editing) {
+            files_address_key(character);
+        } else if (keyboard_last_ctrl()
+                   && (character == 'l' || character == 'L')) {
+            files_address_start();
+        } else if (!keyboard_last_ctrl()) {
+            files_key_navigate(character);
+        }
+        return;
+    }
     if (files_menu_open && files_menu_key(character)) {
         return;
     }
@@ -9230,6 +9660,10 @@ static bool taskbar_drag_motion(const struct drag_state *drag, int32_t x,
 
 static enum desktop_result handle_press(int32_t x, int32_t y,
                                         struct drag_state *drag) {
+    if (protected_active) {
+        protected_press(x, y);
+        return DESKTOP_CONTINUE;
+    }
     if (login_active) {
         login_press(x, y);
         return DESKTOP_CONTINUE;
@@ -9335,7 +9769,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
             drag->offset_y = y - (int32_t)frame.y;
         }
     } else if (kind == WINDOW_FILES) {
-        if (files_click(content_rect(frame), x, y)) {
+        if (files_click(content_rect(frame), x, y)
+            && files_picker.owner == 0) {
             files_drag_start(x, y);
             drag->active = true;
             drag->mode = DRAG_FILES;
@@ -9587,6 +10022,12 @@ static enum desktop_result handle_super_key(char character) {
 }
 
 static enum desktop_result handle_key(char character, bool super) {
+    if (protected_active) {
+        if (!super) {
+            protected_key(character);
+        }
+        return DESKTOP_CONTINUE;
+    }
     if (login_active) {
         if (!super) {
             login_key(character);
@@ -9659,7 +10100,7 @@ static enum desktop_result handle_key(char character, bool super) {
 /* Right click: raises the window under the pointer; Files gets a menu,
    and so does the taskbar. */
 static void handle_right_press(int32_t x, int32_t y) {
-    if (login_active) {
+    if (protected_active || login_active) {
         return;
     }
     start_menu_open = false;
@@ -10192,6 +10633,50 @@ int64_t desktop_app_window_event(uint64_t owner,
     return result;
 }
 
+int64_t desktop_app_pick_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              char *path, size_t capacity) {
+    if (owner == 0 || name == NULL || identity == NULL || path == NULL) {
+        return -22;
+    }
+    if (!desktop_active || login_active) {
+        return -38;
+    }
+    if (files_picker.owner != 0) {
+        return -16;
+    }
+    files_picker.owner = owner;
+    files_picker.result = 0;
+    files_picker.open_pending = true;
+    files_picker.path[0] = '\0';
+    files_picker.identity = *identity;
+    text_copy(files_picker.name, sizeof(files_picker.name), name);
+    while (files_picker.result == 0) {
+        if (user_current_killed() || !desktop_active) {
+            files_picker_cancel();
+            break;
+        }
+        (void)scheduler_block_current_until_locked(
+            &files_picker, timer_ticks() + APP_WAIT_RECHECK_TICKS);
+    }
+    int64_t result = -125;
+    if (files_picker.result == 1 && !user_current_killed()) {
+        size_t length = text_length(files_picker.path);
+        if (length + 1 > capacity) {
+            result = -36;
+        } else {
+            for (size_t i = 0; i <= length; i++) {
+                path[i] = files_picker.path[i];
+            }
+            result = (int64_t)length;
+        }
+    }
+    files_picker.owner = 0;
+    files_picker.result = 0;
+    files_picker.open_pending = false;
+    return result;
+}
+
 void desktop_app_process_exited(uint64_t process_id) {
     for (size_t i = 0; i < APP_WINDOW_COUNT; i++) {
         if (process_id != 0 && app_windows[i].owner == process_id) {
@@ -10378,7 +10863,7 @@ static enum run_result app_job_start(struct app_job *job) {
 }
 
 /*
- * Starts an ELF program from the initramfs (/bin, /lib) or a disk
+ * Starts an ELF program from the system root (/bin, /lib) or a disk
  * (/disk...) as the logged-in account, after the same permission check
  * Files uses. RUN_STARTED means it is on its way: whether the file was
  * a program at all is known when its job ends.
@@ -10773,6 +11258,20 @@ static void tasks_key(char character) {
 static bool apps_poll(void) {
     bool redraw = false;
     uint64_t now = timer_ticks();
+    if (files_picker.owner != 0 && files_picker.result == 0
+        && files_picker.open_pending) {
+        files_picker.open_pending = false;
+        window_open(WINDOW_FILES);
+        char home[FILES_PATH_CAPACITY];
+        size_t length = accounts_home_path(NULL, home, sizeof(home));
+        if (length != 0) {
+            (void)files_visit(home, length);
+        }
+        files_menu_open = false;
+        files_prompt_kind = FILES_PROMPT_NONE;
+        files_marks_clear();
+        redraw = true;
+    }
     for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
         struct app_window *window = &app_windows[slot];
         if (window->owner == 0) {
@@ -10930,7 +11429,7 @@ static size_t wheel_scrolled(size_t first, int32_t notches, size_t rows,
 /* Mouse wheel or two-finger scroll (positive notches scroll up). It goes
    to the window under the pointer, focused or not. */
 static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
-    if (notches == 0 || login_active || start_menu_open) {
+    if (notches == 0 || protected_active || login_active || start_menu_open) {
         return false;
     }
     enum window_kind kind = window_at(x, y);
@@ -11033,12 +11532,18 @@ static bool desktop_step(void) {
     }
     if (mouse_read_state(&loop_mouse)) {
         struct mouse_state mouse = loop_mouse;
+        bool protected_was_active = protected_active;
+        if (protected_active) {
+            loop_drag.active = false;
+        }
         bool pressed = (mouse.buttons & 1) != 0;
         bool was_pressed = (loop_previous_buttons & 1) != 0;
         /* Before the press, so a click on a just-revealed taskbar works. */
-        redraw |= taskbar_track_pointer(
-            mouse.x, mouse.y,
-            pressed && loop_drag.active && loop_drag.mode == DRAG_TASKBAR);
+        if (!protected_active) {
+            redraw |= taskbar_track_pointer(
+                mouse.x, mouse.y,
+                pressed && loop_drag.active && loop_drag.mode == DRAG_TASKBAR);
+        }
         if (pressed && !was_pressed) {
             status_text[0] = '\0';
             if (handle_press(mouse.x, mouse.y, &loop_drag) == DESKTOP_EXIT) {
@@ -11074,8 +11579,12 @@ static bool desktop_step(void) {
             redraw = true;
         }
         loop_previous_buttons = mouse.buttons;
-        redraw |= start_menu_hover(mouse.x, mouse.y);
-        apps_mouse_update(mouse.x, mouse.y, mouse.buttons);
+        if (!protected_active) {
+            redraw |= start_menu_hover(mouse.x, mouse.y);
+        }
+        if (!protected_was_active && !protected_active) {
+            apps_mouse_update(mouse.x, mouse.y, mouse.buttons);
+        }
         redraw |= handle_wheel(mouse.x, mouse.y, mouse_take_wheel());
     }
     apps_check_resize();
@@ -11126,6 +11635,9 @@ void desktop_run(void) {
     status_text[0] = '\0';
     exit_to_shell = false;
     login_active = false;
+    protected_active = false;
+    protected_action = PROTECTED_ACTION_NONE;
+    protected_grant = PROTECTED_ACTION_NONE;
     if (installer_available()) {
         /* Live session: no accounts, the installer opens. */
         accounts_logout();

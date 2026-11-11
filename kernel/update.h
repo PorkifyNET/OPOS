@@ -33,7 +33,8 @@
  * version)" entry for them, then the staged files are copied over the
  * installed ones (the kernel last). STATE.TXT in the staging folder records
  * the step and options, so update_resume can finish after a power cut on the
- * next start. UPDATE_OPTION_NO_PREVIOUS explicitly skips that backup.
+ * next start. UPDATE_OPTION_NO_PREVIOUS is rejected while disk roots are
+ * being introduced: a previous boot pair is required for recovery.
  */
 
 enum update_result {

@@ -18,7 +18,9 @@
  *
  * Permissions: programs run as the account that started them. They may
  * read system files, but never change them; they reach only their own
- * home folder under /disk/Users; everything else on the disks is shared.
+ * home folder under /disk/Users. Programs launched from a disk can write
+ * only to their private app storage; use opos_app_storage() to find it.
+ * To read another file in the home folder, use opos_pick_file().
  */
 #ifndef OPOS_H
 #define OPOS_H
@@ -42,6 +44,7 @@
 #define OPOS_EINVAL 22
 #define OPOS_EROFS 30
 #define OPOS_ENAMETOOLONG 36
+#define OPOS_ECANCELED 125
 #define OPOS_ENOSYS 38
 #define OPOS_ENOTEMPTY 39
 
@@ -123,6 +126,8 @@ static inline long opos_syscall6(long number, long a, long b, long c,
 
 #define OPOS_SYS_ABI_VERSION 0x4f500000L
 #define OPOS_SYS_USER_INFO 0x4f500001L
+#define OPOS_SYS_APP_STORAGE 0x4f500002L
+#define OPOS_SYS_PICK_FILE 0x4f500003L
 
 /* The kernel's ABI version; at least OPOS_ABI_VERSION on a kernel that
    can run this program. */
@@ -144,6 +149,21 @@ struct opos_user_info {
 static inline long opos_user_info(struct opos_user_info *info) {
     info->size = sizeof(*info);
     return opos_syscall1(OPOS_SYS_USER_INFO, (long)info);
+}
+
+/* Private writable directory for disk-launched apps. Returns path length,
+   -OPOS_ENOENT if no private storage is available, or another error. */
+static inline long opos_app_storage(char *path, size_t capacity) {
+    return opos_syscall2(OPOS_SYS_APP_STORAGE, (long)path, (long)capacity);
+}
+
+/* Shows Files for the user to choose one readable file. Returns its path
+   length, -OPOS_ECANCELED on Esc/close, or another negative error. The
+   returned path can be opened for reading by this app and its children.
+   Choosing another file replaces the earlier grant for future opens;
+   already open handles stay valid. Disk apps only. */
+static inline long opos_pick_file(char *path, size_t capacity) {
+    return opos_syscall2(OPOS_SYS_PICK_FILE, (long)path, (long)capacity);
 }
 
 /* ------------------------------------------------------- system update */

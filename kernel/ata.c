@@ -160,6 +160,7 @@ static bool ata_start_command(size_t unit, uint32_t first_sector,
         io_out8(base + ATA_LBA_HIGH, (uint8_t)(first_sector >> 16));
         io_out8(base + ATA_COMMAND, write ? ATA_COMMAND_WRITE_SECTORS_EXT
                                           : ATA_COMMAND_READ_SECTORS_EXT);
+        ata_delay_400ns(unit);
         return true;
     }
 
@@ -176,6 +177,7 @@ static bool ata_start_command(size_t unit, uint32_t first_sector,
     io_out8(base + ATA_LBA_HIGH, (uint8_t)(first_sector >> 16));
     io_out8(base + ATA_COMMAND, write ? ATA_COMMAND_WRITE_SECTORS
                                       : ATA_COMMAND_READ_SECTORS);
+    ata_delay_400ns(unit);
     return true;
 }
 
@@ -193,6 +195,7 @@ bool ata_read_sectors(size_t unit, uint32_t first_sector,
         }
         ata_read_data_sector(unit, destination + (size_t)i * 512);
     }
+    ata_delay_400ns(unit);
     return ata_wait_status(unit, false);
 }
 
@@ -200,6 +203,8 @@ static bool send_flush(size_t unit) {
     io_out8(base_of(unit) + ATA_COMMAND,
             units[unit].lba48 ? ATA_COMMAND_CACHE_FLUSH_EXT
                               : ATA_COMMAND_CACHE_FLUSH);
+    /* BSY may not be visible yet; without the delay the wait can end early. */
+    ata_delay_400ns(unit);
     return ata_wait_status(unit, false);
 }
 
@@ -217,6 +222,7 @@ bool ata_write_sectors(size_t unit, uint32_t first_sector,
         }
         ata_write_data_sector(unit, source + (size_t)i * 512);
     }
+    ata_delay_400ns(unit);
     if (!ata_wait_status(unit, false)) {
         return false;
     }

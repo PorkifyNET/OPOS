@@ -117,10 +117,11 @@ struct permission_identity;
  * path, whose bytes are image. For a disk program: confines the identity,
  * records the program's hash, and sets capabilities to what the parent
  * held intersected with the defaults plus the account's grants. askable
- * becomes PERMISSION_CAPS_ASK_ON_USE plus the stored ask bits, minus
- * decided bits, within what the parent held. Other programs are left
- * alone. A missing store grants nothing extra; a malformed one also makes
- * nothing askable.
+ * becomes what the program's manifest declares (manifest.h), or without
+ * one PERMISSION_CAPS_ASK_ON_USE plus the stored ask bits; minus decided
+ * bits, within what the parent held. program_name takes the manifest's
+ * name. Other programs are left alone. A missing store grants nothing
+ * extra; a malformed one also makes nothing askable.
  */
 void permission_apply_program(struct permission_identity *identity,
                               const char *path, size_t length,

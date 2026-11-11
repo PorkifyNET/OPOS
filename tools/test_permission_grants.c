@@ -545,10 +545,88 @@ static void test_migration_and_launch(void) {
     files[store].data[0] = 'O';
 }
 
+/* A minimal ELF64 image whose PT_NOTE holds one manifest note. */
+static size_t manifest_elf(uint8_t *out, const char *name,
+                           uint32_t capabilities) {
+    memset(out, 0, 256);
+    memcpy(out, "\x7f" "ELF", 4);
+    out[4] = 2;
+    out[5] = 1;
+    out[32] = 64;  /* program headers at 64 */
+    out[54] = 56;  /* entry size */
+    out[56] = 1;   /* one entry */
+    out[64] = 4;   /* PT_NOTE */
+    out[64 + 8] = 120;
+    out[64 + 32] = 76;
+    uint8_t *note = out + 120;
+    note[0] = 5;
+    note[4] = 56;
+    note[8] = 2;
+    memcpy(note + 12, "OPOS", 5);
+    note[20] = 1; /* format */
+    memcpy(note + 24, &capabilities, 4);
+    strcpy((char *)note + 28, name);
+    strcpy((char *)note + 60, "2.0");
+    return 196;
+}
+
+static void test_manifest_launch(void) {
+    struct permission_identity session = permission_session_identity();
+    uint8_t elf[256];
+
+    /* Declaring files.shared lets a new program ask for it, and only it. */
+    size_t size = manifest_elf(elf, "Viewer", PERMISSION_CAP_FILES_SHARED);
+    put_file("/disk/Programs/viewer", elf, size);
+    struct permission_identity identity = session;
+    permission_apply_program(&identity, "/disk/Programs/viewer", 21, elf,
+                             size);
+    assert(strcmp(identity.program_name, "Viewer") == 0);
+    assert(identity.askable == PERMISSION_CAP_FILES_SHARED);
+    assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
+
+    /* Declaring nothing: never asks, even with a migration record. */
+    size = manifest_elf(elf, "Quiet", 0);
+    uint8_t hash[SHA256_DIGEST_SIZE];
+    hash_of(elf, size, hash);
+    struct permission_grants grants;
+    assert(permission_grants_load(0, &grants));
+    assert(permission_grants_set(&grants, hash, "Quiet", 0, 0,
+                                 PERMISSION_CAP_FILES_SHARED, 0));
+    assert(permission_grants_save(0, &grants));
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/quiet", 20, elf,
+                             size);
+    assert(identity.askable == 0);
+
+    /* Defaults are not "asked for", and decided bits stay decided. */
+    size = manifest_elf(elf, "Chat", PERMISSION_CAP_NET
+                                         | PERMISSION_CAP_WINDOW
+                                         | PERMISSION_CAP_CLIPBOARD_READ);
+    hash_of(elf, size, hash);
+    assert(permission_grants_decide(0, hash, NULL, PERMISSION_CAP_NET,
+                                    false, 1));
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/chat", 19, elf,
+                             size);
+    assert(identity.askable == PERMISSION_CAP_CLIPBOARD_READ);
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+
+    /* A broken manifest counts as none; the name is cleared on the next
+       program. */
+    size = manifest_elf(elf, "Broken", PERMISSION_CAP_FILES_SHARED);
+    elf[120 + 4] = 52;
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/broken", 21, elf,
+                             size);
+    assert(identity.program_name[0] == '\0');
+    assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
+}
+
 int main(void) {
     test_records();
     test_storage();
     test_migration_and_launch();
+    test_manifest_launch();
     puts("permission grants: passed");
     return 0;
 }

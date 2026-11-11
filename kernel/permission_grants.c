@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "manifest.h"
 #include "permission_grants.h"
 #include "permissions.h"
 #include "sha256.h"
@@ -344,6 +345,7 @@ void permission_apply_program(struct permission_identity *identity,
     permission_confine_disk_program(identity, path, length);
     identity->askable = 0;
     identity->program_known = false;
+    identity->program_name[0] = '\0';
     if (image == NULL || size == 0) {
         return;
     }
@@ -352,7 +354,18 @@ void permission_apply_program(struct permission_identity *identity,
     sha256_update(&hash, image, size);
     sha256_final(&hash, identity->program);
     identity->program_known = true;
-    identity->askable = PERMISSION_CAPS_ASK_ON_USE & parent;
+    /* With a manifest, the program may ask only for what it declared
+       (files.shared included). Without one: net and clipboard.read, plus
+       what migration recorded. */
+    struct manifest manifest;
+    bool declared = manifest_read(image, size, &manifest);
+    for (size_t i = 0; i < sizeof(identity->program_name); i++) {
+        identity->program_name[i] = declared ? manifest.name[i] : '\0';
+    }
+    uint32_t requestable = declared
+        ? manifest.capabilities & ~PERMISSION_CAPS_DISK_DEFAULT
+        : PERMISSION_CAPS_ASK_ON_USE;
+    identity->askable = requestable & parent;
     if (identity->account == PERMISSION_NO_ACCOUNT
         || identity->account >= accounts_count()) {
         return; /* nowhere to keep answers: ask, and remember per process */
@@ -367,10 +380,12 @@ void permission_apply_program(struct permission_identity *identity,
         return;
     }
     uint32_t decided = grant->granted | grant->denied;
+    if (!declared) {
+        requestable |= grant->ask;
+    }
     identity->capabilities = parent
         & (PERMISSION_CAPS_DISK_DEFAULT | grant->granted) & ~grant->denied;
-    identity->askable = (PERMISSION_CAPS_ASK_ON_USE | grant->ask) & ~decided
-        & parent;
+    identity->askable = requestable & ~decided & parent;
 }
 
 bool permission_grants_decide(size_t account,

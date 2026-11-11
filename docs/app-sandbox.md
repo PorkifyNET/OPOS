@@ -71,11 +71,27 @@ cannot script.
 
 ### Manifest
 
-A program declares what it wants in an ELF note section, `.opos.manifest`,
-so the SDK can fill it from a source line. The manifest holds a name, a
-version and the capabilities it requests. It is a request, never a grant.
-A program without a manifest asks for nothing beyond the defaults. The
-kernel reads the note at `execve` and ignores it if it is malformed.
+A program declares what it wants in an ELF note, so the SDK can fill it
+from a source line. The manifest holds a name, a version and the
+capabilities it requests. It is a request, never a grant. The kernel
+reads the note at `execve` and ignores it if it is malformed.
+
+As built in step 4 (`kernel/manifest.c`, `OPOS_MANIFEST` in `<opos.h>`):
+the note is type 2, owner "OPOS", in the existing `.note.opos` section
+and PT_NOTE segment next to crt0's ABI note (type 1). Its descriptor is
+56 bytes: format 1, capability bits, a 32-byte name and a 16-byte
+version, both NUL-terminated. Two manifests, bad bounds, an empty or
+unterminated name, or a control character make the kernel ignore it.
+
+- With a manifest, a program may ask only for what it lists beyond the
+  defaults. That includes `files.shared`, which a new program can get no
+  other way. The migration record does not add to it.
+- Without one, it may ask for `net` and `clipboard.read`, plus what
+  migration recorded. Linux programs and older SDK programs work
+  unchanged.
+- The prompt shows the manifest name. When it differs from the
+  executable's file name, the file name follows in parentheses, so a
+  program cannot pass for "Files" by its manifest alone.
 
 ### Identity of a program
 
@@ -204,7 +220,7 @@ that ability through a prompt, not silently and not by removal.
    `sdk/examples/sharedread.c` reports which paths a disk program may
    read.
 3. Done. Enforce `net` and `clipboard.read` with the desktop prompt.
-4. Manifest note and SDK support.
+4. Done. Manifest note and SDK support.
 5. Security Center window.
 6. Built-in programs.
 

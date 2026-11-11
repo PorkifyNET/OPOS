@@ -156,7 +156,7 @@ static struct {
     /* Clicks this soon after the panel opens are ignored, so a click
        meant for something else cannot answer it. */
     uint64_t opened_tick;
-    char name[32];
+    char name[72];
 } app_permission;
 
 static bool protected_active;
@@ -4763,8 +4763,9 @@ static void capability_text(uint32_t capability, const char **what,
                             const char **detail) {
     switch (capability) {
     case PERMISSION_CAP_FILES_SHARED:
-        *what = "READ EVERY FILE ON YOUR DISKS THAT IS NOT PRIVATE";
-        *detail = "ALL FILES OUTSIDE HOME FOLDERS AND SYSTEM FILES.";
+        /* At most 46 characters: the panel's width at 1280 and above. */
+        *what = "READ ALL NON-PRIVATE FILES ON YOUR DISKS";
+        *detail = "EVERYTHING BUT HOME FOLDERS AND SYSTEM FILES.";
         return;
     case PERMISSION_CAP_NET:
         *what = "USE THE NETWORK";
@@ -4789,7 +4790,7 @@ static void draw_app_permission(void) {
     const char *what;
     const char *detail;
     capability_text(app_permission.capability, &what, &detail);
-    char title[64];
+    char title[96];
     size_t used = 0;
     for (const char *p = "ALLOW "; *p != '\0'; p++) {
         title[used++] = *p;

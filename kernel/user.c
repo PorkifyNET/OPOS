@@ -1461,13 +1461,45 @@ static uint64_t user_clock_stamp(void) {
 static bool user_ask_capability(struct user_process *process,
                                 uint32_t capability) {
     process->identity.askable &= ~capability;
-    int64_t answer = desktop_app_ask_permission(process->id, process->name,
+    /* A manifest name is the program's own claim: show the executable's
+       name beside it, so "Files" cannot pass for the real Files. */
+    const char *claimed = process->identity.program_name;
+    size_t same = 0;
+    while (claimed[same] != '\0' && process->name[same] != '\0'
+           && (claimed[same] | 0x20) == (process->name[same] | 0x20)) {
+        same++;
+    }
+    bool redundant = claimed[same] == '\0' && process->name[same] == '\0';
+    char label[72];
+    size_t used = 0;
+    for (size_t i = 0; !redundant && claimed[i] != '\0'
+                       && used + 1 < sizeof(label); i++) {
+        label[used++] = claimed[i];
+    }
+    if (used != 0) {
+        static const char open[] = " (";
+        for (size_t i = 0; open[i] != '\0' && used + 1 < sizeof(label); i++) {
+            label[used++] = open[i];
+        }
+    }
+    size_t file_start = used;
+    for (size_t i = 0; process->name[i] != '\0' && used + 2 < sizeof(label);
+         i++) {
+        label[used++] = process->name[i];
+    }
+    if (file_start != 0) {
+        label[used++] = ')';
+    }
+    label[used] = '\0';
+    int64_t answer = desktop_app_ask_permission(process->id, label,
                                                 capability);
     if (answer < 0) {
         return false;
     }
     (void)permission_grants_decide(process->identity.account,
-                                   process->identity.program, process->name,
+                                   process->identity.program,
+                                   claimed[0] != '\0' ? claimed
+                                                      : process->name,
                                    capability, answer == 1,
                                    user_clock_stamp());
     if (answer == 1) {

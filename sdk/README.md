@@ -218,6 +218,39 @@ folder when Start > Programs opens. A disk app with the same name as a
 built-in `/bin` app does not replace the built-in menu entry.
 See `docs/security-model.md`.
 
+### Capabilities and the manifest
+
+A program launched from a disk holds `OPOS_CAP_STORAGE`,
+`OPOS_CAP_FILES_PICK`, `OPOS_CAP_CLIPBOARD_WRITE` and `OPOS_CAP_WINDOW`.
+Anything else fails with `OPOS_EACCES` until the person allows it:
+
+| Capability | Needed for |
+| --- | --- |
+| `OPOS_CAP_NET` | `socket()`, so all networking and name lookups |
+| `OPOS_CAP_CLIPBOARD_READ` | `opos_clipboard_get` |
+| `OPOS_CAP_FILES_SHARED` | reading files on `/disk..`/`/cdrom..` outside the program's own folder |
+
+The first time a program needs one, OPOS shows a Deny/Allow prompt. The
+answer is remembered for that exact executable, so rebuilding it asks
+again. A file in `<disk>/Programs/<folder>/` may read its own folder
+without `OPOS_CAP_FILES_SHARED`.
+
+Declare what the program may ask for once, at file scope:
+
+```c
+#include <opos.h>
+
+OPOS_MANIFEST("Fetch", "1.0", OPOS_CAP_NET);
+```
+
+With a manifest, the program can only ask for what it lists, and the
+prompt uses its name (shown beside the executable's file name when they
+differ). Listing `OPOS_CAP_FILES_SHARED` is the only way a new program can
+ask for that one. Without a manifest, a program may ask for
+`OPOS_CAP_NET` and `OPOS_CAP_CLIPBOARD_READ`. A manifest never grants
+anything by itself. `examples/fetch.c`, `sharedread.c` and `pickfile.c`
+carry one.
+
 ## Limits
 
 - Each program gets one window. Up to four program windows can be open at

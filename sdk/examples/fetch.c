@@ -16,6 +16,9 @@
 
 #define MAX_BODY (16u * 1024 * 1024)
 
+/* Run from a disk, it asks once before it uses the network. */
+OPOS_MANIFEST("Fetch", "1.0", OPOS_CAP_NET);
+
 static void usage(void) {
     printf("Usage: fetch [-o FILE] [http://|https://]HOST[:PORT][/PATH]\n");
 }

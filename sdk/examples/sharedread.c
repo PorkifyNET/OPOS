@@ -2,10 +2,14 @@
    OPOS allowed it. Copy it to /disk/Programs (or a folder below it) to see
    the files.shared rules from docs/app-sandbox.md:
 
-     sharedread /disk/notes.txt            refused without files.shared
+     sharedread /disk/notes.txt            asks for files.shared once;
+                                           refused if denied
      sharedread /disk/Programs/Me/data.txt allowed when run from
                                            /disk/Programs/Me/sharedread */
 #include <opos.h>
+
+/* Declares files.shared, so a refused read asks the person once. */
+OPOS_MANIFEST("Shared Read", "1.0", OPOS_CAP_FILES_SHARED);
 
 int main(int argc, char **argv) {
     if (argc < 2) {

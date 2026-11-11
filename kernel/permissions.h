@@ -65,6 +65,9 @@ struct permission_identity {
     /* SHA-256 of the confined program's executable, when known. */
     bool program_known;
     uint8_t program[32];
+    /* Name from the program's manifest, or empty. Chosen by the program,
+       so never shown without the executable's own name beside it. */
+    char program_name[32];
     /* <volume>/Programs/<folder> when the executable lives in such a
        folder: readable without files.shared. Empty otherwise. */
     char program_folder[128];

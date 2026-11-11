@@ -1476,6 +1476,18 @@ static bool user_ask_capability(struct user_process *process,
     return answer == 1;
 }
 
+/* True when the process holds capability, after asking the person if the
+   program may still ask for it. */
+static bool user_capability_allowed(struct user_process *process,
+                                    uint32_t capability) {
+    if (permission_has(&process->identity, capability)) {
+        return true;
+    }
+    return process->identity.program_known
+        && (process->identity.askable & capability) == capability
+        && user_ask_capability(process, capability);
+}
+
 /* True when the process's identity may access the resolved path. A
    program that may still ask for the missing capability asks first. */
 static bool user_path_allowed(struct user_process *process,
@@ -1487,9 +1499,7 @@ static bool user_path_allowed(struct user_process *process,
     }
     uint32_t missing = permission_program_missing(&process->identity, path,
                                                   path_length, access);
-    return missing != 0 && process->identity.program_known
-        && (process->identity.askable & missing) == missing
-        && user_ask_capability(process, missing)
+    return missing != 0 && user_capability_allowed(process, missing)
         && permission_program_allows(&process->identity, path, path_length,
                                      access);
 }
@@ -3291,7 +3301,7 @@ static int64_t user_opos_update(const struct user_process *process,
 #define OPOS_WINDOW_PIXELS_MAX 4096
 
 /* Returns true when the process must end (frame->rax holds the status). */
-static bool user_opos_window(const struct user_process *process,
+static bool user_opos_window(struct user_process *process,
                              struct linux_syscall_frame *frame) {
     uint64_t number = frame->rax;
     int64_t result = -22;
@@ -3369,8 +3379,12 @@ static bool user_opos_window(const struct user_process *process,
         if (length > OPOS_CLIPBOARD_MAX) {
             length = OPOS_CLIPBOARD_MAX;
         }
-        if (length != 0
-            && !paging_user_range_valid(address, length, false, false)) {
+        if (!user_capability_allowed(process,
+                                     PERMISSION_CAP_CLIPBOARD_WRITE)) {
+            result = -13;
+        } else if (length != 0
+                   && !paging_user_range_valid(address, length, false,
+                                               false)) {
             result = -14;
         } else {
             desktop_clipboard_set((const char *)address, length);
@@ -3382,8 +3396,13 @@ static bool user_opos_window(const struct user_process *process,
         if (capacity > OPOS_CLIPBOARD_MAX) {
             capacity = OPOS_CLIPBOARD_MAX;
         }
-        if (capacity != 0
-            && !paging_user_range_valid(address, capacity, true, false)) {
+        if (!user_capability_allowed(process,
+                                     PERMISSION_CAP_CLIPBOARD_READ)) {
+            result = -13;
+        } else if (capacity != 0
+                   && !paging_user_range_valid(address, capacity, true,
+                                               false)) {
+            /* Checked after the prompt: the memory may have changed. */
             result = -14;
         } else {
             result = (int64_t)desktop_clipboard_get((char *)address, capacity);
@@ -3606,6 +3625,10 @@ static int64_t user_linux_socket(struct user_process *process,
     if (protocol != 0
         && protocol != (kind == LINUX_SOCK_STREAM ? 6u : 17u)) {
         return -93; /* EPROTONOSUPPORT */
+    }
+    /* Every network path (DNS included) starts here. */
+    if (!user_capability_allowed(process, PERMISSION_CAP_NET)) {
+        return -13;
     }
     struct user_file_descriptor file = {
         .kind = USER_OPEN_FILE_SOCKET,

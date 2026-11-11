@@ -352,7 +352,13 @@ void permission_apply_program(struct permission_identity *identity,
     sha256_update(&hash, image, size);
     sha256_final(&hash, identity->program);
     identity->program_known = true;
+    identity->askable = PERMISSION_CAPS_ASK_ON_USE & parent;
+    if (identity->account == PERMISSION_NO_ACCOUNT
+        || identity->account >= accounts_count()) {
+        return; /* nowhere to keep answers: ask, and remember per process */
+    }
     if (!permission_grants_load(identity->account, &scratch)) {
+        identity->askable = 0; /* damaged store: refuse, never guess */
         return;
     }
     const struct permission_grant *grant =
@@ -360,9 +366,11 @@ void permission_apply_program(struct permission_identity *identity,
     if (grant == NULL) {
         return;
     }
+    uint32_t decided = grant->granted | grant->denied;
     identity->capabilities = parent
         & (PERMISSION_CAPS_DISK_DEFAULT | grant->granted) & ~grant->denied;
-    identity->askable = grant->ask & parent;
+    identity->askable = (PERMISSION_CAPS_ASK_ON_USE | grant->ask) & ~decided
+        & parent;
 }
 
 bool permission_grants_decide(size_t account,

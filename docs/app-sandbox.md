@@ -116,9 +116,17 @@ All checks run in the kernel, in the path every syscall already uses.
   folder, because its directory is shared with other programs. Running a
   disk program (`execve`, spawn) needs no `files.shared`: running confers
   no data to the caller.
-- `net`: check in the socket-creating syscalls in `kernel/user.c`. A
-  denied call returns `EACCES`.
-- `clipboard.read`: check in `OPOS_SYSCALL_CLIPBOARD_GET`.
+- `net` (implemented): checked in `socket()` (`user_linux_socket`). Name
+  lookups are made in user space over UDP sockets, so every network path
+  starts there. A denied call returns `EACCES`. A socket a parent already
+  holds is inherited like any other descriptor; passing one to a child is
+  the parent's choice.
+- `clipboard.read` and `clipboard.write` (implemented): checked in
+  `OPOS_SYSCALL_CLIPBOARD_GET` and `_SET`. `clipboard.write` is a default
+  and is only missing if the person refused it.
+- `net` and `clipboard.read` are asked for on first use by every disk
+  program (`PERMISSION_CAPS_ASK_ON_USE`), within what its parent held.
+  With no account, the answer lasts for that process only.
 - Linux-compatibility programs use the same identity. The compatibility
   layer translates calls into the same kernel checks. It is not trusted to
   enforce them itself.
@@ -195,7 +203,7 @@ that ability through a prompt, not silently and not by removal.
 2. Done. Enforce `files.shared`, with the migration prompt above.
    `sdk/examples/sharedread.c` reports which paths a disk program may
    read.
-3. Enforce `net` and `clipboard.read` with the desktop prompt.
+3. Done. Enforce `net` and `clipboard.read` with the desktop prompt.
 4. Manifest note and SDK support.
 5. Security Center window.
 6. Built-in programs.
@@ -206,8 +214,9 @@ was never meant to have can now fail with `EACCES`.
 
 ## Open questions
 
-- Does a denied `net` call fail at `socket()` or at `connect()`? A
-  program that never connects should not need the capability.
+- Resolved: a denied `net` call fails at `socket()`, the one entry point.
+  A program that creates a socket and never connects asks anyway, which
+  is rare.
 - How are grants handled for programs run by the Terminal from a script?
 - Should the picker also hand out directory grants, not only one file?
   A document editor wants a folder.

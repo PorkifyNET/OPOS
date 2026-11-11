@@ -439,12 +439,14 @@ static void test_migration_and_launch(void) {
     assert(identity.confined && identity.program_known);
     assert(memcmp(identity.program, old_hash, SHA256_DIGEST_SIZE) == 0);
     assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
-    assert(identity.askable == PERMISSION_CAP_FILES_SHARED);
+    assert(identity.askable
+           == (PERMISSION_CAP_FILES_SHARED | PERMISSION_CAPS_ASK_ON_USE));
     identity = session;
     permission_apply_program(&identity, "/disk/Programs/new", 18, new_elf,
                              sizeof(new_elf));
     assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
-    assert(identity.askable == 0);
+    /* Any program may ask for the network and the clipboard. */
+    assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
 
     /* Built-in programs are left alone. */
     identity = session;
@@ -465,21 +467,42 @@ static void test_migration_and_launch(void) {
                              sizeof(old_elf));
     assert(identity.capabilities
            == (PERMISSION_CAPS_DISK_DEFAULT | PERMISSION_CAP_FILES_SHARED));
-    assert(identity.askable == 0);
+    assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
 
-    /* A parent without the capability bounds the child. */
+    /* A parent without the capability bounds the child, which cannot ask
+       for it either. */
     struct permission_identity parent = session;
-    parent.capabilities &= ~PERMISSION_CAP_FILES_SHARED;
+    parent.capabilities &= ~(PERMISSION_CAP_FILES_SHARED
+                             | PERMISSION_CAP_NET);
     permission_apply_program(&parent, "/disk/Programs/old", 18, old_elf,
                              sizeof(old_elf));
     assert(!permission_has(&parent, PERMISSION_CAP_FILES_SHARED));
+    assert(parent.askable == PERMISSION_CAP_CLIPBOARD_READ);
+
+    /* Allowing the network keeps it; refusing the clipboard stops asks. */
+    assert(permission_grants_decide(0, old_hash, NULL, PERMISSION_CAP_NET,
+                                    true, 10));
+    assert(permission_grants_decide(0, old_hash, NULL,
+                                    PERMISSION_CAP_CLIPBOARD_READ, false, 11));
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(permission_has(&identity, PERMISSION_CAP_NET));
+    assert(!permission_has(&identity, PERMISSION_CAP_CLIPBOARD_READ));
+    assert(identity.askable == 0);
+    assert(permission_grants_decide(0, old_hash, NULL, PERMISSION_CAP_NET,
+                                    false, 12));
+    assert(permission_grants_decide(0, old_hash, NULL,
+                                    PERMISSION_CAP_CLIPBOARD_READ, false, 13));
 
     /* Refusing replaces it and is not asked again; NULL keeps the name. */
     assert(permission_grants_decide(0, old_hash, NULL,
                                     PERMISSION_CAP_FILES_SHARED, false, 8));
     assert(permission_grants_load(0, &grants));
     old = permission_grants_find(&grants, old_hash);
-    assert(old->granted == 0 && old->denied == PERMISSION_CAP_FILES_SHARED
+    assert(old->granted == 0
+           && old->denied == (PERMISSION_CAP_FILES_SHARED | PERMISSION_CAP_NET
+                              | PERMISSION_CAP_CLIPBOARD_READ)
            && old->ask == 0 && strcmp(old->name, "old") == 0);
     identity = session;
     permission_apply_program(&identity, "/disk/Programs/old", 18, old_elf,
@@ -494,16 +517,32 @@ static void test_migration_and_launch(void) {
     permission_apply_program(&identity, "/disk/Programs/Suite/tool", 25,
                              tool_elf, sizeof(tool_elf));
     assert(!permission_has(&identity, PERMISSION_CAP_CLIPBOARD_WRITE));
-    assert(identity.askable == PERMISSION_CAP_FILES_SHARED);
+    assert(identity.askable
+           == (PERMISSION_CAP_FILES_SHARED | PERMISSION_CAPS_ASK_ON_USE));
 
-    /* Without an account nothing is loaded. */
+    /* Without an account nothing is loaded, but the program may ask; the
+       answer lasts for that process only. */
     struct permission_identity guest = {
         .account = PERMISSION_NO_ACCOUNT, .capabilities = PERMISSION_CAPS_ALL
     };
     permission_apply_program(&guest, "/disk/Programs/old", 18, old_elf,
                              sizeof(old_elf));
     assert(guest.capabilities == PERMISSION_CAPS_DISK_DEFAULT
-           && guest.askable == 0);
+           && guest.askable == PERMISSION_CAPS_ASK_ON_USE);
+    assert(!permission_grants_decide(PERMISSION_NO_ACCOUNT, old_hash, NULL,
+                                     PERMISSION_CAP_NET, true, 1));
+
+    /* A damaged store makes nothing askable. */
+    static const char alice[] = "/disk/Users/Alice/AppData/Permissions.dat";
+    int store = find_file(alice, strlen(alice));
+    assert(store >= 0);
+    files[store].data[0] = 'Z';
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/new", 18, new_elf,
+                             sizeof(new_elf));
+    assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT
+           && identity.askable == 0);
+    files[store].data[0] = 'O';
 }
 
 int main(void) {

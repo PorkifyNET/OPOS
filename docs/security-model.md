@@ -113,8 +113,10 @@ file handles already opened remain valid. Grants follow `fork` and
 The picker cannot grant access to another account's home or to the
 password file.
 
-Each process also carries a capability set. Built-in programs hold every
-capability. A disk app holds `storage`, `files.pick`, `clipboard.write`
+Each process also carries a capability set. Built-in programs hold what
+their job needs (`docs/app-sandbox.md`): only fetch, update and the
+browser may use the network, and only the browser may read the
+clipboard. A disk app holds `storage`, `files.pick`, `clipboard.write`
 and `window`, plus what the account granted that executable (keyed by its
 SHA-256) in `Permissions.dat`, minus what was refused. Children inherit
 the set and can only narrow it. The kernel checks `files.shared` (shared

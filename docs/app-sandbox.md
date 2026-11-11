@@ -205,6 +205,30 @@ they should go through the same model, with defaults that match their job
 the order below, because the desktop tools are integrated and the risk is
 lower than a third-party program.
 
+As built in step 6 (`permission_builtin_capabilities` in
+`kernel/permissions.c`), each `/bin` program holds a fixed set. A program
+started by a built-in can only narrow it further.
+
+| Program | Holds beyond the disk default |
+| --- | --- |
+| notepad | `files.shared` |
+| fetch, update | `files.shared`, `net` |
+| browser | `net`, `clipboard.read` |
+| any other `/bin` program | `files.shared` |
+| `/tests`, `/lib` | everything (self-tests) |
+| anything else not on a disk (a CD) | nothing |
+
+Built-ins are still not confined, and file checks apply only to confined
+programs, so file access is as before. What changes is that notepad
+cannot use the network, and only the browser can read the clipboard. A
+disk program that starts a built-in keeps its own limits and prompts.
+`files.all` was not added: confining the built-ins needs the picker to
+cover what Files and the Terminal pass to them on the command line.
+
+`<home>/AppData` itself can no longer be removed or renamed, by programs
+or in Files. Moving it aside used to leave `Permissions.dat` outside the
+protected path.
+
 ## Migration of existing disk programs
 
 Disk programs installed before step 2 read shared files freely. They keep
@@ -242,7 +266,7 @@ that ability through a prompt, not silently and not by removal.
 3. Done. Enforce `net` and `clipboard.read` with the desktop prompt.
 4. Done. Manifest note and SDK support.
 5. Done. Security Center window.
-6. Built-in programs.
+6. Done. Built-in programs.
 
 Each step must keep ABI version 1 working. New calls and fields are
 added. Existing ones do not change meaning, except that a call a program

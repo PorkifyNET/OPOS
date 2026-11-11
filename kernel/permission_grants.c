@@ -338,7 +338,14 @@ static struct permission_grants scratch;
 void permission_apply_program(struct permission_identity *identity,
                               const char *path, size_t length,
                               const uint8_t *image, size_t size) {
-    if (identity == NULL || !permission_is_disk_program(path, length)) {
+    if (identity == NULL || path == NULL || length == 0) {
+        return; /* kernel-embedded test programs have no path */
+    }
+    if (!permission_is_disk_program(path, length)) {
+        /* Built-ins narrow too, never widen what the parent held. */
+        uint32_t allowed = permission_builtin_capabilities(path, length);
+        identity->capabilities &= allowed;
+        identity->askable &= allowed;
         return;
     }
     uint32_t parent = identity->capabilities;

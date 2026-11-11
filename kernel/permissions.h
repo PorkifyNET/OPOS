@@ -113,6 +113,14 @@ bool permission_has(const struct permission_identity *identity,
 bool permission_is_disk_program(const char *path, size_t length);
 
 /*
+ * The most a program that is not on a disk may hold: a fixed set per
+ * /bin program (notepad has no net, the browser may read the clipboard),
+ * everything for /tests and /lib, and PERMISSION_CAPS_DISK_DEFAULT for
+ * anything else (a CD, for example). Disk programs get the disk default.
+ */
+uint32_t permission_builtin_capabilities(const char *path, size_t length);
+
+/*
  * When permission_program_allows refuses, the one capability that would
  * allow it (today only PERMISSION_CAP_FILES_SHARED), or 0 when no
  * capability would.

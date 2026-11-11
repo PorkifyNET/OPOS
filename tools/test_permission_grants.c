@@ -448,12 +448,14 @@ static void test_migration_and_launch(void) {
     /* Any program may ask for the network and the clipboard. */
     assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
 
-    /* Built-in programs are left alone. */
+    /* Built-in programs are not confined or recorded; they only narrow to
+       their job (see test_builtin_launch). */
     identity = session;
     permission_apply_program(&identity, "/bin/hello", 10, new_elf,
                              sizeof(new_elf));
     assert(!identity.confined && !identity.program_known);
-    assert(identity.capabilities == PERMISSION_CAPS_ALL);
+    assert(identity.capabilities
+           == permission_builtin_capabilities("/bin/hello", 10));
 
     /* Allowing stores the grant; the next launch has it. */
     assert(permission_grants_decide(0, old_hash, "old",
@@ -622,6 +624,39 @@ static void test_manifest_launch(void) {
     assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
 }
 
+static void test_builtin_launch(void) {
+    struct permission_identity identity = permission_session_identity();
+    static const uint8_t elf[] = {0x7F, 'E', 'L', 'F', 2, 1};
+    permission_apply_program(&identity, "/bin/notepad", 12, elf,
+                             sizeof(elf));
+    assert(!identity.confined);
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+    assert(!permission_has(&identity, PERMISSION_CAP_CLIPBOARD_READ));
+    assert(permission_has(&identity, PERMISSION_CAP_CLIPBOARD_WRITE));
+    /* notepad starting fetch cannot regain the network. */
+    permission_apply_program(&identity, "/bin/fetch", 10, elf, sizeof(elf));
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+
+    /* A disk program starting the browser keeps its own limits and may
+       still ask for what both allow. */
+    identity = permission_session_identity();
+    identity.askable = PERMISSION_CAPS_ASK_ON_USE;
+    identity.capabilities = PERMISSION_CAPS_DISK_DEFAULT;
+    permission_apply_program(&identity, "/bin/notepad", 12, elf,
+                             sizeof(elf));
+    assert(identity.askable == 0);
+    identity.askable = PERMISSION_CAPS_ASK_ON_USE;
+    permission_apply_program(&identity, "/bin/browser", 12, elf,
+                             sizeof(elf));
+    assert(identity.askable == PERMISSION_CAPS_ASK_ON_USE);
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+
+    /* No path (kernel-embedded tests): unchanged. */
+    identity = permission_session_identity();
+    permission_apply_program(&identity, NULL, 0, elf, sizeof(elf));
+    assert(identity.capabilities == PERMISSION_CAPS_ALL);
+}
+
 static void test_forget(void) {
     uint8_t program[SHA256_DIGEST_SIZE];
     memset(program, 0x5A, sizeof(program));
@@ -642,6 +677,7 @@ int main(void) {
     test_migration_and_launch();
     test_manifest_launch();
     test_forget();
+    test_builtin_launch();
     puts("permission grants: passed");
     return 0;
 }

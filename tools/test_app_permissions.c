@@ -230,6 +230,36 @@ int main(void) {
                   PERMISSION_WRITE));
     assert(allows(&built_in, "/disk/Users/Alice/Permissions.dat",
                   PERMISSION_WRITE));
+    /* AppData stays put, so Permissions.dat cannot be moved aside. */
+    assert(!allows(&built_in, "/disk/Users/Alice/AppData", PERMISSION_REMOVE));
+    assert(!allows(&built_in, "/disk/Users/Alice/appdata", PERMISSION_REMOVE));
+    assert(!permission_ui_allows("/disk/Users/Alice/AppData", 25,
+                                 PERMISSION_REMOVE));
+    assert(allows(&built_in, "/disk/Users/Alice/AppData", PERMISSION_WRITE));
+    assert(allows(&built_in, "/disk/Users/Alice/AppData/Other.dat",
+                  PERMISSION_REMOVE));
+
+    /* Built-ins hold what their job needs, matched by /bin name. */
+    assert(permission_builtin_capabilities("/bin/notepad", 12)
+           == (PERMISSION_CAPS_DISK_DEFAULT | PERMISSION_CAP_FILES_SHARED));
+    assert(permission_builtin_capabilities("/BIN/Notepad", 12)
+           == permission_builtin_capabilities("/bin/notepad", 12));
+    assert(permission_builtin_capabilities("/bin/fetch", 10)
+           & PERMISSION_CAP_NET);
+    assert(!(permission_builtin_capabilities("/bin/fetch", 10)
+             & PERMISSION_CAP_CLIPBOARD_READ));
+    assert(permission_builtin_capabilities("/bin/browser", 12)
+           & PERMISSION_CAP_CLIPBOARD_READ);
+    assert(!(permission_builtin_capabilities("/bin/unknown", 12)
+             & (PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ)));
+    assert(permission_builtin_capabilities("/tests/musl-net-test", 20)
+           == PERMISSION_CAPS_ALL);
+    assert(permission_builtin_capabilities("/bin/x/fetch", 12)
+           == PERMISSION_CAPS_DISK_DEFAULT);
+    assert(permission_builtin_capabilities("/cdrom/fetch", 12)
+           == PERMISSION_CAPS_DISK_DEFAULT);
+    assert(permission_builtin_capabilities("/disk/bin/fetch", 15)
+           == PERMISSION_CAPS_DISK_DEFAULT);
 
     /* files.shared: a confined program reads the person's volumes only
        with it, or inside its own program folder. */

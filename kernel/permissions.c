@@ -228,6 +228,54 @@ static bool same_entry(const char *folder, size_t folder_length,
 }
 
 /* Splits off the component starting at *offset; returns its length. */
+/* Each built-in gets what its job needs. Not enforced on unconfined
+   programs: files.shared, storage and files.pick, so file access is as
+   before. What changes for them is net and the clipboard. */
+#define BUILTIN_BASE                                                       \
+    (PERMISSION_CAP_STORAGE | PERMISSION_CAP_FILES_PICK                    \
+     | PERMISSION_CAP_FILES_SHARED | PERMISSION_CAP_CLIPBOARD_WRITE        \
+     | PERMISSION_CAP_WINDOW)
+
+static const struct {
+    const char *name;
+    uint32_t capabilities;
+} builtin_programs[] = {
+    {"notepad", BUILTIN_BASE},
+    {"fetch", BUILTIN_BASE | PERMISSION_CAP_NET},
+    {"update", BUILTIN_BASE | PERMISSION_CAP_NET},
+    {"browser", (BUILTIN_BASE & ~PERMISSION_CAP_FILES_SHARED)
+                    | PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ},
+};
+
+uint32_t permission_builtin_capabilities(const char *path, size_t length) {
+    if (path == NULL || permission_is_disk_program(path, length)) {
+        return PERMISSION_CAPS_DISK_DEFAULT;
+    }
+    size_t offset = 0;
+    const char *top;
+    size_t top_length = next_component(path, length, &offset, &top);
+    const char *name;
+    size_t name_length = next_component(path, length, &offset, &name);
+    const char *deeper;
+    bool nested = next_component(path, length, &offset, &deeper) != 0;
+    /* Self-tests and libraries the kernel shell runs. */
+    if (equal_ignore_case(top, top_length, "tests")
+        || equal_ignore_case(top, top_length, "lib")) {
+        return PERMISSION_CAPS_ALL;
+    }
+    if (!equal_ignore_case(top, top_length, "bin") || name_length == 0
+        || nested) {
+        return PERMISSION_CAPS_DISK_DEFAULT; /* e.g. a CD: nothing extra */
+    }
+    for (size_t i = 0; i < sizeof(builtin_programs)
+                               / sizeof(builtin_programs[0]); i++) {
+        if (equal_ignore_case(name, name_length, builtin_programs[i].name)) {
+            return builtin_programs[i].capabilities;
+        }
+    }
+    return BUILTIN_BASE;
+}
+
 static size_t next_component(const char *path, size_t length, size_t *offset,
                              const char **component) {
     size_t start = *offset;
@@ -339,6 +387,12 @@ static struct path_info classify(const char *path, size_t length) {
         && same_entry(path, third_end, fourth, fourth_length,
                       "Permissions.dat")) {
         info.class = CLASS_GRANTS;
+        info.anchor = true;
+    }
+    /* AppData itself cannot be removed or renamed. Moving it aside would
+       leave Permissions.dat outside the path checked above, writable. */
+    if (fourth_length == 0
+        && same_entry(path, home_length, third, third_length, "AppData")) {
         info.anchor = true;
     }
     return info;

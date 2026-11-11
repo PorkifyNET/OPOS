@@ -1,6 +1,9 @@
-OPOS 0.1.2: the first release with a web browser.
+OPOS 0.1.4: program permissions.
 
-- New web browser (run /bin/browser URL): HTTP and HTTPS, HTML, CSS layout (flex, grid, media queries, custom properties) and TrueType text.
-- Browser: text selection and copy, find in page (Ctrl+F), a certificate error page.
-- Browser forms: text fields, multi-line text areas, check boxes, radio buttons, drop-down lists, and GET and POST submission.
-- Terminal: 1000 lines of scrollback and text selection with the mouse.
+- Programs installed on a disk can only read your private files when you pick them in Files, and get their own folder under AppData/Programs.
+- OPOS asks before a disk program reads shared files, uses the network or reads the clipboard. Your answer is remembered per program.
+- New Security Center (Start > SECURITY CENTER) lists each program's permissions and lets you change or revoke them.
+- Programs can declare the permissions they may ask for in a manifest (see the SDK).
+- Built-in programs hold only the permissions their job needs. For example, Notepad cannot use the network, and only the browser can read the clipboard.
+- Disk programs installed before this version keep shared-file access after a one-time prompt.
+- Fix: the ATA driver waits 400 ns after each command before reading status, which avoids spurious disk timeouts.

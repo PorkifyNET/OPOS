@@ -1,14 +1,13 @@
-# Installed-disk system root migration (design draft)
+# Installed-disk system root migration
 
-This is a plan, not current OPOS behavior. The goal is to run an installed
-system's `/bin`, `/lib`, `/etc` and `/share` from its own disk while keeping a
-small initramfs for boot and recovery. The live ISO must continue to run from
-its initramfs. The migration must preserve existing installations and user
-files, and a failed update must leave a bootable previous system.
+Installed OPOS runs `/bin`, `/lib`, `/etc` and `/share` from its own disk
+after verifying a generation against the booted full initramfs. The live ISO
+still runs from its initramfs. Shrinking the initramfs and proving the full
+hardware and power-loss matrix remain future work.
 
 ## Implementation status
 
-The first VFS seam is present but is not selected by normal boot. After the
+The VFS seam is selected on normal installed boots. After the
 boot FAT volume is mounted, `vfs_select_disk_root()` can map `/` onto a
 protected `/disk/OPOS/roots/<generation>` directory. It rejects missing roots,
 other volumes, reserved mount-point names and a switch after file objects
@@ -17,9 +16,30 @@ volume. Permission checks classify both spellings as system files and block
 changes to the selected tree, including through its physical path. A QEMU
 smoke boot with a temporary selector call confirmed matching device/inode for
 `/bin/notepad` and its backing file, and the focused permission test passes.
-Normal builds still use the initramfs root. Installer population, signed
-generation selection, boot activation, program-discovery changes and updates
-remain future stages.
+Live builds still use the initramfs root. Program discovery and launching
+use VFS paths under either root. The selected tree is locked by FAT
+device/inode identity, including through its short-name alias and descendants
+that do not exist yet; `make permissions-test` covers this guard.
+
+New installs copy the complete initramfs tree into
+`/disk/OPOS/roots/generation-<version-with-underscores>`, compare every file
+and reject unexpected entries, then write a versioned `.ready` marker. A boot
+entry may pin `cmdline: opos.root=generation-0_1_3` (for version 0.1.3).
+Installed boots automatically stage a missing generation from their paired
+full initramfs, verify the tree, then map it as `/`. A staging failure leaves
+the full initramfs active for retry. A ready but damaged generation enters
+the recovery shell. An old pin left in a menu after an update is ignored only
+when a previous kernel exists; the current kernel chooses its own generation.
+The previous menu entry boots its saved kernel/initramfs pair. This is
+payload integrity relative to the booted initramfs, not verified boot or a
+signed on-disk inventory.
+
+`sh tools/test_disk_root_qemu.sh` installs onto a disposable blank FAT16 disk,
+tests that a damaged file or an unexpected program rejects the generation,
+then checks namespace, permissions and `/bin/fetch` under the disk root. It
+reboots from that disk without a root option, removes the ready marker in a
+test hook before selection, and confirms that staging repairs it and selects
+the complete generation. The live ISO's menu has no root option.
 
 ## Current contracts to preserve
 
@@ -27,13 +47,13 @@ remain future stages.
 | --- | --- | --- |
 | Boot | `kernel/main.c` requires Limine's `initramfs.tar` module before storage starts. The ISO alone also has `install.tar`. | Keep a required recovery initramfs; choose a disk root only after the boot volume is mounted. Never infer installed mode merely from a mounted FAT disk. |
 | Namespace | `kernel/vfs.c` serves `/` from the read-only initramfs, the selected boot volume at `/disk`, and other FAT/ISO volumes at `/disk2` and `/cdrom`. | Change the VFS root provider explicitly. Preserve `/disk` as a compatibility path during migration. |
-| Installation | `kernel/installer.c` copies `kernel.elf`, `initramfs.tar` and Limine files to `/disk/boot`; it does not unpack the initramfs into a writable system tree. | New installs need a complete disk system tree plus a recovery image. Existing installs must not be silently repartitioned or reformatted. |
-| Programs | `kernel/desktop.c` discovers Terminal commands and Notepad through `initramfs_find_file`; Start > Programs reads `/bin` and `/disk/Programs`. `kernel/user.c` also has an initramfs-only child-spawn path. | Move discovery to VFS lookups and keep the existing launch and account rules. Audit every direct initramfs lookup before switching roots. |
+| Installation | `kernel/installer.c` copies `kernel.elf`, the full `initramfs.tar` and Limine files to `/disk/boot`, and stages a verified system tree under `/disk/OPOS/roots`. | Keep the full initramfs for recovery and preserve existing installations. |
+| Programs | Terminal commands, Notepad, Start > Programs and child spawn use VFS paths under either root. | Keep the existing launch and account rules; audit remaining direct initramfs lookups before switching roots. |
 | Data | Accounts, settings, backgrounds, app storage and installed apps use `/disk/OPOS`, `/disk/Users` and `/disk/Programs`. | Keep those paths and their contents during the first transition; move user data only as a separate later migration. |
 | Security | `kernel/permissions.c` classifies protected files by `/disk` path; disk-launched executables are confined by path. `/` is currently read-only. | `/bin` and its `/disk` alias must resolve to the same protected object and policy. Executable trust must be based on the selected protected system tree, not on a spelling of its path. |
-| Updates | `kernel/update.c` accepts signed manifest paths only below `boot/`, stages in `/disk/OPOS/UPDATE`, backs up kernel/initramfs to `boot/old`, and resumes interrupted copies at boot. | Teach the updater a new manifest format and root-generation transaction before publishing a release that uses it. Old updaters must reject the new format. |
+| Updates | `kernel/update.c` accepts signed manifest paths only below `boot/`, stages in `/disk/OPOS/UPDATE`, backs up kernel/initramfs to `boot/old`, and resumes interrupted copies at boot. | The new kernel stages its own generation from its paired full initramfs on first boot. A later recovery-only initramfs needs a new signed manifest format. |
 
-## Proposed layout and boot choice
+## Layout and remaining design work
 
 - Keep `/disk` as the FAT system volume and keep `/disk/Users`,
   `/disk/Programs`, `/disk/OPOS` and `/disk/boot` in place.
@@ -46,10 +66,9 @@ remain future stages.
 - Keep a boot/recovery initramfs containing only what is needed to mount the
   boot disk, finish or undo an interrupted transition, and offer a usable
   recovery shell. Keep the current full initramfs until those paths work.
-- A boot entry must identify the exact system generation it belongs to.
-  Resolve how Limine passes that identity (boot path or command line) before
-  coding the selector. Do not use an unverified, mutable "latest" pointer to
-  choose a root for a previous-version boot entry.
+- Each kernel derives its generation from its compiled version and paired
+  full initramfs. An optional `opos.root=` boot argument pins the current
+  kernel's generation. There is no mutable "latest" pointer.
 - On the live ISO, always use the initramfs root even if an installed disk is
   visible. On an installed boot, mount the Limine-selected partition, validate
   the selected generation and required files, then select the disk root before
@@ -60,11 +79,9 @@ remain future stages.
   path must have identical identity and access decisions. Files must not gain
   a write path through either spelling.
 
-Before implementation, settle the on-disk marker format, the boot-entry field
-that pins a generation, where each generation's signed file inventory is kept,
-and how a partly written FAT boot-menu file is recovered. These choices must
-be fixed together: a marker alone cannot prove that its tree is complete or
-that the selected kernel and root belong together. This plan does not claim
+The current marker is checked together with a byte-for-byte comparison to the
+booted full initramfs. A signed on-disk inventory, smaller initramfs and a
+boot-menu recovery journal remain future design work. This does not claim
 verified boot; the current boot chain does not provide it.
 
 ## Rollout sequence
@@ -134,6 +151,32 @@ Program discovery in Terminal, Notepad and the kernel shell, child-spawn
 executable loading, and root directory listings now use VFS paths under both
 the legacy initramfs root and the optional disk root. The editor and Files
 read-only checks already use VFS paths; their UI text now describes either
-root. The next slice is to prove namespace and permission equivalence,
-including disk aliases and FAT name variants. Installer changes, activation
-and payload removal follow only after those gates pass.
+root. The disk-root QEMU test covers a full new install, FAT short aliases,
+permission decisions, launch from the selected root, rejection of a damaged
+tree, and an automatic installed boot. `sh tools/test_update_root_qemu.sh`
+installs 0.1.3, updates both kernel and initramfs to a 0.1.4 test payload,
+boots the new generation and the saved previous entry, and uses SIGKILL at
+five durable checkpoints: prepared state, backup, menu, copying state, and
+after the initramfs copy. Each interrupted image resumes to a complete new
+generation while its previous entry still boots the old generation. The test
+uses a forced unsigned development manifest and QEMU BIOS/MBR with threaded
+TCG. An OVMF/GPT install test now installs onto a dedicated OPOS partition
+beside an EFI System Partition and a separate 32 MiB data partition. It checks
+the data partition byte-for-byte after installation, then boots and verifies
+the installed system root. A separate OVMF smoke boot reaches live-ISO network
+initialization. Cuts in the middle of individual disk writes, marker and menu
+writes, signed release updates, VMware, VirtualBox and physical hardware
+remain unproved. The UEFI/GPT test also cuts QEMU at the
+prepared, backup, menu, copying, and first-file durable checkpoints. For each
+cut it verifies recovery reaches a complete new generation and the previous
+entry boots the old generation. These checks do not cover interruption in the
+middle of an individual disk, marker, or menu write. A smaller recovery
+initramfs waits for the remaining gates.
+
+`sh tools/test_update_root_uefi_qemu.sh` installs 0.1.3 on GPT with OVMF,
+updates kernel and initramfs to 0.1.4, verifies the new root, then sets the
+Limine default to the saved previous entry and verifies the old kernel/root
+boots. The previous-entry check runs through the GPT system-volume menu under
+fresh OVMF variables. Its five power-cut cases use separate disk images and
+OVMF variables, kill QEMU after each durable marker, and verify both recovery
+and previous-version boot.

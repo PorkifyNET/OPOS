@@ -14,12 +14,16 @@ Development-only flags are available:
 - `--ignoreversion` permits same-version installs and downgrades.
 - `--force` bypasses signature and file SHA-256 checks. It does not bypass
   administrator, manifest/path, download-completeness or disk-write checks.
-- `--no-prev-version` skips backing up the current kernel and initramfs and
-  does not create a new previous-version boot entry.
+- `--no-prev-version` is rejected during the disk-root migration. Every
+  update must preserve a previous kernel and initramfs boot entry.
 
-These flags compose. The summary explains every active flag and its risks.
+The accepted flags compose. The summary explains every active flag and its risks.
 Using any of them implies `install`, so `update --ignoreversion` is shorthand
 for `update install --ignoreversion`.
+Because root directories are named by version, a same-version build with a
+different `initramfs.tar` cannot replace an already ready generation. Its
+new kernel enters recovery when verification detects the mismatch; boot the
+previous entry, then publish that build with a new version number.
 
 ## Publishing a release
 
@@ -64,10 +68,14 @@ ISO built with it.
 2. Each changed file goes into `/disk/OPOS/UPDATE` and its SHA-256 is
    checked as it arrives. A damaged download is retried (3 tries).
 3. The running `boot/kernel.elf` and `boot/initramfs.tar` are copied to
-   `boot/old/`, and `limine.conf` gets an "OPOS (previous version)" entry
-   that boots them. Then the new files are copied into place, the kernel
-   last, and each is checked again.
-4. The new version runs after a restart.
+   `boot/old/` and flushed. The "OPOS (previous version)" menu entry is
+   written and flushed, followed by the `COPYING` state. Only then are live
+   boot files replaced, with the kernel last.
+4. On restart, the new kernel stages its complete system tree from its paired
+   initramfs if needed, verifies it, and selects it as `/`. A failed staging
+   attempt leaves the full initramfs active; a ready but damaged tree enters
+   the recovery shell. The previous menu entry boots the saved pair and its
+   corresponding root generation.
 
 `STATE.TXT` in the staging folder records the step. If the power fails
 during step 3, OPOS finishes the update at the next start (before the

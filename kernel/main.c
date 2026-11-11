@@ -36,6 +36,8 @@
 #include "installer.h"
 #include "iso9660.h"
 #include "storage.h"
+#include "system_root.h"
+#include "vfs.h"
 #include "xhci.h"
 #include "optical.h"
 #include "boot_display.h"
@@ -100,6 +102,12 @@ static volatile struct limine_module_request module_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_executable_file_request executable_file_request = {
     .id = LIMINE_EXECUTABLE_FILE_REQUEST_ID,
+    .revision = 0
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_executable_cmdline_request cmdline_request = {
+    .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID,
     .revision = 0
 };
 
@@ -1293,6 +1301,69 @@ void kmain(void) {
     /* An update cut short by a power loss is finished first. */
     update_resume();
 
+    bool root_selection_failed = false;
+    const char *cmdline = cmdline_request.response != NULL
+        ? cmdline_request.response->cmdline : NULL;
+    static const char root_option[] = "opos.root=";
+    bool root_requested = cmdline != NULL;
+    for (size_t i = 0; root_requested && i < sizeof(root_option) - 1; i++) {
+        root_requested = cmdline[i] != '\0'
+            && cmdline[i] == root_option[i];
+    }
+    if (!installer_available() && fat16_system_mounted()) {
+        char generation[64];
+        char root[128];
+        bool known = system_root_generation(generation, sizeof(generation))
+            && system_root_path(root, sizeof(root));
+        size_t generation_length = 0;
+        while (known && generation[generation_length] != '\0') {
+            generation_length++;
+        }
+        if (root_requested) {
+            const char *pin = cmdline + sizeof(root_option) - 1;
+            size_t pin_length = 0;
+            while (pin[pin_length] != '\0') pin_length++;
+            bool matches = known && pin_length == generation_length;
+            for (size_t i = 0; matches && i < pin_length; i++) {
+                matches = pin[i] == generation[i];
+            }
+            if (!matches) {
+                size_t old_size;
+                if (!vfs_file_size("/disk/boot/old/kernel.elf", 25,
+                                   &old_size)) {
+                    console_write_error("OPOS: disk system root pin does not match this kernel; recovery shell will start\n");
+                    root_selection_failed = true;
+                } else {
+                    console_write_string("OPOS: old root pin belongs to previous boot entry; selecting current generation\n");
+                }
+            }
+        }
+        if (!root_selection_failed && known) {
+            size_t root_length = 0;
+            while (root[root_length] != '\0') root_length++;
+            if (!system_root_ready(root, root_length)) {
+                const char *error = NULL;
+                console_write_string("OPOS: staging disk system root\n");
+                if (!installer_stage_system_root(&error)) {
+                    console_write_error("OPOS: disk system root staging failed: ");
+                    console_write_error(error != NULL ? error : "UNKNOWN");
+                    console_write_error("\n");
+                    if (root_requested) root_selection_failed = true;
+                    known = false;
+                }
+            }
+            if (known && system_root_select(generation, generation_length)) {
+                console_write_string("OPOS: verified disk system root selected\n");
+            } else if (known) {
+                console_write_error("OPOS: disk system root verification failed; recovery shell will start\n");
+                root_selection_failed = true;
+            }
+        }
+    } else if (root_requested && !installer_available()) {
+        console_write_error("OPOS: disk system root unavailable; recovery shell will start\n");
+        root_selection_failed = true;
+    }
+
     /* CD/DVD drives, and the disc in each (mounted at /cdrom...). */
     optical_initialize();
     iso_refresh();
@@ -1375,7 +1446,7 @@ void kmain(void) {
     }
 
     uint64_t reported_dropped_characters = 0;
-    bool boot_shell = settings_take_boot_shell_once();
+    bool boot_shell = root_selection_failed || settings_take_boot_shell_once();
     /* Installation media always starts the desktop with the installer. */
     if (!boot_shell
         && (settings_get(SETTING_AUTOSTART_DESKTOP) || installer_available())) {

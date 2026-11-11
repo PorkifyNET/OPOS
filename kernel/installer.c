@@ -3,9 +3,12 @@
 #include <stdint.h>
 
 #include "block.h"
+#include "console.h"
 #include "fat16.h"
+#include "initramfs.h"
 #include "installer.h"
 #include "partition.h"
+#include "system_root.h"
 #include "vfs.h"
 
 #define SECTOR_SIZE 512
@@ -153,10 +156,19 @@ static bool make_directory(const char *path) {
 }
 
 /* Writes a file in chunks and reads it back to compare. */
+static bool copy_error(const char *path, const char *step) {
+    console_write_string("OPOS: install copy ");
+    console_write_string(step);
+    console_write_string(" failed: ");
+    console_write_string(path);
+    console_write_string("\n");
+    return false;
+}
+
 static bool copy_file(const char *path, const struct payload_file *file) {
     size_t length = text_length(path);
     if (!vfs_create_file(path, length, true)) {
-        return false;
+        return copy_error(path, "create");
     }
     for (size_t offset = 0; offset < file->size; offset += WRITE_CHUNK) {
         size_t chunk = file->size - offset < WRITE_CHUNK
@@ -165,12 +177,12 @@ static bool copy_file(const char *path, const struct payload_file *file) {
         if (!vfs_write_at(path, length, offset, file->data + offset, chunk,
                           &written)
             || written != chunk) {
-            return false;
+            return copy_error(path, "write");
         }
     }
     size_t size;
     if (!vfs_file_size(path, length, &size) || size != file->size) {
-        return false;
+        return copy_error(path, "size");
     }
     for (size_t offset = 0; offset < file->size; offset += VERIFY_CHUNK) {
         size_t chunk = file->size - offset < VERIFY_CHUNK
@@ -178,15 +190,84 @@ static bool copy_file(const char *path, const struct payload_file *file) {
         size_t read = 0;
         if (!vfs_read_at(path, length, offset, verify_buffer, chunk, &read)
             || read != chunk) {
-            return false;
+            return copy_error(path, "read");
         }
         for (size_t i = 0; i < chunk; i++) {
             if (verify_buffer[i] != file->data[offset + i]) {
-                return false;
+                return copy_error(path, "verify");
             }
         }
     }
     return true;
+}
+
+static void report(installer_progress progress, const char *step,
+                   unsigned percent);
+static bool fail(const char **error, const char *reason);
+static bool file_matches(const char *path, const struct payload_file *file);
+
+static bool populate_system_root(installer_progress progress,
+                                 const char **error) {
+    char root[128];
+    if (!system_root_path(root, sizeof(root))
+        || !make_directory("/disk/OPOS")
+        || !make_directory("/disk/OPOS/roots")
+        || !make_directory(root)) {
+        return fail(error, "CREATING SYSTEM ROOT FAILED");
+    }
+    size_t root_length = text_length(root);
+    size_t count = initramfs_file_count();
+    if (count == 0) return fail(error, "SYSTEM PAYLOAD IS EMPTY");
+    for (size_t index = 0; index < count; index++) {
+        char relative[256];
+        size_t file_size;
+        if (!initramfs_file_at(index, relative, sizeof(relative),
+                               &file_size)) {
+            return fail(error, "SYSTEM PAYLOAD IS INVALID");
+        }
+        size_t relative_length = text_length(relative);
+        char path[512];
+        if (root_length + 1 + relative_length >= sizeof(path)) {
+            return fail(error, "SYSTEM FILE PATH TOO LONG");
+        }
+        for (size_t i = 0; i < root_length; i++) path[i] = root[i];
+        path[root_length] = '/';
+        for (size_t i = 0; i < relative_length; i++) {
+            path[root_length + 1 + i] = relative[i];
+            if (relative[i] == '/') {
+                path[root_length + 1 + i] = '\0';
+                if (!make_directory(path)) {
+                    return fail(error, "CREATING SYSTEM FOLDERS FAILED");
+                }
+                path[root_length + 1 + i] = '/';
+            }
+        }
+        path[root_length + 1 + relative_length] = '\0';
+        struct initramfs_file file;
+        if (!initramfs_find_file(relative, &file)
+            || file.size != file_size) {
+            return fail(error, "SYSTEM PAYLOAD IS INVALID");
+        }
+        struct payload_file payload = {file.data, file.size};
+        report(progress, "COPYING SYSTEM ROOT",
+               (unsigned)(84 + index * 10 / count));
+        if (!file_matches(path, &payload) && !copy_file(path, &payload)) {
+            return fail(error, "COPYING SYSTEM ROOT FAILED");
+        }
+    }
+    report(progress, "VERIFYING SYSTEM ROOT", 94);
+    if (!system_root_verify_tree(root, root_length)
+        || !system_root_write_ready(root, root_length)) {
+        return fail(error, "VERIFYING SYSTEM ROOT FAILED");
+    }
+    return true;
+}
+
+bool installer_stage_system_root(const char **error) {
+    if (installer_available() || !fat16_system_mounted()) {
+        return fail(error, "SYSTEM DISK IS NOT MOUNTED");
+    }
+    return populate_system_root(NULL, error);
 }
 
 struct install_copy {
@@ -478,7 +559,7 @@ static bool copy_system_files(installer_progress progress,
             return fail(error, "COPYING FILES FAILED");
         }
     }
-    return true;
+    return populate_system_root(progress, error);
 }
 
 static bool install_steps(installer_progress progress, const char **error) {

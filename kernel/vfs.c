@@ -250,14 +250,52 @@ bool vfs_disk_root_contains(const char *path, size_t path_length) {
     if (path_is_disk_root_alias(path, path_length)) {
         return true;
     }
-    return namespace_prefix(path, path_length, disk_root_path,
-                            disk_root_path_length);
+    size_t volume;
+    if (disk_prefix_length(path, path_length, &volume) == 0 || volume != 0) {
+        return false;
+    }
+    struct vfs_metadata root;
+    if (!vfs_stat(disk_root_path, disk_root_path_length, &root)) {
+        return false;
+    }
+    /* A descendant may not exist yet. Compare every existing parent with the
+       selected root by FAT identity, so 8.3 aliases cannot bypass the lock. */
+    for (size_t end = 5; end <= path_length; end++) {
+        if (end != path_length && path[end] != '/') {
+            continue;
+        }
+        struct vfs_metadata entry;
+        if (vfs_stat(path, end, &entry)
+            && entry.device == root.device && entry.inode == root.inode) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool vfs_disk_root_ancestor(const char *path, size_t path_length) {
-    return disk_root_path_length != 0 && path != NULL
-        && namespace_prefix(disk_root_path, disk_root_path_length,
-                            path, path_length);
+    size_t volume;
+    if (disk_root_path_length == 0 || path == NULL
+        || disk_prefix_length(path, path_length, &volume) == 0
+        || volume != 0) {
+        return false;
+    }
+    struct vfs_metadata entry;
+    if (!vfs_stat(path, path_length, &entry)) {
+        return false;
+    }
+    for (size_t end = 5; end <= disk_root_path_length; end++) {
+        if (end != disk_root_path_length && disk_root_path[end] != '/') {
+            continue;
+        }
+        struct vfs_metadata ancestor;
+        if (vfs_stat(disk_root_path, end, &ancestor)
+            && entry.device == ancestor.device
+            && entry.inode == ancestor.inode) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ------------------------------------------------- CD/DVD (ISO 9660) */

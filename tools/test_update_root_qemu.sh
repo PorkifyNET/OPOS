@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-qemu_args='-accel tcg,thread=multi'
+qemu_args="${QEMU_ARGS:--accel tcg,thread=multi}"
 
 make build/initramfs.tar build/install.tar
 python3 - <<'PY'

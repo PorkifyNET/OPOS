@@ -39,9 +39,11 @@ import struct
 import sys
 
 BLOCK = 512
-PACKAGE_MAX = 16 * 1024
+PACKAGE_MAX = 64 * 1024
 FILES_MAX = 512
-PATH_MAX = 200
+STARTS_MAX = 16
+FILE_SIZE_MAX = 0xFFFFFFFF  # the largest FAT file
+PATH_MAX = 150
 NAME_MAX = 31
 PUBLISHER_MAX = 63
 ID_MAX = 63
@@ -121,6 +123,8 @@ def parse_package(text, template):
     exec and either sha256/size or source) and "start" (list of
     (path, label)).
     """
+    if not template and len(text.encode("utf-8")) > PACKAGE_MAX:
+        fail(f"PACKAGE: larger than {PACKAGE_MAX} bytes")
     if not printable(text.replace("\n", "")):
         fail("PACKAGE: only printable ASCII is allowed")
     package = {"files": [], "start": []}
@@ -154,8 +158,9 @@ def parse_package(text, template):
                 entry["source"] = rest[0]
             else:
                 if (len(rest) != 2 or not HASH_PATTERN.match(rest[0])
-                        or not rest[1].isdigit()
-                        or (len(rest[1]) > 1 and rest[1][0] == "0")):
+                        or not re.fullmatch(r"[0-9]{1,10}", rest[1])
+                        or (len(rest[1]) > 1 and rest[1][0] == "0")
+                        or int(rest[1]) > FILE_SIZE_MAX):
                     fail(f"PACKAGE line {number}: expected "
                          "'file: files/NAME SHA256 SIZE [exec]'")
                 entry["sha256"] = rest[0]
@@ -167,6 +172,8 @@ def parse_package(text, template):
             seen_paths.add(folded)
             package["files"].append(entry)
         else:  # start
+            if len(package["start"]) == STARTS_MAX:
+                fail(f"PACKAGE: more than {STARTS_MAX} start lines")
             path, _, label = value.partition(" ")
             if not label or len(label) > NAME_MAX:
                 fail(f"PACKAGE line {number}: start needs a label of 1 "
@@ -440,6 +447,8 @@ def build(template_path, out):
                 data = handle.read()
         except OSError as error:
             fail(f"{entry['path']}: cannot read {source}: {error.strerror}")
+        if len(data) > FILE_SIZE_MAX:
+            fail(f"{entry['path']}: larger than {FILE_SIZE_MAX} bytes")
         if entry["exec"]:
             check_executable(package["platform"], entry["path"], data)
         digest = hashlib.sha256(data).hexdigest()

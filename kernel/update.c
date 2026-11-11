@@ -9,6 +9,7 @@
 #include "console.h"
 #include "fat16.h"
 #include "installer.h"
+#include "package.h"
 #include "scheduler.h"
 #include "sha256.h"
 #include "timer.h"
@@ -72,8 +73,12 @@ const char *update_current_version(void) {
     return OPOS_VERSION;
 }
 
+bool update_call_busy(void) {
+    return busy;
+}
+
 bool update_call_enter(void) {
-    if (busy) {
+    if (busy || package_call_busy()) {
         return false;
     }
     busy = true;

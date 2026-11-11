@@ -67,8 +67,7 @@ all of a program's threads.
 ## Packages
 
 A package (`.opk`) bundles a program and its files so OPOS can install,
-update and remove it (`docs/packages.md` in the OPOS source). OPOS cannot
-install packages yet; this builds and checks them for when it can.
+update and remove it (`docs/packages.md` in the OPOS source).
 
 Describe the package in a `.pkg` file next to your program, like
 `examples/pickfile.pkg`:
@@ -99,8 +98,23 @@ make package PKG=myapp.pkg              # build/org.example.myapp-1.0.opk
 python3 tools/mkopk.py check build/org.example.myapp-1.0.opk
 ```
 
-`tools/mkopk.py` applies the same rules the installer will, and prints
+`tools/mkopk.py` applies the same rules the installer does, and prints
 why it rejects a package. It needs only Python 3.
+
+Copy the package to an installed OPOS and install it in the Terminal:
+
+```sh
+run /bin/pkg install /disk/org.example.myapp-1.0.opk              # for you
+run /bin/pkg install /disk/org.example.myapp-1.0.opk --everyone   # admin
+run /bin/pkg list
+run /bin/pkg remove org.example.myapp
+```
+
+It lands in `<home>/Programs/<id>` (or `/disk/Programs/<id>`), its
+`start` entries appear in Start > Programs, and nothing but the
+installer can change its files. Programs can do the same with
+`opos_package_check`, `opos_package_install` and `opos_package_remove`
+in `<opos.h>`.
 
 ## Windows
 

@@ -129,7 +129,7 @@ class BuildTests(Fixture):
         self.assertNotIn("paint.elf", members[0][1].decode())
 
     def test_long_path_uses_ustar_prefix(self):
-        long_path = "files/" + "/".join(["folder"] * 20) + "/x.dat"
+        long_path = "files/" + "/".join(["folder"] * 18) + "/x.dat"
         template = TEMPLATE.replace("files/data/brushes.dat", long_path)
         with open(self.build(template), "rb") as handle:
             members = mkopk.read_members(handle.read())
@@ -239,6 +239,16 @@ class RejectTests(Fixture):
 
     def test_bad_file_line(self):
         self.build_rejects(TEMPLATE + "file: files/x\n", "SOURCE")
+
+    def test_too_many_starts(self):
+        self.build_rejects(TEMPLATE + "start: files/paint P\n" * 16,
+                           "more than 16 start")
+
+    def test_size_limits(self):
+        digest = "0" * 64
+        for size in ("4294967296", "00", "01", "12345678901"):
+            text = HEAD + f"file: files/b.dat {digest} {size}\n"
+            self.check_rejects(self.archive(text, []), "SHA256 SIZE")
 
 
 class ExecutableTests(Fixture):

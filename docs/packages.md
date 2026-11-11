@@ -73,17 +73,22 @@ Compression is left for later, as for updates.
 As built in step 1 (`sdk/tools/mkopk.py`, the reference for the
 installer's checks):
 
-- `PACKAGE` is the first member, at most 16 KB, printable ASCII, one
+- `PACKAGE` is the first member, at most 64 KB, printable ASCII, one
   `key: value` per line. That lets the installer read it before any
-  file data arrives.
+  file data arrives. (Step 1 said 16 KB, which cannot hold 512 file
+  lines; step 2 raised it.)
 - Only regular-file members. Folders are implied by paths; folder, link
   and special entries reject the package. So does data after the two
   end blocks, a bad header checksum, or a member listed twice.
-- Paths have no spaces and none of `" * : < > ? \ |`, are at most 200
+- Paths have no spaces and none of `" * : < > ? \ |`, are at most 150
   characters, and no part ends in `.`. Names are compared ignoring case,
-  as FAT does. A name cannot be both a file and a folder.
-- At most 512 files. `name` and `start` labels are 1 to 31 characters,
-  `publisher` at most 63, versions at most 15.
+  as FAT does. A name cannot be both a file and a folder. (Step 1 said
+  200. A program can only open paths shorter than 256 characters, and
+  the longest install folder, `/disk/Users/<20>/Programs/<63>/`, takes
+  107 of them.)
+- At most 512 files of at most 4 GiB - 1 each (the FAT limit), and at
+  most 16 `start` lines. `name` and `start` labels are 1 to 31
+  characters, `publisher` at most 63, versions at most 15.
 - `format`, `id`, `name`, `version`, `publisher` and `platform` are
   required; each single key appears once.
 - An `opos` executable needs exactly one valid manifest note, checked as
@@ -223,6 +228,69 @@ confined and checked exactly like a package installed for everyone.
 - A person installs, updates and removes their own copies without a
   password. The warning for packages outside the Store still applies.
 
+### As built in step 2
+
+Packages from outside the Store install and remove, for everyone or for
+one account. The Store, the index and its key come in step 4.
+
+- Kernel: `kernel/package.c` checks `PACKAGE` text and ustar headers
+  (the same rules as `mkopk.py`; `make package-test` compares the two on
+  86 cases). `kernel/package_install.c` installs, removes, resumes and
+  lists start entries.
+- System calls `0x4f500030`-`32` (`opos_package_check`,
+  `opos_package_install`, `opos_package_remove` in `<opos.h>`). They
+  take a file path rather than streamed data: the kernel reads the
+  archive itself, with the caller's right to read it checked first.
+  Confined (disk) programs cannot call them. A package from outside the
+  Store installs only with `OPOS_PACKAGE_CONFIRMED`, which the caller
+  passes after the person agreed.
+- `/bin/pkg info|install|remove|list` shows what a package is, warns
+  that it is not from the Store, and asks for YES (`-y` skips it).
+  `--everyone` installs for every account; `--ignoreversion` reinstalls.
+  It is not in Start > Programs, like `update`.
+- Installing reads `PACKAGE` alone first, so refusals (wrong platform,
+  newer OPOS needed, conflicts, version not newer, not confirmed) cost no
+  copying. Then the archive is read again and every member is copied to
+  `/disk/OPOS/PKGSTAGE/NEW` while its SHA-256 is computed, and the
+  refusals are checked again on that read. What is installed is what was
+  checked, even if the archive changed in between.
+- Then `STATE.TXT` names the target folder and record, and the work only
+  rolls forward: the old folder to `PKGSTAGE/OLD`, `NEW` to the target,
+  the record written, `OLD` and the staging folder removed. Removing is
+  the same without `NEW`. At boot, `package_resume` finishes it. A
+  `STATE.TXT` naming anything but a package folder and its record is
+  refused, and installs stop until the staging folder is removed.
+- Records are `origin: sideloaded` followed by the package's `PACKAGE`
+  text, so they also hold each file's hash.
+- Protection (`kernel/permissions.c`): the installer lists every
+  installed folder; permissions.c matches a path's folder by device and
+  inode, so 8.3 aliases do not get around it. Programs may only read
+  inside a package folder. Files treats one installed for everyone like
+  system files (administrator, warning and password) and an account's
+  own copy as read-only: it changes only through the installer.
+  `/disk/Programs` and `<home>/Programs` cannot be moved or removed, and
+  `<home>/AppData/Packages` is read-only, readable only by the account's
+  own unconfined programs.
+- A program in `<home>/Programs/<folder>` reads its own folder like one
+  in `/disk/Programs/<folder>`.
+- An account that already has its own copy can still update it after an
+  administrator installed the same id for everyone.
+- Start > Programs lists every `start` entry of the account's own and
+  everyone's packages. Built-in and loose program names win over package
+  labels, so a package cannot appear as a built-in.
+- Packages and system updates refuse to run at the same time.
+- Tested in QEMU (KVM, installed BIOS disk): install for one account and
+  everyone, update, `NOT_NEWER`, a damaged member, a Windows package, a
+  package needing OPOS 9.0, removal, the account/everyone conflict, the
+  YES prompt, `pkg list`, Start > Programs launching a packaged program,
+  boot resume of an interrupted install and removal, and a forged
+  `STATE.TXT`.
+
+Not done yet: a window for the warning (Files cannot open a `.opk`
+yet), deleting a removed program's data, and package identity for
+grants and storage (step 3), so an update still asks for permissions
+again.
+
 ### Dependencies
 
 None in the first version. A package carries everything it needs in its
@@ -296,7 +364,7 @@ by itself in the first version.
    `sdk/tools/mkopk.py` (`build` and `check`), tests in
    `sdk/tools/test_mkopk.py` (`make package-test`), example
    `sdk/examples/pickfile.pkg`.
-2. Kernel: package parser and checks, staging, the protected class,
+2. Done. Kernel: package parser and checks, staging, the protected class,
    records and resume, for everyone and for one account. Tested with
    sideloaded packages in QEMU.
 3. Identity: `store:<id>` grants and `<id>` storage, with a test that

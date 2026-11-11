@@ -14,6 +14,10 @@
  *   /disk/Users                                         list of homes
  *   /disk/Users/<name>                                  one account's home
  *   /disk/Users/<name>/AppData/Permissions.dat          capability grants
+ *   /disk/Programs/<id>, /disk/Users/<name>/Programs/<id>
+ *                                   installed packages (docs/packages.md),
+ *                                   only for folders the installer listed
+ *   /disk/Users/<name>/AppData/Packages                 package records
  *   anything else (/disk/..., /disk2..., /)              shared
  *
  * Programs may read system files but never change them, never see
@@ -149,6 +153,19 @@ bool permission_program_allows(const struct permission_identity *identity,
  */
 size_t permission_canonicalize(const char *path, size_t length, char *out,
                                size_t capacity);
+
+/*
+ * Installed package folders, kept by package_install.c: /disk/Programs/<id>
+ * (owner PERMISSION_NO_ACCOUNT: installed for everyone) or
+ * /disk/Users/<name>/Programs/<id> (owner: that account). Programs may
+ * only read inside them. OPOS's windows treat one installed for everyone
+ * like system files and an account's own copy as read-only. A folder is
+ * recognised by device and inode, so another spelling (an 8.3 alias)
+ * cannot get around it.
+ */
+#define PERMISSION_PACKAGE_FOLDERS_MAX 128
+void permission_package_folders_clear(void);
+bool permission_package_folder_add(const char *path, size_t owner);
 
 /* OPOS's own windows, acting for the logged-in person. */
 bool permission_ui_allows(const char *path, size_t length,

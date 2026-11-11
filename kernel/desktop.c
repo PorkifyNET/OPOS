@@ -16,6 +16,7 @@
 #include "keyboard.h"
 #include "permission_grants.h"
 #include "permissions.h"
+#include "package.h"
 #include "memory.h"
 #include "mouse.h"
 #include "optical.h"
@@ -7760,9 +7761,12 @@ static void draw_taskbar_menu(void) {
 
 /*
  * Start > PROGRAMS: built-in /bin and installed /disk/Programs files in a
- * submenu beside Start. Built-in names take precedence over disk names.
- * Terminal-only tools stay in /bin but are omitted from the menu, including
- * disk files with those names. The list is read each time it opens.
+ * submenu beside Start, then the start entries of installed packages
+ * (package.h): the account's own and everyone's. Built-in names take
+ * precedence over disk names and package labels, so a package cannot pass
+ * for a built-in. Terminal-only tools stay in /bin but are omitted from the
+ * menu, including disk files with those names. The list is read each time
+ * it opens.
  */
 #define PROGRAMS_MAX 32
 #define PROGRAMS_NAME_CAPACITY 32
@@ -7771,7 +7775,8 @@ static void draw_taskbar_menu(void) {
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
 
 static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
-static bool programs_disk[PROGRAMS_MAX];
+static char programs_paths[PROGRAMS_MAX][256];
+static struct package_start_entry programs_packages[PROGRAMS_MAX];
 static size_t programs_count;
 static bool programs_focus;  /* the keyboard is in the submenu */
 static size_t programs_selection;
@@ -7800,7 +7805,48 @@ static bool programs_name_equal(const char *a, const char *b) {
 
 static bool programs_terminal_only(const char *name) {
     return programs_name_equal(name, "fetch")
-        || programs_name_equal(name, "update");
+        || programs_name_equal(name, "update")
+        || programs_name_equal(name, "pkg");
+}
+
+/* Adds name (length bytes) with its path, sorted, unless a program of
+   that name is listed already. */
+static void programs_add(const char *name, size_t name_length,
+                         const char *path) {
+    if (programs_count == PROGRAMS_MAX
+        || name_length >= PROGRAMS_NAME_CAPACITY) {
+        return;
+    }
+    char copy[PROGRAMS_NAME_CAPACITY];
+    for (size_t j = 0; j < name_length; j++) {
+        copy[j] = name[j];
+    }
+    copy[name_length] = '\0';
+    for (size_t j = 0; j < programs_count; j++) {
+        if (programs_name_equal(copy, programs_names[j])) {
+            return;
+        }
+    }
+    /* Sorted by name, case ignored. */
+    size_t at = programs_count++;
+    while (at > 0) {
+        const char *other = programs_names[at - 1];
+        size_t j = 0;
+        while (j < name_length && other[j] != '\0'
+               && ascii_upper(name[j]) == ascii_upper(other[j])) {
+            j++;
+        }
+        char mine = j < name_length ? ascii_upper(name[j]) : 0;
+        if (mine >= ascii_upper(other[j])) {
+            break;
+        }
+        text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
+        text_copy(programs_paths[at], sizeof(programs_paths[at]),
+                  programs_paths[at - 1]);
+        at--;
+    }
+    text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, copy);
+    text_copy(programs_paths[at], sizeof(programs_paths[at]), path);
 }
 
 static void programs_load_directory(const char *directory, bool disk) {
@@ -7820,23 +7866,12 @@ static void programs_load_directory(const char *directory, bool disk) {
             || programs_terminal_only(entry.name)) {
             continue;
         }
+        char path[64];
+        size_t path_length = append_text(path, sizeof(path), 0, directory);
+        path_length = append_text(path, sizeof(path), path_length, "/");
+        path_length = append_text(path, sizeof(path), path_length,
+                                  entry.name);
         if (disk) {
-            bool duplicate = false;
-            for (size_t j = 0; j < programs_count; j++) {
-                if (programs_name_equal(entry.name, programs_names[j])) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (duplicate) {
-                continue;
-            }
-            char path[64];
-            size_t path_length = append_text(path, sizeof(path), 0,
-                                             directory);
-            path_length = append_text(path, sizeof(path), path_length, "/");
-            path_length = append_text(path, sizeof(path), path_length,
-                                      entry.name);
             uint8_t magic[4];
             size_t bytes = 0;
             if (!vfs_read_at(path, path_length, 0, magic,
@@ -7846,28 +7881,7 @@ static void programs_load_directory(const char *directory, bool disk) {
                 continue;
             }
         }
-        /* Sorted by name, case ignored. */
-        size_t at = programs_count++;
-        while (at > 0) {
-            const char *other = programs_names[at - 1];
-            size_t j = 0;
-            while (j < entry.name_length && other[j] != '\0'
-                   && ascii_upper(entry.name[j]) == ascii_upper(other[j])) {
-                j++;
-            }
-            char mine = j < entry.name_length ? ascii_upper(entry.name[j]) : 0;
-            if (mine >= ascii_upper(other[j])) {
-                break;
-            }
-            text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
-            programs_disk[at] = programs_disk[at - 1];
-            at--;
-        }
-        for (size_t j = 0; j < entry.name_length; j++) {
-            programs_names[at][j] = entry.name[j];
-        }
-        programs_names[at][entry.name_length] = '\0';
-        programs_disk[at] = disk;
+        programs_add(entry.name, entry.name_length, path);
     }
 }
 
@@ -7881,6 +7895,15 @@ static void programs_load(void) {
                                    sizeof(disk_directory) - 1);
     }
     programs_load_directory(disk_directory, true);
+    size_t account = accounts_current();
+    size_t count = package_start_entries(
+        account == ACCOUNT_NONE ? PERMISSION_NO_ACCOUNT : account,
+        programs_packages, PROGRAMS_MAX);
+    for (size_t i = 0; i < count; i++) {
+        programs_add(programs_packages[i].label,
+                     text_length(programs_packages[i].label),
+                     programs_packages[i].path);
+    }
 }
 
 static void programs_show(bool focus) {
@@ -7944,13 +7967,8 @@ static void programs_launch(size_t index) {
     }
     start_menu_open = false;
     programs_open = false;
-    char path[64];
-    size_t length = append_text(path, sizeof(path), 0,
-                                programs_disk[index]
-                                    ? PROGRAMS_DISK_DIRECTORY "/"
-                                    : PROGRAMS_DIRECTORY "/");
-    length = append_text(path, sizeof(path), length, programs_names[index]);
-    files_run_program(path, length);
+    files_run_program(programs_paths[index],
+                      text_length(programs_paths[index]));
 }
 
 static void draw_programs_menu(void) {

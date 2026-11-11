@@ -15,6 +15,7 @@
 #include "cmos.h"
 #include "net.h"
 #include "timer.h"
+#include "package.h"
 #include "update.h"
 #include "user.h"
 #include "vfs.h"
@@ -3319,6 +3320,97 @@ static int64_t user_opos_update(const struct user_process *process,
 }
 
 /*
+ * Packages (ABI 1, added later; older kernels answer -ENOSYS). See
+ * docs/packages.md and package.h. The kernel checks every package itself,
+ * so the caller is not trusted; it must only be an unconfined program
+ * that may read the archive. Results are 0 or -PACKAGE_* (opos.h
+ * OPOS_PACKAGE_E*).
+ *
+ *   check   (path, length, info)           read a package, install nothing
+ *   install (path, length, options, info)  PACKAGE_OPTION_*
+ *   remove  (id, length, options)          PACKAGE_OPTION_EVERYONE only
+ */
+#define OPOS_SYSCALL_PACKAGE_CHECK (OPOS_SYSCALL_BASE + 0x30)
+#define OPOS_SYSCALL_PACKAGE_INSTALL (OPOS_SYSCALL_BASE + 0x31)
+#define OPOS_SYSCALL_PACKAGE_REMOVE (OPOS_SYSCALL_BASE + 0x32)
+
+/* Copies a user string of length bytes into out (NUL-terminated). */
+static bool user_copy_string(uintptr_t address, size_t length, char *out,
+                             size_t capacity) {
+    if (length == 0 || length >= capacity
+        || !paging_user_range_valid(address, length, false, false)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        out[i] = ((const char *)address)[i];
+        if (out[i] == '\0') {
+            return false;
+        }
+    }
+    out[length] = '\0';
+    return true;
+}
+
+static int64_t user_opos_package(const struct user_process *process,
+                                 const struct linux_syscall_frame *frame,
+                                 uint64_t number) {
+    if (process->identity.confined) {
+        return -(int64_t)PACKAGE_NOT_ALLOWED;
+    }
+    size_t account = process->identity.account;
+    bool admin = process->identity.admin;
+    if (number == OPOS_SYSCALL_PACKAGE_REMOVE) {
+        char id[PACKAGE_ID_MAX + 1];
+        uint32_t options = (uint32_t)frame->rdx;
+        if ((options & ~PACKAGE_OPTION_EVERYONE) != 0
+            || !user_copy_string((uintptr_t)frame->rdi, (size_t)frame->rsi,
+                                 id, sizeof(id))) {
+            return -(int64_t)PACKAGE_INVALID;
+        }
+        enum package_result result = package_remove(
+            id, (size_t)frame->rsi, account, admin,
+            (options & PACKAGE_OPTION_EVERYONE) != 0);
+        return result == PACKAGE_OK ? 0 : -(int64_t)result;
+    }
+    bool install = number == OPOS_SYSCALL_PACKAGE_INSTALL;
+    uintptr_t info_address = (uintptr_t)(install ? frame->r10 : frame->rdx);
+    uint32_t options = install ? (uint32_t)frame->rdx : 0;
+    char raw[USER_FILE_PATH_CAPACITY];
+    char path[USER_FILE_PATH_CAPACITY];
+    if (!user_copy_string((uintptr_t)frame->rdi, (size_t)frame->rsi, raw,
+                          sizeof(raw))) {
+        return -(int64_t)PACKAGE_INVALID;
+    }
+    size_t path_length = permission_canonicalize(raw, (size_t)frame->rsi,
+                                                 path, sizeof(path));
+    if (path_length == 0) {
+        return -(int64_t)PACKAGE_INVALID;
+    }
+    if (!permission_program_allows(&process->identity, path, path_length,
+                                   PERMISSION_READ)) {
+        return -(int64_t)PACKAGE_NOT_FOUND;
+    }
+    if (info_address != 0
+        && !paging_user_range_valid(info_address, sizeof(struct package_info),
+                                    true, false)) {
+        return -14;
+    }
+    struct package_info info = {0};
+    info.size = sizeof(info);
+    if (info_address != 0
+        && ((const struct package_info *)info_address)->size < sizeof(info)) {
+        return -(int64_t)PACKAGE_INVALID;
+    }
+    enum package_result result = install
+        ? package_install(path, path_length, account, admin, options, &info)
+        : package_check(path, path_length, account, &info);
+    if (info_address != 0) {
+        *(struct package_info *)info_address = info;
+    }
+    return result == PACKAGE_OK ? 0 : -(int64_t)result;
+}
+
+/*
  * Windows (ABI 1): one window per program, shown by the desktop. See
  * desktop_app_window_* in desktop.c and sdk/include/opos.h.
  */
@@ -4792,6 +4884,16 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         } else {
             frame->rax = (uint64_t)user_opos_update(process, frame, number);
             update_call_leave();
+        }
+        return false;
+    }
+    if (number >= OPOS_SYSCALL_PACKAGE_CHECK
+        && number <= OPOS_SYSCALL_PACKAGE_REMOVE) {
+        if (!package_call_enter()) {
+            frame->rax = (uint64_t)-(int64_t)PACKAGE_BUSY;
+        } else {
+            frame->rax = (uint64_t)user_opos_package(process, frame, number);
+            package_call_leave();
         }
         return false;
     }

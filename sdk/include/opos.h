@@ -319,6 +319,103 @@ static inline long opos_update_cancel(void) {
     return opos_syscall0(OPOS_SYS_UPDATE_CANCEL);
 }
 
+/* ----------------------------------------------------------- packages */
+
+/*
+ * Installing packages (.opk, see tools/mkopk.py). The kernel reads and
+ * checks the package itself; a program only names the file and says what
+ * the person agreed to. Programs started from a disk cannot use these.
+ * Kernels before these calls answer -OPOS_ENOSYS.
+ *
+ *   opos_package_check(path, &info)        what is this package?
+ *   opos_package_install(path, options, &info)
+ *   opos_package_remove(id, options)
+ *
+ * Installing for everyone (OPOS_PACKAGE_EVERYONE) needs an administrator;
+ * without it, the package is installed for the calling account only.
+ * Packages from outside the OPOS Store install only with
+ * OPOS_PACKAGE_CONFIRMED: show the person what the package is and that
+ * OPOS cannot check who made it, and pass it only if they agree.
+ * Errors are -OPOS_PACKAGE_E* (not errno values), or -OPOS_EFAULT.
+ */
+#define OPOS_SYS_PACKAGE_CHECK 0x4f500030L
+#define OPOS_SYS_PACKAGE_INSTALL 0x4f500031L
+#define OPOS_SYS_PACKAGE_REMOVE 0x4f500032L
+
+#define OPOS_PACKAGE_EVERYONE 1u
+#define OPOS_PACKAGE_CONFIRMED 2u
+#define OPOS_PACKAGE_IGNORE_VERSION 4u  /* reinstall or downgrade */
+
+#define OPOS_PACKAGE_ENOT_INSTALLED 1  /* live media */
+#define OPOS_PACKAGE_ENOT_ALLOWED 2    /* not an administrator, or no account */
+#define OPOS_PACKAGE_EBAD 3            /* breaks a rule; info.reason says */
+#define OPOS_PACKAGE_EUNSUPPORTED 4    /* needs a newer OPOS (format) */
+#define OPOS_PACKAGE_ENEEDS_NEWER 5    /* requires-opos is newer */
+#define OPOS_PACKAGE_EPLATFORM 6       /* e.g. a Windows program */
+#define OPOS_PACKAGE_ENOT_NEWER 7      /* same or newer version installed */
+#define OPOS_PACKAGE_EBUSY 8           /* another program is installing */
+#define OPOS_PACKAGE_EDISK 9
+#define OPOS_PACKAGE_ENOT_FOUND 10     /* no such file, or id not installed */
+#define OPOS_PACKAGE_ECONFLICT 11      /* installed elsewhere, or folder in use */
+#define OPOS_PACKAGE_ENOT_CONFIRMED 12 /* OPOS_PACKAGE_CONFIRMED missing */
+#define OPOS_PACKAGE_EINVAL 13
+
+#define OPOS_PACKAGE_PLATFORM_OPOS 0
+#define OPOS_PACKAGE_PLATFORM_LINUX 1
+#define OPOS_PACKAGE_PLATFORM_WINDOWS 2
+
+#define OPOS_PACKAGE_INSTALLED_NONE 0
+#define OPOS_PACKAGE_INSTALLED_EVERYONE 1
+#define OPOS_PACKAGE_INSTALLED_ACCOUNT 2 /* the calling account's own copy */
+
+struct opos_package_info {
+    uint32_t size;        /* sizeof(struct opos_package_info), set by the call */
+    uint32_t platform;    /* OPOS_PACKAGE_PLATFORM_* */
+    uint32_t file_count;
+    uint32_t start_count; /* Start menu entries */
+    uint64_t total_size;  /* bytes once installed */
+    uint32_t installed;   /* OPOS_PACKAGE_INSTALLED_* */
+    uint32_t store;       /* 1: from the OPOS Store */
+    char id[64];
+    char name[32];
+    char version[16];
+    char publisher[64];
+    char requires_opos[16];     /* "" when any version will do */
+    char installed_version[16]; /* when installed */
+    char reason[128];           /* why a check failed, or "" */
+};
+
+static inline long opos_package_check(const char *path,
+                                      struct opos_package_info *info) {
+    size_t length = 0;
+    while (path[length] != '\0') {
+        length++;
+    }
+    info->size = sizeof(*info);
+    return opos_syscall3(OPOS_SYS_PACKAGE_CHECK, (long)path, (long)length,
+                         (long)info);
+}
+
+static inline long opos_package_install(const char *path, uint32_t options,
+                                        struct opos_package_info *info) {
+    size_t length = 0;
+    while (path[length] != '\0') {
+        length++;
+    }
+    info->size = sizeof(*info);
+    return opos_syscall4(OPOS_SYS_PACKAGE_INSTALL, (long)path, (long)length,
+                         (long)options, (long)info);
+}
+
+static inline long opos_package_remove(const char *id, uint32_t options) {
+    size_t length = 0;
+    while (id[length] != '\0') {
+        length++;
+    }
+    return opos_syscall3(OPOS_SYS_PACKAGE_REMOVE, (long)id, (long)length,
+                         (long)options);
+}
+
 /* ------------------------------------------------------------ windows */
 
 /*

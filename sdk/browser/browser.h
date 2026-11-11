@@ -63,6 +63,9 @@ struct style {
     bool no_marker;          /* list-style: none */
     bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
     bool opacity_zero;       /* opacity: 0 */
+    /* align-items (container) and align-self (item): 0 normal/auto,
+       1 start, 2 center, 3 end. */
+    uint8_t align_items, align_self;
     bool grid_area_set;      /* grid-area or grid-row given: may share a cell */
     uint32_t grid_area_name; /* grid-area: <name> hash, 0 = none */
     uint8_t area_count;      /* grid-template-areas: names in the container */

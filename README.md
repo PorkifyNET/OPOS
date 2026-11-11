@@ -38,10 +38,14 @@ hardware support remain future work.
   sidebar place to move them (copied when they come from a read-only place
   or another volume); a sidebar grouped into your folders and This PC;
   back/forward/up buttons and an address bar (Ctrl+L).
-- Start > Programs lists the programs in `/bin`.
+- Start > Programs lists graphical built-in programs from `/bin` and ELF
+  programs placed in writable `/disk/Programs`. Built-in names take
+  precedence. The `fetch` and `update` tools run from Terminal, not the menu.
 - Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
   selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
-  editor remains for administrators editing system files and as a fallback.
+  editor remains for administrators editing system files and as a fallback;
+  protected changes show a warning and require the administrator password
+  when one is configured.
 - Programs run side by side, each on its own task, with up to four program
   windows open at once; the desktop stays responsive while they compute. The
   Task Manager (Ctrl+Shift+Esc) shows their CPU and memory use and ends them;
@@ -170,7 +174,7 @@ computer with accounts the kernel shell first asks for an administrator.
 | `kernel/accounts.c`, `permissions.c`, `cmos.c` | Accounts, file access rules, settings |
 | `sdk/` | Application SDK: header, start-up code, linker script, examples |
 | `tools/` | Host tools and QEMU test scripts |
-| `docs/` | Technical notes |
+| `docs/` | Technical notes, including the [installed-disk root migration plan](docs/system-root-migration.md) |
 
 ## Contributing
 

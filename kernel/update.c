@@ -102,7 +102,7 @@ static char lower(char c) {
 
 static bool starts_with_folded(const char *text, const char *prefix) {
     for (size_t i = 0; prefix[i] != '\0'; i++) {
-        if (lower(text[i]) != prefix[i]) {
+        if (lower(text[i]) != lower(prefix[i])) {
             return false;
         }
     }
@@ -518,6 +518,7 @@ enum update_result update_begin(bool admin, uint32_t options,
     }
     bool force = (options & UPDATE_OPTION_FORCE) != 0;
     if ((options & ~UPDATE_OPTION_MASK) != 0
+        || (options & UPDATE_OPTION_NO_PREVIOUS) != 0
         || length == 0 || length > UPDATE_MANIFEST_MAX
         || (sig_length == 0 && !force)
         || sig_length > UPDATE_SIGNATURE_MAX) {
@@ -656,8 +657,7 @@ static void remove_staging(void) {
                      &not_empty);
 }
 
-/* Copies the running system's kernel and initramfs to boot/old and adds
-   the boot menu entry for them. */
+/* Copies the running system's kernel and initramfs to boot/old. */
 static bool keep_previous_version(void) {
     if (!make_directory(OLD_DIRECTORY)) {
         return false;
@@ -681,10 +681,6 @@ static bool keep_previous_version(void) {
         if (!copy_file(from, to)) {
             return false;
         }
-    }
-    if (!boot_display_add_previous_entry()) {
-        console_write_string(
-            "OPOS: update: could not add the previous-version boot entry\n");
     }
     return true;
 }
@@ -757,14 +753,21 @@ static bool parse_state_options(const char *state, const char *step,
 
 /* Runs the install from `copying` (false: from the backup step). */
 static enum update_result apply(bool copying) {
-    block_begin_batch();
-    bool ok = true;
     if (!copying) {
-        ok = ((session_options & UPDATE_OPTION_NO_PREVIOUS) != 0
-              || keep_previous_version())
-            && write_state(STATE_COPYING);
+        /* PREPARED is durable. Keep the old pair durable before the menu
+           advertises it, and keep both durable before touching live files. */
+        block_begin_batch();
+        bool saved = keep_previous_version();
+        if (!block_end_batch() || !saved) return UPDATE_DISK_ERROR;
+        block_begin_batch();
+        saved = boot_display_add_previous_entry();
+        if (!block_end_batch() || !saved) return UPDATE_DISK_ERROR;
+        block_begin_batch();
+        saved = write_state(STATE_COPYING);
+        if (!block_end_batch() || !saved) return UPDATE_DISK_ERROR;
     }
-    ok = ok && install_staged();
+    block_begin_batch();
+    bool ok = install_staged();
     if (!block_end_batch()) {
         ok = false;
     }

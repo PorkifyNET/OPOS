@@ -53,7 +53,7 @@ compared by identity (device and inode), so 8.3 aliases such as
 around the rules. Paths must be canonical (no `.`, `..` or `//`); the
 kernel resolves them before asking.
 
-| Location | Programs | Files and editor (standard) | Files and editor (administrator) |
+| Location | Built-in programs | Files and editor (standard) | Files and editor (administrator) |
 | --- | --- | --- | --- |
 | `/disk/OPOS`, `/disk/boot`, `/disk/EFI`, `/disk/OPOS.CFG` | read | read | read and change contents |
 | `/disk/OPOS/ACCOUNTS.DAT` | no access | no access | no access |
@@ -62,16 +62,51 @@ kernel resolves them before asking.
 | `/disk/Users/<other name>` | no access | no access | full |
 | everything else (`/disk`, `/disk2`..., the initramfs) | full (initramfs is read-only) | full | full |
 
+`/disk/OPOS.CFG` is a binary settings file. Administrators can change its
+contents through Settings; the built-in text editor opens binary files
+read-only. For a direct confirmation check in Files, create a text file inside
+`/disk/OPOS` while logged in as an administrator.
+
 The protected folders themselves (`/disk/OPOS`, `/disk/Users`, a home
 folder, `/disk` itself) cannot be deleted or renamed by anyone, programs
 or windows. Homes go away with their account (and are kept on deletion).
 `ACCOUNTS.DAT` is only touched by the account code in the kernel.
+
+When an administrator uses the built-in Files or editor to write, create,
+rename, delete or move something in a protected system location, the desktop
+shows a warning first. It checks the logged-in administrator's password when
+one is configured. A successful confirmation authorizes only that queued
+action; it does not unlock the location for later actions or for programs.
 
 Programs run as the account that started them, and child processes
 (`fork`, `execve`, spawn) keep that identity. Without an account logged
 in, a computer without accounts belongs to whoever is at the keyboard
 (administrator); a computer with accounts gives a standard identity with
 no home folder (for example the live session started from the ISO).
+
+An executable launched from a disk (`/disk`, `/disk2`, etc.) is confined to
+writing under `/disk/Users/<account>/AppData/Programs/<id>`. The kernel
+creates this directory when it can; the app obtains its path with
+`opos_app_storage()`. If there is no logged-in account or the directory
+cannot be created, disk apps have no writable files. The ID is derived
+from the executable path, so moving or renaming the executable gives it
+new storage. `fork` and spawn inherit the limit, and `execve` cannot
+remove it. When an unrestricted process executes a disk app, all open
+filesystem handles are closed before it starts. Disk apps cannot call the
+administrator update API. Built-in programs from the read-only initramfs
+keep the location-based permissions in the table above.
+
+Disk apps can read their own app storage and shared/system files allowed
+by the table. To read another file in their account home, they call
+`opos_pick_file()`. Files shows the requesting program and lets the user
+choose a file or cancel. The selected file gets one read grant, checked
+against its device and inode so replacing the file at that path does not
+extend the grant. A new selection replaces the path grant for future opens;
+file handles already opened remain valid. Grants follow `fork` and
+`execve` but never allow writing outside app storage.
+The picker cannot grant access to another account's home or to the
+password file. Disk apps still have network and shared clipboard access;
+shared disk files are readable without a picker.
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none
@@ -103,8 +138,7 @@ disk, because nothing is encrypted.
   bad user address is a denial of service, not a contained error.
 - `getuid` still returns 0 for every program (the Linux tests expect it).
   OPOS programs ask for their account with the native `USER_INFO` call.
-- No per-program sandbox yet: a program can read and write everything its
-  account can. Per-application permissions and file pickers are the next
-  step (project summary, priority 7).
+- Shared disk files remain readable to all programs, and built-in programs
+  retain account-wide read access. A broader app privacy model remains.
 - No disk encryption, no verified boot, no signed updates.
 - The kernel is written in C and has had no fuzzing or external audit.

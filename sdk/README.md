@@ -204,7 +204,18 @@ fills in, so the kernel can grow them without breaking older programs.
 
 Programs run as the account that started them. They can read system files
 but not change them, cannot read the password file, reach only their own
-home folder in `/disk/Users`, and can use everything else on the disks.
+home folder in `/disk/Users`. Programs launched from disk can write only
+inside their private directory; `opos_app_storage(path, capacity)` returns
+its path. To read a file elsewhere in their account home, call
+`opos_pick_file(path, capacity)` and open the returned path. The user chooses
+the file in Files; Esc or closing Files cancels the request. Built-in
+programs from the ISO retain the broader shared-disk
+access described in the security model.
+
+`sdk/build/pickfile` is a small example. Copy it to `/disk/Programs`, launch
+it from Start > Programs, and select a document in Files. OPOS creates the
+folder when Start > Programs opens. A disk app with the same name as a
+built-in `/bin` app does not replace the built-in menu entry.
 See `docs/security-model.md`.
 
 ## Limits

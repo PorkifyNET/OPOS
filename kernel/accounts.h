@@ -10,8 +10,7 @@
  * Each account has a name, an optional password (salted, iterated
  * SHA-256), an administrator flag, its personal settings, and a home
  * folder /disk/Users/<name> with Documents, Pictures, Music, Videos and
- * Downloads. There are no file permissions yet: every account can read
- * every file.
+ * Downloads. The kernel enforces location-based access to home folders.
  */
 
 #define ACCOUNT_MAX 8
@@ -36,6 +35,8 @@ size_t accounts_count(void);
 const char *accounts_name(size_t index);
 bool accounts_has_password(size_t index);
 bool accounts_is_admin(size_t index);
+/* Checks a password without changing the logged-in account. */
+bool accounts_password_matches(size_t index, const char *password);
 /* Index of the account with this name (case-insensitive), or ACCOUNT_NONE. */
 size_t accounts_find(const char *name);
 

@@ -21,6 +21,9 @@ void installer_set_payload(const void *install_archive, size_t archive_size,
 
 /* True when booted from installation media that can install OPOS. */
 bool installer_available(void);
+/* Populate/verify this kernel's generation from its full boot initramfs.
+   Used after formatting a new install and on the first boot after an update. */
+bool installer_stage_system_root(const char **error);
 
 /* Called before each install step with a description and 0-100 percent. */
 typedef void (*installer_progress)(const char *step, unsigned percent);

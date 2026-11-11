@@ -385,8 +385,8 @@ struct user_child_job {
     uint64_t parent_process_id;
     uint64_t task_id;
     enum user_program program;
-    const uint8_t *image_data;
-    size_t image_size;
+    size_t path_length;
+    char path[USER_FILE_PATH_CAPACITY];
     bool elf_image;
     bool forked;
     uintptr_t fork_stack_pointer;
@@ -2872,6 +2872,9 @@ static int64_t user_linux_execve(struct user_process *process,
         return -7;
     }
 
+    struct permission_identity next_identity = process->identity;
+    permission_confine_disk_program(&next_identity, path, path_length);
+
     uint64_t old_address_space = process->address_space;
     uint64_t new_address_space = 0;
     bool kernel_space_active = scheduler_activate_current_address_space(
@@ -2978,12 +2981,26 @@ static int64_t user_linux_execve(struct user_process *process,
     for (size_t i = 0; i < USER_STACK_PAGES; i++) {
         process->stack_pages[i] = stack_physical[i];
     }
+    bool entering_confinement = next_identity.confined
+        && !process->identity.confined;
     for (size_t i = 0; i < USER_DESCRIPTOR_CAPACITY; i++) {
         if (process->descriptors[i].used
-            && process->descriptors[i].close_on_exec) {
-            (void)user_close_descriptor(process, i);
+            && (process->descriptors[i].close_on_exec
+                || (entering_confinement
+                    && open_files[process->descriptors[i].file_slot].kind
+                           == USER_OPEN_FILE_VFS))) {
+            uint8_t slot = process->descriptors[i].file_slot;
+            if (user_close_descriptor(process, i) != 0
+                && entering_confinement
+                && open_files[slot].kind == USER_OPEN_FILE_VFS) {
+                /* Even on a VFS close failure, the new image must not
+                   inherit a file handle outside its grants. */
+                process->descriptors[i] = (struct user_descriptor){0};
+                open_files[slot] = (struct user_file_descriptor){0};
+            }
         }
     }
+    process->identity = next_identity;
     for (size_t i = 0; i < LINUX_SIGNAL_COUNT; i++) {
         if (process->signal_actions[i].handler != LINUX_SIG_IGN) {
             process->signal_actions[i] = (struct linux_signal_action) {0};
@@ -3010,6 +3027,8 @@ static int64_t user_linux_execve(struct user_process *process,
 #define OPOS_SYSCALL_BASE 0x4f500000ULL
 #define OPOS_SYSCALL_ABI_VERSION (OPOS_SYSCALL_BASE + 0)
 #define OPOS_SYSCALL_USER_INFO (OPOS_SYSCALL_BASE + 1)
+#define OPOS_SYSCALL_APP_STORAGE (OPOS_SYSCALL_BASE + 2)
+#define OPOS_SYSCALL_PICK_FILE (OPOS_SYSCALL_BASE + 3)
 #define OPOS_ABI_VERSION 1
 #define OPOS_USER_ADMIN 1u
 #define OPOS_USER_ACCOUNT 2u
@@ -3062,6 +3081,64 @@ static int64_t user_opos_user_info(const struct user_process *process,
     return 0;
 }
 
+static int64_t user_opos_app_storage(const struct user_process *process,
+                                      uintptr_t address, size_t capacity) {
+    const char *path = process->identity.private_path;
+    if (!process->identity.confined || path[0] == '\0') {
+        return -2;
+    }
+    size_t length = 0;
+    while (path[length] != '\0') {
+        length++;
+    }
+    if (capacity <= length) {
+        return -36;
+    }
+    if (!paging_user_range_valid(address, length + 1, true, false)) {
+        return -14;
+    }
+    for (size_t i = 0; i <= length; i++) {
+        ((char *)address)[i] = path[i];
+    }
+    return (int64_t)length;
+}
+
+static int64_t user_opos_pick_file(struct user_process *process,
+                                   uintptr_t address, size_t capacity) {
+    if (!process->identity.confined) {
+        return -22;
+    }
+    if (capacity == 0) {
+        return -36;
+    }
+    size_t checked = capacity < USER_FILE_PATH_CAPACITY
+        ? capacity : USER_FILE_PATH_CAPACITY;
+    if (!paging_user_range_valid(address, checked, true, false)) {
+        return -14;
+    }
+    char path[USER_FILE_PATH_CAPACITY];
+    int64_t length = desktop_app_pick_file(process->id, process->name,
+                                           &process->identity, path,
+                                           sizeof(path));
+    if (length < 0) {
+        return length;
+    }
+    if ((size_t)length + 1 > capacity) {
+        return -36;
+    }
+    if (!paging_user_range_valid(address, (size_t)length + 1, true, false)) {
+        return -14;
+    }
+    if (!permission_grant_read_file(&process->identity, path,
+                                    (size_t)length)) {
+        return -2; /* removed or no longer allowed while the picker ran */
+    }
+    for (size_t i = 0; i <= (size_t)length; i++) {
+        ((char *)address)[i] = path[i];
+    }
+    return length;
+}
+
 
 /*
  * System updates (ABI 1, added later; older kernels answer -ENOSYS). The
@@ -3081,7 +3158,7 @@ static int64_t user_opos_user_info(const struct user_process *process,
 static int64_t user_opos_update(const struct user_process *process,
                                 const struct linux_syscall_frame *frame,
                                 uint64_t number) {
-    bool admin = process->identity.admin;
+    bool admin = process->identity.admin && !process->identity.confined;
     enum update_result result = UPDATE_INVALID;
     if (number == OPOS_SYSCALL_UPDATE_BEGIN
         || number == OPOS_SYSCALL_UPDATE_BEGIN_FORCE
@@ -4592,6 +4669,16 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                                                    (uintptr_t)frame->rdi);
         return false;
     }
+    if (number == OPOS_SYSCALL_APP_STORAGE) {
+        frame->rax = (uint64_t)user_opos_app_storage(
+            process, (uintptr_t)frame->rdi, (size_t)frame->rsi);
+        return false;
+    }
+    if (number == OPOS_SYSCALL_PICK_FILE) {
+        frame->rax = (uint64_t)user_opos_pick_file(
+            process, (uintptr_t)frame->rdi, (size_t)frame->rsi);
+        return false;
+    }
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
         && number <= OPOS_SYSCALL_CLIPBOARD_GET) {
         return user_opos_window(process, frame);
@@ -6002,6 +6089,8 @@ static bool user_process_run_image(enum user_program program,
        parent program. */
     process->identity = identity != NULL ? *identity
                                          : permission_session_identity();
+    permission_confine_disk_program(&process->identity, initial_execfn,
+                                     initial_execfn_length);
     user_set_process_name(process, initial_execfn, initial_execfn_length);
     static const char default_cwd[] = "/";
     const char *cwd = initial_cwd != NULL ? initial_cwd : default_cwd;
@@ -6519,14 +6608,24 @@ static void user_child_worker(void *argument) {
                                            &job->exit_status);
         }
     } else {
-        started = user_process_run_image(
-            job->elf_image ? USER_PROGRAM_MODULE_ELF : job->program,
-            job->elf_image ? job->image_data : NULL,
-            job->elf_image ? job->image_size : 0,
-            job->cwd, job->cwd_length,
-            job->elf_image ? "/tests/elf-test" : NULL,
-            job->elf_image ? sizeof("/tests/elf-test") - 1 : 0,
-            &job->identity, NULL, 0, &job->process_id, &job->exit_status);
+        uint8_t *image = NULL;
+        size_t image_size = 0;
+        if (job->elf_image) {
+            image = user_exec_image_buffer(scheduler_current_slot());
+        }
+        if (job->elf_image && (image == NULL
+            || !vfs_read_file(job->path, job->path_length, image,
+                              USER_EXEC_IMAGE_MAX, &image_size))) {
+            started = false;
+        } else {
+            started = user_process_run_image(
+                job->elf_image ? USER_PROGRAM_MODULE_ELF : job->program,
+                image, image_size, job->cwd, job->cwd_length,
+                job->elf_image ? job->path : NULL,
+                job->elf_image ? job->path_length : 0,
+                &job->identity, NULL, 0, &job->process_id,
+                &job->exit_status);
+        }
     }
 
     uint64_t flags;
@@ -6599,21 +6698,40 @@ static int64_t user_spawn_child(struct user_process *parent,
         return -22;
     }
 
-    struct initramfs_file file = {0};
     bool elf_image = program_selector == 1;
+    char canonical_path[USER_FILE_PATH_CAPACITY];
+    size_t canonical_length = 0;
     if (elf_image) {
-        char kernel_path[256];
+        char absolute_path[USER_FILE_PATH_CAPACITY];
         size_t source_offset = path[0] == '/' ? 1 : 0;
         if (source_offset == path_length) {
             return -2;
         }
-        size_t kernel_path_length = path_length - source_offset;
-        for (size_t i = 0; i < kernel_path_length; i++) {
-            kernel_path[i] = path[source_offset + i];
+        size_t name_length = path_length - source_offset;
+        if (name_length + 2 > sizeof(absolute_path)) {
+            return -36;
         }
-        kernel_path[kernel_path_length] = '\0';
-        if (!initramfs_find_file(kernel_path, &file)) {
+        absolute_path[0] = '/';
+        for (size_t i = 0; i < name_length; i++) {
+            absolute_path[i + 1] = path[source_offset + i];
+        }
+        canonical_length = permission_canonicalize(
+            absolute_path, name_length + 1, canonical_path,
+            sizeof(canonical_path));
+        if (canonical_length == 0) {
+            return -36;
+        }
+        if (!user_path_allowed(parent, canonical_path, canonical_length,
+                               PERMISSION_READ)) {
+            return -13;
+        }
+        struct vfs_metadata metadata;
+        if (!vfs_stat(canonical_path, canonical_length, &metadata)
+            || metadata.type != VFS_NODE_FILE) {
             return -2;
+        }
+        if (metadata.size > USER_EXEC_IMAGE_MAX) {
+            return -7;
         }
     }
 
@@ -6632,8 +6750,7 @@ static int64_t user_spawn_child(struct user_process *parent,
         .handle = __atomic_fetch_add(&next_child_handle, 1, __ATOMIC_RELAXED),
         .parent_process_id = parent->id,
         .program = USER_PROGRAM_PREEMPT_TEST,
-        .image_data = file.data,
-        .image_size = file.size,
+        .path_length = canonical_length,
         .elf_image = elf_image,
         .cwd_length = parent->cwd_length,
         .identity = parent->identity,
@@ -6641,6 +6758,11 @@ static int64_t user_spawn_child(struct user_process *parent,
     };
     for (size_t i = 0; i < parent->cwd_length; i++) {
         job->cwd[i] = parent->cwd[i];
+    }
+    if (elf_image) {
+        for (size_t i = 0; i <= canonical_length; i++) {
+            job->path[i] = canonical_path[i];
+        }
     }
     if (!scheduler_spawn(user_child_worker, job, &job->task_id)) {
         job->state = USER_CHILD_UNUSED;

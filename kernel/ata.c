@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "ata.h"
+#include "console.h"
 #include "io.h"
 
 /* Register offsets from a channel's command block base. */
@@ -27,7 +28,8 @@
 #define ATA_COMMAND_CACHE_FLUSH_EXT 0xea
 #define ATA_LBA28_MAX 0x0fffffff
 #define ATA_IDENTIFY_LBA48_SUPPORTED (1u << 10)
-#define ATA_POLL_LIMIT 1000000
+/* Slow host-backed disks can need more polls to finish a write or flush. */
+#define ATA_POLL_LIMIT 10000000
 /* A channel with nothing attached floats its status register high; the
    IDENTIFY wait gives up quickly instead of spinning the full limit. */
 #define ATA_PROBE_POLL_LIMIT 100000
@@ -76,18 +78,23 @@ static bool ata_wait_status_limit(size_t unit, bool require_data,
     for (unsigned i = 0; i < limit; i++) {
         uint8_t status = io_in8(base + ATA_STATUS);
         if (status == 0 || status == 0xff) {
+            console_write_string("ATA invalid status\n");
             return false;
         }
         if ((status & ATA_STATUS_BUSY) != 0) {
             continue;
         }
         if ((status & (ATA_STATUS_ERROR | ATA_STATUS_DEVICE_FAULT)) != 0) {
+            console_write_string("ATA device error ");
+            console_write_hex(status);
+            console_write_string("\n");
             return false;
         }
         if (!require_data || (status & ATA_STATUS_DRQ) != 0) {
             return true;
         }
     }
+    console_write_string("ATA status timeout\n");
     return false;
 }
 
@@ -153,6 +160,7 @@ static bool ata_start_command(size_t unit, uint32_t first_sector,
         io_out8(base + ATA_LBA_HIGH, (uint8_t)(first_sector >> 16));
         io_out8(base + ATA_COMMAND, write ? ATA_COMMAND_WRITE_SECTORS_EXT
                                           : ATA_COMMAND_READ_SECTORS_EXT);
+        ata_delay_400ns(unit);
         return true;
     }
 
@@ -169,6 +177,7 @@ static bool ata_start_command(size_t unit, uint32_t first_sector,
     io_out8(base + ATA_LBA_HIGH, (uint8_t)(first_sector >> 16));
     io_out8(base + ATA_COMMAND, write ? ATA_COMMAND_WRITE_SECTORS
                                       : ATA_COMMAND_READ_SECTORS);
+    ata_delay_400ns(unit);
     return true;
 }
 
@@ -186,6 +195,7 @@ bool ata_read_sectors(size_t unit, uint32_t first_sector,
         }
         ata_read_data_sector(unit, destination + (size_t)i * 512);
     }
+    ata_delay_400ns(unit);
     return ata_wait_status(unit, false);
 }
 
@@ -193,6 +203,8 @@ static bool send_flush(size_t unit) {
     io_out8(base_of(unit) + ATA_COMMAND,
             units[unit].lba48 ? ATA_COMMAND_CACHE_FLUSH_EXT
                               : ATA_COMMAND_CACHE_FLUSH);
+    /* BSY may not be visible yet; without the delay the wait can end early. */
+    ata_delay_400ns(unit);
     return ata_wait_status(unit, false);
 }
 
@@ -210,6 +222,7 @@ bool ata_write_sectors(size_t unit, uint32_t first_sector,
         }
         ata_write_data_sector(unit, source + (size_t)i * 512);
     }
+    ata_delay_400ns(unit);
     if (!ata_wait_status(unit, false)) {
         return false;
     }

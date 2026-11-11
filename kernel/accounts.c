@@ -273,6 +273,23 @@ bool accounts_is_admin(size_t index) {
         && (accounts[index].flags & ACCOUNT_FLAG_ADMIN) != 0;
 }
 
+bool accounts_password_matches(size_t index, const char *password) {
+    if (index >= account_count) {
+        return false;
+    }
+    if (!accounts_has_password(index)) {
+        return true;
+    }
+    uint8_t hash[SHA256_DIGEST_SIZE];
+    hash_password(accounts[index].salt, password != NULL ? password : "",
+                  hash);
+    uint8_t difference = 0;
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        difference |= (uint8_t)(hash[i] ^ accounts[index].hash[i]);
+    }
+    return difference == 0;
+}
+
 size_t accounts_find(const char *name) {
     for (size_t i = 0; i < account_count; i++) {
         if (names_equal(accounts[i].name, name)) {
@@ -288,20 +305,8 @@ bool accounts_login_required(void) {
 }
 
 bool accounts_login(size_t index, const char *password) {
-    if (index >= account_count) {
+    if (!accounts_password_matches(index, password)) {
         return false;
-    }
-    if (accounts_has_password(index)) {
-        uint8_t hash[SHA256_DIGEST_SIZE];
-        hash_password(accounts[index].salt, password != NULL ? password : "",
-                      hash);
-        uint8_t difference = 0;
-        for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
-            difference |= (uint8_t)(hash[i] ^ accounts[index].hash[i]);
-        }
-        if (difference != 0) {
-            return false;
-        }
     }
     current_account = index;
     /* Recreates missing home folders (deleted, or an older install). */

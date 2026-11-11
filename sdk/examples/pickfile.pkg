@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.pickfile
+name: Pick File
+version: 1.0
+publisher: OPOS SDK examples
+platform: opos
+requires-opos: 0.1.4
+file: files/pickfile ../build/pickfile exec
+start: files/pickfile Pick File

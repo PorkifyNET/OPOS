@@ -3,6 +3,10 @@
 #
 #   make                 builds build/libopos.a and the examples
 #   make APP=myapp       builds build/myapp from myapp.c in this folder
+#   make package PKG=myapp.pkg
+#                        builds the programs, then the package described by
+#                        myapp.pkg (see tools/mkopk.py and
+#                        examples/pickfile.pkg) as build/<id>-<version>.opk
 #
 # Copy the result to an OPOS disk (for example with mtools: mcopy) and run
 # it from the Terminal with "run /disk/hello", or double-click it in Files.
@@ -68,6 +72,16 @@ $(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.l
 
 $(BUILD)/%: %.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
+
+PYTHON ?= python3
+
+.PHONY: package package-test
+package: all
+	@test -n "$(PKG)" || { echo "usage: make package PKG=myapp.pkg"; exit 1; }
+	$(PYTHON) tools/mkopk.py build $(PKG) -o $(BUILD)
+
+package-test:
+	$(PYTHON) tools/test_mkopk.py
 
 clean:
 	rm -rf $(BUILD)

@@ -70,6 +70,29 @@ Compression is left for later, as for updates.
 - A line with an unknown key makes the package "need a newer OPOS", as
   update manifests do.
 
+As built in step 1 (`sdk/tools/mkopk.py`, the reference for the
+installer's checks):
+
+- `PACKAGE` is the first member, at most 16 KB, printable ASCII, one
+  `key: value` per line. That lets the installer read it before any
+  file data arrives.
+- Only regular-file members. Folders are implied by paths; folder, link
+  and special entries reject the package. So does data after the two
+  end blocks, a bad header checksum, or a member listed twice.
+- Paths have no spaces and none of `" * : < > ? \ |`, are at most 200
+  characters, and no part ends in `.`. Names are compared ignoring case,
+  as FAT does. A name cannot be both a file and a folder.
+- At most 512 files. `name` and `start` labels are 1 to 31 characters,
+  `publisher` at most 63, versions at most 15.
+- `format`, `id`, `name`, `version`, `publisher` and `platform` are
+  required; each single key appears once.
+- An `opos` executable needs exactly one valid manifest note, checked as
+  `manifest_read()` does. A `linux` one must be an x86-64 ELF64, a
+  `windows` one must start with `MZ`. `capabilities:` takes
+  `files.shared`, `net` and `clipboard.read`, and is refused in an
+  `opos` package.
+- The archive is reproducible: times, owners and modes are fixed.
+
 ### Trust
 
 There is one store key, an ECDSA P-256 key like the update key but
@@ -268,9 +291,11 @@ by itself in the first version.
 
 ## Order of work
 
-1. SDK: `make package` builds a `.opk` from a program and a
-   `PACKAGE.in` file, filling in hashes and sizes. Host tool
-   `tools/mkopk.py`, with tests for every reject case.
+1. Done. SDK: `make package PKG=x.pkg` builds a `.opk` from a program
+   and a `.pkg` file, filling in hashes and sizes. Host tool
+   `sdk/tools/mkopk.py` (`build` and `check`), tests in
+   `sdk/tools/test_mkopk.py` (`make package-test`), example
+   `sdk/examples/pickfile.pkg`.
 2. Kernel: package parser and checks, staging, the protected class,
    records and resume, for everyone and for one account. Tested with
    sideloaded packages in QEMU.

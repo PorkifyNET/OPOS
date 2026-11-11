@@ -62,7 +62,7 @@ LDFLAGS := -nostdlib -static \
 	-Wl,--build-id=none \
 	-Wl,-T,kernel/linker.ld
 
-.PHONY: all run test-disk persistence-test permissions-test release clean
+.PHONY: all run test-disk persistence-test permissions-test package-test release clean
 
 all: $(ISO)
 
@@ -85,6 +85,9 @@ permissions-test:
 	$(BUILD)/test_manifest
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -Ikernel tools/test_vfs_root_guard.c -o $(BUILD)/test_vfs_root_guard
 	$(BUILD)/test_vfs_root_guard
+
+package-test:
+	python3 sdk/tools/test_mkopk.py
 
 $(BUILD)/mkfat16_test: tools/mkfat16_test.c
 	mkdir -p $(BUILD)

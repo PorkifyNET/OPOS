@@ -1,0 +1,199 @@
+# Application sandbox and permissions (design draft)
+
+Status: proposal. Nothing here is implemented except what the "Current
+state" section describes. `docs/security-model.md` stays the description of
+the shipped code. This page plans the next step toward "applications are
+guests" from `agents/OPOS_Project_Summary.md`.
+
+## Goal
+
+A program that is not part of the system should only touch what the user
+has given it. The user sees what a program asks for, can say no, and can
+take access back later. The kernel enforces this. A program or a
+compatibility layer cannot talk its way around it.
+
+## Current state
+
+- A program launched from a disk is "confined" (`permission_identity.confined`).
+  It can write only under its own `AppData/Programs/<id>` directory.
+- It can read its own app storage, system files, and everything in the
+  shared class (`/disk`, `/disk2`, and so on outside the protected
+  folders). It can read one file in the account home after the user picks
+  it in Files (`opos_pick_file()`, one grant, checked by device and inode).
+- It has full network access and full shared clipboard access. Nothing
+  asks the user for either.
+- Built-in programs from the initramfs are not confined. They read the
+  whole account.
+- There is no record of what a program is. The id is a hash of the
+  executable path, so a renamed or replaced executable is a different or
+  unnoticed program.
+
+The gaps, in order of harm: shared disk files are readable by any disk
+program; network and clipboard cannot be refused; a program cannot be
+identified across updates; nothing is shown to the user.
+
+## Threat model
+
+In scope: a disk program that is malicious or compromised and runs as the
+logged-in user. It may try to read files, send data out, watch the
+clipboard, write outside its storage, or start another program to get
+wider rights.
+
+Out of scope for this draft: kernel bugs, hardware attacks, someone with
+physical access, a malicious administrator, and programs the user
+deliberately gave full trust. A user-approved privileged component is a
+separate policy (see the project summary, section 7).
+
+## Design
+
+### Capabilities
+
+A capability is a named right that the kernel checks. The first set:
+
+| Capability | Meaning | Default for a new disk program |
+| --- | --- | --- |
+| `storage` | Read and write its own app storage | granted |
+| `files.pick` | Use `opos_pick_file()` and `opos_save_file()` (new) | granted |
+| `files.shared` | Read the shared class outside its own directory | denied |
+| `net` | Open sockets (one capability, no local/internet split) | denied, asked on first use |
+| `clipboard.read` | Read the shared clipboard | denied, asked on first use |
+| `clipboard.write` | Replace the clipboard | granted |
+| `window` | Open windows and receive their events | granted |
+
+Capabilities are added to `struct permission_identity` as a bit set, next
+to `confined`. Child processes inherit the set and can only narrow it, as
+`confined` already works. `execve` of another disk program intersects the
+two sets.
+
+`files.pick` stays the main way to reach user documents. It is the safe
+default because the user chooses the file with Files, which a program
+cannot script.
+
+### Manifest
+
+A program declares what it wants in an ELF note section, `.opos.manifest`,
+so the SDK can fill it from a source line. The manifest holds a name, a
+version and the capabilities it requests. It is a request, never a grant.
+A program without a manifest asks for nothing beyond the defaults. The
+kernel reads the note at `execve` and ignores it if it is malformed.
+
+### Identity of a program
+
+A grant needs a stable key. Options:
+
+1. Executable path. Simple, but a renamed file loses its grants and a
+   replaced file keeps them. This is today's behavior for storage.
+2. SHA-256 of the executable (`kernel/sha256.c` exists). Exact, but every
+   update asks again.
+3. Name from the manifest plus the signer's key. Stable across updates,
+   needs program signing, which does not exist yet.
+
+Decision: use option 2. Grants are keyed by the SHA-256 of the
+executable. A changed executable is a new program and is asked again.
+This is stricter than needed for honest updates, but it is safe, and no
+signing infrastructure is required. Move to option 3 when the Store and
+package signing exist.
+
+### Where grants live
+
+Per account, in a file the kernel alone writes: for example
+`/disk/Users/<name>/AppData/Permissions.dat`. It is classed like
+`ACCOUNTS.DAT`: programs get no access, and Files shows it read-only. Each
+record holds the executable hash, a display name, the granted capabilities
+and a timestamp. Two accounts never share grants.
+
+### Enforcement points
+
+All checks run in the kernel, in the path every syscall already uses.
+
+- `files.shared`: in `permission_program_allows`, the `CLASS_SHARED` case
+  returns true for a confined program only when it holds `files.shared`,
+  or the path is under the program's own executable directory, or it is
+  the single picked file. The executable directory is needed so a program
+  can read its own data files next to it.
+- `net`: check in the socket-creating syscalls in `kernel/user.c`. A
+  denied call returns `EACCES`.
+- `clipboard.read`: check in `OPOS_SYSCALL_CLIPBOARD_GET`.
+- Linux-compatibility programs use the same identity. The compatibility
+  layer translates calls into the same kernel checks. It is not trusted to
+  enforce them itself.
+
+### Asking the user
+
+The first time a program uses a denied capability that it could request,
+the syscall blocks and the desktop shows a prompt: program name, the
+capability in plain words, "Allow once", "Always allow", "Deny". The
+program receives `EACCES` on deny. The prompt belongs to the desktop, a
+program cannot draw over or click it, and while it is open the requesting
+program gets no input. If no desktop runs (kernel shell, ISO with no
+account), the answer is deny.
+
+Programs that only run in the Terminal use the same prompt. The Terminal
+window shows that a request is pending.
+
+### Security Center
+
+A new built-in window lists every program with grants, what each has, and
+the last time each was used. The user can revoke a capability. A revoke
+takes effect at the next check, because the kernel reads the grant from
+the identity of the running process, which the desktop updates.
+It also shows a short log of blocked actions, kept locally and never sent
+anywhere.
+
+### Built-in programs
+
+Programs from the initramfs keep their account-wide read today. Later
+they should go through the same model, with defaults that match their job
+(Files has `files.shared` and `files.all`, for example). This is last in
+the order below, because the desktop tools are integrated and the risk is
+lower than a third-party program.
+
+## Migration of existing disk programs
+
+Disk programs installed before step 2 read shared files freely. They keep
+that ability through a prompt, not silently and not by removal.
+
+- The first time such a program runs after the update, and it has no
+  record in the grants store, the desktop asks once: program name, "reads
+  every file on this disk that is not private", "Allow", "Deny".
+- Allow stores `files.shared` for that executable hash. Deny stores the
+  absence. Neither asks again until the user changes it in the Security
+  Center.
+- A program installed after the update starts with the defaults in the
+  table above and gets no migration prompt. It asks like any new program.
+- With no desktop (kernel shell, no account), the answer is deny and
+  nothing is stored.
+- Migration happens once per account. A marker in the grants store says it
+  ran, so a later new program is not treated as "existing".
+
+## Order of work
+
+1. Add the capability bit set and the grants store. Add tests next to
+   `tools/test_app_permissions.c`. No behavior change yet.
+2. Enforce `files.shared`, with the migration prompt above. This closes
+   the largest current gap. Check that the examples in `sdk/examples`
+   still work, and add a test with a program that reads a file in `/disk`
+   without the capability.
+3. Enforce `net` and `clipboard.read` with the desktop prompt.
+4. Manifest note and SDK support.
+5. Security Center window.
+6. Built-in programs.
+
+Each step must keep ABI version 1 working. New calls and fields are
+added. Existing ones do not change meaning, except that a call a program
+was never meant to have can now fail with `EACCES`.
+
+## Open questions
+
+- Does a denied `net` call fail at `socket()` or at `connect()`? A
+  program that never connects should not need the capability.
+- How are grants handled for programs run by the Terminal from a script?
+- Should the picker also hand out directory grants, not only one file?
+  A document editor wants a folder.
+- How does a user grant `files.shared` knowing it is broad? The prompt may
+  need to say "every file on this disk that is not private".
+
+## Not covered
+
+Memory and CPU limits, per-program network filters, camera and microphone
+(no drivers exist), and sandboxing built-in desktop tools from each other.

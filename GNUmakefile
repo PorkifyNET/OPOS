@@ -79,7 +79,7 @@ permissions-test:
 	mkdir -p $(BUILD)
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_app_permissions.c kernel/permissions.c kernel/sha256.c -o $(BUILD)/test_app_permissions
 	$(BUILD)/test_app_permissions
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/sha256.c -o $(BUILD)/test_permission_grants
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/permissions.c kernel/sha256.c -o $(BUILD)/test_permission_grants
 	$(BUILD)/test_permission_grants
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -Ikernel tools/test_vfs_root_guard.c -o $(BUILD)/test_vfs_root_guard
 	$(BUILD)/test_vfs_root_guard

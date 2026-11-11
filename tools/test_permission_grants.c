@@ -11,42 +11,80 @@
 #include "sha256.h"
 #include "vfs.h"
 
-/* One in-memory file plus a list of directories stand in for the disk. */
-static char directories[8][128];
+/* A few in-memory files and directories stand in for the disk. */
+#define FILE_SLOTS 8
+#define FILE_CAPACITY (PERMISSION_GRANTS_FILE_MAX + 64)
+
+static struct {
+    char path[128];
+    uint8_t data[FILE_CAPACITY];
+    size_t size;
+    bool used;
+} files[FILE_SLOTS];
+static char directories[16][128];
 static size_t directory_count;
-static char file_path[128];
-static uint8_t file_data[PERMISSION_GRANTS_FILE_MAX + 64];
-static size_t file_size;
-static bool file_exists;
 static bool fail_writes;
 
 size_t accounts_count(void) { return 2; }
+size_t accounts_current(void) { return 0; }
+bool accounts_is_admin(size_t account) { return account == 0; }
 const char *accounts_name(size_t account) {
     return account == 0 ? "Alice" : "Bob";
 }
 
-static bool is_file(const char *path, size_t length) {
-    return file_exists && strlen(file_path) == length
-        && strncmp(path, file_path, length) == 0;
+bool vfs_disk_root_backing_path(const char *path, size_t length, char *backing,
+                                size_t capacity, size_t *backing_length) {
+    (void)path, (void)length, (void)backing, (void)capacity;
+    (void)backing_length;
+    return false;
+}
+bool vfs_disk_root_contains(const char *path, size_t length) {
+    (void)path, (void)length;
+    return false;
+}
+bool vfs_disk_root_ancestor(const char *path, size_t length) {
+    (void)path, (void)length;
+    return false;
 }
 
-bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
-    if (is_file(path, length)) {
-        *metadata = (struct vfs_metadata){.type = VFS_NODE_FILE};
-        return true;
+static int find_file(const char *path, size_t length) {
+    for (int i = 0; i < FILE_SLOTS; i++) {
+        if (files[i].used && strlen(files[i].path) == length
+            && strncmp(path, files[i].path, length) == 0) {
+            return i;
+        }
     }
+    return -1;
+}
+
+static bool is_directory(const char *path, size_t length) {
     for (size_t i = 0; i < directory_count; i++) {
         if (strlen(directories[i]) == length
             && strncmp(path, directories[i], length) == 0) {
-            *metadata = (struct vfs_metadata){.type = VFS_NODE_DIRECTORY};
             return true;
         }
     }
     return false;
 }
 
+bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
+    int file = find_file(path, length);
+    if (file >= 0) {
+        *metadata = (struct vfs_metadata){
+            .type = VFS_NODE_FILE, .size = files[file].size,
+            .inode = (uint64_t)file + 100
+        };
+        return true;
+    }
+    if (is_directory(path, length)) {
+        *metadata = (struct vfs_metadata){.type = VFS_NODE_DIRECTORY};
+        return true;
+    }
+    return false;
+}
+
 bool vfs_create_directory(const char *path, size_t length) {
-    assert(directory_count < 8 && length < sizeof(directories[0]));
+    assert(directory_count < 16 && length < sizeof(directories[0]));
     memcpy(directories[directory_count], path, length);
     directories[directory_count++][length] = '\0';
     return true;
@@ -54,48 +92,105 @@ bool vfs_create_directory(const char *path, size_t length) {
 
 bool vfs_read_file(const char *path, size_t length, uint8_t *buffer,
                    size_t capacity, size_t *size) {
-    if (!is_file(path, length) || file_size > capacity) {
+    int file = find_file(path, length);
+    if (file < 0 || files[file].size > capacity) {
         return false;
     }
-    memcpy(buffer, file_data, file_size);
-    *size = file_size;
+    memcpy(buffer, files[file].data, files[file].size);
+    *size = files[file].size;
     return true;
 }
 
 bool vfs_write_file(const char *path, size_t length, const uint8_t *buffer,
                     size_t size) {
-    if (fail_writes || length >= sizeof(file_path)
-        || size > sizeof(file_data)) {
+    if (fail_writes || length >= sizeof(files[0].path)
+        || size > FILE_CAPACITY) {
         return false;
     }
-    memcpy(file_path, path, length);
-    file_path[length] = '\0';
-    memcpy(file_data, buffer, size);
-    file_size = size;
-    file_exists = true;
+    int file = find_file(path, length);
+    for (int i = 0; file < 0 && i < FILE_SLOTS; i++) {
+        if (!files[i].used) {
+            file = i;
+        }
+    }
+    assert(file >= 0);
+    memcpy(files[file].path, path, length);
+    files[file].path[length] = '\0';
+    memcpy(files[file].data, buffer, size);
+    files[file].size = size;
+    files[file].used = true;
     return true;
 }
 
 bool vfs_file_size(const char *path, size_t length, size_t *size) {
-    if (!is_file(path, length)) {
+    int file = find_file(path, length);
+    if (file < 0) {
         return false;
     }
-    *size = file_size;
+    *size = files[file].size;
     return true;
 }
 
 bool vfs_read_at(const char *path, size_t length, size_t offset,
                  uint8_t *buffer, size_t count, size_t *bytes_read) {
-    if (!is_file(path, length) || offset > file_size) {
+    int file = find_file(path, length);
+    if (file < 0 || offset > files[file].size) {
         return false;
     }
     /* Short reads, to exercise the loop. */
-    size_t available = file_size - offset;
+    size_t available = files[file].size - offset;
     size_t take = count < available ? count : available;
     take = take > 1000 ? 1000 : take;
-    memcpy(buffer, file_data + offset, take);
+    memcpy(buffer, files[file].data + offset, take);
     *bytes_read = take;
     return true;
+}
+
+/* Children of path: directories first, then files. */
+static bool child_at(const char *path, size_t length, size_t index,
+                     struct vfs_directory_entry *entry) {
+    for (size_t pass = 0; pass < 2; pass++) {
+        size_t limit = pass == 0 ? directory_count : FILE_SLOTS;
+        for (size_t i = 0; i < limit; i++) {
+            const char *candidate = pass == 0 ? directories[i]
+                                              : files[i].path;
+            if ((pass == 1 && !files[i].used)
+                || strncmp(candidate, path, length) != 0
+                || candidate[length] != '/'
+                || strchr(candidate + length + 1, '/') != NULL) {
+                continue;
+            }
+            if (index-- == 0) {
+                if (entry != NULL) {
+                    const char *name = candidate + length + 1;
+                    *entry = (struct vfs_directory_entry){
+                        .name_length = strlen(name),
+                        .type = pass == 0 ? VFS_NODE_DIRECTORY
+                                          : VFS_NODE_FILE,
+                    };
+                    strcpy(entry->name, name);
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool vfs_directory_count(const char *path, size_t length, size_t *count) {
+    if (!is_directory(path, length)) {
+        return false;
+    }
+    *count = 0;
+    while (child_at(path, length, *count, NULL)) {
+        (*count)++;
+    }
+    return true;
+}
+
+bool vfs_directory_entry_at(const char *path, size_t length, size_t index,
+                            struct vfs_directory_entry *entry) {
+    return child_at(path, length, index, entry);
 }
 
 static void program(uint8_t out[SHA256_DIGEST_SIZE], uint8_t seed) {
@@ -104,9 +199,21 @@ static void program(uint8_t out[SHA256_DIGEST_SIZE], uint8_t seed) {
     }
 }
 
-static uint8_t image[PERMISSION_GRANTS_FILE_MAX + 64];
+static void hash_of(const uint8_t *data, size_t size,
+                    uint8_t out[SHA256_DIGEST_SIZE]) {
+    struct sha256_context context;
+    sha256_init(&context);
+    sha256_update(&context, data, size);
+    sha256_final(&context, out);
+}
 
-int main(void) {
+static void put_file(const char *path, const uint8_t *data, size_t size) {
+    assert(vfs_write_file(path, strlen(path), data, size));
+}
+
+static uint8_t image[FILE_CAPACITY];
+
+static void test_records(void) {
     struct permission_grants grants;
     struct permission_grants copy;
     uint8_t a[SHA256_DIGEST_SIZE];
@@ -117,21 +224,26 @@ int main(void) {
     /* Set, find, update. */
     permission_grants_clear(&grants);
     assert(permission_grants_find(&grants, a) == NULL);
-    assert(permission_grants_set(&grants, a, "Editor",
-                                 PERMISSION_CAP_NET, 0, 20261111120000ull));
+    assert(permission_grants_set(&grants, a, "Editor", PERMISSION_CAP_NET, 0,
+                                 0, 20261111120000ull));
     assert(permission_grants_set(&grants, b, "Game",
                                  PERMISSION_CAP_FILES_SHARED
                                      | PERMISSION_CAP_NET,
-                                 PERMISSION_CAP_NET, 0));
+                                 PERMISSION_CAP_NET,
+                                 PERMISSION_CAP_NET | PERMISSION_CAP_FILES_SHARED
+                                     | PERMISSION_CAP_CLIPBOARD_READ,
+                                 0));
     assert(grants.count == 2);
     struct permission_grant *game = permission_grants_find(&grants, b);
     assert(game != NULL && strcmp(game->name, "Game") == 0);
-    /* Refusal wins over a grant of the same bit. */
+    /* Refusal wins over a grant of the same bit; decided bits are not
+       askable. */
     assert(game->granted == PERMISSION_CAP_FILES_SHARED);
     assert(game->denied == PERMISSION_CAP_NET);
+    assert(game->ask == PERMISSION_CAP_CLIPBOARD_READ);
     assert(permission_grants_set(&grants, a, "Editor 2",
                                  PERMISSION_CAP_CLIPBOARD_READ | 0x80000000u,
-                                 0, 5));
+                                 0, 0, 5));
     assert(grants.count == 2);
     struct permission_grant *editor = permission_grants_find(&grants, a);
     assert(editor->granted == PERMISSION_CAP_CLIPBOARD_READ);
@@ -139,7 +251,7 @@ int main(void) {
     char long_name[80];
     memset(long_name, 'x', sizeof(long_name) - 1);
     long_name[sizeof(long_name) - 1] = '\0';
-    assert(permission_grants_set(&grants, a, long_name, 0, 0, 0));
+    assert(permission_grants_set(&grants, a, long_name, 0, 0, 0, 0));
     assert(strlen(permission_grants_find(&grants, a)->name)
            == PERMISSION_GRANT_NAME_MAX);
     grants.flags = PERMISSION_GRANTS_MIGRATED;
@@ -156,6 +268,8 @@ int main(void) {
                   2 * sizeof(grants.records[0])) == 0);
 
     /* Malformed files are rejected whole. */
+    const size_t first = PERMISSION_GRANTS_HEADER_SIZE;
+    const size_t second = first + PERMISSION_GRANTS_RECORD_SIZE;
     uint8_t bad[sizeof(image)];
     memcpy(bad, image, size);
     assert(!permission_grants_decode(bad, size - 1, &copy) && copy.count == 0);
@@ -179,22 +293,28 @@ int main(void) {
     assert(!permission_grants_decode(bad, size, &copy));
     memcpy(bad, image, size);
     /* Second record's name loses its terminator. */
-    memset(bad + PERMISSION_GRANTS_HEADER_SIZE + PERMISSION_GRANTS_RECORD_SIZE
-               + 48, 'y', PERMISSION_GRANT_NAME_MAX + 1);
+    memset(bad + second + 56, 'y', PERMISSION_GRANT_NAME_MAX + 1);
     assert(!permission_grants_decode(bad, size, &copy));
     memcpy(bad, image, size);
     /* First record both grants and denies NET. */
-    bad[PERMISSION_GRANTS_HEADER_SIZE + 36] = PERMISSION_CAP_NET;
-    bad[PERMISSION_GRANTS_HEADER_SIZE + 32] = PERMISSION_CAP_NET;
+    bad[first + 36] = PERMISSION_CAP_NET;
+    bad[first + 32] = PERMISSION_CAP_NET;
+    assert(!permission_grants_decode(bad, size, &copy));
+    memcpy(bad, image, size);
+    /* Second record asks for a bit it was already granted. */
+    bad[second + 40] = PERMISSION_CAP_FILES_SHARED;
+    assert(!permission_grants_decode(bad, size, &copy));
+    memcpy(bad, image, size);
+    /* Reserved bytes must stay zero. */
+    bad[first + 45] = 1;
     assert(!permission_grants_decode(bad, size, &copy));
     memcpy(bad, image, size);
     /* The same program twice. */
-    memcpy(bad + PERMISSION_GRANTS_HEADER_SIZE + PERMISSION_GRANTS_RECORD_SIZE,
-           bad + PERMISSION_GRANTS_HEADER_SIZE, SHA256_DIGEST_SIZE);
+    memcpy(bad + second, bad + first, SHA256_DIGEST_SIZE);
     assert(!permission_grants_decode(bad, size, &copy));
     memcpy(bad, image, size);
     /* Unknown capability bits from a future version are dropped. */
-    bad[PERMISSION_GRANTS_HEADER_SIZE + 35] = 0x80;
+    bad[first + 35] = 0x80;
     assert(permission_grants_decode(bad, size, &copy));
     assert(copy.records[0].granted == 0);
 
@@ -209,17 +329,23 @@ int main(void) {
     for (int i = 0; i < PERMISSION_GRANTS_MAX; i++) {
         uint8_t key[SHA256_DIGEST_SIZE];
         program(key, (uint8_t)(i + 10));
-        assert(permission_grants_set(&grants, key, "p", 0, 0, 0));
+        assert(permission_grants_set(&grants, key, "p", 0, 0, 0, 0));
     }
     uint8_t extra[SHA256_DIGEST_SIZE];
     program(extra, 200);
-    assert(!permission_grants_set(&grants, extra, "p", 0, 0, 0));
+    assert(!permission_grants_set(&grants, extra, "p", 0, 0, 0, 0));
     size = permission_grants_encode(&grants, image, sizeof(image));
     assert(size == PERMISSION_GRANTS_FILE_MAX);
     assert(permission_grants_decode(image, size, &copy)
            && copy.count == PERMISSION_GRANTS_MAX);
+}
 
-    /* Paths. */
+static void test_storage(void) {
+    struct permission_grants grants;
+    struct permission_grants copy;
+    uint8_t a[SHA256_DIGEST_SIZE];
+    program(a, 1);
+
     char path[128];
     assert(permission_grants_path(0, path, sizeof(path)) != 0);
     assert(strcmp(path, "/disk/Users/Alice/AppData/Permissions.dat") == 0);
@@ -228,42 +354,162 @@ int main(void) {
     assert(permission_grants_path(5, path, sizeof(path)) == 0);
     assert(permission_grants_path(0, path, 20) == 0);
 
-    /* Load and save. */
     assert(permission_grants_load(1, &copy) && copy.count == 0);
     assert(!permission_grants_load(PERMISSION_NO_ACCOUNT, &copy));
     permission_grants_clear(&grants);
     assert(permission_grants_set(&grants, a, "Editor", PERMISSION_CAP_NET,
-                                 0, 1));
+                                 0, 0, 1));
+    size_t directories_before = directory_count;
     assert(permission_grants_save(1, &grants));
-    assert(strcmp(file_path, "/disk/Users/Bob/AppData/Permissions.dat") == 0);
-    assert(directory_count == 2);
-    assert(strcmp(directories[0], "/disk/Users/Bob") == 0);
-    assert(strcmp(directories[1], "/disk/Users/Bob/AppData") == 0);
+    static const char bob[] = "/disk/Users/Bob/AppData/Permissions.dat";
+    int file = find_file(bob, strlen(bob));
+    assert(file >= 0);
+    assert(directory_count == directories_before + 2);
+    assert(is_directory("/disk/Users/Bob", 15));
+    assert(is_directory("/disk/Users/Bob/AppData", 23));
     assert(permission_grants_load(1, &copy) && copy.count == 1);
     assert(permission_grants_find(&copy, a)->granted == PERMISSION_CAP_NET);
-    assert(permission_grants_save(1, &grants) && directory_count == 2);
+    assert(permission_grants_save(1, &grants)
+           && directory_count == directories_before + 2);
     fail_writes = true;
     assert(!permission_grants_save(1, &grants));
     fail_writes = false;
-    file_data[0] = 'Z';
+    files[file].data[0] = 'Z';
     assert(!permission_grants_load(1, &copy) && copy.count == 0);
+    /* A damaged store is left alone, not overwritten by a decision. */
+    assert(!permission_grants_decide(1, a, "Editor", PERMISSION_CAP_NET,
+                                     true, 2));
+    assert(files[file].data[0] == 'Z');
+    files[file].used = false;
     assert(!permission_grants_save(PERMISSION_NO_ACCOUNT, &grants));
 
     /* Program hash matches a one-shot SHA-256 of the same bytes. */
     for (size_t i = 0; i < 5000; i++) {
         image[i] = (uint8_t)(i * 7);
     }
-    assert(vfs_write_file("/disk/Programs/app", 18, image, 5000));
+    put_file("/disk/hashme", image, 5000);
     uint8_t expected[SHA256_DIGEST_SIZE];
     uint8_t actual[SHA256_DIGEST_SIZE];
-    struct sha256_context context;
-    sha256_init(&context);
-    sha256_update(&context, image, 5000);
-    sha256_final(&context, expected);
-    assert(permission_program_hash("/disk/Programs/app", 18, actual));
+    hash_of(image, 5000, expected);
+    assert(permission_program_hash("/disk/hashme", 12, actual));
     assert(memcmp(actual, expected, sizeof(actual)) == 0);
-    assert(!permission_program_hash("/disk/Programs/none", 19, actual));
+    assert(!permission_program_hash("/disk/none", 10, actual));
+    files[find_file("/disk/hashme", 12)].used = false;
+}
 
+static void test_migration_and_launch(void) {
+    /* /disk/Programs/old (ELF), /disk/Programs/Suite/tool (ELF),
+       /disk/Programs/readme (not ELF). */
+    static const uint8_t old_elf[] = {0x7F, 'E', 'L', 'F', 1, 2, 3};
+    static const uint8_t tool_elf[] = {0x7F, 'E', 'L', 'F', 9, 9};
+    static const uint8_t readme[] = "not a program";
+    (void)vfs_create_directory("/disk/Programs", 14);
+    (void)vfs_create_directory("/disk/Programs/Suite", 20);
+    put_file("/disk/Programs/old", old_elf, sizeof(old_elf));
+    put_file("/disk/Programs/Suite/tool", tool_elf, sizeof(tool_elf));
+    put_file("/disk/Programs/readme", readme, sizeof(readme));
+    uint8_t old_hash[SHA256_DIGEST_SIZE];
+    uint8_t tool_hash[SHA256_DIGEST_SIZE];
+    hash_of(old_elf, sizeof(old_elf), old_hash);
+    hash_of(tool_elf, sizeof(tool_elf), tool_hash);
+
+    struct permission_grants grants;
+    assert(permission_grants_migrate(0, 0));
+    assert(permission_grants_load(0, &grants));
+    assert(grants.flags & PERMISSION_GRANTS_MIGRATED);
+    assert(grants.count == 2);
+    const struct permission_grant *old =
+        permission_grants_find(&grants, old_hash);
+    assert(old != NULL && strcmp(old->name, "old") == 0);
+    assert(old->ask == PERMISSION_CAP_FILES_SHARED);
+    assert(old->granted == 0 && old->denied == 0);
+    assert(permission_grants_find(&grants, tool_hash) != NULL);
+
+    /* Once only: a program installed afterwards gets no record. */
+    static const uint8_t new_elf[] = {0x7F, 'E', 'L', 'F', 4, 4};
+    put_file("/disk/Programs/new", new_elf, sizeof(new_elf));
+    assert(permission_grants_migrate(0, 0));
+    assert(permission_grants_load(0, &grants) && grants.count == 2);
+
+    /* Launching: a migrated program may ask; a new one may not. */
+    struct permission_identity session = permission_session_identity();
+    struct permission_identity identity = session;
+    permission_apply_program(&identity, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(identity.confined && identity.program_known);
+    assert(memcmp(identity.program, old_hash, SHA256_DIGEST_SIZE) == 0);
+    assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
+    assert(identity.askable == PERMISSION_CAP_FILES_SHARED);
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/new", 18, new_elf,
+                             sizeof(new_elf));
+    assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT);
+    assert(identity.askable == 0);
+
+    /* Built-in programs are left alone. */
+    identity = session;
+    permission_apply_program(&identity, "/bin/hello", 10, new_elf,
+                             sizeof(new_elf));
+    assert(!identity.confined && !identity.program_known);
+    assert(identity.capabilities == PERMISSION_CAPS_ALL);
+
+    /* Allowing stores the grant; the next launch has it. */
+    assert(permission_grants_decide(0, old_hash, "old",
+                                    PERMISSION_CAP_FILES_SHARED, true, 7));
+    assert(permission_grants_load(0, &grants));
+    old = permission_grants_find(&grants, old_hash);
+    assert(old->granted == PERMISSION_CAP_FILES_SHARED && old->ask == 0
+           && old->updated == 7 && strcmp(old->name, "old") == 0);
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(identity.capabilities
+           == (PERMISSION_CAPS_DISK_DEFAULT | PERMISSION_CAP_FILES_SHARED));
+    assert(identity.askable == 0);
+
+    /* A parent without the capability bounds the child. */
+    struct permission_identity parent = session;
+    parent.capabilities &= ~PERMISSION_CAP_FILES_SHARED;
+    permission_apply_program(&parent, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(!permission_has(&parent, PERMISSION_CAP_FILES_SHARED));
+
+    /* Refusing replaces it and is not asked again; NULL keeps the name. */
+    assert(permission_grants_decide(0, old_hash, NULL,
+                                    PERMISSION_CAP_FILES_SHARED, false, 8));
+    assert(permission_grants_load(0, &grants));
+    old = permission_grants_find(&grants, old_hash);
+    assert(old->granted == 0 && old->denied == PERMISSION_CAP_FILES_SHARED
+           && old->ask == 0 && strcmp(old->name, "old") == 0);
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(identity.capabilities == PERMISSION_CAPS_DISK_DEFAULT
+           && identity.askable == 0);
+
+    /* Denying a default capability removes it. */
+    assert(permission_grants_decide(0, tool_hash, NULL,
+                                    PERMISSION_CAP_CLIPBOARD_WRITE, false, 9));
+    identity = session;
+    permission_apply_program(&identity, "/disk/Programs/Suite/tool", 25,
+                             tool_elf, sizeof(tool_elf));
+    assert(!permission_has(&identity, PERMISSION_CAP_CLIPBOARD_WRITE));
+    assert(identity.askable == PERMISSION_CAP_FILES_SHARED);
+
+    /* Without an account nothing is loaded. */
+    struct permission_identity guest = {
+        .account = PERMISSION_NO_ACCOUNT, .capabilities = PERMISSION_CAPS_ALL
+    };
+    permission_apply_program(&guest, "/disk/Programs/old", 18, old_elf,
+                             sizeof(old_elf));
+    assert(guest.capabilities == PERMISSION_CAPS_DISK_DEFAULT
+           && guest.askable == 0);
+}
+
+int main(void) {
+    test_records();
+    test_storage();
+    test_migration_and_launch();
     puts("permission grants: passed");
     return 0;
 }

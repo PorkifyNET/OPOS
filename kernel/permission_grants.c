@@ -12,6 +12,9 @@
 
 #define GRANTS_VERSION 1
 #define NAME_FIELD (PERMISSION_GRANT_NAME_MAX + 1)
+#define NAME_OFFSET 56
+_Static_assert(NAME_OFFSET + NAME_FIELD == PERMISSION_GRANTS_RECORD_SIZE,
+               "grant record layout");
 #define PATH_CAPACITY 128
 
 static uint8_t file_buffer[PERMISSION_GRANTS_FILE_MAX];
@@ -83,11 +86,12 @@ bool permission_grants_decode(const uint8_t *data, size_t size,
         }
         grant->granted = read_u32(record + 32) & PERMISSION_CAPS_ALL;
         grant->denied = read_u32(record + 36) & PERMISSION_CAPS_ALL;
-        grant->updated = read_u64(record + 40);
+        grant->ask = read_u32(record + 40) & PERMISSION_CAPS_ALL;
+        grant->updated = read_u64(record + 48);
         bool terminated = false;
         for (size_t j = 0; j < NAME_FIELD; j++) {
-            grant->name[j] = (char)record[48 + j];
-            terminated = terminated || record[48 + j] == 0;
+            grant->name[j] = (char)record[NAME_OFFSET + j];
+            terminated = terminated || record[NAME_OFFSET + j] == 0;
         }
         bool duplicate = false;
         for (uint32_t j = 0; j < i; j++) {
@@ -95,7 +99,8 @@ bool permission_grants_decode(const uint8_t *data, size_t size,
                 || same_program(grants->records[j].program, grant->program);
         }
         if (!terminated || (grant->granted & grant->denied) != 0
-            || duplicate) {
+            || (grant->ask & (grant->granted | grant->denied)) != 0
+            || read_u32(record + 44) != 0 || duplicate) {
             permission_grants_clear(grants);
             return false;
         }
@@ -135,10 +140,11 @@ size_t permission_grants_encode(const struct permission_grants *grants,
         }
         write_u32(record + 32, grant->granted);
         write_u32(record + 36, grant->denied);
-        write_u64(record + 40, grant->updated);
+        write_u32(record + 40, grant->ask);
+        write_u64(record + 48, grant->updated);
         for (size_t j = 0; j < PERMISSION_GRANT_NAME_MAX
                            && grant->name[j] != '\0'; j++) {
-            record[48 + j] = (uint8_t)grant->name[j];
+            record[NAME_OFFSET + j] = (uint8_t)grant->name[j];
         }
     }
     return size;
@@ -161,7 +167,7 @@ struct permission_grant *permission_grants_find(
 bool permission_grants_set(struct permission_grants *grants,
                            const uint8_t program[SHA256_DIGEST_SIZE],
                            const char *name, uint32_t granted,
-                           uint32_t denied, uint64_t updated) {
+                           uint32_t denied, uint32_t ask, uint64_t updated) {
     if (grants == NULL || program == NULL) {
         return false;
     }
@@ -178,6 +184,7 @@ bool permission_grants_set(struct permission_grants *grants,
     denied &= PERMISSION_CAPS_ALL;
     grant->denied = denied;
     grant->granted = granted & PERMISSION_CAPS_ALL & ~denied;
+    grant->ask = ask & PERMISSION_CAPS_ALL & ~(grant->granted | denied);
     grant->updated = updated;
     size_t length = 0;
     if (name != NULL) {
@@ -321,4 +328,145 @@ bool permission_program_hash(const char *path, size_t length,
     }
     sha256_final(&hash, out);
     return true;
+}
+
+/* Loaded on demand. Kernel code is not preempted and nothing below
+   blocks while it is in use, so one copy serves every caller. */
+static struct permission_grants scratch;
+
+void permission_apply_program(struct permission_identity *identity,
+                              const char *path, size_t length,
+                              const uint8_t *image, size_t size) {
+    if (identity == NULL || !permission_is_disk_program(path, length)) {
+        return;
+    }
+    uint32_t parent = identity->capabilities;
+    permission_confine_disk_program(identity, path, length);
+    identity->askable = 0;
+    identity->program_known = false;
+    if (image == NULL || size == 0) {
+        return;
+    }
+    struct sha256_context hash;
+    sha256_init(&hash);
+    sha256_update(&hash, image, size);
+    sha256_final(&hash, identity->program);
+    identity->program_known = true;
+    if (!permission_grants_load(identity->account, &scratch)) {
+        return;
+    }
+    const struct permission_grant *grant =
+        permission_grants_find(&scratch, identity->program);
+    if (grant == NULL) {
+        return;
+    }
+    identity->capabilities = parent
+        & (PERMISSION_CAPS_DISK_DEFAULT | grant->granted) & ~grant->denied;
+    identity->askable = grant->ask & parent;
+}
+
+bool permission_grants_decide(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE],
+                              const char *name, uint32_t capability,
+                              bool allow, uint64_t now) {
+    capability &= PERMISSION_CAPS_ALL;
+    /* A malformed store is left for the person to inspect, not replaced. */
+    if (capability == 0 || program == NULL
+        || !permission_grants_load(account, &scratch)) {
+        return false;
+    }
+    uint32_t granted = 0;
+    uint32_t denied = 0;
+    uint32_t ask = 0;
+    char kept[PERMISSION_GRANT_NAME_MAX + 1] = {0};
+    const struct permission_grant *grant =
+        permission_grants_find(&scratch, program);
+    if (grant != NULL) {
+        granted = grant->granted;
+        denied = grant->denied;
+        ask = grant->ask;
+        for (size_t i = 0; i < sizeof(kept); i++) {
+            kept[i] = grant->name[i];
+        }
+    }
+    if (allow) {
+        granted |= capability;
+        denied &= ~capability;
+    } else {
+        denied |= capability;
+        granted &= ~capability;
+    }
+    ask &= ~capability;
+    return permission_grants_set(&scratch, program,
+                                 name != NULL ? name : kept, granted, denied,
+                                 ask, now)
+        && permission_grants_save(account, &scratch);
+}
+
+static bool is_elf(const char *path, size_t length) {
+    uint8_t magic[4];
+    size_t got = 0;
+    return vfs_read_at(path, length, 0, magic, sizeof(magic), &got)
+        && got == sizeof(magic) && magic[0] == 0x7F && magic[1] == 'E'
+        && magic[2] == 'L' && magic[3] == 'F';
+}
+
+#define MIGRATE_DEPTH 3
+
+static void migrate_directory(const char *path, size_t length, size_t depth,
+                              uint64_t now) {
+    size_t count = 0;
+    if (!vfs_directory_count(path, length, &count)) {
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at(path, length, i, &entry)
+            || entry.name_length == 0
+            || (entry.name[0] == '.'
+                && (entry.name_length == 1
+                    || (entry.name_length == 2 && entry.name[1] == '.')))
+            || length + 1 + entry.name_length >= 256) {
+            continue;
+        }
+        char child[256];
+        for (size_t j = 0; j < length; j++) {
+            child[j] = path[j];
+        }
+        child[length] = '/';
+        for (size_t j = 0; j < entry.name_length; j++) {
+            child[length + 1 + j] = entry.name[j];
+        }
+        size_t child_length = length + 1 + entry.name_length;
+        child[child_length] = '\0';
+        if (entry.type == VFS_NODE_DIRECTORY) {
+            if (depth + 1 < MIGRATE_DEPTH) {
+                migrate_directory(child, child_length, depth + 1, now);
+            }
+            continue;
+        }
+        uint8_t program[SHA256_DIGEST_SIZE];
+        if (scratch.count >= PERMISSION_GRANTS_MAX
+            || !is_elf(child, child_length)
+            || !permission_program_hash(child, child_length, program)
+            || permission_grants_find(&scratch, program) != NULL) {
+            continue;
+        }
+        (void)permission_grants_set(&scratch, program, child + length + 1,
+                                    0, 0,
+                                    PERMISSION_CAP_FILES_SHARED, now);
+    }
+}
+
+bool permission_grants_migrate(size_t account, uint64_t now) {
+    if (!permission_grants_load(account, &scratch)) {
+        return false;
+    }
+    if ((scratch.flags & PERMISSION_GRANTS_MIGRATED) != 0) {
+        return true;
+    }
+    static const char programs[] = "/disk/Programs";
+    migrate_directory(programs, sizeof(programs) - 1, 0, now);
+    scratch.flags |= PERMISSION_GRANTS_MIGRATED;
+    return permission_grants_save(account, &scratch);
 }

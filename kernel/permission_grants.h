@@ -20,19 +20,21 @@
  *   header (16): "OPGR", version (1), 3 reserved zero bytes,
  *                flags (u32), record count (u32)
  *   record (96): program SHA-256 (32), granted (u32), denied (u32),
- *                updated (u64), display name (48, NUL-padded)
+ *                ask (u32), 4 reserved zero bytes, updated (u64),
+ *                display name (40, NUL-padded)
  * The file is exactly header + count * record bytes.
  */
 
 #define PERMISSION_GRANTS_MAX 64
-#define PERMISSION_GRANT_NAME_MAX 47
+#define PERMISSION_GRANT_NAME_MAX 39
 #define PERMISSION_GRANTS_HEADER_SIZE 16
 #define PERMISSION_GRANTS_RECORD_SIZE 96
 #define PERMISSION_GRANTS_FILE_MAX                                         \
     (PERMISSION_GRANTS_HEADER_SIZE                                         \
      + PERMISSION_GRANTS_MAX * PERMISSION_GRANTS_RECORD_SIZE)
 
-/* The one-time prompt for programs installed before enforcement ran. */
+/* Programs already in <volume>/Programs were recorded (once per account,
+   at the first login with files.shared enforced). */
 #define PERMISSION_GRANTS_MIGRATED (1u << 0)
 
 struct permission_grant {
@@ -42,6 +44,9 @@ struct permission_grant {
     /* Bits the user refused. They are not asked again. A bit is never in
        both sets. */
     uint32_t denied;
+    /* Undecided bits the program may ask for on first use, beyond those
+       every program may ask for. Never overlaps granted or denied. */
+    uint32_t ask;
     /* Real-time clock as decimal YYYYMMDDhhmmss, or 0 when unknown. */
     uint64_t updated;
     char name[PERMISSION_GRANT_NAME_MAX + 1];
@@ -74,14 +79,14 @@ struct permission_grant *permission_grants_find(
     const uint8_t program[SHA256_DIGEST_SIZE]);
 
 /*
- * Records a decision. granted and denied replace the stored sets; a bit in
- * both counts as denied. name is cut to PERMISSION_GRANT_NAME_MAX bytes.
- * Returns false when the store is full.
+ * Stores a record. granted, denied and ask replace the stored sets; a bit
+ * in several counts as denied, then granted. name is cut to
+ * PERMISSION_GRANT_NAME_MAX bytes. Returns false when the store is full.
  */
 bool permission_grants_set(struct permission_grants *grants,
                            const uint8_t program[SHA256_DIGEST_SIZE],
                            const char *name, uint32_t granted,
-                           uint32_t denied, uint64_t updated);
+                           uint32_t denied, uint32_t ask, uint64_t updated);
 
 /* Forgets a program. Returns false when it had no record. */
 bool permission_grants_remove(struct permission_grants *grants,
@@ -104,5 +109,38 @@ bool permission_grants_save(size_t account,
 /* SHA-256 of the file at path: the key for permission_grants_find. */
 bool permission_program_hash(const char *path, size_t length,
                              uint8_t out[SHA256_DIGEST_SIZE]);
+
+struct permission_identity;
+
+/*
+ * Called when a process starts or replaces itself with the executable at
+ * path, whose bytes are image. For a disk program: confines the identity,
+ * records the program's hash, and sets capabilities to what the parent
+ * held intersected with the defaults plus the account's grants. askable
+ * becomes the stored ask bits the parent also held. Other programs are
+ * left alone. A missing or malformed store grants nothing extra.
+ */
+void permission_apply_program(struct permission_identity *identity,
+                              const char *path, size_t length,
+                              const uint8_t *image, size_t size);
+
+/*
+ * Stores the person's answer for one capability of a program: allowed or
+ * refused, and no longer askable. Returns false when the store could not
+ * be read or written.
+ */
+bool permission_grants_decide(size_t account,
+                              const uint8_t program[SHA256_DIGEST_SIZE],
+                              const char *name, uint32_t capability,
+                              bool allow, uint64_t now);
+
+/*
+ * Once per account: every ELF executable below /disk/Programs without a
+ * record gets one that may ask for files.shared, so programs installed
+ * before files.shared was enforced can ask instead of failing silently.
+ * Programs that appear later get no such record. Returns true when the
+ * store is (now) marked migrated.
+ */
+bool permission_grants_migrate(size_t account, uint64_t now);
 
 #endif

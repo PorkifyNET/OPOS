@@ -32,8 +32,9 @@
 /*
  * Capabilities: named rights a process holds (docs/app-sandbox.md). They
  * are recorded on every identity and inherited by children, which can
- * only narrow them. Nothing enforces them yet; the confined/private_path
- * rules below still decide file access.
+ * only narrow them. Enforced so far: files.shared, which a confined
+ * program needs to read the shared class on /disk.., /cdrom.. outside its
+ * own program folder.
  */
 #define PERMISSION_CAP_STORAGE         (1u << 0) /* own app storage */
 #define PERMISSION_CAP_FILES_PICK      (1u << 1) /* picker-granted files */
@@ -54,6 +55,15 @@ struct permission_identity {
     bool admin;
     /* PERMISSION_CAP_* bits. */
     uint32_t capabilities;
+    /* Bits the program may still ask the person for, within what its
+       parent held. A bit leaves this set once asked. */
+    uint32_t askable;
+    /* SHA-256 of the confined program's executable, when known. */
+    bool program_known;
+    uint8_t program[32];
+    /* <volume>/Programs/<folder> when the executable lives in such a
+       folder: readable without files.shared. Empty otherwise. */
+    char program_folder[128];
     /* Disk-launched programs may write only below this directory. Empty
        means the directory could not be prepared, so writes are denied. */
     bool confined;
@@ -90,6 +100,24 @@ void permission_confine_disk_program(struct permission_identity *identity,
 /* True when identity holds every bit in capabilities. */
 bool permission_has(const struct permission_identity *identity,
                     uint32_t capabilities);
+
+/* True for an executable on a disk volume (/disk, /disk2..): the programs
+   permission_confine_disk_program confines. */
+bool permission_is_disk_program(const char *path, size_t length);
+
+/*
+ * When permission_program_allows refuses, the one capability that would
+ * allow it (today only PERMISSION_CAP_FILES_SHARED), or 0 when no
+ * capability would.
+ */
+uint32_t permission_program_missing(const struct permission_identity *identity,
+                                    const char *path, size_t length,
+                                    enum permission_access access);
+
+/* Whether a program may execute (not read) path: reading is allowed, or
+   only files.shared is missing. Running a program confers no data. */
+bool permission_program_may_run(const struct permission_identity *identity,
+                                const char *path, size_t length);
 
 /* Called only after the desktop picker chooses a file. */
 bool permission_grant_read_file(struct permission_identity *identity,

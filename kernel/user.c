@@ -9,6 +9,7 @@
 #include "memory.h"
 #include "paging.h"
 #include "permissions.h"
+#include "permission_grants.h"
 #include "accounts.h"
 #include "scheduler.h"
 #include "cmos.h"
@@ -1440,11 +1441,56 @@ static int64_t user_resolve_file_path(struct user_process *process,
     return 0;
 }
 
-/* True when the process's identity may access the resolved path. */
-static bool user_path_allowed(const struct user_process *process,
+/* Real-time clock as decimal YYYYMMDDhhmmss, or 0 when unreadable. */
+static uint64_t user_clock_stamp(void) {
+    struct rtc_time time;
+    if (!rtc_read(&time)) {
+        return 0;
+    }
+    return ((((uint64_t)time.year * 100 + time.month) * 100 + time.day)
+                * 100 + time.hour) * 10000
+        + (uint64_t)time.minute * 100 + time.second;
+}
+
+/*
+ * Asks the person at the desktop whether this program may have
+ * capability, at most once per process. Allow and refuse are stored for
+ * the program; no desktop, a busy prompt, or ending the program refuses
+ * this time only.
+ */
+static bool user_ask_capability(struct user_process *process,
+                                uint32_t capability) {
+    process->identity.askable &= ~capability;
+    int64_t answer = desktop_app_ask_permission(process->id, process->name,
+                                                capability);
+    if (answer < 0) {
+        return false;
+    }
+    (void)permission_grants_decide(process->identity.account,
+                                   process->identity.program, process->name,
+                                   capability, answer == 1,
+                                   user_clock_stamp());
+    if (answer == 1) {
+        process->identity.capabilities |= capability;
+    }
+    return answer == 1;
+}
+
+/* True when the process's identity may access the resolved path. A
+   program that may still ask for the missing capability asks first. */
+static bool user_path_allowed(struct user_process *process,
                               const char *path, size_t path_length,
                               enum permission_access access) {
-    return permission_program_allows(&process->identity, path, path_length,
+    if (permission_program_allows(&process->identity, path, path_length,
+                                  access)) {
+        return true;
+    }
+    uint32_t missing = permission_program_missing(&process->identity, path,
+                                                  path_length, access);
+    return missing != 0 && process->identity.program_known
+        && (process->identity.askable & missing) == missing
+        && user_ask_capability(process, missing)
+        && permission_program_allows(&process->identity, path, path_length,
                                      access);
 }
 
@@ -2763,7 +2809,7 @@ static int64_t user_linux_execve(struct user_process *process,
     if (resolved != 0) {
         return resolved;
     }
-    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)) {
+    if (!permission_program_may_run(&process->identity, path, path_length)) {
         return -13;
     }
     struct user_exec_vectors vectors = {0};
@@ -2873,7 +2919,8 @@ static int64_t user_linux_execve(struct user_process *process,
     }
 
     struct permission_identity next_identity = process->identity;
-    permission_confine_disk_program(&next_identity, path, path_length);
+    permission_apply_program(&next_identity, path, path_length, exec_image,
+                             image_size);
 
     uint64_t old_address_space = process->address_space;
     uint64_t new_address_space = 0;
@@ -6089,8 +6136,9 @@ static bool user_process_run_image(enum user_program program,
        parent program. */
     process->identity = identity != NULL ? *identity
                                          : permission_session_identity();
-    permission_confine_disk_program(&process->identity, initial_execfn,
-                                     initial_execfn_length);
+    permission_apply_program(&process->identity, initial_execfn,
+                             initial_execfn_length, image_data,
+                             elf_image_size);
     user_set_process_name(process, initial_execfn, initial_execfn_length);
     static const char default_cwd[] = "/";
     const char *cwd = initial_cwd != NULL ? initial_cwd : default_cwd;
@@ -6721,8 +6769,8 @@ static int64_t user_spawn_child(struct user_process *parent,
         if (canonical_length == 0) {
             return -36;
         }
-        if (!user_path_allowed(parent, canonical_path, canonical_length,
-                               PERMISSION_READ)) {
+        if (!permission_program_may_run(&parent->identity, canonical_path,
+                                        canonical_length)) {
             return -13;
         }
         struct vfs_metadata metadata;

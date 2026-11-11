@@ -168,8 +168,11 @@ that ability through a prompt, not silently and not by removal.
 
 ## Order of work
 
-1. Add the capability bit set and the grants store. Add tests next to
-   `tools/test_app_permissions.c`. No behavior change yet.
+1. Done. Add the capability bit set and the grants store
+   (`kernel/permission_grants.c`). Tests are in
+   `tools/test_app_permissions.c` and `tools/test_permission_grants.c`.
+   No behavior change yet, except that programs cannot reach
+   `Permissions.dat`.
 2. Enforce `files.shared`, with the migration prompt above. This closes
    the largest current gap. Check that the examples in `sdk/examples`
    still work, and add a test with a program that reads a file in `/disk`

@@ -60,6 +60,7 @@ kernel resolves them before asking.
 | `/disk/Users` | read | read | read |
 | `/disk/Users/<own name>` | full | full | full |
 | `/disk/Users/<other name>` | no access | no access | full |
+| `/disk/Users/<any name>/AppData/Permissions.dat` | no access | read (own home) | read |
 | everything else (`/disk`, `/disk2`..., the initramfs) | full (initramfs is read-only) | full | full |
 
 `/disk/OPOS.CFG` is a binary settings file. Administrators can change its
@@ -71,6 +72,9 @@ The protected folders themselves (`/disk/OPOS`, `/disk/Users`, a home
 folder, `/disk` itself) cannot be deleted or renamed by anyone, programs
 or windows. Homes go away with their account (and are kept on deletion).
 `ACCOUNTS.DAT` is only touched by the account code in the kernel.
+`Permissions.dat` holds per-program capability grants for the planned
+application sandbox (`docs/app-sandbox.md`). Only the kernel writes it.
+Nothing reads or enforces those grants yet.
 
 When an administrator uses the built-in Files or editor to write, create,
 rename, delete or move something in a protected system location, the desktop
@@ -107,6 +111,12 @@ file handles already opened remain valid. Grants follow `fork` and
 The picker cannot grant access to another account's home or to the
 password file. Disk apps still have network and shared clipboard access;
 shared disk files are readable without a picker.
+
+Each process also carries a capability set. Built-in programs hold every
+capability. A disk app holds only `storage`, `files.pick`,
+`clipboard.write` and `window`. Children inherit the set and can only
+narrow it. The kernel records the set but does not check it yet, so it
+changes no access decision today.
 
 Programs run side by side with the desktop. Logging out, or leaving the
 desktop for the kernel shell, first ends every running program, so none

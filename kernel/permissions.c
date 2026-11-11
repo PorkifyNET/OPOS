@@ -23,6 +23,8 @@ enum path_class {
     CLASS_SECRET,
     CLASS_USERS,
     CLASS_HOME,
+    /* <home>/AppData/Permissions.dat: kernel-written capability grants. */
+    CLASS_GRANTS,
 };
 
 struct path_info {
@@ -86,11 +88,17 @@ static bool ensure_directory(const char *path) {
 
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length) {
-    if (identity == NULL || identity->confined || path == NULL
+    if (identity == NULL || path == NULL
         || length < 5 || lower(path[0]) != '/'
         || lower(path[1]) != 'd' || lower(path[2]) != 'i'
         || lower(path[3]) != 's' || lower(path[4]) != 'k'
         || (length > 5 && path[5] != '/' && (path[5] < '0' || path[5] > '9'))) {
+        return;
+    }
+    /* A confined parent running another disk program keeps the
+       intersection of both sets. Per-program grants join in later. */
+    identity->capabilities &= PERMISSION_CAPS_DISK_DEFAULT;
+    if (identity->confined) {
         return;
     }
     identity->confined = true;
@@ -271,8 +279,12 @@ static struct path_info classify(const char *path, size_t length) {
         info.anchor = true;
         return info;
     }
+    size_t home_length = offset;
     const char *third;
     size_t third_length = next_component(path, length, &offset, &third);
+    size_t third_end = offset;
+    const char *fourth;
+    size_t fourth_length = next_component(path, length, &offset, &fourth);
     info.class = CLASS_HOME;
     info.anchor = third_length == 0;
     static const char users[] = ACCOUNT_HOME_ROOT;
@@ -282,6 +294,15 @@ static struct path_info classify(const char *path, size_t length) {
             info.owner = i;
             break;
         }
+    }
+    /* Any home, owned or orphaned. Anything below a directory spelled
+       Permissions.dat is covered too, so it cannot be used as a disguise. */
+    if (fourth_length != 0
+        && same_entry(path, home_length, third, third_length, "AppData")
+        && same_entry(path, third_end, fourth, fourth_length,
+                      "Permissions.dat")) {
+        info.class = CLASS_GRANTS;
+        info.anchor = true;
     }
     return info;
 }
@@ -338,14 +359,22 @@ struct permission_identity permission_session_identity(void) {
     size_t current = accounts_current();
     if (current != ACCOUNT_NONE) {
         return (struct permission_identity){
-            .account = current, .admin = accounts_is_admin(current)
+            .account = current, .admin = accounts_is_admin(current),
+            .capabilities = PERMISSION_CAPS_ALL
         };
     }
     /* No accounts at all (live media, or a disk set up without any): the
        person at the keyboard owns the machine. */
     return (struct permission_identity){
-        .account = PERMISSION_NO_ACCOUNT, .admin = accounts_count() == 0
+        .account = PERMISSION_NO_ACCOUNT, .admin = accounts_count() == 0,
+        .capabilities = PERMISSION_CAPS_ALL
     };
+}
+
+bool permission_has(const struct permission_identity *identity,
+                    uint32_t capabilities) {
+    return identity != NULL
+        && (identity->capabilities & capabilities) == capabilities;
 }
 
 bool permission_program_allows(const struct permission_identity *identity,
@@ -368,6 +397,7 @@ bool permission_program_allows(const struct permission_identity *identity,
     case CLASS_SYSTEM:
         return access == PERMISSION_READ;
     case CLASS_SECRET:
+    case CLASS_GRANTS:
         return false;
     case CLASS_USERS:
         return access == PERMISSION_READ;
@@ -447,6 +477,13 @@ bool permission_ui_allows(const char *path, size_t length,
             && (access == PERMISSION_WRITE || !info.anchor);
     case CLASS_SECRET:
         return false;
+    case CLASS_GRANTS:
+        /* Visible so the person can see it exists; changed only through
+           the kernel. Other homes stay admin-only, as for CLASS_HOME. */
+        return access == PERMISSION_READ
+            && (info.owner == identity.account
+                    ? info.owner != PERMISSION_NO_ACCOUNT || identity.admin
+                    : identity.admin);
     case CLASS_USERS:
         return access == PERMISSION_READ;
     case CLASS_HOME:

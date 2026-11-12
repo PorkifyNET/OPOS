@@ -100,25 +100,20 @@ The format already supports them, and the window shows "MAY ASK FOR"
 from the `capabilities:` line of a Linux package's `PACKAGE`.
 
 Proposal:
-- Lua and SQLite go into the Store first: their licenses (MIT and
+- Lua and SQLite went into the Store first: their licenses (MIT and
   public domain) allow redistribution, and they are tested above.
 - Each Linux package is built from a pinned source release with a
   checked SHA-256, by a script in `store/linux/<name>/` that
   `make store` runs, so anyone can rebuild what the Store ships.
-- The build needs a musl cross compiler. The one in WSL
-  (`~/opos-merge/build/musl-local`) has a `musl-gcc.specs` that points
-  at `/usr/lib/x86_64-linux-musl`, which does not exist there; a specs
-  file with the real paths fixes it. The build should fetch or build
-  its own pinned musl toolchain instead.
-- Each package keeps its license file next to it, as
-  `docs/packages.md` requires.
+- Each package carries its license and musl's, as `docs/packages.md`
+  requires.
 
 ## Order of work
 
 1. Done. Real programs: Lua and SQLite run as Linux packages; the fixes
    above.
-2. Lua and SQLite in the Store, built by `make store` from pinned
-   sources with their licenses.
+2. Done. Lua and SQLite in the Store, built by `make store` from pinned
+   sources with their licenses. See "As built in step 2".
 3. `/dev` devices and a non-root identity.
 4. Higher limits: descriptors, open files, executable size, `mmap`,
    `mremap`.
@@ -126,6 +121,41 @@ Proposal:
    Ctrl+C and Ctrl+D.
 6. A larger program as the next test (BusyBox), then dynamic linking.
 7. Graphics through an SDL2 backend.
+
+## As built in step 2
+
+**Build scripts.** `store/linux/<name>/build.sh` builds one Linux
+package. `make store` runs those named in `STORE_LINUX` (default
+`lua sqlite`) after the OPOS packages, so the signed index lists all of
+them. Each script:
+- downloads its pinned source release into `STORE_SOURCES` (default
+  `build/store_sources`) once, and stops when its SHA-256 differs;
+- builds one static program with `LINUX_CC`;
+- packages the stripped program with its license and musl's
+  (`LICENSE`, `LICENSE.musl`) via `mkopk.py`.
+
+`store/linux/common.sh` holds the shared steps.
+
+| Package | Source | License |
+| --- | --- | --- |
+| `org.lua.lua` 5.4.7 | `lua-5.4.7.tar.gz` from lua.org | MIT, taken from the source's `lua.h` |
+| `org.sqlite.sqlite3` 3.46.1 | `sqlite-amalgamation-3460100.zip` from sqlite.org | Public domain (`store/linux/sqlite/LICENSE`) |
+
+Both need `requires-opos: 0.1.5`, the first version with the system
+calls from step 1. An older OPOS lists them as needing an update.
+
+**Toolchain.** `LINUX_CC` is `gcc -specs build/musl-local.specs` when
+that file exists (musl unpacked in `build/musl-local`), and otherwise
+`musl-gcc` from the distribution (`apt install musl-tools`).
+`MUSL_LICENSE` is musl's copyright file from the same place. Both can be
+set on the `make` command line. Fetching a pinned toolchain is not done
+yet.
+
+**QEMU test.** `build/store/` on the test disk as the package source:
+the Store window lists Hello, Sketch, Lua and SQLite. INSTALL installs
+Lua and SQLite, each "MAY ASK FOR: NOTHING BEYOND ITS OWN FILES".
+`lua -e "print(6*7, _VERSION)"` prints `42 Lua 5.4`, and
+`sqlite3 -version` prints `3.46.1 2024-08-13 ...`.
 
 ## Tests
 

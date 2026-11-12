@@ -48,6 +48,16 @@ UPDATE_KEY ?= $(HOME)/.opos-signing/update-key.pem
 STORE := $(BUILD)/store
 STORE_KEY ?= $(HOME)/.opos-signing/store-key.pem
 STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
+# Linux programs built from pinned sources by store/linux/<name>/build.sh
+# (docs/linux-programs.md). Sources are downloaded once into
+# STORE_SOURCES. LINUX_CC is a static musl compiler: the musl files in
+# build/musl-local with build/musl-local.specs when present, else the
+# distribution's musl-gcc (Ubuntu/Debian: apt install musl-tools).
+STORE_LINUX ?= lua sqlite
+STORE_SOURCES ?= $(BUILD)/store_sources
+MUSL_SPECS := $(BUILD)/musl-local.specs
+LINUX_CC ?= $(if $(wildcard $(MUSL_SPECS)),gcc -specs $(abspath $(MUSL_SPECS)),musl-gcc)
+MUSL_LICENSE ?= $(firstword $(wildcard $(BUILD)/musl-local/usr/share/doc/musl/copyright /usr/share/doc/musl/copyright))
 # BearSSL files the kernel uses to check update signatures (ECDSA P-256).
 KERNEL_BEARSSL_SOURCES := $(addprefix sdk/bearssl/src/,codec/ccopy.c \
 	ec/ec_p256_m31.c ec/ec_secp256r1.c ec/ec_secp384r1.c ec/ec_secp521r1.c \
@@ -329,6 +339,14 @@ store:
 	for package in $(STORE_PACKAGES); do \
 		python3 sdk/tools/mkopk.py build $$package -o $(BUILD)/store_opk || exit 1; \
 	done
+	@test -n "$(MUSL_LICENSE)" || { echo "store: musl's copyright file not found; set MUSL_LICENSE"; exit 1; }
+	for program in $(STORE_LINUX); do \
+		LINUX_CC="$(LINUX_CC)" MUSL_LICENSE="$(abspath $(MUSL_LICENSE))" \
+		MKOPK="$(abspath sdk/tools/mkopk.py)" \
+		sh store/linux/$$program/build.sh $(abspath $(BUILD)/store_opk) \
+			$(abspath $(STORE_SOURCES)) || exit 1; \
+	done
+	rm -rf $(BUILD)/store_opk/work-*
 	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
 		--descriptions store/descriptions.txt $(BUILD)/store_opk
 	rm -rf $(BUILD)/store_opk

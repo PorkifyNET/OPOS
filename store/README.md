@@ -2,12 +2,20 @@
 
 The packages OPOS publishes in its Store, built from this repository.
 `make store` builds each package listed in `STORE_PACKAGES` in
-`GNUmakefile` and writes `build/store/`:
+`GNUmakefile`, and each Linux program in `STORE_LINUX` with
+`linux/<name>/build.sh` (docs/linux-programs.md), and writes
+`build/store/`:
 
 - one `<id>-<version>.opk` per package,
 - `index`, listing them with the descriptions in `descriptions.txt`,
 - `index.sig`, signed with the store key
   (`STORE_KEY`, default `~/.opos-signing/store-key.pem`).
+
+Linux programs are downloaded from their pinned source releases (each
+checked against its SHA-256) and built with a static musl compiler:
+`build/musl-local.specs` when present, otherwise `musl-gcc`
+(`apt install musl-tools`). Override with `LINUX_CC=...` and
+`MUSL_LICENSE=...`.
 
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads

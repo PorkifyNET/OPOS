@@ -2,3 +2,5 @@
 # --descriptions): "id: description".
 net.porkify.opos.hello: Greets you and shows your account, its home folder and the kernel ABI version.
 net.porkify.opos.sketch: A small drawing program. Left button draws, right button erases, C clears.
+org.lua.lua: The Lua 5.4 interpreter, a small fast scripting language. Run it from the Terminal with a script, or alone for its prompt.
+org.sqlite.sqlite3: The sqlite3 shell for SQLite databases. Run it from the Terminal with a database file.

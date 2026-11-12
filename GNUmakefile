@@ -30,10 +30,11 @@ SDK_FETCH := sdk/build/fetch
 SDK_UPDATE := sdk/build/update
 SDK_PKG := sdk/build/pkg
 SDK_PLAY := sdk/build/play
+SDK_NOTIFY := sdk/build/notify
 SDK_FONTTEST := sdk/build/fonttest
 SDK_BROWSER := sdk/build/browser
 FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt)
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/examples/play.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/examples/play.c sdk/examples/notify.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -236,6 +237,9 @@ $(SDK_PKG): $(SDK_SOURCES)
 $(SDK_PLAY): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/play
 
+$(SDK_NOTIFY): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/notify
+
 # The SDK is self-contained, so it carries copies of the kernel's image
 # decoder; these rules keep them identical.
 sdk/include/opos_image.h: kernel/image.h
@@ -244,7 +248,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(SDK_PKG) $(SDK_PLAY) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF) $(MUSL_LIBC_SO)
+$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(SDK_PKG) $(SDK_PLAY) $(SDK_NOTIFY) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF) $(MUSL_LIBC_SO)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -263,6 +267,7 @@ $(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE)
 	cp $(SDK_UPDATE) $(BUILD)/initramfs_root/bin/update
 	cp $(SDK_PKG) $(BUILD)/initramfs_root/bin/pkg
 	cp $(SDK_PLAY) $(BUILD)/initramfs_root/bin/play
+	cp $(SDK_NOTIFY) $(BUILD)/initramfs_root/bin/notify
 	cp $(SDK_BROWSER) $(BUILD)/initramfs_root/bin/browser
 	cp $(SDK_FONTTEST) $(BUILD)/initramfs_root/tests/fonttest
 	mkdir -p $(BUILD)/initramfs_root/share/fonts

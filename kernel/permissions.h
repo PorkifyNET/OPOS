@@ -48,10 +48,13 @@
 #define PERMISSION_CAP_CLIPBOARD_READ  (1u << 4)
 #define PERMISSION_CAP_CLIPBOARD_WRITE (1u << 5)
 #define PERMISSION_CAP_WINDOW          (1u << 6)
-#define PERMISSION_CAPS_ALL            0x7Fu
+/* Post notifications (docs/notifications.md, step 4). */
+#define PERMISSION_CAP_NOTIFY          (1u << 7)
+#define PERMISSION_CAPS_ALL            0xFFu
 /* What any disk program may ask the person for on first use. */
 #define PERMISSION_CAPS_ASK_ON_USE                                         \
-    (PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ)
+    (PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ                    \
+     | PERMISSION_CAP_NOTIFY)
 /* What a disk program holds before the user grants it anything. */
 #define PERMISSION_CAPS_DISK_DEFAULT                                       \
     (PERMISSION_CAP_STORAGE | PERMISSION_CAP_FILES_PICK                    \

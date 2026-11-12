@@ -1506,7 +1506,7 @@ static const struct terminal_help_entry terminal_help_entries[] = {
     {"run", "run PATH [ARGUMENTS]", "Runs an ELF program by path."},
     {"ps", "ps", "Lists running user programs."},
     {"kill", "kill PID", "Ends the program with the given process ID."},
-    {"notify", "notify TITLE [BODY]", "Shows a notification (for testing)."},
+    {"notify", "notify TITLE [BODY]", "Shows a notification using /bin/notify."},
     {"shell", "shell", "Leaves the desktop for the administrator shell."},
     {"reboot", "reboot", "Restarts the computer."},
     {"shutdown", "shutdown", "Turns off the computer through ACPI."},
@@ -1681,29 +1681,6 @@ static bool terminal_execute(void) {
             terminal_length - i, NULL, 0);
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
-        }
-    } else if (terminal_length > 7
-               && text_equals(terminal_line, 7, "notify ")) {
-        /* notify TITLE [BODY]: the first word is the title. */
-        char title[NOTIFY_TITLE_MAX];
-        char body[NOTIFY_BODY_MAX];
-        size_t i = 7;
-        size_t length = 0;
-        while (i < terminal_length && terminal_line[i] == ' ') {
-            i++;
-        }
-        while (i < terminal_length && terminal_line[i] != ' '
-               && length + 1 < sizeof(title)) {
-            title[length++] = terminal_line[i++];
-        }
-        title[length] = '\0';
-        length = 0;
-        while (i < terminal_length && length + 1 < sizeof(body)) {
-            body[length++] = terminal_line[i++];
-        }
-        body[length] = '\0';
-        if (notify_post("TERMINAL", title, body) == 0) {
-            terminal_print("Usage: notify TITLE [BODY]");
         }
     } else if (text_equals(terminal_line, terminal_length, "net")) {
         net_describe(terminal_print);
@@ -5731,6 +5708,10 @@ static void capability_text(uint32_t capability, const char **what,
         *what = "READ THE CLIPBOARD";
         *detail = "WHATEVER YOU COPY, IN ANY PROGRAM.";
         return;
+    case PERMISSION_CAP_NOTIFY:
+        *what = "SHOW NOTIFICATIONS";
+        *detail = "POPUPS BY THE CLOCK, WITH A SOUND.";
+        return;
     default:
         *what = "USE A RESTRICTED FEATURE";
         *detail = "";
@@ -8934,6 +8915,10 @@ static void toasts_reset(void) {
     toast_count = 0;
 }
 
+/* The front window is a program's that set DESKTOP_APP_QUIET
+   (defined with the program windows). */
+static bool front_window_quiet(void);
+
 /* Log out: no panel, no toasts. */
 static void notifications_session_end(void) {
     toast_count = 0;
@@ -8959,7 +8944,7 @@ static bool toasts_poll(void) {
     if (login_active || protected_active) {
         return changed;
     }
-    bool quiet = appearance_do_not_disturb();
+    bool quiet = appearance_do_not_disturb() || front_window_quiet();
     if (center_open) {
         struct notification fresh;
         bool any = false;
@@ -12520,12 +12505,23 @@ uint64_t desktop_app_window_size(uint64_t owner) {
         | (uint64_t)window->reported_height;
 }
 
+static bool front_window_quiet(void) {
+    if (z_count == 0 || !window_is_app(z_order[z_count - 1])) {
+        return false;
+    }
+    const struct app_window *window =
+        &app_windows[z_order[z_count - 1] - WINDOW_APP];
+    return window->owner != 0
+        && (window->options & DESKTOP_APP_QUIET) != 0;
+}
+
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {
     struct app_window *window = app_window_of(owner);
     if (window == NULL) {
         return -9;
     }
-    if ((options & ~(uint32_t)DESKTOP_APP_KEY_STATE) != 0) {
+    if ((options & ~(uint32_t)(DESKTOP_APP_KEY_STATE | DESKTOP_APP_QUIET))
+        != 0) {
         return -22;
     }
     window->options = options;
@@ -13379,13 +13375,13 @@ static void tasks_key(char character) {
 /*
  * What each disk program of the logged-in account may do
  * (docs/app-sandbox.md): one row per program in Permissions.dat, with
- * Network, Clipboard and Shared files. Clicking a setting (or 1, 2, 3)
+ * Network, Clipboard, Shared files and Notify. Clicking a setting (or 1-4)
  * denies what was allowed and allows what was denied; an undecided one
  * becomes denied. Denying takes effect in running copies at once.
  * Forget (Delete) removes the program's record, so it asks again.
  */
 #define SECURITY_ROW_HEIGHT 24
-#define SECURITY_COLUMNS 3
+#define SECURITY_COLUMNS 4
 
 static struct permission_grants security_store;
 static bool security_store_ok;
@@ -13395,11 +13391,11 @@ static uint64_t security_loaded_tick;
 
 static const uint32_t security_caps[SECURITY_COLUMNS] = {
     PERMISSION_CAP_NET, PERMISSION_CAP_CLIPBOARD_READ,
-    PERMISSION_CAP_FILES_SHARED,
+    PERMISSION_CAP_FILES_SHARED, PERMISSION_CAP_NOTIFY,
 };
 /* In characters; fits the half-width tile of a 1920-pixel screen. */
 static const int64_t security_column_x[SECURITY_COLUMNS + 2] = {
-    0, 22, 33, 44, 58
+    0, 18, 28, 38, 51, 61
 };
 #define SECURITY_CELL_CHARS 10
 
@@ -13527,7 +13523,8 @@ static void draw_security(struct rect area, bool focused) {
                       "WHAT YOUR DISK PROGRAMS MAY DO. CLICK A SETTING "
                       "TO CHANGE IT.", 151, 190, 255);
     static const char *const headings[SECURITY_COLUMNS + 2] = {
-        "PROGRAM", "NETWORK", "CLIPBOARD", "SHARED FILES", "CHANGED"
+        "PROGRAM", "NETWORK", "CLIPBOARD", "SHARED FILES", "NOTIFY",
+        "CHANGED"
     };
     for (size_t i = 0; i < SECURITY_COLUMNS + 2; i++) {
         draw_text_clipped(x + security_column_x[i] * CHAR_WIDTH,
@@ -13580,8 +13577,10 @@ static void draw_security(struct rect area, bool focused) {
         }
         char when[11];
         security_format_date(grant->updated, when);
-        draw_text_clipped(x + security_column_x[4] * CHAR_WIDTH, row.y + 5,
-                          width - security_column_x[4] * CHAR_WIDTH, when,
+        draw_text_clipped(x + security_column_x[SECURITY_COLUMNS + 1]
+                              * CHAR_WIDTH, row.y + 5,
+                          width - security_column_x[SECURITY_COLUMNS + 1]
+                              * CHAR_WIDTH, when,
                           200, 205, 220);
     }
     if (security_store.count == 0) {
@@ -13596,7 +13595,7 @@ static void draw_security(struct rect area, bool focused) {
     }
     draw_text_clipped(x, button.y + 7, button.x - x - 16,
                       security_message[0] != '\0' ? security_message
-                      : "1 2 3: CHANGE  DELETE: FORGET PROGRAM",
+                      : "1-4: CHANGE  DELETE: FORGET PROGRAM",
                       security_message[0] != '\0' ? 240 : 150,
                       security_message[0] != '\0' ? 205 : 160,
                       security_message[0] != '\0' ? 100 : 185);
@@ -13945,6 +13944,7 @@ static void store_asks_text(const char *asks, char *out, size_t capacity) {
         {"net", "NETWORK"},
         {"clipboard.read", "READING THE CLIPBOARD"},
         {"files.shared", "SHARED FILES"},
+        {"notifications", "NOTIFICATIONS"},
     };
     size_t used = append_text(out, capacity, 0, "MAY ASK FOR: ");
     bool any = false;

@@ -15,7 +15,8 @@
  */
 
 #define NOTIFY_CAPACITY 64u
-#define NOTIFY_SOURCE_MAX 32u
+/* Room for "Program Name (executable)" (see user.c). */
+#define NOTIFY_SOURCE_MAX 72u
 #define NOTIFY_TITLE_MAX 64u
 #define NOTIFY_BODY_MAX 192u
 

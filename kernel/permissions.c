@@ -277,6 +277,7 @@ static const struct {
     {"fetch", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"update", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"pkg", BUILTIN_BASE | PERMISSION_CAP_NET},
+    {"notify", BUILTIN_BASE | PERMISSION_CAP_NOTIFY},
     {"browser", (BUILTIN_BASE & ~PERMISSION_CAP_FILES_SHARED)
                     | PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ},
 };

@@ -12,6 +12,7 @@
 #include "permission_grants.h"
 #include "accounts.h"
 #include "scheduler.h"
+#include "notify.h"
 #include "sound.h"
 #include "cmos.h"
 #include "net.h"
@@ -1669,15 +1670,11 @@ uint64_t user_clock_stamp(void) {
         + (uint64_t)time.minute * 100 + time.second;
 }
 
-/*
- * Asks the person at the desktop whether this program may have
- * capability, at most once per process. Allow and refuse are stored for
- * the program; no desktop, a busy prompt, or ending the program refuses
- * this time only.
- */
-static bool user_ask_capability(struct user_process *process,
-                                uint32_t capability) {
-    process->identity.askable &= ~capability;
+/* The program's manifest name with the executable's beside it, as
+   prompts and notifications show it: "Name (file)", or just the file
+   name when there is no manifest name or it is the same. */
+static void user_program_label(const struct user_process *process,
+                               char *label, size_t capacity) {
     /* A manifest name is the program's own claim: show the executable's
        name beside it, so "Files" cannot pass for the real Files. */
     const char *claimed = process->identity.program_name;
@@ -1687,20 +1684,19 @@ static bool user_ask_capability(struct user_process *process,
         same++;
     }
     bool redundant = claimed[same] == '\0' && process->name[same] == '\0';
-    char label[72];
     size_t used = 0;
     for (size_t i = 0; !redundant && claimed[i] != '\0'
-                       && used + 1 < sizeof(label); i++) {
+                       && used + 1 < capacity; i++) {
         label[used++] = claimed[i];
     }
     if (used != 0) {
         static const char open[] = " (";
-        for (size_t i = 0; open[i] != '\0' && used + 1 < sizeof(label); i++) {
+        for (size_t i = 0; open[i] != '\0' && used + 1 < capacity; i++) {
             label[used++] = open[i];
         }
     }
     size_t file_start = used;
-    for (size_t i = 0; process->name[i] != '\0' && used + 2 < sizeof(label);
+    for (size_t i = 0; process->name[i] != '\0' && used + 2 < capacity;
          i++) {
         label[used++] = process->name[i];
     }
@@ -1708,6 +1704,20 @@ static bool user_ask_capability(struct user_process *process,
         label[used++] = ')';
     }
     label[used] = '\0';
+}
+
+/*
+ * Asks the person at the desktop whether this program may have
+ * capability, at most once per process. Allow and refuse are stored for
+ * the program; no desktop, a busy prompt, or ending the program refuses
+ * this time only.
+ */
+static bool user_ask_capability(struct user_process *process,
+                                uint32_t capability) {
+    process->identity.askable &= ~capability;
+    const char *claimed = process->identity.program_name;
+    char label[72];
+    user_program_label(process, label, sizeof(label));
     int64_t answer = desktop_app_ask_permission(process->id, label,
                                                 capability);
     if (answer < 0) {
@@ -4062,6 +4072,119 @@ static int64_t user_opos_sound(struct user_process *process,
 }
 
 /*
+ * Notifications (docs/notifications.md, step 4): notify(title, title
+ * length, body, body length) posts one under the program's name. It needs
+ * the notifications capability (asked for on first use) and is limited to
+ * OPOS_NOTIFY_PER_MINUTE per program: per executable (its SHA-256) when
+ * known, else per process name, so a script that starts it in a loop is
+ * limited too.
+ */
+#define OPOS_SYSCALL_NOTIFY (OPOS_SYSCALL_BASE + 0x50)
+#define OPOS_NOTIFY_PER_MINUTE 10u
+#define OPOS_NOTIFY_RATE_SLOTS 16u
+
+static struct {
+    bool used;
+    uint8_t key[33]; /* 'H' + SHA-256, or 'N' + the process name */
+    uint64_t since;  /* timer tick the minute started */
+    uint32_t count;
+} user_notify_rate[OPOS_NOTIFY_RATE_SLOTS];
+
+/* False when the program already posted its share this minute. */
+static bool user_notify_rate_take(const struct user_process *process) {
+    uint8_t key[33] = {0};
+    if (process->identity.program_known) {
+        key[0] = 'H';
+        for (size_t i = 0; i < 32; i++) {
+            key[1 + i] = process->identity.program[i];
+        }
+    } else {
+        key[0] = 'N';
+        for (size_t i = 0; i < 31 && process->name[i] != '\0'; i++) {
+            key[1 + i] = (uint8_t)process->name[i];
+        }
+    }
+    uint64_t now = timer_ticks();
+    size_t slot = OPOS_NOTIFY_RATE_SLOTS;
+    size_t oldest = 0;
+    for (size_t i = 0; i < OPOS_NOTIFY_RATE_SLOTS && slot == OPOS_NOTIFY_RATE_SLOTS;
+         i++) {
+        bool same = user_notify_rate[i].used;
+        for (size_t b = 0; same && b < sizeof(key); b++) {
+            same = user_notify_rate[i].key[b] == key[b];
+        }
+        if (same) {
+            slot = i;
+        } else if (!user_notify_rate[i].used
+                   || (user_notify_rate[oldest].used
+                       && user_notify_rate[i].since
+                              < user_notify_rate[oldest].since)) {
+            oldest = i;
+        }
+    }
+    if (slot == OPOS_NOTIFY_RATE_SLOTS) {
+        slot = oldest;
+        user_notify_rate[slot].used = true;
+        for (size_t b = 0; b < sizeof(key); b++) {
+            user_notify_rate[slot].key[b] = key[b];
+        }
+        user_notify_rate[slot].since = now;
+        user_notify_rate[slot].count = 0;
+    }
+    if (now - user_notify_rate[slot].since >= 60u * 100u) {
+        user_notify_rate[slot].since = now;
+        user_notify_rate[slot].count = 0;
+    }
+    if (user_notify_rate[slot].count >= OPOS_NOTIFY_PER_MINUTE) {
+        return false;
+    }
+    user_notify_rate[slot].count++;
+    return true;
+}
+
+/* Copies a user string of length bytes (cut to fit) into out. */
+static bool user_copy_text(uintptr_t address, size_t length, char *out,
+                           size_t capacity) {
+    if (length >= capacity) {
+        length = capacity - 1;
+    }
+    if (length != 0
+        && !paging_user_range_valid(address, length, false, false)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        out[i] = ((const char *)address)[i];
+    }
+    out[length] = '\0';
+    return true;
+}
+
+static int64_t user_opos_notify(struct user_process *process,
+                                const struct linux_syscall_frame *frame) {
+    char title[NOTIFY_TITLE_MAX];
+    char body[NOTIFY_BODY_MAX];
+    if (!user_copy_text((uintptr_t)frame->rdi, (size_t)frame->rsi, title,
+                        sizeof(title))
+        || !user_copy_text((uintptr_t)frame->rdx, (size_t)frame->r10, body,
+                           sizeof(body))) {
+        return -14;
+    }
+    if (title[0] == '\0') {
+        return -22;
+    }
+    if (!user_capability_allowed(process, PERMISSION_CAP_NOTIFY)) {
+        return -13;
+    }
+    if (!user_notify_rate_take(process)) {
+        return -11;
+    }
+    char source[NOTIFY_SOURCE_MAX];
+    user_program_label(process, source, sizeof(source));
+    uint32_t id = notify_post(source, title, body);
+    return id != 0 ? (int64_t)id : -22;
+}
+
+/*
  * Windows (ABI 1): one window per program, shown by the desktop. See
  * desktop_app_window_* in desktop.c and sdk/include/opos.h.
  */
@@ -5648,6 +5771,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
         && number <= OPOS_SYSCALL_WINDOW_OPTIONS) {
         return user_opos_window(process, frame);
+    }
+    if (number == OPOS_SYSCALL_NOTIFY) {
+        frame->rax = (uint64_t)user_opos_notify(process, frame);
+        return false;
     }
     if (number >= OPOS_SYSCALL_SOUND_OPEN
         && number <= OPOS_SYSCALL_SOUND_CLOSE) {

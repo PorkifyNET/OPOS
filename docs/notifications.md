@@ -74,9 +74,10 @@ sound, so the sounds come first.
    for testing.
 3. **Notification Center.** The taskbar bell with the unread count, the
    panel, Super+N, dismissing and CLEAR ALL.
-4. **Programs.** OPOS calls `0x4f500050` notify(title, body) and
-   `0x4f500051` do-not-disturb(window, on), SDK `opos_notify` and
-   `opos_window_quiet`, the `notifications` permission in manifests,
+4. **Programs.** OPOS call `0x4f500050` notify(title, body) and a
+   window option `OPOS_WINDOW_QUIET` (each program has one window, so an
+   option fits better than a call), SDK `opos_notify`, the
+   `notifications` permission in manifests,
    prompts and the Security Center, and `/bin/notify TITLE BODY` for the
    Terminal and scripts. SDL programs can mark their window quiet, and
    the Doom package does so while a game is running.
@@ -191,6 +192,46 @@ Each step is one PR, stacked like the sound work.
   grey. `fault` posted "FAULT-TEST STOPPED UNEXPECTEDLY / IT ENDED WITH A
   PAGE FAULT". Not tested: mouse clicks (the QEMU harness cannot click)
   and scrolling past a full panel.
+
+## As built in step 4
+
+- Capability `notifications` is bit 7 (`PERMISSION_CAP_NOTIFY`,
+  `OPOS_CAP_NOTIFY`); `PERMISSION_CAPS_ALL` is now 0xFF. Disk programs
+  without a manifest may ask for it on first use, like `net`; with a
+  manifest, only when it lists it. `/bin/notify` holds it; the kernel
+  shell's programs and self-tests hold everything. Older kernels drop the
+  bit when they read a newer Permissions.dat.
+- OPOS call `0x4f500050` notify(title, title length, body, body length):
+  -14 for a bad address, -22 for an empty title, -13 when refused, -11
+  (EAGAIN) after 10 in a minute. The limit is per program (the
+  executable's SHA-256 when known, else the process name), so starting a
+  program over and over does not get around it. The source shown is the
+  prompt's label: "Manifest name (file)", or just the file name.
+- SDK: `opos_notify(title, body)`, `OPOS_CAP_NOTIFY`, `OPOS_EAGAIN`, and
+  window option `OPOS_WINDOW_QUIET` (desktop.h `DESKTOP_APP_QUIET`):
+  while that window is in front, notifications skip the toast and sound,
+  as with DO NOT DISTURB. Older kernels refuse the option with -22.
+- `/bin/notify TITLE [BODY...]` (sdk/examples/notify.c) replaces the
+  Terminal's built-in `notify` from step 2.
+- The permission prompt reads "SHOW NOTIFICATIONS / POPUPS BY THE CLOCK,
+  WITH A SOUND." The Security Center has a NOTIFY column (key 4); its
+  columns were narrowed so all five fit a half-width tile at 1920 pixels.
+  The Store's "MAY ASK FOR" line, `mkopk.py`, `mkindex.py` and the
+  kernel's PACKAGE parser know the name `notifications`.
+- Not done: SDL's OPOS video driver and the Doom package do not set
+  `OPOS_WINDOW_QUIET` yet. That needs the SDL and Doom recipes rebuilt.
+- Tested in QEMU:
+  - Live ISO: `notify Hello From the notify program` showed a toast from
+    "notify"; ten more runs within a minute posted ten and the eleventh
+    printed "too many notifications; wait a minute".
+  - Installed system (account bob), `/bin/notify` copied to
+    `/disk/Programs/alert`: the first run asked "ALLOW NOTIFY (ALERT)?";
+    DENY was remembered (no second prompt) and showed as DENIED in the
+    Security Center; key 4 made it ALLOWED, and the next run showed a
+    toast from "Notify (alert)".
+  - The shutdown sound (step 1) played from Start > SHUT DOWN, chosen
+    with the keyboard, before the machine turned off.
+  - Not tested: `OPOS_WINDOW_QUIET` (no test program sets it yet).
 
 ## Not planned yet
 

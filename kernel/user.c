@@ -232,6 +232,23 @@ enum user_open_file_kind {
     USER_OPEN_FILE_PIPE_READ,
     USER_OPEN_FILE_PIPE_WRITE,
     USER_OPEN_FILE_SOCKET,
+    /* /dev/null and friends, /etc/passwd and /etc/group: made by the
+       kernel, not on disk (docs/linux-programs.md). */
+    USER_OPEN_FILE_DEVICE,
+};
+
+static int64_t user_linux_getrandom(uintptr_t buffer, size_t length);
+
+enum user_device {
+    USER_DEVICE_NONE,
+    USER_DEVICE_NULL,
+    USER_DEVICE_ZERO,
+    USER_DEVICE_FULL,
+    USER_DEVICE_RANDOM,
+    USER_DEVICE_URANDOM,
+    USER_DEVICE_TTY,
+    USER_DEVICE_PASSWD,
+    USER_DEVICE_GROUP,
 };
 
 struct user_file_descriptor {
@@ -245,6 +262,7 @@ struct user_file_descriptor {
     size_t offset;
     vfs_object_handle object;
     uint8_t pipe_slot;
+    uint8_t device; /* enum user_device, for USER_OPEN_FILE_DEVICE */
     bool nonblocking;
     /* Sockets: SOCK_STREAM or SOCK_DGRAM, enum user_socket_state, the
        net.c handle (TCP connection, listener or UDP socket; -1 = none). */
@@ -1211,6 +1229,9 @@ static bool user_close_open_file(struct user_file_descriptor *file) {
     if (file->kind == USER_OPEN_FILE_VFS) {
         return vfs_close_object(file->object);
     }
+    if (file->kind == USER_OPEN_FILE_DEVICE) {
+        return true;
+    }
     if (file->kind == USER_OPEN_FILE_SOCKET) {
         user_socket_release(file);
         return true;
@@ -1455,6 +1476,222 @@ static bool user_path_allowed(struct user_process *process,
                                      access);
 }
 
+/*
+ * Linux identity (docs/linux-programs.md): each account is one non-root
+ * user, uid and gid 1000 + its account index. Processes without an
+ * account (the kernel shell's) are root, uid 0.
+ */
+static uint32_t user_linux_uid(const struct user_process *process) {
+    size_t account = process->identity.account;
+    if (account == PERMISSION_NO_ACCOUNT || account >= accounts_count()) {
+        return 0;
+    }
+    return 1000 + (uint32_t)account;
+}
+
+static const char *user_identity_name(
+    const struct permission_identity *identity) {
+    size_t account = identity->account;
+    if (account == PERMISSION_NO_ACCOUNT || account >= accounts_count()) {
+        return NULL;
+    }
+    return accounts_name(account);
+}
+
+/* HOME for a program: its storage folder when confined (each missing
+   level is made when create is set), else the account's home, else /. */
+static void user_identity_home(const struct permission_identity *identity,
+                               char *home, size_t capacity, bool create) {
+    const char *name = user_identity_name(identity);
+    size_t used = 0;
+    if (identity->confined && identity->private_path[0] != '\0') {
+        while (identity->private_path[used] != '\0'
+               && used + 1 < capacity) {
+            home[used] = identity->private_path[used];
+            used++;
+        }
+        home[used] = '\0';
+        /* <home>/AppData/Programs/<folder>: make each missing level. */
+        for (size_t i = 1; create && i <= used; i++) {
+            if (i == used || home[i] == '/') {
+                (void)vfs_create_directory(home, i);
+            }
+        }
+        return;
+    }
+    if (name != NULL) {
+        static const char root[] = ACCOUNT_HOME_ROOT "/";
+        for (size_t i = 0; root[i] != '\0' && used + 1 < capacity; i++) {
+            home[used++] = root[i];
+        }
+        for (size_t i = 0; name[i] != '\0' && used + 1 < capacity; i++) {
+            home[used++] = name[i];
+        }
+        home[used] = '\0';
+        return;
+    }
+    home[0] = '/';
+    home[1] = '\0';
+}
+
+static enum user_device user_device_for_path(const char *path,
+                                             size_t length) {
+    static const struct {
+        const char *path;
+        enum user_device device;
+    } devices[] = {
+        {"/dev/null", USER_DEVICE_NULL},
+        {"/dev/zero", USER_DEVICE_ZERO},
+        {"/dev/full", USER_DEVICE_FULL},
+        {"/dev/random", USER_DEVICE_RANDOM},
+        {"/dev/urandom", USER_DEVICE_URANDOM},
+        {"/dev/tty", USER_DEVICE_TTY},
+        {"/etc/passwd", USER_DEVICE_PASSWD},
+        {"/etc/group", USER_DEVICE_GROUP},
+    };
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        size_t j = 0;
+        while (j < length && devices[i].path[j] != '\0'
+               && devices[i].path[j] == path[j]) {
+            j++;
+        }
+        if (j == length && devices[i].path[j] == '\0') {
+            return devices[i].device;
+        }
+    }
+    return USER_DEVICE_NONE;
+}
+
+static bool user_device_generated(enum user_device device) {
+    return device == USER_DEVICE_PASSWD || device == USER_DEVICE_GROUP;
+}
+
+static size_t user_append_text(char *buffer, size_t used, size_t capacity,
+                               const char *text) {
+    for (size_t i = 0; text[i] != '\0' && used + 1 < capacity; i++) {
+        buffer[used++] = text[i];
+    }
+    buffer[used] = '\0';
+    return used;
+}
+
+static size_t user_append_decimal(char *buffer, size_t used,
+                                  size_t capacity, uint32_t value) {
+    char digits[11];
+    size_t count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    while (count > 0 && used + 1 < capacity) {
+        buffer[used++] = digits[--count];
+    }
+    buffer[used] = '\0';
+    return used;
+}
+
+/* /etc/passwd or /etc/group as this process sees them: root and its own
+   account, whose home is the program's HOME. */
+#define USER_GENERATED_CAPACITY 512
+static size_t user_device_text(struct user_process *process,
+                               enum user_device device,
+                               char text[USER_GENERATED_CAPACITY]) {
+    const char *name = user_identity_name(&process->identity);
+    uint32_t uid = user_linux_uid(process);
+    size_t used = 0;
+    text[0] = '\0';
+    if (device == USER_DEVICE_PASSWD) {
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY,
+                                "root:x:0:0:root:/:/bin/sh\n");
+    } else {
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY,
+                                "root:x:0:\n");
+    }
+    if (name == NULL || uid == 0) {
+        return used;
+    }
+    used = user_append_text(text, used, USER_GENERATED_CAPACITY, name);
+    used = user_append_text(text, used, USER_GENERATED_CAPACITY, ":x:");
+    used = user_append_decimal(text, used, USER_GENERATED_CAPACITY, uid);
+    if (device == USER_DEVICE_PASSWD) {
+        char home[USER_FILE_PATH_CAPACITY];
+        user_identity_home(&process->identity, home, sizeof(home), false);
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, ":");
+        used = user_append_decimal(text, used, USER_GENERATED_CAPACITY,
+                                   uid);
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, ":");
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, name);
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, ":");
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, home);
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY,
+                                ":/bin/sh\n");
+    } else {
+        used = user_append_text(text, used, USER_GENERATED_CAPACITY, ":\n");
+    }
+    return used;
+}
+
+static void user_device_stat(struct user_process *process,
+                             enum user_device device,
+                             struct linux_stat *stat) {
+    for (size_t i = 0; i < sizeof(*stat); i++) {
+        ((uint8_t *)stat)[i] = 0;
+    }
+    stat->device = 4;
+    stat->inode = 400 + (uint64_t)device;
+    stat->link_count = 1;
+    if (user_device_generated(device)) {
+        char text[USER_GENERATED_CAPACITY];
+        stat->mode = LINUX_MODE_REGULAR | 0644;
+        stat->size = (int64_t)user_device_text(process, device, text);
+        stat->block_size = 512;
+        stat->block_count = (stat->size + 511) / 512;
+        return;
+    }
+    /* Linux major 1 (mem) minors, and 5:0 for /dev/tty. */
+    static const uint8_t minor[] = {0, 3, 5, 7, 8, 9, 0};
+    stat->mode = LINUX_MODE_CHARACTER | 0666;
+    stat->device_type = device == USER_DEVICE_TTY
+        ? (5u << 8) : (1u << 8) | minor[device];
+    stat->block_size = 4096;
+}
+
+static int64_t user_device_read(struct user_process *process,
+                                struct user_file_descriptor *file,
+                                uint8_t *buffer, size_t length) {
+    switch ((enum user_device)file->device) {
+    case USER_DEVICE_ZERO:
+    case USER_DEVICE_FULL:
+        for (size_t i = 0; i < length; i++) {
+            buffer[i] = 0;
+        }
+        return (int64_t)length;
+    case USER_DEVICE_RANDOM:
+    case USER_DEVICE_URANDOM:
+        return user_linux_getrandom((uintptr_t)buffer, length);
+    case USER_DEVICE_PASSWD:
+    case USER_DEVICE_GROUP: {
+        char text[USER_GENERATED_CAPACITY];
+        size_t size = user_device_text(process,
+                                       (enum user_device)file->device, text);
+        size_t copied = 0;
+        while (copied < length && file->offset + copied < size) {
+            buffer[copied] = (uint8_t)text[file->offset + copied];
+            copied++;
+        }
+        file->offset += copied;
+        return (int64_t)copied;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int64_t user_device_write(struct user_file_descriptor *file,
+                                 size_t length) {
+    return file->device == USER_DEVICE_FULL ? -28 : (int64_t)length;
+}
+
 static int64_t user_linux_open_file(struct user_process *process,
                                     int64_t directory_descriptor,
                                     uintptr_t path_address, uint64_t flags) {
@@ -1478,8 +1715,24 @@ static int64_t user_linux_open_file(struct user_process *process,
     }
     bool modifies = access != LINUX_O_RDONLY
         || (flags & (LINUX_O_CREAT | LINUX_O_TRUNC)) != 0;
-    if (!user_path_allowed(process, path, path_length,
-                           modifies ? PERMISSION_WRITE : PERMISSION_READ)) {
+    enum user_device device = user_device_for_path(path, path_length);
+    if (device == USER_DEVICE_TTY) {
+        return -6; /* ENXIO: no controlling terminal */
+    }
+    if (device != USER_DEVICE_NONE) {
+        if ((flags & LINUX_O_DIRECTORY) != 0) {
+            return -20;
+        }
+        if ((flags & (LINUX_O_CREAT | LINUX_O_EXCL))
+            == (LINUX_O_CREAT | LINUX_O_EXCL)) {
+            return -17;
+        }
+        if (user_device_generated(device) && modifies) {
+            return -13;
+        }
+    } else if (!user_path_allowed(process, path, path_length,
+                                  modifies ? PERMISSION_WRITE
+                                           : PERMISSION_READ)) {
         return -13;
     }
 
@@ -1501,6 +1754,23 @@ static int64_t user_linux_open_file(struct user_process *process,
     if (descriptor_slot == USER_DESCRIPTOR_CAPACITY
         || file_slot == USER_OPEN_FILE_CAPACITY) {
         return -24;
+    }
+
+    if (device != USER_DEVICE_NONE) {
+        open_files[file_slot] = (struct user_file_descriptor) {
+            .used = true,
+            .references = 1,
+            .kind = USER_OPEN_FILE_DEVICE,
+            .readable = access != LINUX_O_WRONLY,
+            .writable = access != LINUX_O_RDONLY,
+            .device = (uint8_t)device,
+        };
+        process->descriptors[descriptor_slot] = (struct user_descriptor) {
+            .used = true,
+            .close_on_exec = (flags & LINUX_O_CLOEXEC) != 0,
+            .file_slot = (uint8_t)file_slot,
+        };
+        return (int64_t)descriptor_slot;
     }
 
     struct vfs_metadata metadata;
@@ -1787,6 +2057,11 @@ static int64_t user_linux_stat_path(struct user_process *process,
     if (copied != 0) {
         return copied;
     }
+    enum user_device device = user_device_for_path(path, path_length);
+    if (device != USER_DEVICE_NONE) {
+        user_device_stat(process, device, (struct linux_stat *)stat_address);
+        return 0;
+    }
     if (!user_path_allowed(process, path, path_length, PERMISSION_READ)
         && !user_path_leads_to_own(process, path, path_length)) {
         return -13;
@@ -1796,6 +2071,8 @@ static int64_t user_linux_stat_path(struct user_process *process,
         return -2;
     }
     user_linux_fill_stat((struct linux_stat *)stat_address, &metadata);
+    ((struct linux_stat *)stat_address)->uid = user_linux_uid(process);
+    ((struct linux_stat *)stat_address)->gid = user_linux_uid(process);
     return 0;
 }
 
@@ -2112,6 +2389,10 @@ static int64_t user_linux_fstat(struct user_process *process,
         stat->block_size = USER_PIPE_BUFFER_CAPACITY;
         return 0;
     }
+    if (file->kind == USER_OPEN_FILE_DEVICE) {
+        user_device_stat(process, (enum user_device)file->device, stat);
+        return 0;
+    }
     if (file->kind == USER_OPEN_FILE_SOCKET) {
         for (size_t i = 0; i < sizeof(*stat); i++) {
             ((uint8_t *)stat)[i] = 0;
@@ -2128,6 +2409,8 @@ static int64_t user_linux_fstat(struct user_process *process,
         return -5;
     }
     user_linux_fill_stat(stat, &metadata);
+    stat->uid = user_linux_uid(process);
+    stat->gid = user_linux_uid(process);
     return 0;
 }
 
@@ -4979,6 +5262,8 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, false, false)) {
             frame->rax = (uint64_t)(int64_t)-14;
+        } else if (file->kind == USER_OPEN_FILE_DEVICE) {
+            frame->rax = (uint64_t)user_device_write(file, length);
         } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
             frame->rax = (uint64_t)user_pipe_write(
                 file, (const uint8_t *)buffer_address, length, true);
@@ -5076,6 +5361,9 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, true, false)) {
             frame->rax = (uint64_t)(int64_t)-14;
+        } else if (file->kind == USER_OPEN_FILE_DEVICE) {
+            frame->rax = (uint64_t)user_device_read(
+                process, file, (uint8_t *)buffer_address, length);
         } else if (file->kind == USER_OPEN_FILE_PIPE_READ) {
             frame->rax = (uint64_t)user_pipe_read(
                 file, (uint8_t *)buffer_address, length);
@@ -5395,6 +5683,26 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             frame->rax = (uint64_t)(int64_t)(file == NULL ? -9 : -22);
             return false;
         }
+        if (file->kind == USER_OPEN_FILE_DEVICE
+            && !user_device_generated((enum user_device)file->device)) {
+            frame->rax = 0;
+            return false;
+        }
+        if (file->kind == USER_OPEN_FILE_DEVICE) {
+            char text[USER_GENERATED_CAPACITY];
+            int64_t base = frame->rdx == 0 ? 0
+                : frame->rdx == 1 ? (int64_t)file->offset
+                : (int64_t)user_device_text(
+                      process, (enum user_device)file->device, text);
+            int64_t target = base + (int64_t)frame->rsi;
+            if (target < 0) {
+                frame->rax = (uint64_t)(int64_t)-22;
+            } else {
+                file->offset = (size_t)target;
+                frame->rax = (uint64_t)target;
+            }
+            return false;
+        }
         if (file->kind != USER_OPEN_FILE_VFS) {
             frame->rax = (uint64_t)(int64_t)-29;
             return false;
@@ -5563,8 +5871,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             return false;
         }
         struct vfs_metadata metadata;
-        if (!user_path_allowed(process, path, path_length, PERMISSION_READ)
-            && !user_path_leads_to_own(process, path, path_length)) {
+        enum user_device device = user_device_for_path(path, path_length);
+        if (device != USER_DEVICE_NONE) {
+            frame->rax = (uint64_t)(int64_t)(
+                device == USER_DEVICE_TTY ? -6
+                : user_device_generated(device) && (mode & 2) != 0 ? -13
+                : 0);
+        } else if (!user_path_allowed(process, path, path_length,
+                                      PERMISSION_READ)
+                   && !user_path_leads_to_own(process, path, path_length)) {
             frame->rax = (uint64_t)(int64_t)-13;
         } else if (!vfs_stat(path, path_length, &metadata)) {
             frame->rax = (uint64_t)(int64_t)-2;
@@ -5807,8 +6122,49 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
 
+    /* getuid, getgid, geteuid, getegid */
     if (number == 102 || number == 104 || number == 107 || number == 108) {
+        frame->rax = user_linux_uid(process);
+        return false;
+    }
+
+    /* getresuid, getresgid: real, effective and saved are the same. */
+    if (number == 118 || number == 120) {
+        uintptr_t ids[3] = {(uintptr_t)frame->rdi, (uintptr_t)frame->rsi,
+                            (uintptr_t)frame->rdx};
         frame->rax = 0;
+        for (size_t i = 0; i < 3; i++) {
+            if (!paging_user_range_valid(ids[i], sizeof(uint32_t), true,
+                                         false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return false;
+            }
+        }
+        for (size_t i = 0; i < 3; i++) {
+            *(uint32_t *)ids[i] = user_linux_uid(process);
+        }
+        return false;
+    }
+
+    /* setuid, setgid, setreuid, setregid, setresuid, setresgid, setfsuid,
+       setfsgid: only to the ids the process already has (-1 keeps one). */
+    if (number == 105 || number == 106 || number == 113 || number == 114
+        || number == 117 || number == 119 || number == 122
+        || number == 123) {
+        uint32_t uid = user_linux_uid(process);
+        uint64_t values[3] = {frame->rdi, frame->rsi, frame->rdx};
+        size_t count = number == 105 || number == 106 || number == 122
+            || number == 123 ? 1 : number == 113 || number == 114 ? 2 : 3;
+        bool allowed = true;
+        for (size_t i = 0; i < count; i++) {
+            uint32_t value = (uint32_t)values[i];
+            if (value != uid && value != UINT32_MAX) {
+                allowed = false;
+            }
+        }
+        /* setfsuid and setfsgid return the previous id. */
+        frame->rax = number == 122 || number == 123 ? uid
+                   : allowed ? 0 : (uint64_t)(int64_t)-1;
         return false;
     }
 
@@ -6542,37 +6898,9 @@ static bool user_start_environment(struct user_exec_vectors *vectors,
 static void user_build_start_environment(
     struct user_exec_vectors *vectors,
     const struct permission_identity *identity) {
-    char home[USER_FILE_PATH_CAPACITY] = "/";
-    const char *name = NULL;
-    size_t account = identity->account;
-    if (account != PERMISSION_NO_ACCOUNT && account < accounts_count()) {
-        name = accounts_name(account);
-    }
-    if (identity->confined && identity->private_path[0] != '\0') {
-        size_t length = 0;
-        while (identity->private_path[length] != '\0'
-               && length + 1 < sizeof(home)) {
-            home[length] = identity->private_path[length];
-            length++;
-        }
-        home[length] = '\0';
-        /* <home>/AppData/Programs/<folder>: make each missing level. */
-        for (size_t i = 1; i <= length; i++) {
-            if (i == length || home[i] == '/') {
-                (void)vfs_create_directory(home, i);
-            }
-        }
-    } else if (name != NULL) {
-        size_t used = 0;
-        static const char root[] = ACCOUNT_HOME_ROOT "/";
-        for (size_t i = 0; root[i] != '\0'; i++) {
-            home[used++] = root[i];
-        }
-        for (size_t i = 0; name[i] != '\0' && used + 1 < sizeof(home); i++) {
-            home[used++] = name[i];
-        }
-        home[used] = '\0';
-    }
+    char home[USER_FILE_PATH_CAPACITY];
+    const char *name = user_identity_name(identity);
+    user_identity_home(identity, home, sizeof(home), true);
     (void)user_start_environment(vectors, "HOME=", home, NULL);
     if (name != NULL) {
         (void)user_start_environment(vectors, "USER=", name, NULL);

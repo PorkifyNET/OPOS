@@ -67,13 +67,12 @@ paths, so nothing new is revealed.
 
 In the order the next programs are likely to hit them.
 
-1. **Devices.** No `/dev`: `/dev/null`, `/dev/zero`, `/dev/urandom`
-   and `/dev/tty` are opened by many programs (SQLite falls back
-   quietly when `/dev/urandom` is missing).
-2. **Identity.** Every Linux program sees uid 0 (root) and no
-   `/etc/passwd`. Programs behave differently as root (SQLite calls
-   `fchown`). OPOS should report one non-root uid per account and a
-   generated `passwd` line.
+1. **Devices.** Done in step 3: `/dev/null`, `/dev/zero`, `/dev/full`,
+   `/dev/random` and `/dev/urandom`. Still missing: `/dev/tty` (opening
+   it fails with `ENXIO`, as with no controlling terminal), listing
+   `/dev`, `/proc`.
+2. **Identity.** Done in step 3: one non-root uid per account, and
+   generated `/etc/passwd` and `/etc/group`.
 3. **Limits.** 11 file descriptors per process and 32 open files system
    wide; a 1 MiB executable; a 4 MiB `mmap` area; 16 arguments and 16
    environment strings; no `mremap` (Lua's `realloc` falls back to
@@ -114,7 +113,8 @@ Proposal:
    above.
 2. Done. Lua and SQLite in the Store, built by `make store` from pinned
    sources with their licenses. See "As built in step 2".
-3. `/dev` devices and a non-root identity.
+3. Done. `/dev` devices and a non-root identity. See "As built in
+   step 3".
 4. Higher limits: descriptors, open files, executable size, `mmap`,
    `mremap`.
 5. Terminal: raw mode, escape sequences in the desktop Terminal,
@@ -156,6 +156,49 @@ the Store window lists Hello, Sketch, Lua and SQLite. INSTALL installs
 Lua and SQLite, each "MAY ASK FOR: NOTHING BEYOND ITS OWN FILES".
 `lua -e "print(6*7, _VERSION)"` prints `42 Lua 5.4`, and
 `sqlite3 -version` prints `3.46.1 2024-08-13 ...`.
+
+## As built in step 3
+
+**Devices.** Opening one of these paths gives a kernel-made file, not
+a file on disk. No folder permission is needed, as on Linux.
+
+| Path | Read | Write | `stat` |
+| --- | --- | --- | --- |
+| `/dev/null` | end of file | accepted, discarded | character device 1:3 |
+| `/dev/zero` | zeros | accepted, discarded | 1:5 |
+| `/dev/full` | zeros | `ENOSPC` | 1:7 |
+| `/dev/random`, `/dev/urandom` | random bytes, as `getrandom` | accepted, discarded | 1:8, 1:9 |
+| `/dev/tty` | open fails with `ENXIO` | | 5:0 |
+
+`stat`, `access` and `lseek` (always 0) work on them.
+
+**Identity.** A process of an account has uid and gid
+`1000 + account index`. A process without an account (one started from
+the kernel shell) is root, uid 0.
+- `getuid`, `geteuid`, `getgid`, `getegid`, `getresuid` and `getresgid`
+  return that id.
+- The `setuid` family succeeds only for the ids the process already has;
+  any other id gives `EPERM`.
+- `stat` reports every file as owned by the calling process, because
+  FAT has no owners.
+
+**`/etc/passwd` and `/etc/group`.** These are made for the reading
+process. They contain `root` and the process's own account: its name,
+uid, gid, `HOME` (its storage folder when confined) and `/bin/sh`. Other
+accounts are not listed. Both files are read-only (`EACCES`).
+`getpwuid`, `getpwnam` and `getgrgid` work.
+
+**QEMU test.** A static musl test program, installed as a Linux
+package, passes 22 checks:
+- each device's reads, writes, `fstat` and `stat`;
+- `freopen` of `stderr` to `/dev/null`;
+- uid 1000;
+- `getpwuid`, whose home equals `HOME` and whose name equals `USER`;
+- `setuid(0)` fails with `EPERM`;
+- `HOME` is owned by the process's uid.
+
+SQLite runs without errors as a non-root user. No unimplemented system
+call was logged.
 
 ## Tests
 

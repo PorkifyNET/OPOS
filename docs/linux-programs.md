@@ -52,6 +52,11 @@ it may write, so dotfiles (`~/.sqliterc`, `~/.luarc`) and relative
 not visible to it, as before. Programs that are not confined (built-in
 ones) get the account's home.
 
+OPOS has no `/tmp`. A confined program also gets `TMPDIR` set to
+`$HOME/tmp` (created at start), which most programs use for temporary
+files instead of `/tmp`; Chocolate Doom writes each song there as a MIDI
+file before playing it.
+
 Programs started from the kernel shell keep an empty environment: its
 self-tests check the exact initial stack.
 
@@ -90,8 +95,9 @@ In the order the next programs are likely to hit them.
    more (glibc's loader, `/proc`, and many more system calls).
 8. **Graphics.** Linux GUI programs draw through X11 or Wayland, which
    OPOS does not have. SDL 2 programs work since step 7, with an SDL
-   video driver that draws into an OPOS window. Still missing: OpenGL,
-   sound, game controllers, and programs that use X11 or Wayland
+   video driver that draws into an OPOS window, and SDL sound plays
+   through OPOS sound (docs/sound.md). Still missing: OpenGL,
+   game controllers, and programs that use X11 or Wayland
    directly (GTK, Qt).
 
 ## Linux packages in the Store
@@ -445,9 +451,12 @@ script copies the driver next to SDL's dummy driver, whose sources
 SDL's `configure` already compiles, and adds it to SDL's driver list,
 where it comes first. Everything that needs a Linux device, server or
 library OPOS lacks is off: X11, Wayland, KMS, OpenGL, Vulkan, sound
-servers, udev, D-Bus. Sound, game controllers and haptics use SDL's
-dummy drivers. The driver is zlib-licensed like SDL, so programs built
-with it keep their own license.
+servers, udev, D-Bus. Game controllers and haptics use SDL's dummy
+drivers. Sound goes through an OPOS audio driver,
+`store/linux/sdl2/opos/SDL_oposaudio.c`, added the same way next to the
+dummy audio driver (see "As built in step 3" in `docs/sound.md`). The
+drivers are zlib-licensed like SDL, so programs built with them keep
+their own license.
 
 **The driver.**
 - One window per program, as OPOS gives a program one window. A second
@@ -504,14 +513,16 @@ the SDL library above and packages it with Freedoom: Phase 1 0.13.0
 (BSD-3-Clause), a complete free game for the Doom engine. The package is
 `org.chocolate-doom.freedoom`, named Freedoom, about 33 MB, with one
 Start menu entry. It carries the Chocolate Doom source, the licenses of
-SDL and musl, and Freedoom's COPYING and CREDITS. Like the SDL demos it is
-opt-in: add `doom` to `STORE_LINUX`. The recipe builds SDL itself when it
-was not built yet (`SDL2_LIBRARY_ONLY=1`).
+SDL, SDL_mixer and musl, and Freedoom's COPYING and CREDITS. Like the SDL
+demos it is opt-in: add `doom` to `STORE_LINUX`. The recipe builds SDL
+(`SDL2_LIBRARY_ONLY=1`) and SDL_mixer (`store/linux/sdl2_mixer/build.sh`)
+itself when they were not built yet.
 
 Chocolate Doom normally builds with autotools or CMake. The recipe writes
 the few `config.h` lines they would and compiles the game's source list
-with `$LINUX_CC` directly, without SDL_mixer and SDL_net. There is no
-sound: OPOS has no sound driver yet.
+with `$LINUX_CC` directly, with SDL_mixer and without SDL_net (no
+multiplayer). Sound effects and music play through OPOS sound (step 4 of
+`docs/sound.md`).
 
 Tested in QEMU: installed with `pkg install`, started from the Terminal,
 it loads `freedoom1.wad` from its folder, opens a window titled

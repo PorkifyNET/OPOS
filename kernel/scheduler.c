@@ -70,6 +70,9 @@ struct scheduler_task {
     const void *wait_event;
     bool kernel_preemptible;
     volatile bool interrupted;
+    /* Set when a sleep or wait ends: the task runs before the others
+       that are only waiting for their turn (see scheduler_switch). */
+    bool woken;
     uint64_t run_ticks;
     bool kernel_gs_active;
     uint64_t user_fs_base;
@@ -209,6 +212,7 @@ void *scheduler_timer_tick(void *interrupt_frame) {
                  && tasks[i].wake_tick != 0))
             && now >= tasks[i].wake_tick) {
             tasks[i].state = SCHEDULER_TASK_RUNNABLE;
+            tasks[i].woken = true;
         }
     }
     return scheduler_switch(interrupt_frame);
@@ -222,7 +226,30 @@ void *scheduler_yield(void *interrupt_frame) {
     return scheduler_switch(interrupt_frame);
 }
 
-/* Picks the next task to run (round robin) and switches to it. */
+/*
+ * Picks the next task to run and switches to it: round robin, except that
+ * a task whose sleep or wait just ended goes first. Such a task mostly
+ * waits (for the timer, a device or another task), so it uses little of
+ * its turn, and running it at once keeps things like a program's sound
+ * thread from waiting behind every busy task (docs/sound.md).
+ */
+static size_t scheduler_pick(void) {
+    for (size_t offset = 1; offset <= SCHEDULER_TASK_CAPACITY; offset++) {
+        size_t candidate = (current_task + offset) % SCHEDULER_TASK_CAPACITY;
+        if (tasks[candidate].state == SCHEDULER_TASK_RUNNABLE
+            && tasks[candidate].woken) {
+            return candidate;
+        }
+    }
+    for (size_t offset = 1; offset <= SCHEDULER_TASK_CAPACITY; offset++) {
+        size_t candidate = (current_task + offset) % SCHEDULER_TASK_CAPACITY;
+        if (tasks[candidate].state == SCHEDULER_TASK_RUNNABLE) {
+            return candidate;
+        }
+    }
+    return SCHEDULER_TASK_CAPACITY;
+}
+
 static void *scheduler_switch(void *interrupt_frame) {
     struct scheduler_task *current = &tasks[current_task];
     struct scheduler_interrupt_frame *frame = interrupt_frame;
@@ -235,35 +262,34 @@ static void *scheduler_switch(void *interrupt_frame) {
         current->state = SCHEDULER_TASK_RUNNABLE;
     }
 
-    for (size_t offset = 1; offset <= SCHEDULER_TASK_CAPACITY; offset++) {
-        size_t candidate = (current_task + offset) % SCHEDULER_TASK_CAPACITY;
-        if (tasks[candidate].state == SCHEDULER_TASK_RUNNABLE) {
-            if (tasks[candidate].address_space != current->address_space
-                && !paging_address_space_activate(tasks[candidate].address_space)) {
-                current->state = SCHEDULER_TASK_RUNNING;
-                return interrupt_frame;
-            }
-            bool swap_kernel_gs = current->kernel_gs_active
-                != tasks[candidate].kernel_gs_active;
-            if ((frame->code_segment & 3) == 3) {
-                current->user_fs_base = scheduler_read_fs_base();
-            }
-            struct scheduler_interrupt_frame *candidate_frame =
-                tasks[candidate].frame;
-            scheduler_write_fs_base(
-                candidate_frame != NULL
-                    && (candidate_frame->code_segment & 3) == 3
-                ? tasks[candidate].user_fs_base : 0);
-            scheduler_save_fpu(current->fpu_state);
-            scheduler_restore_fpu(tasks[candidate].fpu_state);
-            current_task = candidate;
-            tasks[candidate].state = SCHEDULER_TASK_RUNNING;
-            interrupts_set_task_kernel_stack(tasks[candidate].kernel_stack_top);
-            if (swap_kernel_gs) {
-                __asm__ volatile ("swapgs" : : : "memory");
-            }
-            return tasks[candidate].frame;
+    size_t candidate = scheduler_pick();
+    if (candidate != SCHEDULER_TASK_CAPACITY) {
+        tasks[candidate].woken = false;
+        if (tasks[candidate].address_space != current->address_space
+            && !paging_address_space_activate(tasks[candidate].address_space)) {
+            current->state = SCHEDULER_TASK_RUNNING;
+            return interrupt_frame;
         }
+        bool swap_kernel_gs = current->kernel_gs_active
+            != tasks[candidate].kernel_gs_active;
+        if ((frame->code_segment & 3) == 3) {
+            current->user_fs_base = scheduler_read_fs_base();
+        }
+        struct scheduler_interrupt_frame *candidate_frame =
+            tasks[candidate].frame;
+        scheduler_write_fs_base(
+            candidate_frame != NULL
+                && (candidate_frame->code_segment & 3) == 3
+            ? tasks[candidate].user_fs_base : 0);
+        scheduler_save_fpu(current->fpu_state);
+        scheduler_restore_fpu(tasks[candidate].fpu_state);
+        current_task = candidate;
+        tasks[candidate].state = SCHEDULER_TASK_RUNNING;
+        interrupts_set_task_kernel_stack(tasks[candidate].kernel_stack_top);
+        if (swap_kernel_gs) {
+            __asm__ volatile ("swapgs" : : : "memory");
+        }
+        return tasks[candidate].frame;
     }
 
     if (current->state == SCHEDULER_TASK_RUNNABLE) {
@@ -573,6 +599,7 @@ size_t scheduler_wake_event_count(const void *event, size_t maximum) {
         if (tasks[i].state == SCHEDULER_TASK_BLOCKED
             && tasks[i].wait_event == event) {
             tasks[i].state = SCHEDULER_TASK_RUNNABLE;
+            tasks[i].woken = true;
             woken++;
             if (woken == maximum) {
                 break;

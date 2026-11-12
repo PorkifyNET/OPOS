@@ -55,6 +55,9 @@ void pci_enable_device(const struct pci_device *device);
 int pci_set_power_d0(const struct pci_device *device);
 /* Reads a 32-bit configuration register (offset is rounded down to 4). */
 uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset);
+/* Writes a 32-bit configuration register (offset is rounded down to 4). */
+void pci_config_write32(const struct pci_device *device, uint8_t offset,
+                        uint32_t value);
 
 void pci_initialize(void);
 void pci_get_storage_controllers(struct pci_storage_controllers *controllers);

@@ -23,6 +23,7 @@
 #include "power.h"
 #include "scheduler.h"
 #include "storage.h"
+#include "sound.h"
 #include "svga.h"
 #include "boot_display.h"
 #include "vmware.h"
@@ -8628,6 +8629,84 @@ static void draw_net_popup(void) {
     }
 }
 
+/*
+ * The volume keys (set-1 E0 30 up, E0 2E down, E0 20 mute) change the
+ * master volume in steps of 5; a small popup over the clock shows the
+ * result for two seconds.
+ */
+#define VOLUME_KEY_UP 0xb0
+#define VOLUME_KEY_DOWN 0xae
+#define VOLUME_KEY_MUTE 0xa0
+#define VOLUME_STEP 5u
+#define VOLUME_POPUP_TICKS 200u
+static uint64_t volume_popup_until;
+
+/* True when key was a volume key (the popup then needs drawing). */
+static bool volume_key(uint8_t key) {
+    if (key == VOLUME_KEY_UP || key == VOLUME_KEY_DOWN) {
+        uint32_t volume = sound_volume();
+        volume = key == VOLUME_KEY_UP
+            ? (volume + VOLUME_STEP > 100 ? 100 : volume + VOLUME_STEP)
+            : (volume < VOLUME_STEP ? 0 : volume - VOLUME_STEP);
+        sound_set_muted(false);
+        sound_set_volume(volume);
+    } else if (key == VOLUME_KEY_MUTE) {
+        sound_set_muted(!sound_muted());
+    } else {
+        return false;
+    }
+    volume_popup_until = timer_ticks() + VOLUME_POPUP_TICKS;
+    return true;
+}
+
+static struct rect volume_popup_rect(void) {
+    struct rect clock = clock_rect();
+    int64_t width = 16 * CHAR_WIDTH + 26;
+    int64_t height = CHAR_HEIGHT + 30;
+    return taskbar_popup_rect(clock.x + clock.width - width, clock.y, width,
+                              height);
+}
+
+static void draw_volume_popup(void) {
+    if (volume_popup_until == 0) {
+        return;
+    }
+    struct rect popup = volume_popup_rect();
+    fill(popup, 110, 160, 255);
+    fill((struct rect){popup.x + 2, popup.y + 2, popup.width - 4,
+                       popup.height - 4}, 26, 34, 54);
+    char line[24] = "";
+    size_t length;
+    uint32_t volume = sound_volume();
+    if (!sound_output_ready()) {
+        append_text(line, sizeof(line), 0, "NO SOUND OUTPUT");
+    } else if (sound_muted()) {
+        append_text(line, sizeof(line), 0, "MUTED");
+    } else {
+        length = append_text(line, sizeof(line), 0, "VOLUME ");
+        if (volume >= 100) {
+            length = append_text(line, sizeof(line), length, "100");
+        } else {
+            if (volume >= 10) {
+                char tens[2] = {(char)('0' + volume / 10), '\0'};
+                length = append_text(line, sizeof(line), length, tens);
+            }
+            char ones[2] = {(char)('0' + volume % 10), '\0'};
+            length = append_text(line, sizeof(line), length, ones);
+        }
+        append_text(line, sizeof(line), length, "%");
+    }
+    draw_text_clipped(popup.x + 12, popup.y + 8, popup.width - 24, line,
+                      230, 238, 255);
+    struct rect bar = {popup.x + 12, popup.y + 14 + CHAR_HEIGHT,
+                       popup.width - 24, 6};
+    fill(bar, 60, 70, 95);
+    if (sound_output_ready() && !sound_muted()) {
+        fill((struct rect){bar.x, bar.y, bar.width * (int64_t)volume / 100,
+                           bar.height}, 110, 160, 255);
+    }
+}
+
 static void draw_taskbar_menu(void) {
     if (!taskbar_menu_open) {
         return;
@@ -9070,6 +9149,7 @@ static void draw_scene(void) {
     }
     draw_taskbar_menu();
     draw_net_popup();
+    draw_volume_popup();
     draw_protected_confirmation();
     if (buffered) {
         console_frame_present();
@@ -13695,6 +13775,9 @@ static bool desktop_step(void) {
         uint8_t state_key;
         bool state_pressed;
         while (keyboard_read_key_state(&state_key, &state_pressed)) {
+            if (state_pressed && volume_key(state_key)) {
+                redraw = true;
+            }
             int top_slot = z_count != 0 && window_is_app(z_order[z_count - 1])
                 ? (int)(z_order[z_count - 1] - WINDOW_APP) : -1;
             app_key_state(top_slot, state_key, state_pressed);
@@ -13712,6 +13795,11 @@ static bool desktop_step(void) {
         if (result == DESKTOP_EXIT || exit_to_shell) {
             return true;
         }
+    }
+
+    if (volume_popup_until != 0 && timer_ticks() >= volume_popup_until) {
+        volume_popup_until = 0;
+        redraw = true;
     }
 
     /* The host may resize the screen (VMware "Autofit Guest"). */

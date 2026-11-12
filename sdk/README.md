@@ -224,6 +224,14 @@ if (image_probe(data, size, &info) == IMAGE_OK) {
 
 `image_resample` scales (part of) a picture to another size.
 
+Sound: `opos_sound_open(capacity)` opens a stream of 48 kHz, 16-bit
+stereo frames (left and right samples interleaved). `opos_sound_write`
+queues frames and waits while the stream is full, so a program that
+writes in a loop plays in real time. The capacity (1024 to 32768 frames)
+is how much sound can wait in the stream: small for games, larger for
+music. OPOS mixes all programs' streams at the master volume.
+`examples/play.c` plays WAV files.
+
 Memory: `opos_alloc(size)` returns zeroed memory (`mmap`);
 `opos_free(address, size)` returns it. `malloc` takes its memory from
 there too. A program has 64 MiB of such memory in total, including its
@@ -251,6 +259,10 @@ there too. A program has 64 MiB of such memory in total, including its
   | 0x4f500014 | `opos_clipboard_set(text, length)` | bytes kept |
   | 0x4f500015 | `opos_clipboard_get(buffer, capacity)` | full clipboard length |
   | 0x4f500016 | `opos_window_options(options)` | 0, or -22 (unknown option) |
+  | 0x4f500040 | `opos_sound_open(capacity_frames)` | stream handle, or -19 (no sound output), -24 (all streams in use) |
+  | 0x4f500041 | `opos_sound_write(handle, frames, count)` | frames queued (waits while the stream is full) |
+  | 0x4f500042 | `opos_sound_queued(handle)` | frames not played yet |
+  | 0x4f500043 | `opos_sound_close(handle)` | 0 |
 
 - Errors are negative error numbers (`-OPOS_EACCES`, ...).
 - Every file carries an ELF note named `OPOS` (type 1) with the ABI

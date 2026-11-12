@@ -45,6 +45,7 @@
 #include "boot_display.h"
 #include "sdhci.h"
 #include "net.h"
+#include "sound.h"
 #include "nic.h"
 
 #define COM1 0x3f8
@@ -1442,6 +1443,8 @@ void kmain(void) {
     net_initialize();
     console_write_string(nic_ready() ? "OPOS: network card ready\n"
                                      : "OPOS: no network card found\n");
+    /* Sound (docs/sound.md); the timer refills its buffers. */
+    sound_initialize();
     /* I2C touchpad (laptops). Its reset waits about 150 ms. */
     if (i2c_hid_initialize()) {
         console_write_string("OPOS: I2C touchpad ready\n");

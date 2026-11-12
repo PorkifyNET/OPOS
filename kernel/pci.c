@@ -340,3 +340,15 @@ uint32_t pci_config_read32(const struct pci_device *device, uint8_t offset) {
     return pci_read_config32(device->bus, device->device, device->function,
                              offset);
 }
+
+void pci_config_write32(const struct pci_device *device, uint8_t offset,
+                        uint32_t value) {
+    if (device == NULL) {
+        return;
+    }
+    io_out32(PCI_CONFIG_ADDRESS,
+             0x80000000u | ((uint32_t)device->bus << 16)
+                 | ((uint32_t)device->device << 11)
+                 | ((uint32_t)device->function << 8) | (offset & 0xfcu));
+    io_out32(PCI_CONFIG_DATA, value);
+}

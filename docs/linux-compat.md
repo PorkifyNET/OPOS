@@ -102,7 +102,9 @@ general-purpose interrupt context and switches address spaces, 16 KiB execution
 stacks, and separate 16 KiB kernel-entry stacks on timer ticks. `schedtest` runs
 two kernel workers for several ticks and verifies that both complete. Ring-3
 tasks are preemptible while executing user code. Sleeping tasks deschedule and
-wake on PIT deadlines. Keyboard reads atomically block on a scheduler event;
+wake on PIT deadlines. A task whose sleep or wait has just ended runs before
+tasks that are only waiting for their turn, so a program's sound thread does
+not wait behind every busy task. Keyboard reads atomically block on a scheduler event;
 IRQ1 queues a character and wakes matching tasks without a lost-wakeup window.
 Each user process now has a process control block that owns its PID, lifecycle
 and fault state, address space, bounded image segments and pages, stack page, heap,

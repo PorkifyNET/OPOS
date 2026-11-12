@@ -12,6 +12,7 @@
 #include "permission_grants.h"
 #include "accounts.h"
 #include "scheduler.h"
+#include "sound.h"
 #include "cmos.h"
 #include "net.h"
 #include "timer.h"
@@ -4002,6 +4003,65 @@ static int64_t user_opos_package(const struct user_process *process,
 }
 
 /*
+ * Sound (docs/sound.md): streams of 48 kHz, 16-bit stereo frames, mixed by
+ * kernel/sound.c. Writing blocks until every frame is queued.
+ */
+#define OPOS_SYSCALL_SOUND_OPEN (OPOS_SYSCALL_BASE + 0x40)
+#define OPOS_SYSCALL_SOUND_WRITE (OPOS_SYSCALL_BASE + 0x41)
+#define OPOS_SYSCALL_SOUND_QUEUED (OPOS_SYSCALL_BASE + 0x42)
+#define OPOS_SYSCALL_SOUND_CLOSE (OPOS_SYSCALL_BASE + 0x43)
+#define OPOS_SOUND_WRITE_MAX (1u << 20)
+
+static uint8_t user_sound_wait;
+
+static int64_t user_opos_sound(struct user_process *process,
+                               const struct linux_syscall_frame *frame) {
+    uint64_t number = frame->rax;
+    int64_t handle = (int64_t)frame->rdi;
+    if (number == OPOS_SYSCALL_SOUND_OPEN) {
+        return frame->rdi > SOUND_STREAM_MAX_FRAMES ? -22
+            : sound_open(process->id, (uint32_t)frame->rdi);
+    }
+    if (number == OPOS_SYSCALL_SOUND_QUEUED) {
+        return sound_queued(process->id, handle);
+    }
+    if (number == OPOS_SYSCALL_SOUND_CLOSE) {
+        return sound_close(process->id, handle);
+    }
+    uintptr_t address = (uintptr_t)frame->rsi;
+    uint64_t frames = frame->rdx;
+    if (frames > OPOS_SOUND_WRITE_MAX || (address & 1) != 0) {
+        return -22;
+    }
+    uint64_t done = 0;
+    while (done < frames) {
+        if (user_current_killed()) {
+            break;
+        }
+        /* Checked each time: another thread may unmap it while this one
+           waits. */
+        uintptr_t at = address + (uintptr_t)done * 4;
+        if (!paging_user_range_valid(at, (size_t)(frames - done) * 4, false,
+                                     false)) {
+            return done != 0 ? (int64_t)done : -14;
+        }
+        int64_t queued = sound_queue(process->id, handle,
+                                     (const int16_t *)at,
+                                     (uint32_t)(frames - done));
+        if (queued < 0) {
+            return done != 0 ? (int64_t)done : queued;
+        }
+        done += (uint64_t)queued;
+        if (done < frames) {
+            /* The timer drains the stream; look again next tick. */
+            (void)scheduler_block_current_until_locked(&user_sound_wait,
+                                                       timer_ticks() + 1);
+        }
+    }
+    return (int64_t)done;
+}
+
+/*
  * Windows (ABI 1): one window per program, shown by the desktop. See
  * desktop_app_window_* in desktop.c and sdk/include/opos.h.
  */
@@ -5588,6 +5648,11 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
         && number <= OPOS_SYSCALL_WINDOW_OPTIONS) {
         return user_opos_window(process, frame);
+    }
+    if (number >= OPOS_SYSCALL_SOUND_OPEN
+        && number <= OPOS_SYSCALL_SOUND_CLOSE) {
+        frame->rax = (uint64_t)user_opos_sound(process, frame);
+        return false;
     }
     if (number >= OPOS_SYSCALL_UPDATE_BEGIN
         && number <= OPOS_SYSCALL_UPDATE_BEGIN_OPTIONS) {
@@ -7664,6 +7729,7 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
     process->group_exit = false;
     scheduler_clear_interrupt();
     desktop_app_process_exited(process->id);
+    sound_process_exited(process->id);
     user_orphan_children(process->id);
     if (process->faulted) {
         status = process->fault_status;
@@ -7743,6 +7809,23 @@ static void user_build_start_environment(
     const char *name = user_identity_name(identity);
     user_identity_home(identity, home, sizeof(home), true);
     (void)user_start_environment(vectors, "HOME=", home, NULL);
+    /* OPOS has no /tmp: a confined program keeps its temporary files in
+       <home>/tmp, which TMPDIR names (programs fall back to /tmp
+       without it). */
+    if (identity->confined && identity->private_path[0] != '\0') {
+        static const char tmp[] = "/tmp";
+        size_t length = 0;
+        while (home[length] != '\0') {
+            length++;
+        }
+        if (length + sizeof(tmp) <= sizeof(home)) {
+            for (size_t i = 0; i < sizeof(tmp); i++) {
+                home[length + i] = tmp[i];
+            }
+            (void)vfs_create_directory(home, length + sizeof(tmp) - 1);
+            (void)user_start_environment(vectors, "TMPDIR=", home, NULL);
+        }
+    }
     if (name != NULL) {
         (void)user_start_environment(vectors, "USER=", name, NULL);
         (void)user_start_environment(vectors, "LOGNAME=", name, NULL);

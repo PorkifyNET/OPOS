@@ -1,7 +1,8 @@
 #!/bin/sh
 # SDL2 for OPOS: the SDL 2 library with a video driver for OPOS windows
-# (opos/SDL_oposvideo.c), and a package of SDL's own demo programs to
-# show it working. Programs are linked statically with musl.
+# (opos/SDL_oposvideo.c) and an audio driver for OPOS sound
+# (opos/SDL_oposaudio.c), and a package of SDL's own demo programs to
+# show them working. Programs are linked statically with musl.
 # License: zlib (SDL and the OPOS driver). Not built by default: add
 # "sdl2" to STORE_LINUX. With SDL2_LIBRARY_ONLY=1 it only builds and
 # installs the library (no package).
@@ -34,13 +35,27 @@ grep -q OPOS_bootstrap "$SRC/src/video/SDL_video.c" \
     echo "store/linux/sdl2: could not add the OPOS driver" >&2
     exit 1
 }
+# The audio driver likewise goes next to the dummy audio driver.
+cp "$HERE/opos/SDL_oposaudio.c" "$SRC/src/audio/dummy/"
+sed -i 's|^#ifdef SDL_AUDIO_DRIVER_DUMMY$|#ifdef SDL_AUDIO_DRIVER_OPOS\n    \&OPOSAUDIO_bootstrap,\n#endif\n&|' \
+    "$SRC/src/audio/SDL_audio.c"
+sed -i 's|^extern AudioBootStrap DUMMYAUDIO_bootstrap;$|extern AudioBootStrap OPOSAUDIO_bootstrap;\n&|' \
+    "$SRC/src/audio/SDL_sysaudio.h"
+grep -q OPOSAUDIO_bootstrap "$SRC/src/audio/SDL_audio.c" \
+    && grep -q OPOSAUDIO_bootstrap "$SRC/src/audio/SDL_sysaudio.h" || {
+    echo "store/linux/sdl2: could not add the OPOS audio driver" >&2
+    exit 1
+}
 
 PREFIX=$OUT/sdl2
 rm -rf "$PREFIX"
 # Everything that needs a Linux device, server or library OPOS lacks is
 # off: X11, Wayland, KMS, OpenGL, Vulkan, sound servers, udev, D-Bus.
-# Audio, joysticks and haptics use SDL's dummy drivers.
-(cd "$SRC" && CC="$LINUX_CC" CFLAGS="-O2 -DSDL_VIDEO_DRIVER_OPOS=1" \
+# Audio goes through the OPOS driver (without sound hardware SDL finds
+# no audio driver, as before); joysticks and haptics use SDL's dummy
+# drivers.
+(cd "$SRC" && CC="$LINUX_CC" \
+    CFLAGS="-O2 -DSDL_VIDEO_DRIVER_OPOS=1 -DSDL_AUDIO_DRIVER_OPOS=1" \
     LDFLAGS=-static ./configure --prefix="$PREFIX" \
     --disable-shared --enable-static \
     --enable-video-dummy --disable-video-offscreen \
@@ -77,10 +92,12 @@ STAGE=$DIR/stage
 mkdir -p "$STAGE"
 LIBS="-L$PREFIX/lib -lSDL2_test -lSDL2 -lm -static"
 CFLAGS="-O2 -I$PREFIX/include/SDL2"
-for demo in testsprite2 testdraw2 testrendercopyex checkkeys; do
+for demo in testsprite2 testdraw2 testrendercopyex checkkeys \
+        testmultiaudio; do
     extra=
     case $demo in
-        testsprite2|testrendercopyex) extra="$SRC/test/testutils.c" ;;
+        testsprite2|testrendercopyex|testmultiaudio)
+            extra="$SRC/test/testutils.c" ;;
     esac
     $LINUX_CC $CFLAGS -o "$STAGE/$demo" "$SRC/test/$demo.c" $extra $LIBS \
         >> "$DIR/build.log" 2>&1 || {
@@ -89,7 +106,8 @@ for demo in testsprite2 testdraw2 testrendercopyex checkkeys; do
     }
     strip "$STAGE/$demo"
 done
-cp "$SRC/test/icon.bmp" "$SRC/test/sample.bmp" "$STAGE/"
+cp "$SRC/test/icon.bmp" "$SRC/test/sample.bmp" "$SRC/test/sample.wav" \
+    "$STAGE/"
 cp "$SRC/LICENSE.txt" "$STAGE/LICENSE"
 printf '\nThe programs in this package are SDL %s test programs, linked with\nSDL and an SDL video driver for OPOS (zlib license, above), and with\nmusl libc, whose license is in LICENSE.musl.\n' \
     "$VERSION" >> "$STAGE/LICENSE"
@@ -105,13 +123,16 @@ file: files/testsprite2 testsprite2 exec
 file: files/testdraw2 testdraw2 exec
 file: files/testrendercopyex testrendercopyex exec
 file: files/checkkeys checkkeys exec
+file: files/testmultiaudio testmultiaudio exec
 file: files/icon.bmp icon.bmp
 file: files/sample.bmp sample.bmp
+file: files/sample.wav sample.wav
 file: files/LICENSE LICENSE
 file: files/LICENSE.musl LICENSE.musl
 start: files/testsprite2 SDL Sprites
 start: files/testdraw2 SDL Drawing
 start: files/testrendercopyex SDL Rotation
 start: files/checkkeys SDL Keys
+start: files/testmultiaudio SDL Sound
 PKG
 package "$STAGE" "$OUT"

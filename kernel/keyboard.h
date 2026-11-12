@@ -27,6 +27,12 @@
 void keyboard_initialize(void);
 void keyboard_irq_handler(void);
 bool keyboard_read_character(char *character);
+/* The next key press or release, in order: key is the set-1 scan code
+   (0x01-0x7f), plus 0x80 for keys sent after 0xe0 (arrows, right Ctrl).
+   Typematic repeats arrive as more presses. A transition is returned
+   only after the characters typed before it were read, so reading both
+   alternately keeps typing order. */
+bool keyboard_read_key_state(uint8_t *key, bool *pressed);
 bool keyboard_wait_character(char *character);
 uint64_t keyboard_dropped_characters(void);
 bool keyboard_ctrl_held(void);

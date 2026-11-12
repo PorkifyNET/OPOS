@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ELF_MAX_SEGMENT_PAGES 512
+#define ELF_MAX_SEGMENT_PAGES 4096
 #define ELF_MAX_LOAD_SEGMENTS 8
 #define ELF_INTERPRETER_PATH_MAX 256
 

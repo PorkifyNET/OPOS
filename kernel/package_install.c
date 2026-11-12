@@ -579,11 +579,16 @@ static enum package_result scan_archive(const char *path, enum scan_mode mode,
             }
             sha256_update(&hash, chunk, want);
             size_t written = 0;
-            if (stage
-                && (!vfs_write_at(staged, text_length(staged), (size_t)done,
-                                  chunk, want, &written)
-                    || written != want)) {
-                return PACKAGE_DISK_ERROR;
+            /* One cache flush per chunk, not one per sector: flushing
+               each sector made a 30 MB install take a quarter hour. */
+            if (stage) {
+                block_begin_batch();
+                bool wrote = vfs_write_at(staged, text_length(staged),
+                                          (size_t)done, chunk, want,
+                                          &written);
+                if (!block_end_batch() || !wrote || written != want) {
+                    return PACKAGE_DISK_ERROR;
+                }
             }
             pause_briefly();
         }
@@ -797,8 +802,8 @@ static bool apply(bool install) {
     if (!block_end_batch() || !ok) {
         return false;
     }
-    ok = remove_tree(STAGE_OLD);
     block_begin_batch();
+    ok = remove_tree(STAGE_OLD);
     remove_file(STAGE_RECORD);
     ok = clear_staging() && ok;
     return block_end_batch() && ok;
@@ -1119,8 +1124,14 @@ static void forget_program(size_t account, const char *id, bool store,
                                        "/AppData/Programs/");
     used = used == 0 ? 0 : append_text(data, sizeof(data), used, id);
     enum vfs_node_type type;
+    bool removed = true;
     if (remove_data && used != 0 && exists(data, &type)
-        && type == VFS_NODE_DIRECTORY && !remove_tree(data)) {
+        && type == VFS_NODE_DIRECTORY) {
+        block_begin_batch();
+        removed = remove_tree(data);
+        removed = block_end_batch() && removed;
+    }
+    if (!removed) {
         console_write_string("OPOS: packages: could not delete all of ");
         console_write_string(data);
         console_write_string("\n");

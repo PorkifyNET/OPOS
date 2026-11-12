@@ -6,6 +6,7 @@
 #include "initramfs.h"
 #include "iso9660.h"
 #include "vfs.h"
+#include "block.h"
 
 struct vfs_resolved_node {
     bool root;
@@ -916,7 +917,7 @@ bool vfs_object_namespace_path(vfs_object_handle handle, char *path,
     return true;
 }
 
-bool vfs_object_resize(vfs_object_handle handle, uint32_t new_size) {
+static bool vfs_object_resize_unbatched(vfs_object_handle handle, uint32_t new_size) {
     struct vfs_open_object *object = open_object(handle);
     if (object != NULL && object->disk_root_alias) {
         return false;
@@ -950,7 +951,7 @@ bool vfs_object_read_at(vfs_object_handle handle, size_t offset,
         &object->node, offset, buffer, length, bytes_read);
 }
 
-bool vfs_object_write_at(vfs_object_handle handle, size_t offset,
+static bool vfs_object_write_at_unbatched(vfs_object_handle handle, size_t offset,
                          const uint8_t *buffer, size_t length,
                          size_t *bytes_written) {
     struct vfs_open_object *object = open_object(handle);
@@ -1025,7 +1026,7 @@ bool vfs_read_file(const char *path, size_t path_length, uint8_t *buffer,
         && bytes_read == active->size;
 }
 
-bool vfs_write_file(const char *path, size_t path_length,
+static bool vfs_write_file_unbatched(const char *path, size_t path_length,
                     const uint8_t *buffer, size_t file_size) {
     if (path_is_disk_root_alias(path, path_length)) {
         return false;
@@ -1084,7 +1085,7 @@ bool vfs_file_size(const char *path, size_t path_length, size_t *file_size) {
     return true;
 }
 
-bool vfs_create_file(const char *path, size_t path_length, bool truncate) {
+static bool vfs_create_file_unbatched(const char *path, size_t path_length, bool truncate) {
     if (path_is_disk_root_alias(path, path_length)) {
         return false;
     }
@@ -1108,7 +1109,7 @@ bool vfs_create_file(const char *path, size_t path_length, bool truncate) {
         && fat16_create_named(parent_cluster, name, name_length, false, &node);
 }
 
-bool vfs_resize_file(const char *path, size_t path_length, uint32_t new_size) {
+static bool vfs_resize_file_unbatched(const char *path, size_t path_length, uint32_t new_size) {
     if (path_is_disk_root_alias(path, path_length)) {
         return false;
     }
@@ -1123,7 +1124,7 @@ bool vfs_resize_file(const char *path, size_t path_length, uint32_t new_size) {
         : fat16_resize_node(&node, new_size);
 }
 
-bool vfs_create_directory(const char *path, size_t path_length) {
+static bool vfs_create_directory_unbatched(const char *path, size_t path_length) {
     if (path_is_disk_root_alias(path, path_length)) {
         return false;
     }
@@ -1140,7 +1141,7 @@ bool vfs_create_directory(const char *path, size_t path_length) {
         && fat16_create_named(parent_cluster, name, name_length, true, &node);
 }
 
-bool vfs_remove(const char *path, size_t path_length, bool directory,
+static bool vfs_remove_unbatched(const char *path, size_t path_length, bool directory,
                 bool *not_empty) {
     if (path_is_disk_root_alias(path, path_length)) {
         if (not_empty != NULL) {
@@ -1202,7 +1203,7 @@ static bool last_component_equal(const char *path, size_t path_length,
     return true;
 }
 
-enum vfs_rename_result vfs_rename(const char *old_path,
+static enum vfs_rename_result vfs_rename_unbatched(const char *old_path,
                                   size_t old_path_length,
                                   const char *new_path,
                                   size_t new_path_length) {
@@ -1350,7 +1351,7 @@ bool vfs_read_at(const char *path, size_t path_length, size_t offset,
                               offset, buffer, length, bytes_read);
 }
 
-bool vfs_write_at(const char *path, size_t path_length, size_t offset,
+static bool vfs_write_at_unbatched(const char *path, size_t path_length, size_t offset,
                   const uint8_t *buffer, size_t length,
                   size_t *bytes_written) {
     if (path_is_disk_root_alias(path, path_length)) {
@@ -1681,4 +1682,66 @@ bool vfs_object_directory_entry_at(vfs_object_handle handle, size_t index,
     }
     return directory_entry_at(object->root ? 0 : object->node.first_cluster,
                               index, entry);
+}
+
+/*
+ * Each change to a file or folder flushes the disk cache once, when it is
+ * done, not after every sector it writes: a flush per sector made writing
+ * a large file take minutes. Batches nest (block_begin_batch).
+ */
+bool vfs_object_resize(vfs_object_handle handle, uint32_t new_size) {
+    block_begin_batch();
+    bool ok = vfs_object_resize_unbatched(handle, new_size);
+    return block_end_batch() && ok;
+}
+
+bool vfs_object_write_at(vfs_object_handle handle, size_t offset, const uint8_t *buffer, size_t length, size_t *bytes_written) {
+    block_begin_batch();
+    bool ok = vfs_object_write_at_unbatched(handle, offset, buffer, length, bytes_written);
+    return block_end_batch() && ok;
+}
+
+bool vfs_write_file(const char *path, size_t path_length, const uint8_t *buffer, size_t file_size) {
+    block_begin_batch();
+    bool ok = vfs_write_file_unbatched(path, path_length, buffer, file_size);
+    return block_end_batch() && ok;
+}
+
+bool vfs_create_file(const char *path, size_t path_length, bool truncate) {
+    block_begin_batch();
+    bool ok = vfs_create_file_unbatched(path, path_length, truncate);
+    return block_end_batch() && ok;
+}
+
+bool vfs_resize_file(const char *path, size_t path_length, uint32_t new_size) {
+    block_begin_batch();
+    bool ok = vfs_resize_file_unbatched(path, path_length, new_size);
+    return block_end_batch() && ok;
+}
+
+bool vfs_create_directory(const char *path, size_t path_length) {
+    block_begin_batch();
+    bool ok = vfs_create_directory_unbatched(path, path_length);
+    return block_end_batch() && ok;
+}
+
+bool vfs_remove(const char *path, size_t path_length, bool directory, bool *not_empty) {
+    block_begin_batch();
+    bool ok = vfs_remove_unbatched(path, path_length, directory, not_empty);
+    return block_end_batch() && ok;
+}
+
+enum vfs_rename_result vfs_rename(const char *old_path, size_t old_path_length, const char *new_path, size_t new_path_length) {
+    block_begin_batch();
+    enum vfs_rename_result result = vfs_rename_unbatched(old_path, old_path_length, new_path, new_path_length);
+    if (!block_end_batch() && result == VFS_RENAME_OK) {
+        return VFS_RENAME_IO_ERROR;
+    }
+    return result;
+}
+
+bool vfs_write_at(const char *path, size_t path_length, size_t offset, const uint8_t *buffer, size_t length, size_t *bytes_written) {
+    block_begin_batch();
+    bool ok = vfs_write_at_unbatched(path, path_length, offset, buffer, length, bytes_written);
+    return block_end_batch() && ok;
 }

@@ -54,6 +54,61 @@ static uint32_t cached_root_sector;
 static bool cached_root_sector_valid;
 static uint32_t cached_fat_sector;
 static bool cached_fat_sector_valid;
+
+/*
+ * Reading or writing a file at an offset walks its cluster chain, and so
+ * does finding its length. Copying a large file in chunks walked from the
+ * first cluster every time, which grows with the square of the size. These
+ * remember where a few chains were last walked to (cluster number index of
+ * the chain starting at first). Any FAT change other than appending to a
+ * chain forgets them. free_hint is where the last allocation ended; free
+ * clusters are looked for after it first.
+ */
+#define CHAIN_POSITIONS 4
+struct chain_position {
+    uint32_t first;
+    uint32_t index;
+    uint32_t cluster;
+};
+static struct chain_position chain_positions[CHAIN_POSITIONS];
+static size_t chain_position_next;
+static uint32_t free_hint;
+
+static void fat16_forget_positions(void) {
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        chain_positions[i].first = 0;
+    }
+    free_hint = 0;
+}
+
+/* The remembered position furthest along first's chain, at most index. */
+static const struct chain_position *chain_position_find(uint32_t first,
+                                                        uint32_t index) {
+    const struct chain_position *best = NULL;
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        const struct chain_position *position = &chain_positions[i];
+        if (position->first == first && first != 0 && position->index <= index
+            && (best == NULL || position->index > best->index)) {
+            best = position;
+        }
+    }
+    return best;
+}
+
+static void chain_position_store(uint32_t first, uint32_t index,
+                                 uint32_t cluster) {
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        if (chain_positions[i].first == first) {
+            chain_positions[i].index = index;
+            chain_positions[i].cluster = cluster;
+            return;
+        }
+    }
+    chain_positions[chain_position_next] = (struct chain_position){
+        .first = first, .index = index, .cluster = cluster,
+    };
+    chain_position_next = (chain_position_next + 1) % CHAIN_POSITIONS;
+}
 static uint8_t root_sector_buffer[SECTOR_SIZE];
 static uint8_t fat_sector_buffer[SECTOR_SIZE];
 static uint8_t file_sector_buffer[SECTOR_SIZE];
@@ -271,6 +326,7 @@ static bool mount_volume(uint32_t first_sector, uint32_t sectors) {
         return false;
     }
     volume_ready = true;
+    fat16_forget_positions();
     disk_state = FAT_DISK_MOUNTED;
     remember_label();
     return true;
@@ -283,6 +339,7 @@ bool fat16_initialize(void) {
     fsinfo_invalidated = false;
     cached_root_sector_valid = false;
     cached_fat_sector_valid = false;
+    fat16_forget_positions();
     disk_state = FAT_DISK_NO_DEVICE;
     uint64_t disk_sectors = block_sector_count();
     uint8_t sector[SECTOR_SIZE];
@@ -482,6 +539,9 @@ static bool fat16_invalidate_fsinfo(void) {
 static bool fat16_write_fat_entry(uint32_t cluster, uint32_t value) {
     uint32_t fat_sector;
     size_t entry_offset;
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        chain_positions[i].first = 0;
+    }
     if (!fat16_fat_entry_location(cluster, &fat_sector, &entry_offset)
         || !fat16_invalidate_fsinfo()) {
         return false;
@@ -506,6 +566,83 @@ static bool fat16_write_fat_entry(uint32_t cluster, uint32_t value) {
             return false;
         }
     }
+    return true;
+}
+
+/*
+ * Changes to FAT entries that share a FAT sector, written together: one
+ * read and one write per FAT copy instead of per entry. Allocating or
+ * freeing a long chain changes thousands of neighbouring entries.
+ */
+#define FAT_BATCH_MAX 256
+static struct {
+    uint32_t sector;
+    size_t count;
+    uint32_t clusters[FAT_BATCH_MAX];
+    uint32_t values[FAT_BATCH_MAX];
+} fat_batch;
+
+static bool fat_batch_flush(void) {
+    if (fat_batch.count == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        chain_positions[i].first = 0;
+    }
+    size_t count = fat_batch.count;
+    fat_batch.count = 0;
+    if (!fat16_invalidate_fsinfo()) {
+        return false;
+    }
+    for (uint8_t copy = 0; copy < volume.fat_count; copy++) {
+        uint32_t lba = volume.first_sector + volume.reserved_sectors
+            + (uint32_t)copy * volume.sectors_per_fat + fat_batch.sector;
+        if (!fat16_load_fat_sector(lba)) {
+            return false;
+        }
+        for (size_t i = 0; i < count; i++) {
+            uint32_t fat_sector;
+            size_t entry_offset;
+            if (!fat16_fat_entry_location(fat_batch.clusters[i], &fat_sector,
+                                          &entry_offset)) {
+                return false;
+            }
+            uint32_t value = fat_batch.values[i];
+            if (volume.fat32) {
+                uint32_t preserved = read_le32(fat_sector_buffer
+                                               + entry_offset)
+                    & ~FAT32_ENTRY_MASK;
+                write_le32(fat_sector_buffer + entry_offset,
+                           preserved | (value & FAT32_ENTRY_MASK));
+            } else {
+                write_le16(fat_sector_buffer + entry_offset, (uint16_t)value);
+            }
+        }
+        if (!fat_write_sectors(lba, 1, fat_sector_buffer)) {
+            cached_fat_sector_valid = false;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Queues cluster's FAT entry; fat_batch_flush writes the queue. */
+static bool fat_batch_add(uint32_t cluster, uint32_t value) {
+    uint32_t fat_sector;
+    size_t entry_offset;
+    if (!fat16_fat_entry_location(cluster, &fat_sector, &entry_offset)) {
+        return false;
+    }
+    if (fat_batch.count != 0
+        && (fat_batch.sector != fat_sector
+            || fat_batch.count == FAT_BATCH_MAX)
+        && !fat_batch_flush()) {
+        return false;
+    }
+    fat_batch.sector = fat_sector;
+    fat_batch.clusters[fat_batch.count] = cluster;
+    fat_batch.values[fat_batch.count] = value;
+    fat_batch.count++;
     return true;
 }
 
@@ -666,6 +803,12 @@ static bool fat16_chain_length(uint32_t first_cluster, uint32_t *length,
         return true;
     }
     uint32_t cluster = first_cluster;
+    const struct chain_position *known =
+        chain_position_find(first_cluster, UINT32_MAX);
+    if (known != NULL) {
+        cluster = known->cluster;
+        *length = known->index;
+    }
     for (uint32_t visited = 0; visited < volume.cluster_count; visited++) {
         if (cluster < 2 || (uint32_t)cluster > volume.cluster_count + 1) {
             return false;
@@ -678,6 +821,7 @@ static bool fat16_chain_length(uint32_t first_cluster, uint32_t *length,
             return false;
         }
         if (end_of_chain) {
+            chain_position_store(first_cluster, *length - 1, cluster);
             return true;
         }
         cluster = next;
@@ -893,7 +1037,14 @@ static bool fat16_cluster_at(uint32_t first_cluster, uint32_t index,
         return false;
     }
     uint32_t current = first_cluster;
-    for (uint32_t i = 0; i < index; i++) {
+    uint32_t start = 0;
+    const struct chain_position *known =
+        chain_position_find(first_cluster, index);
+    if (known != NULL) {
+        current = known->cluster;
+        start = known->index;
+    }
+    for (uint32_t i = start; i < index; i++) {
         uint32_t next;
         bool end_of_chain;
         if (!fat16_get_next_cluster(current, &next, &end_of_chain)
@@ -902,6 +1053,7 @@ static bool fat16_cluster_at(uint32_t first_cluster, uint32_t index,
         }
         current = next;
     }
+    chain_position_store(first_cluster, index, current);
     *cluster = current;
     return true;
 }
@@ -979,19 +1131,34 @@ static bool fat16_ensure_chain_capacity(uint32_t first_cluster,
     }
     uint32_t additional = required_clusters > existing_clusters
         ? required_clusters - existing_clusters : 0;
-    uint32_t free_cursor = 1;
-    for (uint32_t i = 0; i < additional; i++) {
-        if (!fat16_find_free_cluster(free_cursor, &free_cursor)) {
-            return false;
-        }
-    }
     if (additional == 0) {
         *result_first_cluster = first_cluster;
         return true;
     }
+    /* Enough free clusters after the hint, else from the start. */
+    uint32_t search_from = free_hint;
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t free_cursor = search_from;
+        uint32_t found = 0;
+        while (found < additional
+               && fat16_find_free_cluster(free_cursor, &free_cursor)) {
+            found++;
+        }
+        if (found == additional) {
+            break;
+        }
+        if (search_from <= 1) {
+            return false;
+        }
+        search_from = 1;
+    }
+    struct chain_position kept[CHAIN_POSITIONS];
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        kept[i] = chain_positions[i];
+    }
 
     uint32_t first_new;
-    if (!fat16_find_free_cluster(1, &first_new)) {
+    if (!fat16_find_free_cluster(search_from, &first_new)) {
         return false;
     }
     uint32_t current = first_new;
@@ -1001,14 +1168,23 @@ static bool fat16_ensure_chain_capacity(uint32_t first_cluster,
             && !fat16_find_free_cluster(current, &next)) {
             return false;
         }
-        if (!fat16_write_fat_entry(current, next)) {
+        if (!fat_batch_add(current, next)) {
+            fat_batch.count = 0;
             return false;
         }
+        free_hint = current;
         current = next;
+    }
+    if (!fat_batch_flush()) {
+        return false;
     }
     if (existing_clusters != 0
         && !fat16_write_fat_entry(existing_tail, first_new)) {
         return false;
+    }
+    /* Appending leaves every walked position valid. */
+    for (size_t i = 0; i < CHAIN_POSITIONS; i++) {
+        chain_positions[i] = kept[i];
     }
     *result_first_cluster = existing_clusters == 0
         ? first_new : first_cluster;
@@ -1526,14 +1702,16 @@ static bool fat16_release_chain(uint32_t first_cluster) {
         uint32_t next;
         bool end;
         if (!fat16_get_next_cluster(cluster, &next, &end)
-            || !fat16_write_fat_entry(cluster, 0)) {
+            || !fat_batch_add(cluster, 0)) {
+            fat_batch.count = 0;
             return false;
         }
         if (end) {
-            return true;
+            return fat_batch_flush();
         }
         cluster = next;
     }
+    fat_batch.count = 0;
     return false;
 }
 
@@ -2671,6 +2849,7 @@ static void forget_volume(void) {
     volume = (struct fat16_volume){0};
     cached_root_sector_valid = false;
     cached_fat_sector_valid = false;
+    fat16_forget_positions();
 }
 
 static uint32_t format_volume_id(void) {
@@ -2825,6 +3004,7 @@ static void slot_load(size_t index) {
     directory_cache_valid = false;
     cached_root_sector_valid = false;
     cached_fat_sector_valid = false;
+    fat16_forget_positions();
 }
 
 bool fat16_use(size_t index) {

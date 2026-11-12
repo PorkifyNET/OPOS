@@ -317,13 +317,22 @@ const char *block_device_name(enum block_device device) {
     }
 }
 
+/* Batches nest: only the outermost end flushes. */
+static size_t batch_depth;
+
 void block_begin_batch(void) {
+    batch_depth++;
     ata_set_flush_deferred(true);
     nvme_set_flush_deferred(true);
     scsi_set_flush_deferred(true);
 }
 
 bool block_end_batch(void) {
+    if (batch_depth > 1) {
+        batch_depth--;
+        return true;
+    }
+    batch_depth = 0;
     ata_set_flush_deferred(false);
     nvme_set_flush_deferred(false);
     scsi_set_flush_deferred(false);

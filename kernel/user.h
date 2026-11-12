@@ -102,9 +102,35 @@ typedef void (*user_console_sink)(const char *data, size_t length,
 void user_set_console_sink(user_console_sink sink);
 
 /* Where programs' standard input comes from while set (the desktop
-   Terminal); NULL means the keyboard. Waits for one character; false
-   ends the read with an error. Called with interrupts off. */
-typedef bool (*user_console_input)(char *character);
-void user_set_console_input(user_console_input input);
+   Terminal); NULL means the keyboard. Waits for one character until
+   deadline (timer ticks; UINT64_MAX waits for ever, 0 does not wait):
+   1 got one, 0 none by the deadline, -1 the read must end (the program
+   is ending or has a signal, or the desktop is going away). pending
+   counts characters typed and not yet read. Called with interrupts off. */
+typedef int (*user_console_input)(char *character, uint64_t deadline);
+typedef size_t (*user_console_pending)(void);
+void user_set_console_input(user_console_input input,
+                            user_console_pending pending);
+
+/* The console as a Linux terminal (docs/linux-programs.md, step 5).
+   The Terminal's size in character cells, for TIOCGWINSZ. */
+void user_set_console_size(uint16_t rows, uint16_t columns);
+/* Back to the default settings (line input with echo, Ctrl+C signals),
+   when the program that changed them has ended. */
+void user_console_reset(void);
+/* Its c_lflag: LINUX_TTY_ISIG means Ctrl+C sends SIGINT instead of a
+   character, LINUX_TTY_ECHO that typed text is shown. */
+#define LINUX_TTY_ISIG 0x1u
+#define LINUX_TTY_ICANON 0x2u
+#define LINUX_TTY_ECHO 0x8u
+uint32_t user_console_local_flags(void);
+/* Sends a signal to a process and the processes it started with fork;
+   false when it is not running. */
+bool user_process_signal(uint64_t process_id, uint64_t signal_number);
+/* True while a signal sent to the process is not delivered yet (it has
+   made no system call since). */
+bool user_process_signal_pending(uint64_t process_id, uint64_t signal_number);
+/* True when the calling thread has a signal it does not block. */
+bool user_current_signal_pending(void);
 
 #endif

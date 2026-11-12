@@ -89,10 +89,9 @@ are enforced separately. `uname` returns
 the Linux ABI identity with OPOS-specific release and host fields. The clock
 calls support `CLOCK_MONOTONIC` only and derive time from the 100 Hz PIT;
 `gettimeofday` likewise reports uptime rather than wall-clock epoch time.
-`nanosleep` rounds positive durations up to PIT ticks, puts the calling task on
-a scheduler wake deadline, and lets other tasks run. It does not support signal
-interruption or a remaining-time result. Realtime clock IDs and actual wall-clock
-time are not available. `arch_prctl`
+`nanosleep` rounds positive durations up to PIT ticks and sleeps a tick at a
+time, letting other tasks run; a signal ends it with `EINTR` and writes the
+time left. Realtime clock IDs and actual wall-clock time are not available. `arch_prctl`
 currently supports `ARCH_SET_FS` and `ARCH_GET_FS` only, with nonzero FS bases
 required to refer to a mapped user address.
 
@@ -107,14 +106,17 @@ wake on PIT deadlines. Keyboard reads atomically block on a scheduler event;
 IRQ1 queues a character and wakes matching tasks without a lost-wakeup window.
 Each user process now has a process control block that owns its PID, lifecycle
 and fault state, address space, bounded image segments and pages, stack page, heap,
-anonymous mappings, current directory, and eleven descriptor slots numbered
-0 through 10. Opens allocate slots 3 through 10. Processes start in `/`; spawned children inherit the parent's
+anonymous mappings, current directory, and 64 descriptor slots numbered
+0 through 63. Opens allocate slots 3 through 63; 128 descriptions are open
+system wide. Processes start in `/`; spawned children inherit the parent's
 current directory. Path resolution canonicalizes repeated separators, `.`, and
 `..` against the global mount namespace without traversing above `/`.
 Each open creates an open-file description with its own offset and access mode.
 `dup`, `dup2`, and `dup3` descriptors share that description and offset; the
 underlying VFS object remains alive until its final descriptor closes. `dup3`
-accepts `O_CLOEXEC`, while `dup2`/`dup3` can replace slots 0 through 10.
+accepts `O_CLOEXEC`, while `dup2`/`dup3` can replace any slot below 64.
+`F_DUPFD` honors its lowest number. Duplicating the console (0-2 not yet
+redirected) makes an open `/dev/tty`, so a shell can save and restore it.
 Descriptions share one of 32 refcounted open-file records and
 support up to 4 KiB per filesystem I/O
 call, and are closed automatically on process exit or fault. Standard
@@ -181,7 +183,10 @@ anonymous mappings, and constructs a new Linux initial stack containing the
 provided argument and environment vectors plus the supported auxiliary values.
 `AT_EXECFN` preserves the `execve` pathname; direct shell, desktop, and disk
 launches pass their selected filename through the same launch interface.
-An `ET_EXEC` image may name `/lib/opos-ld.so` through one validated `PT_INTERP`.
+An `ET_EXEC` image may name an interpreter through one validated `PT_INTERP`:
+the regression interpreter `/lib/opos-ld.so`, or musl's dynamic linker
+`/lib/ld-musl-x86_64.so.1` for real dynamically linked musl programs
+(docs/linux-programs.md, step 6).
 Main `ET_DYN` PIE images are loaded at the fixed bias `0x04000000`; dynamically
 linked PIEs provide `PT_PHDR` so the interpreter can derive that bias from
 `AT_PHDR`. ASLR and randomized PIE placement are not implemented.
@@ -246,8 +251,10 @@ exactly one RW, remaining entries R, and at most 16 mapped pages total. File and
 virtual offsets may differ and need only be page-congruent. Process ownership,
 fork cloning, exec replacement, fault cleanup, and normal exit preserve every
 segment's R/RX/RW permissions.
-The current bounded implementation accepts at most 16 arguments, 16 environment
-entries, 1024 total string bytes, a 1 MiB executable file (2 MiB of loaded segments), and a 64 KiB interpreter. The regression
+The current bounded implementation accepts at most 64 arguments, 64 environment
+entries, 2048 total string bytes (all of it must fit the stack's top page with
+the auxiliary vector), a 16 MiB executable file (16 MiB of loaded segments per
+image), and a 4 MiB interpreter. The main stack is 512 KiB. The regression
 executes `/tests/exec-test` and verifies replacement, arguments, descriptor
 inheritance, close-on-exec, FS reset, private file mappings, dynamic-interpreter
 handoff, eager `JUMP_SLOT` relocation, a call into `/lib/libopos-test.so`, and
@@ -338,15 +345,22 @@ lifetime, enumerates the root mount namespace, changes cwd to `/`, and
 verifies read-only initramfs mutation errors and per-mount `st_dev` values. It
 also uses `brk` (12) to allocate,
 verify zeroed pages, write across the heap, shrink back, and check the heap
-limit; the heap is capped at 128 pages. Linux `mmap` (9), `mprotect` (10), and
+limit; the heap is capped at 8192 pages (32 MiB). Linux `mmap` (9), `mprotect` (10), and
 `munmap` (11) support private anonymous mappings and eager private copies of
-regular files in a bounded 1024-page (4 MiB) region. File offsets must be page-aligned;
+regular files in a bounded 16384-page (64 MiB) region; `mremap` (25) shrinks,
+grows in place, or moves pages without copying (`MREMAP_MAYMOVE`). File offsets must be page-aligned;
 bytes beyond EOF are zero-filled. Read-only, writable/non-executable, and
 executable/read-only file mappings are supported without writeback or sharing.
-`MAP_SHARED`, `MAP_FIXED`, demand paging, and writable-executable mappings are
+An address is a hint; `MAP_FIXED` maps at that address in the region,
+replacing what is there, and `MAP_FIXED_NOREPLACE` fails with `EEXIST`
+instead. `MAP_DENYWRITE`, `MAP_EXECUTABLE`, `MAP_NORESERVE`,
+`MAP_POPULATE`, `MAP_NONBLOCK` and `MAP_STACK` are accepted and have no
+effect. `MAP_SHARED`, demand paging, and writable-executable mappings are
 not implemented. `PROT_NONE` reserves physically backed but user-inaccessible
-pages so musl can allocate guarded thread stacks. `mprotect` is restricted to
-those mappings, rejects write-plus-execute, and supports inaccessible, readable,
+pages so musl can allocate guarded thread stacks. `mprotect` works on
+those mappings, and on the main program's loaded segments, where a page
+may only drop write or execute permission or get back its segment's own
+(RELRO). It rejects write-plus-execute, and supports inaccessible, readable,
 writable/non-executable, or executable/read-only page permissions. Anonymous
 executable mappings at allocation time remain rejected. The ELF test verifies
 zeroed pages, private file-copy isolation, RX file mappings, permission
@@ -363,9 +377,11 @@ stack, heap, and anonymous mappings into an isolated address space; cwd, FS base
 and descriptor table are inherited, while open-file descriptions and offsets
 remain shared. The child resumes after `fork` with return value zero and the
 parent receives its PID. `wait4` blocks for an exact positive PID or any child
-with PID `-1`, returns the reaped PID, and writes the normal Linux exit-status
-encoding. Options and resource usage are currently unsupported and must be zero
-and null. Thread-style Linux `clone` shares VM, files, filesystem state, and
+with PID `-1` (0 and `-pgid` also mean any child, as every process is its own
+group), returns the reaped PID, and writes the normal Linux exit-status
+encoding. `WNOHANG` returns 0 while children run; `WUNTRACED` and `WCONTINUED`
+are accepted (processes never stop); resource usage is reported as zero. A
+child that ends sends `SIGCHLD` to its parent. Thread-style Linux `clone` shares VM, files, filesystem state, and
 signal-handler state while giving each thread its own stack, TLS base, TID,
 signal mask, FPU state, scheduler context, and saved syscall return stack.
 `set_tid_address`, `gettid`, robust-list registration, `rt_sigprocmask`, and

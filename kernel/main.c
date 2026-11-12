@@ -990,6 +990,12 @@ void exception_handler(uint64_t vector, uint64_t error_code,
         console_write_hex(error_code);
         console_write_string("\nRIP 0x");
         console_write_hex(instruction_pointer);
+        if (vector == 14) {
+            uint64_t fault_address;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(fault_address));
+            console_write_string("\nADDRESS 0x");
+            console_write_hex(fault_address);
+        }
         console_set_text_style(CONSOLE_TEXT_NORMAL);
         console_write_string("\n");
         return;

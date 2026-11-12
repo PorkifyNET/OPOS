@@ -22,6 +22,7 @@
 #include "user.h"
 #include "vfs.h"
 #include "keyboard.h"
+#include "hda.h"
 #include "net.h"
 
 #define SHELL_LINE_CAPACITY 2048
@@ -553,6 +554,8 @@ static const struct shell_help_entry shell_help_entries[] = {
     {"run", "run PROGRAM [ARGUMENTS]",
      "Runs a built-in test or an ELF program by path."},
     {"net", "net", "Shows network-interface and address status."},
+    {"sound", "sound", "Shows the sound output that was found."},
+    {"beep", "beep [HZ]", "Plays a short tone (default 750 Hz)."},
     {"dhcp", "dhcp", "Restarts DHCP address configuration."},
     {"ping", "ping HOST", "Sends ICMP echo requests to a host."},
     {"lookup", "lookup NAME", "Resolves a DNS name."},
@@ -725,6 +728,26 @@ static void execute_command(void) {
             }
         } else {
             console_write_warning("Usage: touchpad [mouse|multitouch]\n");
+        }
+    } else if (command_matches(command, command_length, "sound")) {
+        hda_describe(shell_print_line);
+    } else if (command_matches(command, command_length, "beep")) {
+        uint32_t frequency = 0;
+        for (size_t i = 0; i < arguments_length; i++) {
+            char c = arguments[i];
+            if (c < '0' || c > '9' || frequency > 100000) {
+                frequency = 0;
+                break;
+            }
+            frequency = frequency * 10 + (uint32_t)(c - '0');
+        }
+        if (arguments_length == 0) {
+            frequency = 750;
+        }
+        if (!hda_beep(frequency, 500)) {
+            console_write_warning(hda_ready()
+                ? "Usage: beep [HZ] with HZ from 20 to 20000\n"
+                : "No sound output.\n");
         }
     } else if (command_matches(command, command_length, "net")) {
         net_describe(shell_print_line);

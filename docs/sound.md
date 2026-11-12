@@ -241,15 +241,43 @@ then:
 
 Report what `sound` printed and whether each tone played (and from
 which output: speakers, headphones, line out). Notes per machine:
-- **VMware Workstation.** The VM needs the HD Audio device: with the VM
-  powered off, add `sound.virtualDev = "hdaudio"` to its `.vmx`. Without
-  it, a VM whose guest OS is "Other" gets VMware's default card for that
-  type (likely the Sound Blaster AudioPCI, `es1371`), which OPOS has no
-  driver for, and `sound` reports no HDA controller.
+- **VMware Workstation.** Works with no `.vmx` change. A VM whose guest
+  OS is "Other" gets the Sound Blaster AudioPCI 97 (`es1371`), which the
+  AudioPCI driver below plays; `sound` prints `Sound: AudioPCI 97`. With
+  `sound.virtualDev = "hdaudio"` in the `.vmx` the VM gets HD Audio
+  instead, and the HDA driver plays (tested: controller 15ad:1977,
+  codec 15ad1975).
 - **VirtualBox.** Settings > Audio > Audio Controller: "Intel HD Audio".
 - **Real hardware.** Headphones and speakers are both driven at once;
   there is no jack detection yet. HDMI and DisplayPort audio are not
   used.
+
+### AudioPCI 97 (step 5, part 2)
+
+`kernel/es1371.c` drives the Ensoniq ES1371 and its successors (Creative
+CT5880, EV1938; PCI 1274:1371, 1274:5880, 1102:8938), VMware's default
+sound card. The ES1370 (QEMU's `-device ES1370`) is a different chip
+and is not driven. The register layout follows Linux's
+`sound/pci/ens1370.c`.
+
+- `sound_initialize` (kernel/sound.c) now picks the card: HDA first,
+  else AudioPCI. `sound_poll`, `sound_beep`, `sound_output_ready` and
+  `sound_describe` sit above both drivers; the beep moved from `hda.c`
+  into the mixer, so it plays on either card.
+- Setup: warm AC'97 reset, sample rate converter cleared and set to
+  48 kHz for DAC2, codec master, headphone and PCM volume at 0 dB.
+  DAC2 then loops over a 32 KiB ring (below 4 GiB, as the card does
+  32-bit DMA), 16-bit stereo, without interrupts.
+- The timer refills the ring from the playing position, like HDA.
+  VMware's card stops after each 1024-frame period until its DAC2
+  interrupt flag is cleared, so each poll clears it by rewriting the
+  serial-interface register (as Linux's interrupt handler does).
+- Tested in VMware Workstation (virtual hardware 21, guest OS "Other",
+  no `sound.virtualDev`): the card is found and DAC2 keeps playing
+  (103,424 frames counted in 200 timer ticks, against 96,000 expected
+  at 48 kHz; the cause of the 8% difference is not known). Whether the
+  sound is heard was not checked by the test, which has no capture.
+  Not tested on a real ES1371.
 
 ## Not planned yet
 

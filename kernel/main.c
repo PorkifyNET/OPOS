@@ -44,7 +44,6 @@
 #include "optical.h"
 #include "boot_display.h"
 #include "sdhci.h"
-#include "hda.h"
 #include "net.h"
 #include "sound.h"
 #include "nic.h"
@@ -1445,9 +1444,6 @@ void kmain(void) {
     console_write_string(nic_ready() ? "OPOS: network card ready\n"
                                      : "OPOS: no network card found\n");
     /* Sound (docs/sound.md); the timer refills its buffers. */
-    if (!hda_initialize()) {
-        console_write_string("OPOS: no sound output found\n");
-    }
     sound_initialize();
     /* I2C touchpad (laptops). Its reset waits about 150 ms. */
     if (i2c_hid_initialize()) {

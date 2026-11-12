@@ -187,9 +187,6 @@ static uint64_t written_bytes;
 static uint32_t last_lpib;
 static hda_source source;
 
-static uint32_t beep_frames_left;
-static uint32_t beep_period;
-static uint32_t beep_phase;
 
 static uint8_t read8(uint32_t offset) {
     return *(volatile uint8_t *)(registers + offset);
@@ -635,21 +632,6 @@ static void silence(int16_t *out, size_t frames) {
     }
 }
 
-/* A square wave, mixed over whatever the source wrote. */
-static void add_beep(int16_t *out, size_t frames) {
-    for (size_t i = 0; i < frames && beep_frames_left != 0; i++) {
-        int16_t value = beep_phase < beep_period / 2 ? 6000 : -6000;
-        int32_t left = out[2 * i] + value;
-        int32_t right = out[2 * i + 1] + value;
-        out[2 * i] = (int16_t)(left > 32767 ? 32767
-                               : left < -32768 ? -32768 : left);
-        out[2 * i + 1] = (int16_t)(right > 32767 ? 32767
-                                   : right < -32768 ? -32768 : right);
-        beep_phase = (beep_phase + 1) % beep_period;
-        beep_frames_left--;
-    }
-}
-
 static void probe_line(const char *a, uint32_t hex, int digits,
                        const char *b) {
     if (probe_count == PROBE_LINES) {
@@ -841,20 +823,9 @@ void hda_poll(void) {
         int16_t *out = (int16_t *)(ring + at);
         size_t frames = chunk / FRAME_BYTES;
         source(out, frames);
-        add_beep(out, frames);
         cache_flush(out, chunk);
         written_bytes += chunk;
     }
-}
-
-bool hda_beep(uint32_t frequency, uint32_t milliseconds) {
-    if (!ready || frequency < 20 || frequency > 20000) {
-        return false;
-    }
-    beep_period = HDA_SAMPLE_RATE / frequency;
-    beep_phase = 0;
-    beep_frames_left = HDA_SAMPLE_RATE / 1000 * milliseconds;
-    return true;
 }
 
 uint64_t hda_frames_played(void) {

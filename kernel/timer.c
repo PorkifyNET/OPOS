@@ -1,10 +1,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "hda.h"
 #include "interrupts.h"
 #include "io.h"
 #include "scheduler.h"
+#include "sound.h"
 #include "svga.h"
 #include "timer.h"
 
@@ -24,7 +24,7 @@ void timer_initialize(void) {
 void timer_irq_handler(void) {
     ticks++;
     svga_timer_tick();
-    hda_poll();
+    sound_poll();
 }
 
 uint64_t timer_ticks(void) {

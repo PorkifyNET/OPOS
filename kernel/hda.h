@@ -30,9 +30,6 @@ void hda_poll(void);
 typedef void (*hda_source)(int16_t *out, size_t frames);
 void hda_set_source(hda_source source);
 
-/* Plays a tone of frequency Hz for milliseconds (kernel shell "beep"). */
-bool hda_beep(uint32_t frequency, uint32_t milliseconds);
-
 /* Frames played since start, for tests and the mixer. */
 uint64_t hda_frames_played(void);
 

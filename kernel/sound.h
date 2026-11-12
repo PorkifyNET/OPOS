@@ -15,8 +15,23 @@
 #define SOUND_STREAM_MAX_FRAMES 32768u
 #define SOUND_VOLUME_DEFAULT 70u
 
-/* Connects the mixer to the HDA driver (after hda_initialize). */
+/* Finds the sound card (HDA, else AudioPCI 97) and connects the mixer to
+   it. Logs "no sound output found" without one. */
 void sound_initialize(void);
+
+/* Whether a sound card plays. */
+bool sound_output_ready(void);
+
+/* From the timer interrupt: refills the card's ring. */
+void sound_poll(void);
+
+/* Plays a square wave of frequency Hz (20-20000) for milliseconds over
+   everything else (kernel shell "beep"). False without sound or for a
+   frequency out of range. */
+bool sound_beep(uint32_t frequency, uint32_t milliseconds);
+
+/* What the drivers found (kernel shell "sound"). */
+void sound_describe(void (*print)(const char *line));
 
 /* Opens a stream for owner (a process id) holding about capacity frames
    (rounded up to a power of two, 1024 to 32768). Returns a handle (1 or

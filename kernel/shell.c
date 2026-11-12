@@ -22,7 +22,6 @@
 #include "user.h"
 #include "vfs.h"
 #include "keyboard.h"
-#include "hda.h"
 #include "net.h"
 #include "sound.h"
 
@@ -793,7 +792,7 @@ static void execute_command(void) {
             console_write_warning("Usage: touchpad [mouse|multitouch]\n");
         }
     } else if (command_matches(command, command_length, "sound")) {
-        hda_describe(shell_print_line);
+        sound_describe(shell_print_line);
         shell_sound_status();
     } else if (command_matches(command, command_length, "volume")) {
         shell_volume(arguments, arguments_length);
@@ -810,8 +809,8 @@ static void execute_command(void) {
         if (arguments_length == 0) {
             frequency = 750;
         }
-        if (!hda_beep(frequency, 500)) {
-            console_write_warning(hda_ready()
+        if (!sound_beep(frequency, 500)) {
+            console_write_warning(sound_output_ready()
                 ? "Usage: beep [HZ] with HZ from 20 to 20000\n"
                 : "No sound output.\n");
         }

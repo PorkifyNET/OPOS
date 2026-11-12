@@ -27,7 +27,6 @@
 #include "svga.h"
 #include "boot_display.h"
 #include "vmware.h"
-#include "hda.h"
 #include "net.h"
 #include "timer.h"
 #include "update.h"
@@ -8679,7 +8678,7 @@ static void draw_volume_popup(void) {
     char line[24] = "";
     size_t length;
     uint32_t volume = sound_volume();
-    if (!hda_ready()) {
+    if (!sound_output_ready()) {
         append_text(line, sizeof(line), 0, "NO SOUND OUTPUT");
     } else if (sound_muted()) {
         append_text(line, sizeof(line), 0, "MUTED");
@@ -8702,7 +8701,7 @@ static void draw_volume_popup(void) {
     struct rect bar = {popup.x + 12, popup.y + 14 + CHAR_HEIGHT,
                        popup.width - 24, 6};
     fill(bar, 60, 70, 95);
-    if (hda_ready() && !sound_muted()) {
+    if (sound_output_ready() && !sound_muted()) {
         fill((struct rect){bar.x, bar.y, bar.width * (int64_t)volume / 100,
                            bar.height}, 110, 160, 255);
     }

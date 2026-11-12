@@ -3,6 +3,8 @@
 #include <stdint.h>
 
 #include "cmos.h"
+#include "console.h"
+#include "es1371.h"
 #include "hda.h"
 #include "memory.h"
 #include "sound.h"
@@ -39,6 +41,10 @@ static volatile uint32_t volume = SOUND_VOLUME_DEFAULT;
 static volatile bool muted;
 /* Mixed in 32 bits before clamping; one HDA buffer at most. */
 static int32_t mix[1024 * 2];
+/* "beep": a square wave over the mix, after the volume. */
+static volatile uint32_t beep_frames_left;
+static uint32_t beep_period;
+static uint32_t beep_phase;
 
 static uint64_t interrupts_save(void) {
     uint64_t flags;
@@ -86,10 +92,20 @@ static void sound_mix(int16_t *out, size_t frames) {
         }
         /* Volume on a squared curve: half way sounds about half as loud. */
         int32_t gain = muted ? 0 : (int32_t)(volume * volume);
-        for (size_t i = 0; i < chunk * 2; i++) {
-            int32_t value = (int32_t)((int64_t)mix[i] * gain / 10000);
-            out[i] = (int16_t)(value > 32767 ? 32767
-                               : value < -32768 ? -32768 : value);
+        for (size_t f = 0; f < chunk; f++) {
+            int32_t beep = 0;
+            if (beep_frames_left != 0) {
+                beep = beep_phase < beep_period / 2 ? 6000 : -6000;
+                beep_phase = (beep_phase + 1) % beep_period;
+                beep_frames_left--;
+            }
+            for (size_t c = 0; c < 2; c++) {
+                int32_t value = (int32_t)((int64_t)mix[2 * f + c] * gain
+                                          / 10000) + beep;
+                out[2 * f + c] = (int16_t)(value > 32767 ? 32767
+                                           : value < -32768 ? -32768
+                                                            : value);
+            }
         }
         out += chunk * 2;
         frames -= chunk;
@@ -99,13 +115,46 @@ static void sound_mix(int16_t *out, size_t frames) {
 void sound_initialize(void) {
     uint32_t saved = settings_sound_volume();
     volume = saved <= 100 ? saved : SOUND_VOLUME_DEFAULT;
-    if (hda_ready()) {
+    if (hda_initialize()) {
         hda_set_source(sound_mix);
+    } else if (es1371_initialize()) {
+        es1371_set_source(sound_mix);
+    } else {
+        console_write_string("OPOS: no sound output found\n");
+    }
+}
+
+bool sound_output_ready(void) {
+    return hda_ready() || es1371_ready();
+}
+
+void sound_poll(void) {
+    hda_poll();
+    es1371_poll();
+}
+
+bool sound_beep(uint32_t frequency, uint32_t milliseconds) {
+    if (!sound_output_ready() || frequency < 20 || frequency > 20000) {
+        return false;
+    }
+    uint64_t flags = interrupts_save();
+    beep_period = 48000u / frequency;
+    beep_phase = 0;
+    beep_frames_left = 48u * milliseconds;
+    interrupts_restore(flags);
+    return true;
+}
+
+void sound_describe(void (*print)(const char *line)) {
+    if (es1371_ready()) {
+        es1371_describe(print);
+    } else {
+        hda_describe(print);
     }
 }
 
 int64_t sound_open(uint64_t owner, uint32_t capacity) {
-    if (!hda_ready()) {
+    if (!sound_output_ready()) {
         return -19;
     }
     if (capacity == 0 || capacity > SOUND_STREAM_MAX_FRAMES) {

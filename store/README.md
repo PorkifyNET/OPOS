@@ -22,6 +22,12 @@ is GPL-2.0, and its package carries its source release and build
 configuration. Add it with `STORE_LINUX="lua sqlite busybox"`. It needs
 the Linux headers (`apt install linux-libc-dev`) and `bzip2`.
 
+`linux/sdl2/build.sh` is not in the default `STORE_LINUX` either. It
+builds SDL 2 with the OPOS video driver in `linux/sdl2/opos/` and
+packages four of SDL's demo programs (SDL Demos). It also installs the
+library into `build/store_opk/sdl2/` while `make store` runs, for later
+recipes of SDL programs. Add it with `STORE_LINUX="lua sqlite sdl2"`.
+
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads
 `releases/latest/download/index` from there. See `docs/packages.md`.

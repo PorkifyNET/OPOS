@@ -50,6 +50,11 @@ int64_t desktop_app_ask_permission(uint64_t owner, const char *name,
                                    uint32_t capability);
 /* Content size as width << 32 | height, or 0 without a window. */
 uint64_t desktop_app_window_size(uint64_t owner);
+/* Window options: DESKTOP_APP_KEY_STATE adds an event for every key press
+   and release (APP_EVENT_KEY_STATE, 8), besides the typed characters.
+   Returns 0, -9 without a window, or -22 for unknown options. */
+#define DESKTOP_APP_KEY_STATE 1u
+int64_t desktop_app_window_options(uint64_t owner, uint32_t options);
 /* The shared clipboard for programs. Set keeps at most 64 KiB. Get copies
    up to capacity bytes and returns the clipboard's full length. */
 void desktop_clipboard_set(const char *text, size_t length);

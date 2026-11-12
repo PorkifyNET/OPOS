@@ -483,6 +483,11 @@ static inline long opos_package_remove(const char *id, uint32_t options) {
    key = notches as a signed number, positive = scroll up. */
 #define OPOS_EVENT_WHEEL 7
 #define OPOS_WHEEL_NOTCHES(event) ((int32_t)(event).key)
+/* With OPOS_WINDOW_KEY_STATE: a key went down (button 1, repeats while
+   held) or up (button 0). key is the PC set-1 scan code, plus 0x80 for
+   keys sent after 0xe0 (arrows, right Ctrl, ...); buttons = OPOS_MOD_*.
+   Typed characters still arrive as OPOS_EVENT_KEY. */
+#define OPOS_EVENT_KEY_STATE 8
 
 /* Modifiers held with a key. Letters typed with Shift already arrive in
    upper case; Ctrl+S arrives as 's' with OPOS_MOD_CTRL. */
@@ -536,6 +541,14 @@ static inline long opos_window_present(const uint32_t *pixels,
 static inline long opos_window_event(struct opos_event *event,
                                      long timeout_ms) {
     return opos_syscall2(OPOS_SYS_WINDOW_EVENT, (long)event, timeout_ms);
+}
+
+/* Window options (OPOS_WINDOW_*), e.g. key presses and releases for
+   games. Call after opos_window_create. */
+#define OPOS_SYS_WINDOW_OPTIONS 0x4f500016L
+#define OPOS_WINDOW_KEY_STATE 1u
+static inline long opos_window_options(uint32_t options) {
+    return opos_syscall1(OPOS_SYS_WINDOW_OPTIONS, (long)options);
 }
 
 /* The content area's current size. */

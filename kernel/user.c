@@ -4004,6 +4004,7 @@ static int64_t user_opos_package(const struct user_process *process,
 #define OPOS_SYSCALL_WINDOW_SIZE (OPOS_SYSCALL_BASE + 0x13)
 #define OPOS_SYSCALL_CLIPBOARD_SET (OPOS_SYSCALL_BASE + 0x14)
 #define OPOS_SYSCALL_CLIPBOARD_GET (OPOS_SYSCALL_BASE + 0x15)
+#define OPOS_SYSCALL_WINDOW_OPTIONS (OPOS_SYSCALL_BASE + 0x16)
 #define OPOS_CLIPBOARD_MAX (64 * 1024)
 #define OPOS_WINDOW_TITLE_MAX 64
 #define OPOS_WINDOW_PIXELS_MAX 4096
@@ -4078,6 +4079,9 @@ static bool user_opos_window(struct user_process *process,
                 }
             }
         }
+    } else if (number == OPOS_SYSCALL_WINDOW_OPTIONS) {
+        result = frame->rdi > 0xffffffffULL ? -22
+            : desktop_app_window_options(process->id, (uint32_t)frame->rdi);
     } else if (number == OPOS_SYSCALL_WINDOW_SIZE) {
         uint64_t size = desktop_app_window_size(process->id);
         result = size == 0 ? -9 : (int64_t)size;
@@ -5575,7 +5579,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
     if (number >= OPOS_SYSCALL_WINDOW_CREATE
-        && number <= OPOS_SYSCALL_CLIPBOARD_GET) {
+        && number <= OPOS_SYSCALL_WINDOW_OPTIONS) {
         return user_opos_window(process, frame);
     }
     if (number >= OPOS_SYSCALL_UPDATE_BEGIN
@@ -6240,7 +6244,17 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         }
         struct vfs_metadata metadata;
         enum user_device device = user_device_for_path(path, path_length);
-        if (device != USER_DEVICE_NONE) {
+        /* /proc and /proc/self exist for readlink("/proc/self/exe"):
+           SDL checks for /proc before it asks. */
+        static const char proc[] = "/proc/self";
+        bool is_proc = (path_length == 5 || path_length == 10)
+            && (mode & 2) == 0;
+        for (size_t i = 0; is_proc && i < path_length; i++) {
+            is_proc = path[i] == proc[i];
+        }
+        if (is_proc) {
+            frame->rax = 0;
+        } else if (device != USER_DEVICE_NONE) {
             frame->rax = (uint64_t)(int64_t)(
                 user_device_generated(device) && (mode & 2) != 0 ? -13 : 0);
         } else if (!user_path_allowed(process, path, path_length,

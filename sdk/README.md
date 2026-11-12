@@ -157,8 +157,13 @@ for (;;) {
   | `OPOS_EVENT_RESIZE` | `width`, `height` of the content area |
   | `OPOS_EVENT_CLOSE` | The user closed the window or logged out. Save and exit: waiting again ends the program |
   | `OPOS_EVENT_WHEEL` | `x`, `y`, `buttons`; `OPOS_WHEEL_NOTCHES(event)` is the signed number of wheel notches, positive = scroll up. Sent for the mouse wheel and two-finger touchpad scrolling while the pointer is over the window, even when the window is not focused |
+  | `OPOS_EVENT_KEY_STATE` | Only after `opos_window_options(OPOS_WINDOW_KEY_STATE)`. A key went down (`button` 1, again while it repeats) or up (`button` 0). `key` is the PC set-1 scan code, plus 0x80 for keys sent after 0xe0 (arrows, right Ctrl, ...); `buttons`: modifiers. It comes before the `OPOS_EVENT_KEY` of the character it types. A key released after the window lost the focus still sends its release |
 
 - `opos_window_size(&width, &height)` reads the current content size.
+- `opos_window_options(OPOS_WINDOW_KEY_STATE)` adds an event for every
+  key press and release, for games that need to know which keys are
+  held. Typed characters still arrive as `OPOS_EVENT_KEY`. Pass 0 to turn
+  it off. Kernels before 0.1.5 answer `-OPOS_ENOSYS`.
 - `opos_clipboard_set(text, length)` replaces the desktop's shared
   clipboard (the one Ctrl+C/V use in every window; at most 64 KiB are
   kept). `opos_clipboard_get(buffer, capacity)` copies up to capacity bytes
@@ -245,6 +250,7 @@ there too. A program has 64 MiB of such memory in total, including its
   | 0x4f500013 | `opos_window_size(&w, &h)` | content area size |
   | 0x4f500014 | `opos_clipboard_set(text, length)` | bytes kept |
   | 0x4f500015 | `opos_clipboard_get(buffer, capacity)` | full clipboard length |
+  | 0x4f500016 | `opos_window_options(options)` | 0, or -22 (unknown option) |
 
 - Errors are negative error numbers (`-OPOS_EACCES`, ...).
 - Every file carries an ELF note named `OPOS` (type 1) with the ABI

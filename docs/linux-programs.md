@@ -88,9 +88,11 @@ In the order the next programs are likely to hit them.
 7. **Dynamic linking.** Dynamically linked musl programs work since
    step 6, with musl's own dynamic linker. glibc programs need far
    more (glibc's loader, `/proc`, and many more system calls).
-8. **Graphics.** Linux GUI programs draw through X11 or Wayland. A
-   first step could be a small SDL2 backend that draws into an OPOS
-   window, which covers many games and simple programs.
+8. **Graphics.** Linux GUI programs draw through X11 or Wayland, which
+   OPOS does not have. SDL 2 programs work since step 7, with an SDL
+   video driver that draws into an OPOS window. Still missing: OpenGL,
+   sound, game controllers, and programs that use X11 or Wayland
+   directly (GTK, Qt).
 
 ## Linux packages in the Store
 
@@ -119,7 +121,7 @@ Proposal:
 5. Done. Terminal: raw mode, escape sequences in the desktop Terminal,
    Ctrl+C and Ctrl+D. See "As built in step 5".
 6. BusyBox and dynamic linking done (see "As built in step 6").
-7. Graphics through an SDL2 backend.
+7. Done. Graphics through SDL 2 (see "As built in step 7").
 
 ## As built in step 2
 
@@ -433,6 +435,68 @@ library, each built with `gcc -specs build/musl-local.specs`:
 
 The old test interpreter `/lib/opos-ld.so` and its libraries stay for
 the kernel's own regression tests.
+
+## As built in step 7
+
+**SDL 2.** `store/linux/sdl2/build.sh` builds SDL 2.32.10 (pinned
+release, SHA-256 checked) as a static library with musl, with a video
+driver for OPOS windows: `store/linux/sdl2/opos/SDL_oposvideo.c`. The
+script copies the driver next to SDL's dummy driver, whose sources
+SDL's `configure` already compiles, and adds it to SDL's driver list,
+where it comes first. Everything that needs a Linux device, server or
+library OPOS lacks is off: X11, Wayland, KMS, OpenGL, Vulkan, sound
+servers, udev, D-Bus. Sound, game controllers and haptics use SDL's
+dummy drivers. The driver is zlib-licensed like SDL, so programs built
+with it keep their own license.
+
+**The driver.**
+- One window per program, as OPOS gives a program one window. A second
+  SDL window fails. The OPOS window opens when SDL first draws, after
+  SDL has set the title.
+- SDL draws in `SDL_PIXELFORMAT_RGB888`, OPOS's own pixel format, with
+  its software renderer. Each frame is presented whole.
+- Keys: presses and releases with SDL scan codes, from the new key-state
+  events below; typed characters as text input. On a kernel without
+  key-state events, each typed key becomes a press and a release.
+- Mouse buttons, motion and the wheel.
+- A resizable window follows the OPOS window's size. A fixed-size one
+  keeps its size, shown at the top left.
+- Closing the window sends SDL's quit event. After that the driver stops
+  asking for events, because OPOS ends a program that waits again after
+  its close event.
+- The display modes offered for full screen are 1024x768, 800x600 and
+  640x480. OPOS does not tell a program the screen size before it opens
+  a window.
+
+**Kernel additions:**
+- **Key presses and releases.** The keyboard driver now keeps every key
+  transition, not only typed characters. A program asks for them with
+  `opos_window_options(OPOS_WINDOW_KEY_STATE)` (new call 0x4f500016) and
+  gets `OPOS_EVENT_KEY_STATE` events with the PC scan code. A press
+  comes before the character it types. A release goes to every window
+  that got the press, so no key stays down when the focus moves. Other
+  programs see no change.
+- **`access("/proc")`.** `/proc` and `/proc/self` exist for `access`.
+  SDL checks that before it reads `/proc/self/exe` to find the program's
+  folder (`SDL_GetBasePath`).
+
+**SDL Demos package** (`org.libsdl.sdl2-demos`, 5 MB, four Start menu
+entries): SDL's `testsprite2`, `testdraw2`, `testrendercopyex` and
+`checkkeys`, statically linked. Tested in QEMU from the Terminal:
+- the sprites, drawing and rotation demos draw in their windows
+  (testsprite2 at about 1100 frames per second);
+- `checkkeys` reports presses, releases, Shift and text in typing order:
+  Shift down, B down, text "B", B up, Shift up;
+- closing a window with Super+Q ends each demo with status 0.
+
+Mouse input was not tested: the QEMU monitor's `mouse_move` does not
+move OPOS's absolute pointer.
+
+**For SDL programs.** While `make store` runs, the recipe installs the
+library into `build/store_opk/sdl2/`. A recipe for an SDL program can
+build there with
+`$LINUX_CC -I.../sdl2/include/SDL2 prog.c -L.../sdl2/lib -lSDL2 -static`.
+A real game is the next test.
 
 ## Tests
 

@@ -11303,6 +11303,9 @@ static void handle_right_press(int32_t x, int32_t y) {
 #define APP_EVENT_RESIZE 5
 #define APP_EVENT_CLOSE 6
 #define APP_EVENT_WHEEL 7 /* x, y; key = signed notches, positive = up */
+/* Key pressed (button 1) or released (button 0): key = set-1 scan code,
+   0x80 added after 0xe0. Only for windows with DESKTOP_APP_KEY_STATE. */
+#define APP_EVENT_KEY_STATE 8
 /* After its window closes a program has this long to exit (3 s). */
 #define APP_CLOSE_GRACE_TICKS 300
 /* Waiting programs look at least this often whether they were ended. */
@@ -11334,6 +11337,8 @@ struct app_window {
     int32_t mouse_y;
     int64_t reported_width;
     int64_t reported_height;
+    uint32_t options;      /* DESKTOP_APP_* */
+    uint32_t keys_down[8]; /* key-state presses sent, by key number */
 };
 
 static struct app_window app_windows[APP_WINDOW_COUNT];
@@ -11396,6 +11401,34 @@ static void app_key(size_t slot, char character) {
                  | (keyboard_last_shift() ? 2u : 0u),
     };
     app_push(slot, &event);
+}
+
+/* A press goes to the window in front; a release goes to every window that
+   got the press, so no key stays down after the focus moved. */
+static void app_key_state(int top_slot, uint8_t key, bool pressed) {
+    uint32_t bit = 1u << (key & 31);
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        struct app_window *window = &app_windows[slot];
+        if ((window->options & DESKTOP_APP_KEY_STATE) == 0) {
+            continue;
+        }
+        bool held = (window->keys_down[key >> 5] & bit) != 0;
+        if (pressed ? (int)slot != top_slot : !held) {
+            continue;
+        }
+        if (pressed) {
+            window->keys_down[key >> 5] |= bit;
+        } else {
+            window->keys_down[key >> 5] &= ~bit;
+        }
+        struct desktop_app_event event = {
+            .type = APP_EVENT_KEY_STATE, .key = key,
+            .button = pressed ? 1u : 0u,
+            .buttons = (keyboard_ctrl_held() ? 1u : 0u)
+                     | (keyboard_shift_held() ? 2u : 0u),
+        };
+        app_push(slot, &event);
+    }
 }
 
 static void app_mouse_press(size_t slot, int32_t x, int32_t y,
@@ -11726,6 +11759,23 @@ uint64_t desktop_app_window_size(uint64_t owner) {
     }
     return (uint64_t)window->reported_width << 32
         | (uint64_t)window->reported_height;
+}
+
+int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
+        return -9;
+    }
+    if ((options & ~(uint32_t)DESKTOP_APP_KEY_STATE) != 0) {
+        return -22;
+    }
+    window->options = options;
+    if ((options & DESKTOP_APP_KEY_STATE) == 0) {
+        for (size_t i = 0; i < 8; i++) {
+            window->keys_down[i] = 0;
+        }
+    }
+    return 0;
 }
 
 int64_t desktop_app_window_event(uint64_t owner,
@@ -13639,7 +13689,19 @@ static bool desktop_step(void) {
     bool redraw = apps_poll();
     char character;
     bool super_pending = false;
-    while (keyboard_read_character(&character)) {
+    for (;;) {
+        /* Key presses and releases (for app windows that asked), then
+           the next character, in typing order. */
+        uint8_t state_key;
+        bool state_pressed;
+        while (keyboard_read_key_state(&state_key, &state_pressed)) {
+            int top_slot = z_count != 0 && window_is_app(z_order[z_count - 1])
+                ? (int)(z_order[z_count - 1] - WINDOW_APP) : -1;
+            app_key_state(top_slot, state_key, state_pressed);
+        }
+        if (!keyboard_read_character(&character)) {
+            break;
+        }
         redraw = true;
         if (character == KEY_SUPER_PREFIX) {
             super_pending = true;

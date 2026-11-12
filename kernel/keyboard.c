@@ -86,6 +86,42 @@ static bool super_combo;
 static bool ctrl_down;
 static const uint8_t keyboard_event;
 
+/* Every key press and release, for programs that want key state (games):
+   the set-1 key number, plus 0x80 for keys sent after 0xe0. */
+#define KEYBOARD_RAW_SIZE 64
+#define KEYBOARD_RAW_MASK (KEYBOARD_RAW_SIZE - 1)
+static uint8_t raw_keys[KEYBOARD_RAW_SIZE];
+static bool raw_released[KEYBOARD_RAW_SIZE];
+/* Characters queued before each transition: a transition is read only
+   once those characters were, so both arrive in typing order. */
+static uint32_t raw_characters_before[KEYBOARD_RAW_SIZE];
+static volatile uint8_t raw_head;
+static volatile uint8_t raw_tail;
+static volatile uint32_t characters_queued;
+static volatile uint32_t characters_read;
+
+static void queue_raw(uint8_t key, bool released) {
+    uint8_t next_head = (raw_head + 1) & KEYBOARD_RAW_MASK;
+    if (next_head == raw_tail) {
+        return;
+    }
+    raw_keys[raw_head] = key;
+    raw_released[raw_head] = released;
+    raw_characters_before[raw_head] = characters_queued;
+    raw_head = next_head;
+}
+
+bool keyboard_read_key_state(uint8_t *key, bool *pressed) {
+    if (key == NULL || pressed == NULL || raw_tail == raw_head
+        || (int32_t)(raw_characters_before[raw_tail] - characters_read) > 0) {
+        return false;
+    }
+    *key = raw_keys[raw_tail];
+    *pressed = !raw_released[raw_tail];
+    raw_tail = (raw_tail + 1) & KEYBOARD_RAW_MASK;
+    return true;
+}
+
 static void queue_character(char character) {
     uint8_t next_head = (queue_head + 1) & KEYBOARD_QUEUE_MASK;
     if (next_head == queue_tail) {
@@ -97,6 +133,7 @@ static void queue_character(char character) {
     ctrl_queue[queue_head] = ctrl_down;
     shift_queue[queue_head] = left_shift || right_shift;
     queue_head = next_head;
+    characters_queued++;
 }
 
 static void keyboard_send(uint8_t value) {
@@ -173,6 +210,10 @@ void keyboard_irq_handler(void) {
     }
     bool released = (scancode & 0x80) != 0;
     uint8_t key = scancode & 0x7f;
+    /* 0xe0 0x2a / 0xe0 0x36 are fake Shifts around some extended keys. */
+    if (!(extended_scancode && (key == 0x2a || key == 0x36))) {
+        queue_raw((uint8_t)(key | (extended_scancode ? 0x80 : 0)), released);
+    }
     char special = '\0';
     if (extended_scancode) {
         extended_scancode = false;
@@ -290,6 +331,7 @@ bool keyboard_read_character(char *character) {
     last_character_ctrl = ctrl_queue[queue_tail];
     last_character_shift = shift_queue[queue_tail];
     queue_tail = (queue_tail + 1) & KEYBOARD_QUEUE_MASK;
+    characters_read++;
     return true;
 }
 

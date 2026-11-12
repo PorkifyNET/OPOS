@@ -21,7 +21,7 @@ cannot change another program's files.
 - Grants are keyed by the executable's SHA-256, so every update asks
   for permissions again (`docs/app-sandbox.md`, "Identity of a program").
 - App storage is `<home>/AppData/Programs/<16 hex>`, named from a hash
-  of the executable path (`permission_identity_set_program` in
+  of the executable path (`permission_confine_disk_program` in
   `kernel/permissions.c`). Moving the executable loses its data.
 - A program's manifest note holds a name, a version and requested
   capabilities (`kernel/manifest.c`). No program is signed.
@@ -287,9 +287,43 @@ one account. The Store, the index and its key come in step 4.
   `STATE.TXT`.
 
 Not done yet: a window for the warning (Files cannot open a `.opk`
-yet), deleting a removed program's data, and package identity for
-grants and storage (step 3), so an update still asks for permissions
-again.
+yet).
+
+### As built in step 3
+
+- `package_identify` (`kernel/package_install.c`) runs when a disk
+  program starts. It looks for an executable inside
+  `/disk/Programs/<id>/` or `<home>/Programs/<id>/` whose package has a
+  record. The executable's SHA-256 must match a file the record marks
+  `exec`. The id folder may use any case, because FAT ignores case. An
+  8.3 alias, a changed file or a damaged record makes the program a
+  loose program.
+- A matched program gets app storage `<home>/AppData/Programs/<id>`
+  (`permission_confine_disk_program_named`). A Store package's grants
+  are keyed by `permission_store_key`, the SHA-256 of `store:<id>`, so
+  `Permissions.dat` keeps its format. A sideloaded package keeps the
+  executable's hash as its key.
+- Removal forgets the program's grants in the removing account: the
+  Store key, or each executable's hash for a sideloaded package. The new
+  `OPOS_PACKAGE_REMOVE_DATA` option also deletes that account's
+  `AppData/Programs/<id>`. `pkg remove` asks before deleting the data,
+  and `--delete-data` deletes it without asking. If the account still
+  has the other copy of the id, its own or everyone's, the removal keeps
+  both grants and data, because that copy uses them.
+- Host tests: `tools/test_permission_grants.c` checks identity with a
+  stubbed `package_identify`, and `tools/test_app_permissions.c` checks
+  storage names.
+- QEMU test on an installed disk, with two versions of one test package:
+  - Install for one account. The storage counter survives the update
+    from 1.0 to 1.1.
+  - Plain removal and reinstall keep the data. `--delete-data` clears it.
+  - Install for everyone uses the same `<id>` folder.
+  - An uppercase spelling of the id folder gets the same identity.
+- Store packages cannot be installed until step 4. So far only the host
+  test covers grants surviving an update.
+- Step 2 sideloaded installs used the hash-named folder for app storage.
+  They now use the `<id>` folder, so data from before this change is not
+  carried over. Step 2 was never released.
 
 ### Dependencies
 
@@ -367,8 +401,9 @@ by itself in the first version.
 2. Done. Kernel: package parser and checks, staging, the protected class,
    records and resume, for everyone and for one account. Tested with
    sideloaded packages in QEMU.
-3. Identity: `store:<id>` grants and `<id>` storage, with a test that
-   an update keeps both.
+3. Done. Identity: `store:<id>` grants and `<id>` storage. The host test
+   shows that an update keeps both. QEMU shows that storage survives an
+   update for sideloaded packages.
 4. Store key, `tools/mkindex.py`, index checks, and `/bin/pkg` with
    install, update, remove and list.
 5. Store window and the Settings > UPDATES line.

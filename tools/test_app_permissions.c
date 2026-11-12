@@ -104,6 +104,27 @@ int main(void) {
     assert(allows(&app, file, PERMISSION_WRITE));
     assert(allows(&app, file, PERMISSION_REMOVE));
     assert(!allows(&app, app.private_path, PERMISSION_REMOVE));
+
+    /* An installed package's storage is named by its id. A name that is
+       not a package id (a path, ".." or a hex folder) gives no storage. */
+    struct permission_identity named = built_in;
+    permission_confine_disk_program_named(
+        &named, "/disk/Programs/org.example.paint/paint", 38,
+        "org.example.paint");
+    assert(strcmp(named.private_path,
+                  "/disk/Users/Alice/AppData/Programs/org.example.paint")
+           == 0);
+    assert(strcmp(named.program_folder,
+                  "/disk/Programs/org.example.paint") == 0);
+    static const char *const bad_names[] = {"..", "../x", "a/b.c",
+                                            "0123456789abcdef", "Org.x"};
+    for (size_t i = 0; i < sizeof(bad_names) / sizeof(bad_names[0]); i++) {
+        struct permission_identity bad = built_in;
+        permission_confine_disk_program_named(
+            &bad, "/disk/Programs/org.example.paint/paint", 38, bad_names[i]);
+        assert(bad.confined && bad.private_path[0] == '\0');
+    }
+
     assert(!allows(&app, "/disk/shared.txt", PERMISSION_WRITE));
     assert(!allows(&app, "/disk2/shared.txt", PERMISSION_WRITE));
     assert(!allows(&app, "/disk/Users/Alice/note.txt", PERMISSION_WRITE));

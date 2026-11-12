@@ -3362,14 +3362,13 @@ static int64_t user_opos_package(const struct user_process *process,
     if (number == OPOS_SYSCALL_PACKAGE_REMOVE) {
         char id[PACKAGE_ID_MAX + 1];
         uint32_t options = (uint32_t)frame->rdx;
-        if ((options & ~PACKAGE_OPTION_EVERYONE) != 0
+        if ((options & ~PACKAGE_REMOVE_OPTION_MASK) != 0
             || !user_copy_string((uintptr_t)frame->rdi, (size_t)frame->rsi,
                                  id, sizeof(id))) {
             return -(int64_t)PACKAGE_INVALID;
         }
         enum package_result result = package_remove(
-            id, (size_t)frame->rsi, account, admin,
-            (options & PACKAGE_OPTION_EVERYONE) != 0);
+            id, (size_t)frame->rsi, account, admin, options);
         return result == PACKAGE_OK ? 0 : -(int64_t)result;
     }
     bool install = number == OPOS_SYSCALL_PACKAGE_INSTALL;

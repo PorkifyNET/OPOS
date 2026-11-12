@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "accounts.h"
+#include "package.h"
 #include "permission_grants.h"
 #include "permissions.h"
 #include "sha256.h"
@@ -21,7 +22,7 @@ static struct {
     size_t size;
     bool used;
 } files[FILE_SLOTS];
-static char directories[16][128];
+static char directories[32][128];
 static size_t directory_count;
 static bool fail_writes;
 
@@ -30,6 +31,29 @@ size_t accounts_current(void) { return 0; }
 bool accounts_is_admin(size_t account) { return account == 0; }
 const char *accounts_name(size_t account) {
     return account == 0 ? "Alice" : "Bob";
+}
+
+/* Stands in for package_install.c: the package the next launch belongs
+   to, or none. The kernel's version checks the record; this one records
+   what it was asked. */
+static const char *stub_package_id;
+static bool stub_store;
+static size_t stub_calls;
+static size_t stub_account;
+static uint8_t stub_hash[SHA256_DIGEST_SIZE];
+bool package_identify(const char *path, size_t length, size_t account,
+                      const uint8_t hash[32], char id[PACKAGE_ID_MAX + 1],
+                      bool *store) {
+    (void)path, (void)length;
+    stub_calls++;
+    stub_account = account;
+    memcpy(stub_hash, hash, SHA256_DIGEST_SIZE);
+    if (stub_package_id == NULL) {
+        return false;
+    }
+    snprintf(id, PACKAGE_ID_MAX + 1, "%s", stub_package_id);
+    *store = stub_store;
+    return true;
 }
 
 bool vfs_disk_root_backing_path(const char *path, size_t length, char *backing,
@@ -84,7 +108,7 @@ bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
 }
 
 bool vfs_create_directory(const char *path, size_t length) {
-    assert(directory_count < 16 && length < sizeof(directories[0]));
+    assert(directory_count < 32 && length < sizeof(directories[0]));
     memcpy(directories[directory_count], path, length);
     directories[directory_count++][length] = '\0';
     return true;
@@ -657,6 +681,80 @@ static void test_builtin_launch(void) {
     assert(identity.capabilities == PERMISSION_CAPS_ALL);
 }
 
+static void test_package_identity(void) {
+    struct permission_identity session = permission_session_identity();
+    static const uint8_t v1[] = {0x7F, 'E', 'L', 'F', 1, 0, 1};
+    static const uint8_t v2[] = {0x7F, 'E', 'L', 'F', 1, 0, 2};
+    static const char path[] = "/disk/Programs/org.example.paint/paint";
+    const size_t length = sizeof(path) - 1;
+    uint8_t v1_hash[SHA256_DIGEST_SIZE];
+    uint8_t v2_hash[SHA256_DIGEST_SIZE];
+    uint8_t key[SHA256_DIGEST_SIZE];
+    hash_of(v1, sizeof(v1), v1_hash);
+    hash_of(v2, sizeof(v2), v2_hash);
+    permission_store_key("org.example.paint", key);
+    static const char store_text[] = "store:org.example.paint";
+    uint8_t expected[SHA256_DIGEST_SIZE];
+    hash_of((const uint8_t *)store_text, sizeof(store_text) - 1, expected);
+    assert(memcmp(key, expected, SHA256_DIGEST_SIZE) == 0);
+
+    /* A Store package: grants keyed by store:<id>, storage by id. */
+    stub_calls = 0;
+    stub_package_id = "org.example.paint";
+    stub_store = true;
+    struct permission_identity identity = session;
+    permission_apply_program(&identity, path, length, v1, sizeof(v1));
+    assert(identity.program_known);
+    assert(memcmp(identity.program, key, SHA256_DIGEST_SIZE) == 0);
+    assert(strcmp(identity.private_path,
+                  "/disk/Users/Alice/AppData/Programs/org.example.paint")
+           == 0);
+    assert(stub_calls == 1 && stub_account == 0);
+    assert(memcmp(stub_hash, v1_hash, SHA256_DIGEST_SIZE) == 0);
+    assert(permission_grants_decide(0, identity.program, "Paint",
+                                    PERMISSION_CAP_NET, true, 3));
+
+    /* The update: new bytes, same grants and storage. */
+    identity = session;
+    permission_apply_program(&identity, path, length, v2, sizeof(v2));
+    assert(memcmp(stub_hash, v2_hash, SHA256_DIGEST_SIZE) == 0);
+    assert(memcmp(identity.program, key, SHA256_DIGEST_SIZE) == 0);
+    assert(permission_has(&identity, PERMISSION_CAP_NET));
+    assert(strcmp(identity.private_path,
+                  "/disk/Users/Alice/AppData/Programs/org.example.paint")
+           == 0);
+
+    /* Sideloaded: same storage, but grants follow the executable's hash,
+       so the update is a new program for grants. */
+    stub_store = false;
+    identity = session;
+    permission_apply_program(&identity, path, length, v2, sizeof(v2));
+    assert(memcmp(identity.program, v2_hash, SHA256_DIGEST_SIZE) == 0);
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+    assert(strcmp(identity.private_path,
+                  "/disk/Users/Alice/AppData/Programs/org.example.paint")
+           == 0);
+
+    /* Not the package's file (or a changed one): a loose program, with
+       hash identity and storage named by its path. */
+    stub_package_id = NULL;
+    identity = session;
+    permission_apply_program(&identity, path, length, v2, sizeof(v2));
+    assert(memcmp(identity.program, v2_hash, SHA256_DIGEST_SIZE) == 0);
+    assert(!permission_has(&identity, PERMISSION_CAP_NET));
+    assert(strncmp(identity.private_path,
+                   "/disk/Users/Alice/AppData/Programs/", 35) == 0);
+    assert(strlen(identity.private_path) == 35 + 16);
+
+    /* No image: nothing to identify, nothing asked. */
+    stub_calls = 0;
+    stub_package_id = "org.example.paint";
+    identity = session;
+    permission_apply_program(&identity, path, length, NULL, 0);
+    assert(stub_calls == 0 && !identity.program_known);
+    stub_package_id = NULL;
+}
+
 static void test_forget(void) {
     uint8_t program[SHA256_DIGEST_SIZE];
     memset(program, 0x5A, sizeof(program));
@@ -678,6 +776,7 @@ int main(void) {
     test_manifest_launch();
     test_forget();
     test_builtin_launch();
+    test_package_identity();
     puts("permission grants: passed");
     return 0;
 }

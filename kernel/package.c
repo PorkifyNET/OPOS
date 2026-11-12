@@ -138,7 +138,7 @@ int package_compare_versions(const char *a, const char *b) {
 
 /* ---------------------------------------------------------------- id */
 
-static bool id_valid(const char *text, size_t length) {
+bool package_id_valid(const char *text, size_t length) {
     if (length == 0 || length > PACKAGE_ID_MAX) {
         return false;
     }
@@ -498,7 +498,7 @@ enum package_result package_parse(const char *text, size_t length,
         return fail(reason, PACKAGE_UNSUPPORTED, "format: ", VALUE(KEY_FORMAT),
                     " is not supported (needs a newer OPOS)");
     }
-    if (!id_valid(VALUE(KEY_ID))) {
+    if (!package_id_valid(VALUE(KEY_ID))) {
         return fail(reason, PACKAGE_BAD, "id: '", VALUE(KEY_ID),
                     "' must look like org.example.name");
     }

@@ -7,7 +7,8 @@
  *   pkg list                      installed packages
  *
  * Options: --everyone (every account; administrators only), -y (do not
- * ask), --ignoreversion (reinstall or downgrade).
+ * ask), --ignoreversion (reinstall or downgrade), --delete-data (remove:
+ * also delete the program's data in your AppData folder).
  *
  * The kernel checks every package; this program only shows the person
  * what they are installing and asks before passing OPOS_PACKAGE_CONFIRMED.
@@ -178,16 +179,25 @@ static int install_command(const char *file, bool everyone, bool yes,
     return 0;
 }
 
-static int remove_command(const char *id, bool everyone, bool yes) {
+static int remove_command(const char *id, bool everyone, bool yes,
+                          bool delete_data) {
     printf("Removing %s for %s.\n", id,
            everyone ? "every account" : "you only");
-    printf("Its settings and data in your AppData folder are kept.\n");
+    printf("Its permissions are forgotten in your account. Other accounts "
+           "keep theirs.\n");
     if (!yes && !ask("Remove it?")) {
         printf("Cancelled.\n");
         return 1;
     }
-    long result = opos_package_remove(id, everyone ? OPOS_PACKAGE_EVERYONE
-                                                   : 0);
+    if (!yes && !delete_data) {
+        delete_data = ask("Also delete its settings and data in your AppData "
+                          "folder?");
+    }
+    printf("Its settings and data in your AppData folder are %s.\n",
+           delete_data ? "deleted" : "kept");
+    uint32_t options = (everyone ? OPOS_PACKAGE_EVERYONE : 0)
+        | (delete_data ? OPOS_PACKAGE_REMOVE_DATA : 0);
+    long result = opos_package_remove(id, options);
     if (result < 0) {
         fail(id, result, NULL);
         return 1;
@@ -291,7 +301,7 @@ static int list_command(void) {
 static int usage(void) {
     printf("Usage: pkg info FILE\n"
            "       pkg install FILE [--everyone] [-y] [--ignoreversion]\n"
-           "       pkg remove ID [--everyone] [-y]\n"
+           "       pkg remove ID [--everyone] [-y] [--delete-data]\n"
            "       pkg list\n");
     return 2;
 }
@@ -303,6 +313,7 @@ int main(int argc, char **argv) {
     bool everyone = false;
     bool yes = false;
     bool ignore_version = false;
+    bool delete_data = false;
     const char *operand = NULL;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--everyone") == 0) {
@@ -311,6 +322,8 @@ int main(int argc, char **argv) {
             yes = true;
         } else if (strcmp(argv[i], "--ignoreversion") == 0) {
             ignore_version = true;
+        } else if (strcmp(argv[i], "--delete-data") == 0) {
+            delete_data = true;
         } else if (operand == NULL && argv[i][0] != '-') {
             operand = argv[i];
         } else {
@@ -330,7 +343,7 @@ int main(int argc, char **argv) {
         return install_command(operand, everyone, yes, ignore_version);
     }
     if (strcmp(argv[1], "remove") == 0) {
-        return remove_command(operand, everyone, yes);
+        return remove_command(operand, everyone, yes, delete_data);
     }
     return usage();
 }

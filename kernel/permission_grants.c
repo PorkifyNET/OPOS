@@ -4,6 +4,7 @@
 
 #include "accounts.h"
 #include "manifest.h"
+#include "package.h"
 #include "permission_grants.h"
 #include "permissions.h"
 #include "sha256.h"
@@ -331,6 +332,19 @@ bool permission_program_hash(const char *path, size_t length,
     return true;
 }
 
+void permission_store_key(const char *id, uint8_t out[SHA256_DIGEST_SIZE]) {
+    static const char prefix[] = "store:";
+    struct sha256_context hash;
+    sha256_init(&hash);
+    sha256_update(&hash, prefix, sizeof(prefix) - 1);
+    size_t length = 0;
+    while (id[length] != '\0') {
+        length++;
+    }
+    sha256_update(&hash, id, length);
+    sha256_final(&hash, out);
+}
+
 /* Loaded on demand. Kernel code is not preempted and nothing below
    blocks while it is in use, so one copy serves every caller. */
 static struct permission_grants scratch;
@@ -349,17 +363,37 @@ void permission_apply_program(struct permission_identity *identity,
         return;
     }
     uint32_t parent = identity->capabilities;
-    permission_confine_disk_program(identity, path, length);
+    /* An installed package's own executable (docs/packages.md,
+       "Identity"): storage named by the package id, and for a Store
+       package grants keyed by store:<id>, so an update keeps both. */
+    bool hashed = image != NULL && size != 0;
+    uint8_t digest[SHA256_DIGEST_SIZE];
+    char package_id[PACKAGE_ID_MAX + 1];
+    bool store = false;
+    bool packaged = false;
+    if (hashed) {
+        struct sha256_context hash;
+        sha256_init(&hash);
+        sha256_update(&hash, image, size);
+        sha256_final(&hash, digest);
+        packaged = package_identify(path, length, identity->account, digest,
+                                    package_id, &store);
+    }
+    permission_confine_disk_program_named(identity, path, length,
+                                          packaged ? package_id : NULL);
     identity->askable = 0;
     identity->program_known = false;
     identity->program_name[0] = '\0';
-    if (image == NULL || size == 0) {
+    if (!hashed) {
         return;
     }
-    struct sha256_context hash;
-    sha256_init(&hash);
-    sha256_update(&hash, image, size);
-    sha256_final(&hash, identity->program);
+    if (packaged && store) {
+        permission_store_key(package_id, identity->program);
+    } else {
+        for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+            identity->program[i] = digest[i];
+        }
+    }
     identity->program_known = true;
     /* With a manifest, the program may ask only for what it declared
        (files.shared included). Without one: net and clipboard.read, plus

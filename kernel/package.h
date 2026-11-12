@@ -98,6 +98,10 @@ enum package_result package_parse(const char *text, size_t length,
                                   bool record, struct package *package,
                                   char *reason);
 
+/* A package id: dot-separated labels of a-z, 0-9 and '-', at least two,
+   each alphanumeric at both ends, at most PACKAGE_ID_MAX characters. */
+bool package_id_valid(const char *text, size_t length);
+
 /* "1.2.3" against "1.2.10": -1, 0 or 1. Both must be valid versions. */
 int package_compare_versions(const char *a, const char *b);
 bool package_version_valid(const char *text, size_t length);
@@ -129,6 +133,11 @@ bool package_ustar_header(const uint8_t block[512], char *name,
                                             package from outside the Store */
 #define PACKAGE_OPTION_IGNORE_VERSION 4u /* reinstall or downgrade */
 #define PACKAGE_OPTION_MASK 7u
+/* Removal only: also delete the calling account's app storage of the
+   program. Removal always forgets its grants in that account. */
+#define PACKAGE_OPTION_REMOVE_DATA 8u
+#define PACKAGE_REMOVE_OPTION_MASK                                         \
+    (PACKAGE_OPTION_EVERYONE | PACKAGE_OPTION_REMOVE_DATA)
 
 #define PACKAGE_INSTALLED_NONE 0
 #define PACKAGE_INSTALLED_EVERYONE 1
@@ -176,7 +185,8 @@ enum package_result package_install(const char *path, size_t length,
                                     uint32_t options,
                                     struct package_info *info);
 enum package_result package_remove(const char *id, size_t length,
-                                   size_t account, bool admin, bool everyone);
+                                   size_t account, bool admin,
+                                   uint32_t options);
 
 /* At boot, after update_resume: finish interrupted work, then list the
    installed package folders for permissions.c. */
@@ -187,5 +197,18 @@ void package_registry_load(void);
    written. An account's own copy hides everyone's copy of the same id. */
 size_t package_start_entries(size_t account, struct package_start_entry *out,
                              size_t capacity);
+
+/*
+ * Identity of a program being started (docs/packages.md, "Identity").
+ * True when path (absolute, canonical) lies inside the folder of a
+ * package installed for everyone or for account, and hash is the SHA-256
+ * of one of that package's executable files as its record lists them.
+ * Then id holds the package id and *store whether it came from the OPOS
+ * Store. Anything else (a changed file, another spelling of the folder,
+ * a damaged record) is false: the program is a loose program.
+ */
+bool package_identify(const char *path, size_t length, size_t account,
+                      const uint8_t hash[32], char id[PACKAGE_ID_MAX + 1],
+                      bool *store);
 
 #endif

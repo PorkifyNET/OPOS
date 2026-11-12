@@ -345,6 +345,11 @@ static inline long opos_update_cancel(void) {
 #define OPOS_PACKAGE_EVERYONE 1u
 #define OPOS_PACKAGE_CONFIRMED 2u
 #define OPOS_PACKAGE_IGNORE_VERSION 4u  /* reinstall or downgrade */
+/* opos_package_remove only: also delete the program's data in the calling
+   account (AppData/Programs/<id>). Removing always forgets the program's
+   permissions in the calling account; other accounts keep both. Kernels
+   before this flag answer -OPOS_PACKAGE_EINVAL. */
+#define OPOS_PACKAGE_REMOVE_DATA 8u
 
 #define OPOS_PACKAGE_ENOT_INSTALLED 1  /* live media */
 #define OPOS_PACKAGE_ENOT_ALLOWED 2    /* not an administrator, or no account */

@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "package.h"
 #include "permissions.h"
 #include "sha256.h"
 #include "vfs.h"
@@ -126,6 +127,12 @@ static size_t program_folder_length(const char *path, size_t length) {
 
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length) {
+    permission_confine_disk_program_named(identity, path, length, NULL);
+}
+
+void permission_confine_disk_program_named(
+    struct permission_identity *identity, const char *path, size_t length,
+    const char *storage) {
     if (identity == NULL || !permission_is_disk_program(path, length)) {
         return;
     }
@@ -172,22 +179,37 @@ void permission_confine_disk_program(struct permission_identity *identity,
     if (used == 0 || !ensure_directory(folder)) {
         return;
     }
-    struct sha256_context hash;
-    uint8_t digest[SHA256_DIGEST_SIZE];
-    sha256_init(&hash);
-    for (size_t i = 0; i < length; i++) {
-        char c = lower(path[i]);
-        sha256_update(&hash, &c, 1);
+    /* A package's storage is named by its id, so an update or a move
+       inside the package keeps it. A loose program's is named by a hash
+       of its path. */
+    size_t storage_length = storage == NULL ? 0 : text_length(storage);
+    char directory[64];
+    if (storage_length != 0) {
+        /* A package id has a dot, so it never looks like a hex folder. */
+        if (!package_id_valid(storage, storage_length)) {
+            return;
+        }
+        for (size_t i = 0; i <= storage_length; i++) {
+            directory[i] = storage[i];
+        }
+    } else {
+        struct sha256_context hash;
+        uint8_t digest[SHA256_DIGEST_SIZE];
+        sha256_init(&hash);
+        for (size_t i = 0; i < length; i++) {
+            char c = lower(path[i]);
+            sha256_update(&hash, &c, 1);
+        }
+        sha256_final(&hash, digest);
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 0; i < 8; i++) {
+            directory[i * 2] = hex[digest[i] >> 4];
+            directory[i * 2 + 1] = hex[digest[i] & 15];
+        }
+        directory[16] = '\0';
+        storage_length = 16;
     }
-    sha256_final(&hash, digest);
-    static const char hex[] = "0123456789abcdef";
-    char directory[17];
-    for (size_t i = 0; i < 8; i++) {
-        directory[i * 2] = hex[digest[i] >> 4];
-        directory[i * 2 + 1] = hex[digest[i] & 15];
-    }
-    directory[16] = '\0';
-    used = join(folder, folder, used, directory, 16);
+    used = join(folder, folder, used, directory, storage_length);
     if (used == 0 || used >= sizeof(identity->private_path)
         || !ensure_directory(folder)) {
         return;

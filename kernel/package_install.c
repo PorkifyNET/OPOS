@@ -10,6 +10,7 @@
 #include "manifest.h"
 #include "package.h"
 #include "permissions.h"
+#include "permission_grants.h"
 #include "scheduler.h"
 #include "sha256.h"
 #include "timer.h"
@@ -61,6 +62,11 @@ static char reason[PACKAGE_REASON_MAX + 1];
 /* Desktop buffers (Start menu), separate from a running install call. */
 static char start_text[RECORD_PREFIX_MAX + PACKAGE_TEXT_MAX];
 static struct package start_package;
+
+/* Launch buffers (package_identify). Program starts use them one at a
+   time, as permission_grants.c's store buffer. */
+static char identify_text[RECORD_PREFIX_MAX + PACKAGE_TEXT_MAX];
+static struct package identify_package;
 
 /* ------------------------------------------------------------ helpers */
 
@@ -288,19 +294,7 @@ static bool join_id(char *out, const char *folder, const char *id) {
 
 /* A directory entry name that is a valid package id. */
 static bool id_name(const char *name, size_t length) {
-    if (length == 0 || length > PACKAGE_ID_MAX) {
-        return false;
-    }
-    bool dot = false;
-    for (size_t i = 0; i < length; i++) {
-        char c = name[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'
-              || c == '.')) {
-            return false;
-        }
-        dot |= c == '.';
-    }
-    return dot;
+    return package_id_valid(name, length);
 }
 
 /* The version line of a record, or false. */
@@ -1029,9 +1023,48 @@ enum package_result package_install(const char *path, size_t length,
 
 /* -------------------------------------------------------------- remove */
 
+/*
+ * After a removal, in the removing account only: forget the program's
+ * grants (store:<id>, or the hash of each executable file of a
+ * sideloaded package, read into package before the removal) and, when
+ * asked, delete its app storage. Other accounts keep both.
+ */
+static void forget_program(size_t account, const char *id, bool store,
+                           bool remove_data) {
+    if (account == PERMISSION_NO_ACCOUNT || account >= accounts_count()) {
+        return;
+    }
+    uint8_t key[SHA256_DIGEST_SIZE];
+    if (store) {
+        permission_store_key(id, key);
+        (void)permission_grants_forget(account, key);
+    } else {
+        for (size_t i = 0; i < package.file_count; i++) {
+            if (package.files[i].exec) {
+                (void)permission_grants_forget(account,
+                                               package.files[i].hash);
+            }
+        }
+    }
+    char data[PATH_CAPACITY];
+    size_t used = home_path(account, data, sizeof(data));
+    used = used == 0 ? 0 : append_text(data, sizeof(data), used,
+                                       "/AppData/Programs/");
+    used = used == 0 ? 0 : append_text(data, sizeof(data), used, id);
+    enum vfs_node_type type;
+    if (remove_data && used != 0 && exists(data, &type)
+        && type == VFS_NODE_DIRECTORY && !remove_tree(data)) {
+        console_write_string("OPOS: packages: could not delete all of ");
+        console_write_string(data);
+        console_write_string("\n");
+    }
+}
+
 enum package_result package_remove(const char *id, size_t length,
                                    size_t account, bool admin,
-                                   bool everyone) {
+                                   uint32_t options) {
+    bool everyone = (options & PACKAGE_OPTION_EVERYONE) != 0;
+    bool remove_data = (options & PACKAGE_OPTION_REMOVE_DATA) != 0;
     if (!installed_system()) {
         return PACKAGE_NOT_INSTALLED;
     }
@@ -1056,6 +1089,23 @@ enum package_result package_remove(const char *id, size_t length,
     if (!exists(state_record, NULL)) {
         return PACKAGE_NOT_FOUND;
     }
+    /* What to forget afterwards. While the account still has the other
+       copy of this id (its own and everyone's), grants and data stay:
+       that copy uses them. */
+    size_t record_length;
+    bool store = false;
+    bool known = read_record(everyone, account, name, &record_length, &store)
+        && package_parse(record_text, record_length, true, &package, NULL)
+               == PACKAGE_OK;
+    bool other_copy = false;
+    if (account != PERMISSION_NO_ACCOUNT) {
+        char other_records[PATH_CAPACITY];
+        char other_programs[PATH_CAPACITY];
+        char other[PATH_CAPACITY];
+        other_copy = scope_paths(!everyone, account, other_records,
+                                 other_programs)
+            && join_id(other, other_records, name) && exists(other, NULL);
+    }
     if (!finish_pending() || !clear_staging() || !make_directory(STAGE)) {
         return PACKAGE_DISK_ERROR;
     }
@@ -1069,7 +1119,120 @@ enum package_result package_remove(const char *id, size_t length,
     }
     ok = apply(false);
     package_registry_load();
+    if (ok && known && !other_copy) {
+        forget_program(account, name, store, remove_data);
+    }
     return ok ? PACKAGE_OK : PACKAGE_DISK_ERROR;
+}
+
+/* ------------------------------------------------------------ identity */
+
+/* The next component of path after *offset. */
+static size_t next_part(const char *path, size_t length, size_t *offset,
+                        const char **part) {
+    while (*offset < length && path[*offset] == '/') {
+        (*offset)++;
+    }
+    size_t start = *offset;
+    while (*offset < length && path[*offset] != '/') {
+        (*offset)++;
+    }
+    *part = path + start;
+    return *offset - start;
+}
+
+static bool same_name(const char *part, size_t length, const char *name) {
+    size_t i = 0;
+    for (; i < length && name[i] != '\0'; i++) {
+        char a = part[i];
+        char b = name[i];
+        a = a >= 'A' && a <= 'Z' ? (char)(a - 'A' + 'a') : a;
+        b = b >= 'A' && b <= 'Z' ? (char)(b - 'A' + 'a') : b;
+        if (a != b) {
+            return false;
+        }
+    }
+    return i == length && name[i] == '\0';
+}
+
+bool package_identify(const char *path, size_t length, size_t account,
+                      const uint8_t hash[32], char id[PACKAGE_ID_MAX + 1],
+                      bool *store) {
+    if (path == NULL || hash == NULL || id == NULL || store == NULL
+        || !fat16_system_mounted()) {
+        return false;
+    }
+    /* /disk/Programs/<id>/... or /disk/Users/<account>/Programs/<id>/...
+       An 8.3 alias of the id folder makes the program a loose one, which
+       is safe. */
+    size_t offset = 0;
+    const char *part;
+    size_t part_length = next_part(path, length, &offset, &part);
+    if (!same_name(part, part_length, "disk")) {
+        return false;
+    }
+    part_length = next_part(path, length, &offset, &part);
+    bool everyone = same_name(part, part_length, "Programs");
+    if (!everyone) {
+        if (!same_name(part, part_length, "Users")
+            || account == PERMISSION_NO_ACCOUNT
+            || account >= accounts_count()) {
+            return false;
+        }
+        part_length = next_part(path, length, &offset, &part);
+        if (!same_name(part, part_length, accounts_name(account))) {
+            return false;
+        }
+        part_length = next_part(path, length, &offset, &part);
+        if (!same_name(part, part_length, "Programs")) {
+            return false;
+        }
+    }
+    /* FAT ignores case, so any case names the same folder. */
+    part_length = next_part(path, length, &offset, &part);
+    char name[PACKAGE_ID_MAX + 1];
+    if (part_length > PACKAGE_ID_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < part_length; i++) {
+        char c = part[i];
+        name[i] = c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+    }
+    name[part_length] = '\0';
+    if (!id_name(name, part_length)) {
+        return false;
+    }
+    const char *rest;
+    if (next_part(path, length, &offset, &rest) == 0) {
+        return false; /* the folder itself, not a file inside it */
+    }
+    char records[PATH_CAPACITY];
+    char programs[PATH_CAPACITY];
+    char record[PATH_CAPACITY];
+    size_t record_length;
+    if (!scope_paths(everyone, account, records, programs)
+        || !join_id(record, records, name)
+        || !read_whole(record, identify_text, sizeof(identify_text),
+                       &record_length)
+        || package_parse(identify_text, record_length, true,
+                         &identify_package, NULL) != PACKAGE_OK
+        || !same_text(identify_package.id, name)) {
+        return false;
+    }
+    bool match = false;
+    for (size_t i = 0; i < identify_package.file_count && !match; i++) {
+        const struct package_file *file = &identify_package.files[i];
+        match = file->exec;
+        for (size_t b = 0; b < 32 && match; b++) {
+            match = file->hash[b] == hash[b];
+        }
+    }
+    if (!match) {
+        return false;
+    }
+    copy_text(id, PACKAGE_ID_MAX + 1, name);
+    *store = identify_package.store;
+    return true;
 }
 
 /* ------------------------------------------------------------- at boot */

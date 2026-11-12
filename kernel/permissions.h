@@ -108,6 +108,14 @@ struct permission_identity permission_session_identity(void);
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length);
 
+/* The same, with app storage <home>/AppData/Programs/<storage> for an
+   installed package (storage is its id) instead of a folder named by a
+   hash of path. NULL storage is permission_confine_disk_program. A name
+   that is not a package id leaves the program without storage. */
+void permission_confine_disk_program_named(
+    struct permission_identity *identity, const char *path, size_t length,
+    const char *storage);
+
 /* True when identity holds every bit in capabilities. */
 bool permission_has(const struct permission_identity *identity,
                     uint32_t capabilities);

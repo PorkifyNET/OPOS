@@ -78,9 +78,9 @@ persistence-test: $(ISO) $(TEST_DISK)
 
 permissions-test:
 	mkdir -p $(BUILD)
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_app_permissions.c kernel/permissions.c kernel/sha256.c -o $(BUILD)/test_app_permissions
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_app_permissions.c kernel/permissions.c kernel/package.c kernel/sha256.c -o $(BUILD)/test_app_permissions
 	$(BUILD)/test_app_permissions
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/permissions.c kernel/manifest.c kernel/sha256.c -o $(BUILD)/test_permission_grants
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/permissions.c kernel/package.c kernel/manifest.c kernel/sha256.c -o $(BUILD)/test_permission_grants
 	$(BUILD)/test_permission_grants
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel -Isdk/include tools/test_manifest.c kernel/manifest.c -o $(BUILD)/test_manifest
 	$(BUILD)/test_manifest

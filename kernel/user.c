@@ -137,6 +137,9 @@
 #define LINUX_O_NOCTTY 0x100
 #define LINUX_O_NONBLOCK 0x800
 #define LINUX_O_LARGEFILE 0x8000 /* always on for 64-bit files */
+/* Accepted and ignored: O_NOFOLLOW (OPOS has no links), O_DSYNC and
+   O_SYNC (every write reaches the disk), O_NOATIME (no access times). */
+#define LINUX_O_NO_EFFECT (0x20000 | 0x1000 | 0x101000 | 0x40000)
 #define LINUX_MODE_DIRECTORY 0040000
 #define LINUX_MODE_CHARACTER 0020000
 #define LINUX_MODE_FIFO 0010000
@@ -1047,91 +1050,6 @@ static int64_t user_socket_receive(struct user_process *process,
                                    bool kernel_buffer);
 static void user_socket_release(struct user_file_descriptor *file);
 
-static bool user_linux_writev(struct user_process *process,
-                              struct linux_syscall_frame *frame) {
-    if (process == NULL || frame->rdi >= USER_DESCRIPTOR_CAPACITY) {
-        frame->rax = (uint64_t)(int64_t)-9;
-        return false;
-    }
-    bool default_output = (frame->rdi == 1 || frame->rdi == 2)
-        && !process->descriptors[frame->rdi].used
-        && !process->descriptors[frame->rdi].closed;
-    struct user_file_descriptor *file = default_output ? NULL
-        : user_file_descriptor(process, frame->rdi);
-    if (!default_output
-        && (file == NULL || !file->writable || file->directory)) {
-        frame->rax = (uint64_t)(int64_t)-9;
-        return false;
-    }
-    if (frame->rdx == 0 || frame->rdx > USER_IOV_MAX) {
-        frame->rax = (uint64_t)(int64_t)-22;
-        return false;
-    }
-
-    size_t iovec_count = (size_t)frame->rdx;
-    if (iovec_count > SIZE_MAX / sizeof(struct linux_iovec)
-        || !paging_user_range_valid((uintptr_t)frame->rsi,
-                                    iovec_count * sizeof(struct linux_iovec),
-                                    false, false)) {
-        frame->rax = (uint64_t)(int64_t)-14;
-        return false;
-    }
-
-    const struct linux_iovec *iovecs =
-        (const struct linux_iovec *)(uintptr_t)frame->rsi;
-    size_t total_length = 0;
-    for (size_t i = 0; i < iovec_count; i++) {
-        if (iovecs[i].length > USER_WRITE_MAX - total_length) {
-            frame->rax = (uint64_t)(int64_t)-22;
-            return false;
-        }
-        size_t length = (size_t)iovecs[i].length;
-        if (length != 0
-            && !paging_user_range_valid(iovecs[i].base, length, false, false)) {
-            frame->rax = (uint64_t)(int64_t)-14;
-            return false;
-        }
-        total_length += length;
-    }
-
-    uint8_t buffer[USER_WRITE_MAX];
-    size_t offset = 0;
-    for (size_t i = 0; i < iovec_count; i++) {
-        for (size_t j = 0; j < iovecs[i].length; j++) {
-            buffer[offset++] = ((const uint8_t *)iovecs[i].base)[j];
-        }
-    }
-    if (default_output) {
-        user_console_write(frame->rdi, (const char *)buffer, total_length);
-        frame->rax = total_length;
-    } else if (file->kind == USER_OPEN_FILE_PIPE_WRITE) {
-        frame->rax = (uint64_t)user_pipe_write(file, buffer, total_length,
-                                               false);
-    } else if (file->kind == USER_OPEN_FILE_SOCKET) {
-        frame->rax = (uint64_t)user_socket_send(
-            process, frame->rdi, (uintptr_t)buffer, total_length, 0, NULL, 0,
-            true);
-    } else {
-        if (file->append) {
-            struct vfs_metadata metadata;
-            if (!vfs_object_metadata(file->object, &metadata)) {
-                frame->rax = (uint64_t)(int64_t)-5;
-                return false;
-            }
-            file->offset = metadata.size;
-        }
-        size_t bytes_written = 0;
-        if (!vfs_object_write_at(file->object, file->offset, buffer,
-                                 total_length, &bytes_written)) {
-            frame->rax = (uint64_t)(int64_t)-5;
-        } else {
-            file->offset += bytes_written;
-            frame->rax = bytes_written;
-        }
-    }
-    return true;
-}
-
 static int64_t user_copy_file_path(uintptr_t address, char path[],
                                    size_t *path_length) {
     if (address == 0 || path == NULL || path_length == NULL) {
@@ -1543,7 +1461,7 @@ static int64_t user_linux_open_file(struct user_process *process,
     const uint64_t supported_flags = LINUX_O_ACCMODE | LINUX_O_CREAT
         | LINUX_O_EXCL | LINUX_O_TRUNC | LINUX_O_APPEND | LINUX_O_DIRECTORY
         | LINUX_O_CLOEXEC | LINUX_O_NOCTTY | LINUX_O_NONBLOCK
-        | LINUX_O_LARGEFILE;
+        | LINUX_O_LARGEFILE | LINUX_O_NO_EFFECT;
     uint64_t access = flags & LINUX_O_ACCMODE;
     if (process == NULL || (flags & ~supported_flags) != 0
         || access == LINUX_O_ACCMODE
@@ -1827,6 +1745,33 @@ static void user_linux_fill_stat(struct linux_stat *stat,
     stat->block_count = (int64_t)((metadata->size + 511) / 512);
 }
 
+/*
+ * Whether path is a folder on the way to the confined program's own
+ * storage or program folder ("/disk", "/disk/Users", ...). Such a folder
+ * may be stat'ed, not listed: Linux programs check each part of a path
+ * (sqlite3 resolving links, for one), and the program knows these names
+ * already.
+ */
+static bool user_path_leads_to_own(const struct user_process *process,
+                                   const char *path, size_t length) {
+    const char *own[2] = {process->identity.private_path,
+                          process->identity.program_folder};
+    for (size_t k = 0; k < 2; k++) {
+        const char *folder = own[k];
+        size_t i = 0;
+        while (i < length && folder[i] != '\0' && folder[i] == path[i]) {
+            i++;
+        }
+        if (i == length && folder[i] == '/') {
+            return true;
+        }
+        if (length == 1 && path[0] == '/' && folder[0] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int64_t user_linux_stat_path(struct user_process *process,
                                     int64_t directory_descriptor,
                                     uintptr_t path_address,
@@ -1842,7 +1787,8 @@ static int64_t user_linux_stat_path(struct user_process *process,
     if (copied != 0) {
         return copied;
     }
-    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)) {
+    if (!user_path_allowed(process, path, path_length, PERMISSION_READ)
+        && !user_path_leads_to_own(process, path, path_length)) {
         return -13;
     }
     struct vfs_metadata metadata;
@@ -4726,6 +4672,20 @@ static int64_t user_linux_fcntl(struct user_process *process,
             }
         }
         return 0;
+    case 5: /* F_GETLK: nobody else holds a lock */
+        if (file == NULL || file->kind != USER_OPEN_FILE_VFS) {
+            return -22;
+        }
+        if (!paging_user_range_valid((uintptr_t)argument, 2, true, false)) {
+            return -14;
+        }
+        *(uint16_t *)(uintptr_t)argument = 2; /* l_type = F_UNLCK */
+        return 0;
+    case 6: /* F_SETLK */
+    case 7: /* F_SETLKW */
+        /* Advisory locks are granted at once; OPOS does not track them
+           between processes yet (docs/linux-programs.md). */
+        return file != NULL && file->kind == USER_OPEN_FILE_VFS ? 0 : -22;
     default:
         return -22;
     }
@@ -4881,6 +4841,48 @@ static int64_t user_linux_getrandom(uintptr_t buffer, size_t length) {
     return (int64_t)length;
 }
 
+/* Serial log of a Linux system call OPOS lacks, once per process and
+   number, to find what Linux programs need (docs/linux-programs.md). */
+static void user_linux_unimplemented(struct user_process *process,
+                                     uint64_t number) {
+    static uint64_t logged_process[32];
+    static uint64_t logged_number[32];
+    static size_t logged_next;
+    for (size_t i = 0; i < 32; i++) {
+        if (logged_process[i] == process->id
+            && logged_number[i] == number) {
+            return;
+        }
+    }
+    logged_process[logged_next] = process->id;
+    logged_number[logged_next] = number;
+    logged_next = (logged_next + 1) % 32;
+    char line[96] = "OPOS: Linux syscall ";
+    size_t used = 20;
+    char digits[20];
+    size_t count = 0;
+    uint64_t value = number;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0 && count < sizeof(digits));
+    while (count != 0) {
+        line[used++] = digits[--count];
+    }
+    static const char middle[] = " not implemented (";
+    for (size_t i = 0; middle[i] != '\0'; i++) {
+        line[used++] = middle[i];
+    }
+    for (size_t i = 0; process->name[i] != '\0' && used + 3 < sizeof(line);
+         i++) {
+        line[used++] = process->name[i];
+    }
+    line[used++] = ')';
+    line[used++] = '\n';
+    line[used] = '\0';
+    console_serial_log(line);
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -4946,9 +4948,11 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-9;
                 return false;
             }
+            /* Larger writes are short, which write() may always be. */
             if (length > USER_WRITE_MAX) {
-                frame->rax = (uint64_t)(int64_t)-22;
-            } else if (length != 0
+                length = USER_WRITE_MAX;
+            }
+            if (length != 0
                        && !paging_user_range_valid(buffer_address, length,
                                                    false, false)) {
                 frame->rax = (uint64_t)(int64_t)-14;
@@ -4965,12 +4969,13 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             && length > USER_SOCKET_IO_MAX) {
             length = USER_SOCKET_IO_MAX;
         }
+        if (file != NULL && file->kind != USER_OPEN_FILE_SOCKET
+            && length > USER_FILE_IO_MAX) {
+            length = USER_FILE_IO_MAX;
+        }
         if (file == NULL || !file->writable) {
             frame->rax = (uint64_t)(int64_t)(file != NULL && file->directory
                                              ? -21 : -9);
-        } else if (length > USER_FILE_IO_MAX
-                   && file->kind != USER_OPEN_FILE_SOCKET) {
-            frame->rax = (uint64_t)(int64_t)-22;
         } else if (length != 0
                    && !paging_user_range_valid(buffer_address, length, false, false)) {
             frame->rax = (uint64_t)(int64_t)-14;
@@ -5009,9 +5014,9 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-9;
                 return false;
             }
+            /* A larger read returns at most one line, as on a terminal. */
             if (length > USER_READ_MAX) {
-                frame->rax = (uint64_t)(int64_t)-22;
-                return false;
+                length = USER_READ_MAX;
             }
             if (length != 0
                 && !paging_user_range_valid(buffer_address, length, true,
@@ -5430,8 +5435,262 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
 
+    /* writev: one write per buffer, stopping at a short write, so each
+       buffer gets write()'s limits and short counts. */
     if (number == 20) {
-        user_linux_writev(process, frame);
+        uint64_t descriptor = frame->rdi;
+        uintptr_t vector = (uintptr_t)frame->rsi;
+        uint64_t count = frame->rdx;
+        if (count == 0 || count > USER_IOV_MAX) {
+            frame->rax = (uint64_t)(int64_t)-22;
+            return false;
+        }
+        if (!paging_user_range_valid(vector,
+                                     count * sizeof(struct linux_iovec),
+                                     false, false)) {
+            frame->rax = (uint64_t)(int64_t)-14;
+            return false;
+        }
+        struct linux_iovec iovecs[USER_IOV_MAX];
+        for (uint64_t i = 0; i < count; i++) {
+            iovecs[i] = ((const struct linux_iovec *)vector)[i];
+        }
+        int64_t total = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            uint64_t done = 0;
+            while (done < iovecs[i].length) {
+                frame->rax = 1;
+                frame->rdi = descriptor;
+                frame->rsi = iovecs[i].base + done;
+                frame->rdx = iovecs[i].length - done;
+                (void)user_linux_syscall_dispatch(frame);
+                int64_t put = (int64_t)frame->rax;
+                if (put <= 0) {
+                    frame->rax = (uint64_t)(total != 0 ? total : put);
+                    return false;
+                }
+                done += (uint64_t)put;
+                total += put;
+            }
+        }
+        frame->rax = (uint64_t)total;
+        return false;
+    }
+
+    /* pread64 and pwrite64: at an offset, without moving the file's. */
+    if (number == 17 || number == 18) {
+        struct user_file_descriptor *file =
+            user_file_descriptor(process, frame->rdi);
+        if (file == NULL) {
+            frame->rax = (uint64_t)(int64_t)-9;
+            return false;
+        }
+        if (file->kind != USER_OPEN_FILE_VFS) {
+            frame->rax = (uint64_t)(int64_t)-29;
+            return false;
+        }
+        if ((int64_t)frame->r10 < 0 || frame->r10 > UINT32_MAX) {
+            frame->rax = (uint64_t)(int64_t)-22;
+            return false;
+        }
+        size_t saved_offset = file->offset;
+        bool saved_append = file->append;
+        file->offset = (size_t)frame->r10;
+        file->append = false; /* pwrite writes at the offset, as on Linux
+                                 without O_APPEND semantics for pwrite */
+        frame->rax = number == 17 ? 0 : 1;
+        (void)user_linux_syscall_dispatch(frame);
+        file->offset = saved_offset;
+        file->append = saved_append;
+        return false;
+    }
+
+    /*
+     * chmod, fchmod, fchmodat, chown, fchown, lchown, fchownat: FAT keeps
+     * no owners or modes, so these succeed without effect when the
+     * program may write the file (sqlite3 calls fchown as "root").
+     */
+    if (number == 91 || number == 93) {
+        struct user_file_descriptor *file =
+            user_file_descriptor(process, frame->rdi);
+        frame->rax = (uint64_t)(int64_t)(file == NULL ? -9 : 0);
+        return false;
+    }
+    if (number == 90 || number == 92 || number == 94 || number == 268
+        || number == 260) {
+        bool at = number == 268 || number == 260;
+        char path[USER_FILE_PATH_CAPACITY];
+        size_t path_length;
+        int64_t resolved = user_resolve_file_path(
+            process, at ? (int64_t)frame->rdi : LINUX_AT_FDCWD,
+            at ? (uintptr_t)frame->rsi : (uintptr_t)frame->rdi, path,
+            &path_length);
+        struct vfs_metadata metadata;
+        if (resolved != 0) {
+            frame->rax = (uint64_t)resolved;
+        } else if (!vfs_stat(path, path_length, &metadata)) {
+            frame->rax = (uint64_t)(int64_t)-2;
+        } else if (!user_path_allowed(process, path, path_length,
+                                      PERMISSION_WRITE)) {
+            frame->rax = (uint64_t)(int64_t)-1;
+        } else {
+            frame->rax = 0;
+        }
+        return false;
+    }
+
+    /* fsync, fdatasync: every write already reaches the disk. */
+    if (number == 74 || number == 75) {
+        frame->rax = (uint64_t)(int64_t)(
+            user_file_descriptor(process, frame->rdi) != NULL ? 0 : -9);
+        return false;
+    }
+
+    /* access and faccessat: whether path exists and this program may use
+       it that way (W_OK needs write permission; X_OK and R_OK need read). */
+    if (number == 21 || number == 269 || number == 439) {
+        int64_t directory = number == 21 ? LINUX_AT_FDCWD
+                                         : (int64_t)frame->rdi;
+        uintptr_t path_address = number == 21 ? (uintptr_t)frame->rdi
+                                               : (uintptr_t)frame->rsi;
+        uint64_t mode = number == 21 ? frame->rsi : frame->rdx;
+        char path[USER_FILE_PATH_CAPACITY];
+        size_t path_length;
+        int64_t resolved = user_resolve_file_path(
+            process, directory, path_address, path, &path_length);
+        if (resolved != 0) {
+            frame->rax = (uint64_t)resolved;
+            return false;
+        }
+        struct vfs_metadata metadata;
+        if (!user_path_allowed(process, path, path_length, PERMISSION_READ)
+            && !user_path_leads_to_own(process, path, path_length)) {
+            frame->rax = (uint64_t)(int64_t)-13;
+        } else if (!vfs_stat(path, path_length, &metadata)) {
+            frame->rax = (uint64_t)(int64_t)-2;
+        } else if ((mode & 2) != 0
+                   && !user_path_allowed(process, path, path_length,
+                                         PERMISSION_WRITE)) {
+            frame->rax = (uint64_t)(int64_t)-13;
+        } else {
+            frame->rax = 0;
+        }
+        return false;
+    }
+
+    /*
+     * ioctl: the console (descriptors 0-2 not redirected) is a terminal,
+     * so isatty() is true and a program like Lua or sqlite3 starts its
+     * prompt. Settings are accepted and ignored: input is always a line
+     * at a time with echo. Everything else is not a terminal (ENOTTY).
+     */
+    if (number == 16) {
+        uint64_t descriptor = frame->rdi;
+        uint64_t request = frame->rsi;
+        uintptr_t argument = (uintptr_t)frame->rdx;
+        bool console = descriptor <= 2
+            && !process->descriptors[descriptor].used
+            && !process->descriptors[descriptor].closed;
+        if (!console) {
+            frame->rax = (uint64_t)(int64_t)(
+                user_file_descriptor(process, descriptor) == NULL ? -9 : -25);
+            return false;
+        }
+        if (request == 0x5401) { /* TCGETS: struct termios, 60 bytes */
+            if (!paging_user_range_valid(argument, 60, true, false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return false;
+            }
+            uint8_t *termios = (uint8_t *)argument;
+            for (size_t i = 0; i < 60; i++) {
+                termios[i] = 0;
+            }
+            uint32_t flags[4] = {
+                0x0500,          /* c_iflag: ICRNL | IXON */
+                0x0005,          /* c_oflag: OPOST | ONLCR */
+                0x00bf,          /* c_cflag: B38400 | CS8 | CREAD */
+                0x8a3b,          /* c_lflag: ISIG ICANON ECHO ECHOE
+                                    ECHOK ECHOCTL ECHOKE IEXTEN */
+            };
+            for (size_t f = 0; f < 4; f++) {
+                for (size_t b = 0; b < 4; b++) {
+                    termios[f * 4 + b] = (uint8_t)(flags[f] >> (8 * b));
+                }
+            }
+            termios[17 + 0] = 3;    /* VINTR ^C */
+            termios[17 + 2] = 127;  /* VERASE */
+            termios[17 + 4] = 4;    /* VEOF ^D */
+            termios[17 + 6] = 1;    /* VMIN */
+            frame->rax = 0;
+            return false;
+        }
+        if (request == 0x5413) { /* TIOCGWINSZ */
+            if (!paging_user_range_valid(argument, 8, true, false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return false;
+            }
+            uint16_t *size = (uint16_t *)argument;
+            size[0] = 24; /* rows */
+            size[1] = 96; /* columns, as the desktop Terminal */
+            size[2] = 0;
+            size[3] = 0;
+            frame->rax = 0;
+            return false;
+        }
+        if (request >= 0x5402 && request <= 0x5404) { /* TCSETS* */
+            frame->rax = 0;
+            return false;
+        }
+        frame->rax = (uint64_t)(int64_t)-25;
+        return false;
+    }
+
+    /* readv: one read per buffer. After the first bytes from a terminal,
+       pipe or socket it stops, so it never waits for more. */
+    if (number == 19) {
+        uint64_t descriptor = frame->rdi;
+        uintptr_t vector = (uintptr_t)frame->rsi;
+        uint64_t count = frame->rdx;
+        if (count == 0 || count > USER_IOV_MAX) {
+            frame->rax = (uint64_t)(int64_t)-22;
+            return false;
+        }
+        if (!paging_user_range_valid(vector,
+                                     count * sizeof(struct linux_iovec),
+                                     false, false)) {
+            frame->rax = (uint64_t)(int64_t)-14;
+            return false;
+        }
+        struct linux_iovec iovecs[USER_IOV_MAX];
+        for (uint64_t i = 0; i < count; i++) {
+            iovecs[i] = ((const struct linux_iovec *)vector)[i];
+        }
+        struct user_file_descriptor *file =
+            user_file_descriptor(process, descriptor);
+        bool stream = file == NULL || file->kind != USER_OPEN_FILE_VFS;
+        int64_t total = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            if (iovecs[i].length == 0) {
+                continue;
+            }
+            frame->rax = 0;
+            frame->rdi = descriptor;
+            frame->rsi = iovecs[i].base;
+            frame->rdx = iovecs[i].length;
+            (void)user_linux_syscall_dispatch(frame);
+            int64_t got = (int64_t)frame->rax;
+            if (got < 0) {
+                if (total == 0) {
+                    total = got;
+                }
+                break;
+            }
+            total += got;
+            if ((uint64_t)got < iovecs[i].length || got == 0 || stream) {
+                break;
+            }
+        }
+        frame->rax = (uint64_t)total;
         return false;
     }
 
@@ -5442,7 +5701,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     }
 
     if (number == 262) {
-        if (frame->r10 != 0) {
+        if ((frame->r10 & ~(uint64_t)0x100) != 0) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else {
             frame->rax = (uint64_t)user_linux_stat_path(
@@ -5631,6 +5890,14 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
 
+    /* CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID and the other
+       monotonic clocks read as CLOCK_MONOTONIC: OPOS does not count CPU
+       time per process yet. */
+    if ((number == 228 || number == 229)
+        && (frame->rdi == 2 || frame->rdi == 3 || frame->rdi == 4
+            || frame->rdi == 7)) {
+        frame->rdi = LINUX_CLOCK_MONOTONIC;
+    }
     if (number == 228) {
         if (frame->rdi != LINUX_CLOCK_MONOTONIC
             && frame->rdi != LINUX_CLOCK_REALTIME) {
@@ -6045,6 +6312,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return true;
     }
 
+    user_linux_unimplemented(process, number);
     frame->rax = (uint64_t)(int64_t)-38;
     return false;
 }
@@ -6241,11 +6509,86 @@ static bool user_finish_process(struct user_process *process, uint64_t status,
  * argv for a program started from the desktop: argv[0] is its path, then
  * the typed arguments split at spaces; "double quotes" keep spaces.
  */
+/* Appends "NAME=value" (value may be NULL for "") to the environment. */
+static bool user_start_environment(struct user_exec_vectors *vectors,
+                                   const char *name, const char *value,
+                                   const char *more) {
+    if (vectors->environment_count == USER_EXEC_VECTOR_MAX) {
+        return false;
+    }
+    size_t start = vectors->string_size;
+    const char *parts[3] = {name, value, more};
+    for (size_t p = 0; p < 3; p++) {
+        for (size_t i = 0; parts[p] != NULL && parts[p][i] != '\0'; i++) {
+            if (vectors->string_size + 2 > USER_EXEC_STRING_MAX) {
+                vectors->string_size = start;
+                return false;
+            }
+            vectors->strings[vectors->string_size++] = parts[p][i];
+        }
+    }
+    vectors->strings[vectors->string_size++] = '\0';
+    vectors->environment_offsets[vectors->environment_count++] =
+        (uint16_t)start;
+    return true;
+}
+
+/*
+ * The environment of a program started from the desktop or a shell
+ * (docs/linux-programs.md): HOME is its own storage folder when it is
+ * confined (created here, as that is the one place it may write), else
+ * the account's home; USER, PATH and TERM as a Linux program expects.
+ */
+static void user_build_start_environment(
+    struct user_exec_vectors *vectors,
+    const struct permission_identity *identity) {
+    char home[USER_FILE_PATH_CAPACITY] = "/";
+    const char *name = NULL;
+    size_t account = identity->account;
+    if (account != PERMISSION_NO_ACCOUNT && account < accounts_count()) {
+        name = accounts_name(account);
+    }
+    if (identity->confined && identity->private_path[0] != '\0') {
+        size_t length = 0;
+        while (identity->private_path[length] != '\0'
+               && length + 1 < sizeof(home)) {
+            home[length] = identity->private_path[length];
+            length++;
+        }
+        home[length] = '\0';
+        /* <home>/AppData/Programs/<folder>: make each missing level. */
+        for (size_t i = 1; i <= length; i++) {
+            if (i == length || home[i] == '/') {
+                (void)vfs_create_directory(home, i);
+            }
+        }
+    } else if (name != NULL) {
+        size_t used = 0;
+        static const char root[] = ACCOUNT_HOME_ROOT "/";
+        for (size_t i = 0; root[i] != '\0'; i++) {
+            home[used++] = root[i];
+        }
+        for (size_t i = 0; name[i] != '\0' && used + 1 < sizeof(home); i++) {
+            home[used++] = name[i];
+        }
+        home[used] = '\0';
+    }
+    (void)user_start_environment(vectors, "HOME=", home, NULL);
+    if (name != NULL) {
+        (void)user_start_environment(vectors, "USER=", name, NULL);
+        (void)user_start_environment(vectors, "LOGNAME=", name, NULL);
+    }
+    (void)user_start_environment(vectors, "PATH=/bin", NULL, NULL);
+    (void)user_start_environment(vectors, "TERM=dumb", NULL, NULL);
+}
+
 static bool user_build_start_vectors(struct user_exec_vectors *vectors,
                                      const char *exec_path,
                                      size_t exec_path_length,
                                      const char *arguments,
-                                     size_t arguments_length) {
+                                     size_t arguments_length,
+                                     const struct permission_identity *identity,
+                                     bool environment) {
     *vectors = (struct user_exec_vectors) {0};
     if (exec_path == NULL || exec_path_length + 1 > USER_EXEC_STRING_MAX) {
         return false;
@@ -6285,6 +6628,9 @@ static bool user_build_start_vectors(struct user_exec_vectors *vectors,
             vectors->strings[vectors->string_size++] = c;
         }
         vectors->strings[vectors->string_size++] = '\0';
+    }
+    if (environment) {
+        user_build_start_environment(vectors, identity);
     }
     return true;
 }
@@ -6564,7 +6910,9 @@ static bool user_process_run_image(enum user_program program,
         struct user_exec_vectors *vectors = &start_vectors[task_slot];
         initial_stack = user_build_start_vectors(
                 vectors, initial_execfn, initial_execfn_length, arguments,
-                arguments_length)
+                arguments_length, &process->identity,
+                /* Kernel-shell self-tests check an empty environment. */
+                identity != NULL)
             ? user_prepare_exec_stack(stack_buffers[USER_STACK_ARGUMENT_PAGE], &elf_plan, vectors,
                                       USER_MMAP_BASE, NULL, 0)
             : 0;

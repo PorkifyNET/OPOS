@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 void console_write_string(const char *string);
+/* To the serial port only: for logs that must not draw over the desktop. */
+void console_serial_log(const char *string);
 void console_write_bytes(const char *data, size_t length);
 void console_write_hex(uint64_t value);
 void console_clear(void);

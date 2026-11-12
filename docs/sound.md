@@ -52,7 +52,7 @@ come later. Input (microphones) is out of scope.
    An OPOS demo program plays a WAV file.
 3. **SDL audio driver.** `store/linux/sdl2/opos/SDL_oposaudio.c`: SDL's
    audio thread fills a buffer from the program's callback and writes it
-   with the sound call. The SDL demos gain `testaudio` (`loopwave`).
+   with the sound call. The SDL demos gain `testmultiaudio`.
 4. **Doom with sound.** SDL_mixer (no codec libraries: Doom's effects are
    raw samples and its music is played by Chocolate Doom's own OPL
    emulator), then Chocolate Doom built with it: effects and music.
@@ -137,6 +137,34 @@ driver's source, so the timer interrupt mixes every 10 ms:
 440 Hz and 880 Hz after the two beeps. By hand: at volume 70 the tones
 peak at 5879 (12000 × 0.49) and at volume 30 at 1079 (12000 × 0.09), and
 `play` prints "no sound output" on a machine without HDA.
+
+## As built in step 3
+
+`store/linux/sdl2/opos/SDL_oposaudio.c` is an SDL 2 audio driver. The
+SDL recipe copies it next to SDL's dummy audio driver (whose sources
+`configure` compiles anyway), puts it first in SDL's driver list and
+builds SDL with `SDL_AUDIO_DRIVER_OPOS`:
+- **Format.** The device always runs at 48 kHz, 16-bit stereo, OPOS's
+  stream format; SDL converts from whatever the program asks for. The
+  program's buffer size (`samples`) is kept, up to 16384 frames.
+- **Playing.** Each SDL audio device opens one OPOS stream twice the
+  size of SDL's buffer (at least 1024 frames). SDL's audio thread fills
+  its buffer from the program's callback and `PlayDevice` writes it with
+  the sound call, which waits while the stream is full. That pacing
+  replaces `WaitDevice`, so the delay stays near two buffers.
+- **No sound hardware.** The driver checks for it when SDL starts its
+  audio (by opening and closing a stream). Without it, SDL has no audio
+  driver, as before this step, and programs run silent.
+- The driver makes the system calls itself, like the video driver, so
+  SDL needs no OPOS headers. The SDL Demos package gains `testmultiaudio`
+  ("SDL Sound" in Start), which plays SDL's `sample.wav` twice.
+
+**Test.** In QEMU with `intel-hda`, `testmultiaudio` from the installed
+package prints "Using audio driver: opos" and exits with status 0. The
+recording (monitor `wavcapture`) holds two plays of 10.81 s and 10.94 s
+(the file is 10.96 s; the quiet ends fall under the detector's
+threshold) that correlate at 0.998 with each other, so playback is
+steady.
 
 ## Not planned yet
 

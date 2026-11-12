@@ -90,8 +90,9 @@ In the order the next programs are likely to hit them.
    more (glibc's loader, `/proc`, and many more system calls).
 8. **Graphics.** Linux GUI programs draw through X11 or Wayland, which
    OPOS does not have. SDL 2 programs work since step 7, with an SDL
-   video driver that draws into an OPOS window. Still missing: OpenGL,
-   sound, game controllers, and programs that use X11 or Wayland
+   video driver that draws into an OPOS window, and SDL sound plays
+   through OPOS sound (docs/sound.md). Still missing: OpenGL,
+   game controllers, and programs that use X11 or Wayland
    directly (GTK, Qt).
 
 ## Linux packages in the Store
@@ -445,9 +446,12 @@ script copies the driver next to SDL's dummy driver, whose sources
 SDL's `configure` already compiles, and adds it to SDL's driver list,
 where it comes first. Everything that needs a Linux device, server or
 library OPOS lacks is off: X11, Wayland, KMS, OpenGL, Vulkan, sound
-servers, udev, D-Bus. Sound, game controllers and haptics use SDL's
-dummy drivers. The driver is zlib-licensed like SDL, so programs built
-with it keep their own license.
+servers, udev, D-Bus. Game controllers and haptics use SDL's dummy
+drivers. Sound goes through an OPOS audio driver,
+`store/linux/sdl2/opos/SDL_oposaudio.c`, added the same way next to the
+dummy audio driver (see "As built in step 3" in `docs/sound.md`). The
+drivers are zlib-licensed like SDL, so programs built with them keep
+their own license.
 
 **The driver.**
 - One window per program, as OPOS gives a program one window. A second
@@ -511,7 +515,8 @@ was not built yet (`SDL2_LIBRARY_ONLY=1`).
 Chocolate Doom normally builds with autotools or CMake. The recipe writes
 the few `config.h` lines they would and compiles the game's source list
 with `$LINUX_CC` directly, without SDL_mixer and SDL_net. There is no
-sound: OPOS has no sound driver yet.
+sound yet: SDL can play sound on OPOS now, but Doom's sound needs
+SDL_mixer (step 4 of `docs/sound.md`).
 
 Tested in QEMU: installed with `pkg install`, started from the Terminal,
 it loads `freedoom1.wad` from its folder, opens a window titled

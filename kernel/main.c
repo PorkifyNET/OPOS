@@ -231,6 +231,10 @@ static void serial_write_string(const char *string) {
     }
 }
 
+void console_serial_log(const char *string) {
+    serial_write_string(string);
+}
+
 static void serial_write_hex(uint64_t value) {
     static const char digits[] = "0123456789ABCDEF";
     serial_write_string("0x");

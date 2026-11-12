@@ -7,7 +7,8 @@ Check the source (`kernel/user.c`, `kernel/elf.c`, `kernel/dynamic_*.c`,
 `kernel/scheduler.c`, `kernel/vfs.c`) when in doubt.
 
 These calls prove the ABI; they are not yet a general Linux compatibility
-layer.
+layer. `docs/linux-programs.md` covers real programs (Lua, SQLite) run as
+Store packages, the calls added for them, and what is still missing.
 
 ## Ring 3, shell tests and the OPOS syscall ABI
 

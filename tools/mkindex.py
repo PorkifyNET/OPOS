@@ -163,6 +163,24 @@ def read_descriptions(path):
     return descriptions
 
 
+def asks(package, data):
+    """What the package's programs may ask for, for the Store window: the
+    capability names from each exec file's OPOS manifest note (or the
+    PACKAGE capabilities line for other platforms), or "none"."""
+    bits = 0
+    if package["platform"] == "opos":
+        exec_paths = {f["path"] for f in package["files"] if f["exec"]}
+        for name, member in mkopk.read_members(data)[1:]:
+            if name in exec_paths:
+                bits |= mkopk.read_manifest_note(member)[0]
+    else:
+        bits = package.get("capability_bits", 0)
+    names = [name for name, bit in sorted(mkopk.CAPABILITIES.items(),
+                                          key=lambda item: item[1])
+             if bits & bit]
+    return " ".join(names) if names else "none"
+
+
 def collect(paths):
     found = []
     for path in paths:
@@ -207,6 +225,7 @@ def build(paths, output, descriptions):
             f"name: {package['name']}",
             f"publisher: {package['publisher']}",
             f"platform: {package['platform']}",
+            f"asks: {asks(package, data)}",
         ]
         if package.get("requires-opos"):
             lines.append(f"requires-opos: {package['requires-opos']}")

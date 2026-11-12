@@ -74,6 +74,7 @@ enum window_kind {
     WINDOW_TASKS,
     WINDOW_IMAGE,
     WINDOW_SECURITY,
+    WINDOW_STORE,
     /* Program windows: one kind per slot (see "program windows"). */
     WINDOW_APP,
     WINDOW_APP_LAST = WINDOW_APP + 3,
@@ -88,7 +89,7 @@ static bool window_is_app(enum window_kind kind) {
 static const char *const window_titles[WINDOW_COUNT] = {
     "TERMINAL", "FILES", "WELCOME", "SETTINGS", "TEXT EDITOR",
     "INSTALL OPOS", "TASK MANAGER", "IMAGE VIEWER", "SECURITY CENTER",
-    "PROGRAM"
+    "OPOS STORE", "PROGRAM"
 };
 
 static const char *app_window_title(size_t slot);
@@ -183,6 +184,7 @@ enum menu_action {
     MENU_TASK_MANAGER,
     MENU_SECURITY,
     MENU_PROGRAMS,
+    MENU_STORE,
     MENU_SETTINGS,
     MENU_INSTALL,
     MENU_LOG_OUT,
@@ -192,7 +194,7 @@ enum menu_action {
 };
 
 static const char *const menu_labels[MENU_COUNT] = {
-    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "SECURITY CENTER", "PROGRAMS", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
+    "TERMINAL", "FILES", "TEXT EDITOR", "TASK MANAGER", "SECURITY CENTER", "PROGRAMS", "OPOS STORE", "SETTINGS", "INSTALL OPOS", "LOG OUT", "REBOOT", "SHUT DOWN"
 };
 
 /* ---------------------------------------------------------------- text */
@@ -632,6 +634,10 @@ static void security_reload(void);
 static void draw_security(struct rect area, bool focused);
 static void security_click(struct rect area, int32_t x, int32_t y);
 static void security_key(char character);
+static void store_open(void);
+static void draw_store(struct rect area, bool focused);
+static void store_click(struct rect area, int32_t x, int32_t y);
+static void store_key(char character);
 static const char *window_title(enum window_kind kind);
 
 static void terminal_output_flush(void) {
@@ -683,6 +689,8 @@ enum app_origin {
     APP_FROM_NOTEPAD,
     /* /bin/update for Settings > UPDATES: its output goes to that page. */
     APP_FROM_UPDATES,
+    /* /bin/pkg for the OPOS Store window: its output goes there. */
+    APP_FROM_STORE,
 };
 
 static enum run_result app_launch(enum app_origin origin, const char *typed,
@@ -3916,6 +3924,10 @@ static void updates_click(struct rect area, int32_t x, int32_t y);
 static void updates_start(bool install);
 static bool updates_checked;
 static bool updates_running;
+/* The OPOS Store window (see "OPOS Store"), shown on the UPDATES page. */
+static bool store_running;
+static bool store_loaded;
+static size_t store_update_count;
 static bool settings_in_sidebar = true;
 /* First row shown; rows scroll so the selected one stays visible. */
 static size_t settings_scroll;
@@ -5450,6 +5462,7 @@ enum updates_button {
     UPDATES_BUTTON_REFRESH,
     UPDATES_BUTTON_UPDATE, /* RESTART once installed */
     UPDATES_BUTTON_DETAILS,
+    UPDATES_BUTTON_STORE, /* programs: opens the OPOS Store */
     UPDATES_BUTTON_COUNT,
 };
 
@@ -5491,6 +5504,8 @@ static const char *updates_button_label(size_t button) {
         return "REFRESH";
     case UPDATES_BUTTON_UPDATE:
         return updates_status == UPDATES_INSTALLED ? "RESTART NOW" : "UPDATE";
+    case UPDATES_BUTTON_STORE:
+        return "OPOS STORE";
     default:
         return updates_details ? "HIDE DETAILS" : "SHOW DETAILS";
     }
@@ -5748,6 +5763,33 @@ static void draw_updates(struct rect area, bool focused) {
     int64_t buttons_top = updates_button_rect(area, 0).y;
     y = draw_wrapped(x, y, width, buttons_top, status, red, green, blue);
     y += 6;
+    /* Programs from the OPOS Store update separately (OPOS STORE). */
+    char programs[80];
+    if (store_running && !store_loaded) {
+        text_copy(programs, sizeof(programs),
+                  "PROGRAMS: CHECKING THE OPOS STORE...");
+    } else if (!store_loaded) {
+        text_copy(programs, sizeof(programs),
+                  "PROGRAMS: OPEN THE OPOS STORE TO CHECK FOR UPDATES.");
+    } else if (store_update_count == 0) {
+        text_copy(programs, sizeof(programs),
+                  "PROGRAMS: EVERY PROGRAM FROM THE OPOS STORE IS UP TO "
+                  "DATE.");
+    } else {
+        size_t used = append_text(programs, sizeof(programs), 0,
+                                  "PROGRAMS: ");
+        used = append_decimal(programs, sizeof(programs), used,
+                              store_update_count);
+        append_text(programs, sizeof(programs), used,
+                    store_update_count == 1
+                        ? " UPDATE IN THE OPOS STORE."
+                        : " UPDATES IN THE OPOS STORE.");
+    }
+    y = draw_wrapped(x, y, width, buttons_top, programs,
+                     store_loaded && store_update_count != 0 ? 240 : 170,
+                     store_loaded && store_update_count != 0 ? 210 : 180,
+                     store_loaded && store_update_count != 0 ? 120 : 205);
+    y += 6;
 
     if (updates_progress >= 0) {
         struct rect bar = {x, y, width - 70, 18};
@@ -5826,6 +5868,9 @@ static void updates_press(size_t button) {
         } else {
             updates_start(true);
         }
+        break;
+    case UPDATES_BUTTON_STORE:
+        store_open();
         break;
     default:
         updates_details = !updates_details;
@@ -7306,6 +7351,9 @@ static void draw_window(enum window_kind kind) {
     case WINDOW_SECURITY:
         draw_security(content, focused);
         break;
+    case WINDOW_STORE:
+        draw_store(content, focused);
+        break;
     case WINDOW_IMAGE:
         draw_viewer(content);
         break;
@@ -8294,6 +8342,9 @@ static enum desktop_result menu_activate(enum menu_action action) {
         break;
     case MENU_SECURITY:
         security_open();
+        break;
+    case MENU_STORE:
+        store_open();
         break;
     case MENU_SETTINGS:
         window_open(WINDOW_SETTINGS);
@@ -9938,6 +9989,8 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         tasks_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_SECURITY) {
         security_click(content_rect(frame), x, y);
+    } else if (kind == WINDOW_STORE) {
+        store_click(content_rect(frame), x, y);
     } else if (kind == WINDOW_IMAGE) {
         viewer_click(content_rect(frame), x, y);
     } else if (window_is_app(kind)) {
@@ -10242,6 +10295,8 @@ static enum desktop_result handle_key(char character, bool super) {
         tasks_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SECURITY) {
         security_key(character);
+    } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_STORE) {
+        store_key(character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_IMAGE) {
         viewer_key(character);
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
@@ -10890,7 +10945,36 @@ static char updates_output[UPDATES_OUTPUT_CAPACITY];
 static size_t updates_output_head;
 static size_t updates_output_count;
 static bool app_current_is_updater(void);
+static bool app_current_has_origin(enum app_origin origin);
 static void updates_feed(char character);
+static void store_feed(char character);
+static void store_finished(bool started, uint64_t exit_status);
+/* The same for /bin/pkg run by the OPOS Store window. */
+static char store_output[UPDATES_OUTPUT_CAPACITY];
+static size_t store_output_head;
+static size_t store_output_count;
+
+static void store_output_sink(const char *data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        while (store_output_count == UPDATES_OUTPUT_CAPACITY) {
+            if (user_current_killed() || !desktop_active) {
+                return;
+            }
+            (void)scheduler_sleep_until(timer_ticks() + 1);
+        }
+        store_output[(store_output_head + store_output_count)
+                     % UPDATES_OUTPUT_CAPACITY] = data[i];
+        store_output_count++;
+    }
+}
+
+static void store_output_drain(void) {
+    while (store_output_count != 0) {
+        store_feed(store_output[store_output_head]);
+        store_output_head = (store_output_head + 1) % UPDATES_OUTPUT_CAPACITY;
+        store_output_count--;
+    }
+}
 
 static void updates_output_sink(const char *data, size_t length) {
     for (size_t i = 0; i < length; i++) {
@@ -10919,6 +11003,10 @@ static void app_output_sink(const char *data, size_t length, bool error) {
     (void)error;
     if (app_current_is_updater()) {
         updates_output_sink(data, length);
+        return;
+    }
+    if (app_current_has_origin(APP_FROM_STORE)) {
+        store_output_sink(data, length);
         return;
     }
     if (app_window_of(user_current_process_id()) == NULL) {
@@ -11111,16 +11199,20 @@ static uint64_t app_job_process(const struct app_job *job) {
                                        : 0;
 }
 
-static bool app_current_is_updater(void) {
+static bool app_current_has_origin(enum app_origin origin) {
     uint64_t process_id = user_current_process_id();
     for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
         const struct app_job *job = &app_jobs[i];
-        if (job->used && job->origin == APP_FROM_UPDATES
+        if (job->used && job->origin == origin
             && process_id != 0 && app_job_process(job) == process_id) {
             return true;
         }
     }
     return false;
+}
+
+static bool app_current_is_updater(void) {
+    return app_current_has_origin(APP_FROM_UPDATES);
 }
 
 /* Ctrl+C in the Terminal: ends the newest program started there. */
@@ -11201,6 +11293,10 @@ static void app_job_report(struct app_job *job) {
     case APP_FROM_UPDATES:
         updates_output_drain();
         updates_finished(started, job->exit_status);
+        break;
+    case APP_FROM_STORE:
+        store_output_drain();
+        store_finished(started, job->exit_status);
         break;
     case APP_FROM_NOTEPAD:
         if (!started && !apps_stopping) {
@@ -11705,6 +11801,572 @@ static void security_key(char character) {
     }
 }
 
+/* ---------------------------------------------------------- OPOS Store */
+
+/*
+ * The OPOS Store window (docs/packages.md, "Store window"). Like Settings
+ * > UPDATES runs /bin/update, it runs /bin/pkg --gui, whose output comes
+ * here (store_feed): @item lines fill the list, @phase and @done the
+ * status line, "pkg: " lines are errors. Installing is for the logged-in
+ * account; UPDATE ALL also updates programs installed for everyone when
+ * the account is an administrator. The kernel checks every package.
+ */
+#define STORE_ITEMS_MAX 64
+#define STORE_ROW_HEIGHT 24
+#define STORE_TEXT 160
+
+struct store_item {
+    char id[64];
+    char version[16];
+    char name[32];
+    char publisher[64];
+    char state[12]; /* new, installed, update, needsopos */
+    char installed[16];
+    char needs[16];
+    char size[12];
+    char asks[64];
+    char description[160];
+};
+
+enum store_button {
+    STORE_BUTTON_REFRESH,
+    STORE_BUTTON_ACTION, /* INSTALL, UPDATE or UPDATE OPOS */
+    STORE_BUTTON_REMOVE,
+    STORE_BUTTON_UPDATE_ALL,
+    STORE_BUTTON_COUNT,
+};
+
+static struct store_item store_items[STORE_ITEMS_MAX];
+static size_t store_item_count;
+static size_t store_selected;
+/* First row shown; the list scrolls with the selection. */
+static size_t store_first;
+static size_t store_button;
+/* After an install, update or removal the list is read again. */
+static bool store_refresh_after;
+static bool store_listing;
+/* The "Installed" view: only programs this account has from the Store. */
+static bool store_installed_only;
+static char store_phase[STORE_TEXT];
+static char store_message[STORE_TEXT];
+static bool store_message_error;
+static char store_line[640];
+static size_t store_line_length;
+
+static const struct store_item *store_current(void) {
+    return store_selected < store_item_count ? &store_items[store_selected]
+                                             : NULL;
+}
+
+static bool store_item_is(const struct store_item *item, const char *state) {
+    return item != NULL && text_equals(item->state, text_length(item->state),
+                                       state);
+}
+
+/* Copies the next tab-separated field of value into out. */
+static void store_field(const char **value, const char *end, char *out,
+                        size_t capacity) {
+    const char *start = *value;
+    const char *stop = start;
+    while (stop < end && *stop != '\t') {
+        stop++;
+    }
+    size_t length = (size_t)(stop - start);
+    if (length >= capacity) {
+        length = capacity - 1;
+    }
+    for (size_t i = 0; i < length; i++) {
+        out[i] = start[i];
+    }
+    out[length] = '\0';
+    *value = stop < end ? stop + 1 : end;
+}
+
+static void store_say(const char *text, size_t length, bool error) {
+    if (length >= sizeof(store_message)) {
+        length = sizeof(store_message) - 1;
+    }
+    for (size_t i = 0; i < length; i++) {
+        char c = text[i];
+        store_message[i] = c >= 'a' && c <= 'z' ? (char)(c - 32) : c;
+    }
+    store_message[length] = '\0';
+    store_message_error = error;
+}
+
+static void store_line_done(void) {
+    const char *line = store_line;
+    size_t length = store_line_length;
+    store_line_length = 0;
+    if (length > 5 && text_equals(line, 5, "pkg: ")) {
+        store_say(line + 5, length - 5, true);
+        return;
+    }
+    if (length == 0 || line[0] != '@') {
+        return;
+    }
+    size_t key_end = 1;
+    while (key_end < length && line[key_end] != ' ') {
+        key_end++;
+    }
+    const char *value = line + (key_end < length ? key_end + 1 : length);
+    const char *end = line + length;
+    const char *key = line + 1;
+    size_t key_length = key_end - 1;
+    if (text_equals(key, key_length, "item")) {
+        if (store_item_count == STORE_ITEMS_MAX) {
+            return;
+        }
+        struct store_item *item = &store_items[store_item_count];
+        store_field(&value, end, item->id, sizeof(item->id));
+        store_field(&value, end, item->version, sizeof(item->version));
+        store_field(&value, end, item->name, sizeof(item->name));
+        store_field(&value, end, item->publisher, sizeof(item->publisher));
+        store_field(&value, end, item->state, sizeof(item->state));
+        store_field(&value, end, item->installed, sizeof(item->installed));
+        store_field(&value, end, item->needs, sizeof(item->needs));
+        store_field(&value, end, item->size, sizeof(item->size));
+        store_field(&value, end, item->asks, sizeof(item->asks));
+        store_field(&value, end, item->description,
+                    sizeof(item->description));
+        if (!store_installed_only || store_item_is(item, "installed")
+            || store_item_is(item, "update")) {
+            store_item_count++;
+        }
+    } else if (text_equals(key, key_length, "phase")) {
+        size_t count = (size_t)(end - value);
+        if (count >= sizeof(store_phase)) {
+            count = sizeof(store_phase) - 1;
+        }
+        for (size_t i = 0; i < count; i++) {
+            store_phase[i] = value[i];
+        }
+        store_phase[count] = '\0';
+    } else if (text_equals(key, key_length, "done")) {
+        store_say(value, (size_t)(end - value), false);
+    } else if (text_equals(key, key_length, "updates")) {
+        store_update_count = 0;
+        for (const char *c = value; c < end && *c >= '0' && *c <= '9'; c++) {
+            store_update_count = store_update_count * 10
+                               + (size_t)(*c - '0');
+        }
+        store_loaded = true;
+    }
+}
+
+static void store_feed(char character) {
+    if (character == '\n') {
+        store_line_done();
+    } else if (character != '\r'
+               && store_line_length + 1 < sizeof(store_line)) {
+        store_line[store_line_length++] = character;
+    }
+}
+
+/* Runs /bin/pkg --gui COMMAND [ID]. */
+static void store_run(const char *command, const char *id) {
+    if (store_running) {
+        return;
+    }
+    char arguments[STORE_TEXT];
+    size_t used = append_text(arguments, sizeof(arguments), 0, "--gui ");
+    used = append_text(arguments, sizeof(arguments), used, command);
+    if (id != NULL) {
+        used = append_text(arguments, sizeof(arguments), used, " ");
+        used = append_text(arguments, sizeof(arguments), used, id);
+    }
+    store_listing = text_equals(command, text_length(command), "available");
+    if (store_listing) {
+        store_item_count = 0;
+    } else {
+        store_message[0] = '\0';
+    }
+    store_phase[0] = '\0';
+    store_line_length = 0;
+    static const char program[] = "/bin/pkg";
+    enum run_result result = app_launch(APP_FROM_STORE, program,
+                                        sizeof(program) - 1, arguments,
+                                        used, NULL, 0);
+    if (result != RUN_STARTED) {
+        text_copy(store_message, sizeof(store_message),
+                  run_result_text(result));
+        store_message_error = true;
+        return;
+    }
+    store_running = true;
+}
+
+static void store_open(void) {
+    window_open(WINDOW_STORE);
+    if (!store_running) {
+        store_message[0] = '\0';
+        store_run("available", NULL);
+    }
+}
+
+/* pkg ended (from app_job_report). */
+static void store_finished(bool started, uint64_t exit_status) {
+    if (store_line_length != 0) {
+        store_line_done();
+    }
+    store_running = false;
+    store_phase[0] = '\0';
+    if (!started) {
+        text_copy(store_message, sizeof(store_message),
+                  "/BIN/PKG COULD NOT START");
+        store_message_error = true;
+    } else if (exit_status != 0 && store_message[0] == '\0') {
+        text_copy(store_message, sizeof(store_message),
+                  exit_status == 128 + 9 ? "PKG WAS ENDED" : "PKG FAILED");
+        store_message_error = true;
+    }
+    if (store_selected >= store_item_count) {
+        store_selected = store_item_count == 0 ? 0 : store_item_count - 1;
+    }
+    if (store_refresh_after) {
+        store_refresh_after = false;
+        store_run("available", NULL);
+    }
+}
+
+static const char *store_action_label(const struct store_item *item) {
+    if (store_item_is(item, "update")) {
+        return "UPDATE";
+    }
+    if (store_item_is(item, "needsopos")) {
+        return "UPDATE OPOS";
+    }
+    if (store_item_is(item, "installed")) {
+        return "INSTALLED";
+    }
+    return "INSTALL";
+}
+
+static bool store_button_enabled(size_t button) {
+    const struct store_item *item = store_current();
+    switch (button) {
+    case STORE_BUTTON_REFRESH:
+        return !store_running;
+    case STORE_BUTTON_ACTION:
+        return !store_running && item != NULL
+            && !store_item_is(item, "installed");
+    case STORE_BUTTON_REMOVE:
+        return !store_running && item != NULL
+            && (store_item_is(item, "installed")
+                || store_item_is(item, "update"));
+    default:
+        return !store_running && store_update_count != 0;
+    }
+}
+
+static const char *store_button_label(size_t button) {
+    switch (button) {
+    case STORE_BUTTON_REFRESH:
+        return "REFRESH";
+    case STORE_BUTTON_ACTION:
+        return store_action_label(store_current());
+    case STORE_BUTTON_REMOVE:
+        return "REMOVE";
+    default:
+        return "UPDATE ALL";
+    }
+}
+
+static struct rect store_button_rect(struct rect area, size_t index) {
+    int64_t width = (area.width - 32 - 3 * 8) / STORE_BUTTON_COUNT;
+    return (struct rect){area.x + 16 + (int64_t)index * (width + 8),
+                         area.y + area.height - 48, width, 34};
+}
+
+/* The list, then the selected program's details above the buttons. */
+static int64_t store_details_top(struct rect area) {
+    return store_button_rect(area, 0).y - 5 * (CHAR_HEIGHT + 6) - 24;
+}
+
+/* "MAY ASK FOR: NETWORK, CLIPBOARD" from the index's asks line. */
+static void store_asks_text(const char *asks, char *out, size_t capacity) {
+    static const char *const names[][2] = {
+        {"net", "NETWORK"},
+        {"clipboard.read", "READING THE CLIPBOARD"},
+        {"files.shared", "SHARED FILES"},
+    };
+    size_t used = append_text(out, capacity, 0, "MAY ASK FOR: ");
+    bool any = false;
+    const char *word = asks;
+    while (*word != '\0') {
+        const char *stop = word;
+        while (*stop != '\0' && *stop != ' ') {
+            stop++;
+        }
+        size_t length = (size_t)(stop - word);
+        const char *label = NULL;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            if (text_equals(word, length, names[i][0])) {
+                label = names[i][1];
+            }
+        }
+        if (label == NULL && !text_equals(word, length, "none")) {
+            label = "SOMETHING THIS OPOS DOES NOT KNOW";
+        }
+        if (label != NULL) {
+            used = append_text(out, capacity, used, any ? ", " : "");
+            used = append_text(out, capacity, used, label);
+            any = true;
+        }
+        word = *stop == ' ' ? stop + 1 : stop;
+    }
+    if (!any) {
+        append_text(out, capacity, used, "NOTHING BEYOND ITS OWN FILES");
+    }
+}
+
+/* ALL and INSTALLED, right of the column headings. */
+static struct rect store_tab_rect(struct rect area, bool installed) {
+    int64_t width = 11 * CHAR_WIDTH;
+    int64_t right = area.x + area.width - 16;
+    return (struct rect){installed ? right - width : right - 2 * width - 8,
+                         area.y + 40, width, CHAR_HEIGHT + 10};
+}
+
+static void store_show_installed(bool installed) {
+    if (store_running || installed == store_installed_only) {
+        return;
+    }
+    store_installed_only = installed;
+    store_selected = 0;
+    store_message[0] = '\0';
+    store_run("available", NULL);
+}
+
+static struct rect store_row_rect(struct rect area, size_t index) {
+    return (struct rect){area.x + 8,
+                         area.y + 72 + (int64_t)index * STORE_ROW_HEIGHT,
+                         area.width - 16, STORE_ROW_HEIGHT};
+}
+
+static size_t store_rows_fit(struct rect area) {
+    int64_t room = store_details_top(area) - 8 - (area.y + 72);
+    return room > 0 ? (size_t)(room / STORE_ROW_HEIGHT) : 0;
+}
+
+static void draw_store(struct rect area, bool focused) {
+    fill(area, 24, 30, 46);
+    int64_t x = area.x + 16;
+    int64_t width = area.width - 32;
+    /* An error is shown in full in the details box instead. */
+    bool error = !store_running && store_message[0] != '\0'
+        && store_message_error;
+    const char *heading = store_running
+        ? (store_phase[0] != '\0' ? store_phase : "WORKING...")
+        : error ? "THAT DID NOT WORK:"
+        : store_message[0] != '\0' ? store_message
+        : "PROGRAMS FROM THE OPOS STORE. INSTALLING IS FOR YOUR ACCOUNT.";
+    draw_text_clipped(x, area.y + 14, width, heading,
+                      error ? 255 : 151, error ? 120 : 190,
+                      error ? 120 : 255);
+    static const char *const headings[] = {"PROGRAM", "VERSION", "STATE"};
+    static const int64_t columns[] = {0, 28, 40};
+    for (size_t i = 0; i < 3; i++) {
+        draw_text_clipped(x + columns[i] * CHAR_WIDTH, area.y + 46,
+                          width - columns[i] * CHAR_WIDTH, headings[i],
+                          150, 160, 185);
+    }
+    for (int tab = 0; tab < 2; tab++) {
+        struct rect box = store_tab_rect(area, tab == 1);
+        bool chosen = store_installed_only == (tab == 1);
+        fill(box, chosen ? 52 : 32, chosen ? 82 : 40, chosen ? 140 : 62);
+        draw_text_clipped(box.x + 8, box.y + 5, box.width - 16,
+                          tab == 1 ? "INSTALLED" : "ALL",
+                          chosen ? 245 : 170, chosen ? 248 : 180,
+                          chosen ? 255 : 205);
+    }
+    int64_t details = store_details_top(area);
+    /* Scroll so the selected row stays visible. */
+    size_t fit = store_rows_fit(area);
+    if (store_selected < store_first) {
+        store_first = store_selected;
+    } else if (fit != 0 && store_selected >= store_first + fit) {
+        store_first = store_selected + 1 - fit;
+    }
+    if (store_first >= store_item_count) {
+        store_first = 0;
+    }
+    for (size_t i = store_first; i < store_item_count; i++) {
+        struct rect row = store_row_rect(area, i - store_first);
+        if (row.y + row.height > details - 8) {
+            break;
+        }
+        const struct store_item *item = &store_items[i];
+        if (i == store_selected) {
+            fill(row, focused ? 52 : 40, focused ? 82 : 52,
+                 focused ? 140 : 80);
+        }
+        draw_text_clipped(x, row.y + 5, (columns[1] - 1) * CHAR_WIDTH,
+                          item->name, 230, 238, 255);
+        draw_text_clipped(x + columns[1] * CHAR_WIDTH, row.y + 5,
+                          (columns[2] - columns[1] - 1) * CHAR_WIDTH,
+                          item->version, 200, 205, 220);
+        char state[48];
+        uint8_t r = 150, g = 160, b = 185;
+        if (store_item_is(item, "update")) {
+            size_t used = append_text(state, sizeof(state), 0,
+                                      "UPDATE FROM ");
+            append_text(state, sizeof(state), used, item->installed);
+            r = 240, g = 210, b = 120;
+        } else if (store_item_is(item, "installed")) {
+            text_copy(state, sizeof(state), "INSTALLED");
+            r = 120, g = 220, b = 140;
+        } else if (store_item_is(item, "needsopos")) {
+            size_t used = append_text(state, sizeof(state), 0,
+                                      "NEEDS OPOS ");
+            used = append_text(state, sizeof(state), used, item->needs);
+            append_text(state, sizeof(state), used, " OR NEWER");
+            r = 255, g = 150, b = 120;
+        } else {
+            text_copy(state, sizeof(state), "");
+        }
+        draw_text_clipped(x + columns[2] * CHAR_WIDTH, row.y + 5,
+                          width - columns[2] * CHAR_WIDTH, state, r, g, b);
+    }
+    if (store_item_count == 0 && !store_running) {
+        draw_text_clipped(x, area.y + 77, width,
+                          store_message_error
+                              ? "THE STORE COULD NOT BE READ. REFRESH TO TRY "
+                                "AGAIN."
+                          : store_installed_only
+                              ? "YOU HAVE NOTHING FROM THE OPOS STORE YET."
+                              : "NOTHING THIS OPOS CAN RUN IS IN THE STORE "
+                                "YET.",
+                          200, 214, 255);
+    }
+    const struct store_item *item = store_current();
+    if (error) {
+        struct rect box = {x, details, width,
+                           store_button_rect(area, 0).y - 10 - details};
+        fill(box, 62, 32, 40);
+        (void)draw_wrapped(box.x + 10, box.y + 6, box.width - 20,
+                           box.y + box.height, store_message,
+                           255, 170, 170);
+    } else if (item != NULL) {
+        struct rect box = {x, details, width,
+                           store_button_rect(area, 0).y - 10 - details};
+        fill(box, 32, 40, 62);
+        char title[128];
+        size_t used = append_text(title, sizeof(title), 0, item->name);
+        used = append_text(title, sizeof(title), used, " (");
+        used = append_text(title, sizeof(title), used, item->id);
+        used = append_text(title, sizeof(title), used, ")  ");
+        used = append_text(title, sizeof(title), used, item->size);
+        append_text(title, sizeof(title), used, " KB");
+        draw_text_clipped(box.x + 10, box.y + 6, box.width - 20, title,
+                          230, 238, 255);
+        char publisher[96] = "PUBLISHER: ";
+        append_text(publisher, sizeof(publisher), text_length(publisher),
+                    item->publisher);
+        draw_text_clipped(box.x + 10, box.y + 6 + CHAR_HEIGHT + 6,
+                          box.width - 20, publisher, 170, 180, 205);
+        int64_t line = box.y + 6 + 2 * (CHAR_HEIGHT + 6);
+        if (item->asks[0] != '\0') {
+            char asks[128];
+            store_asks_text(item->asks, asks, sizeof(asks));
+            draw_text_clipped(box.x + 10, line, box.width - 20, asks,
+                              240, 210, 120);
+            line += CHAR_HEIGHT + 6;
+        }
+        (void)draw_wrapped(box.x + 10, line,
+                           box.width - 20, box.y + box.height,
+                           item->description, 210, 218, 235);
+    }
+    for (size_t i = 0; i < STORE_BUTTON_COUNT; i++) {
+        struct rect button = store_button_rect(area, i);
+        if (!store_button_enabled(i)) {
+            draw_text_button(button, store_button_label(i), false);
+        } else {
+            draw_button(button, store_button_label(i),
+                        focused && i == store_button);
+        }
+    }
+}
+
+static void store_press(size_t button) {
+    if (!store_button_enabled(button)) {
+        return;
+    }
+    const struct store_item *item = store_current();
+    switch (button) {
+    case STORE_BUTTON_REFRESH:
+        store_message[0] = '\0';
+        store_run("available", NULL);
+        break;
+    case STORE_BUTTON_ACTION:
+        if (store_item_is(item, "needsopos")) {
+            settings_open_category(CATEGORY_UPDATES);
+        } else {
+            char id[64];
+            text_copy(id, sizeof(id), item->id);
+            store_refresh_after = true;
+            store_run(store_item_is(item, "update") ? "update" : "install",
+                      id);
+        }
+        break;
+    case STORE_BUTTON_REMOVE: {
+        char id[64];
+        text_copy(id, sizeof(id), item->id);
+        store_refresh_after = true;
+        store_run("remove", id);
+        break;
+    }
+    default:
+        store_refresh_after = true;
+        store_run("update", NULL);
+        break;
+    }
+}
+
+static void store_key(char character) {
+    if (character == KEY_UP && store_selected > 0) {
+        store_selected--;
+        store_message[0] = '\0';
+    } else if (character == KEY_DOWN && store_selected + 1 < store_item_count) {
+        store_selected++;
+        store_message[0] = '\0';
+    } else if (character == KEY_LEFT) {
+        store_button = (store_button + STORE_BUTTON_COUNT - 1)
+                     % STORE_BUTTON_COUNT;
+    } else if (character == KEY_RIGHT) {
+        store_button = (store_button + 1) % STORE_BUTTON_COUNT;
+    } else if (character == '\n' || character == ' ') {
+        store_press(store_button);
+    } else if (character == '\t') {
+        store_show_installed(!store_installed_only);
+    }
+}
+
+static void store_click(struct rect area, int32_t x, int32_t y) {
+    for (int tab = 0; tab < 2; tab++) {
+        if (rect_contains(store_tab_rect(area, tab == 1), x, y)) {
+            store_show_installed(tab == 1);
+            return;
+        }
+    }
+    for (size_t i = 0; i < STORE_BUTTON_COUNT; i++) {
+        if (rect_contains(store_button_rect(area, i), x, y)) {
+            store_button = i;
+            store_press(i);
+            return;
+        }
+    }
+    int64_t details = store_details_top(area);
+    for (size_t i = store_first; i < store_item_count; i++) {
+        struct rect row = store_row_rect(area, i - store_first);
+        if (row.y + row.height <= details - 8 && rect_contains(row, x, y)) {
+            store_selected = i;
+            store_message[0] = '\0';
+            return;
+        }
+    }
+}
+
 /*
  * The desktop's side of programs, once per pass: opens and frees windows,
  * ends programs that ignore a close, shows output, reports ended jobs.
@@ -11775,6 +12437,10 @@ static bool apps_poll(void) {
     }
     if (updates_output_count != 0) {
         updates_output_drain();
+        redraw = true;
+    }
+    if (store_output_count != 0) {
+        store_output_drain();
         redraw = true;
     }
     if (app_output_count != 0) {

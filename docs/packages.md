@@ -393,6 +393,7 @@ the store key.
     name: Paint
     publisher: Example Ltd
     platform: opos
+    asks: net
     requires-opos: 0.1.4
     description: Draws pictures.
 
@@ -464,7 +465,68 @@ by the real key:
 - No index freshness check: an old signed index can still be served.
   It cannot downgrade anything, because installs refuse older versions,
   but it can hide updates.
-- `pkg` has no `--gui` mode yet (step 5).
+- `pkg` had no `--gui` mode yet (added in step 5).
+
+### As built in step 5
+
+**Store window.** Start > OPOS STORE opens a built-in window
+(`WINDOW_STORE`, "OPOS Store" in `kernel/desktop.c`).
+- It runs `/bin/pkg --gui available` and lists each program once: name,
+  version, and state (installed, update from x, needs OPOS x or newer).
+- The selected program's details box shows its id, size, publisher,
+  description, and what it may ask for.
+- Buttons: REFRESH; INSTALL, UPDATE or UPDATE OPOS; REMOVE; UPDATE ALL.
+  UPDATE OPOS opens Settings > UPDATES.
+- ALL and INSTALLED tabs (or Tab) switch to the "Installed" view: the
+  programs this account has from the Store.
+- After an install, update or removal, the list is read again.
+- An error from `pkg` is shown in full in the details box.
+
+**pkg --gui.** Nothing is asked: the window's buttons are the
+confirmation. Besides its normal text, `pkg` prints lines for the
+window, as `/bin/update --gui` does for Settings > UPDATES:
+- `@phase TEXT`: what is happening now.
+- `@item ID VERSION NAME PUBLISHER STATE INSTALLED NEEDS KB ASKS
+  DESCRIPTION`, separated by tabs. STATE is `new`, `installed`,
+  `update` or `needsopos`.
+- `@updates N`: how many installed programs have an update.
+- `@done TEXT`: what was done.
+- Errors are the lines starting with `pkg: `.
+
+The desktop sends the output of a `pkg` it started to the window
+(`APP_FROM_STORE`), not to the Terminal.
+
+**asks.** `mkindex.py` writes an `asks:` line for each entry: the
+capabilities named in the manifest notes of the package's executables
+(`net`, `clipboard.read`, `files.shared`), or `none`. Other platforms
+use the `capabilities:` line of PACKAGE. The line is covered by the
+index signature. The kernel ignores it; the window shows it as "MAY ASK
+FOR: NETWORK". It only informs the person: each permission is still
+asked for when the program first needs it.
+
+**Settings > UPDATES.** A PROGRAMS line under the OPOS status says how
+many Store programs have an update, from the last list the Store window
+read, and an OPOS STORE button opens the window. Nothing updates by
+itself.
+
+**QEMU tests.** On an installed disk, with a signed test repository
+holding Memo 1.0 and 1.1 and a package that needs OPOS 9.0:
+- The list shows "UPDATE FROM 1.0" for Memo and "NEEDS OPOS 9.0 OR
+  NEWER" for the other. UPDATE OPOS opens Settings > UPDATES, which
+  shows "PROGRAMS: 1 UPDATE IN THE OPOS STORE".
+- UPDATE installs Memo 1.1. Settings then says every program is up to
+  date. REMOVE removes it, and INSTALL installs it again.
+- The INSTALLED tab lists only Memo.
+- With the step 4 repository whose Memo 1.1 has other bytes, UPDATE
+  shows the kernel's refusal.
+
+**Not done.**
+- The Installed view shows only Store programs that are still in the
+  index. Sideloaded packages are listed by `pkg list`.
+- The window lists at most 64 programs. The list scrolls with the
+  selection (arrow keys); there is no scroll bar.
+- The PROGRAMS line in Settings is filled only after the Store window
+  has read the index once.
 
 ### Store window
 
@@ -498,7 +560,8 @@ by itself in the first version.
 4. Done. Store key, `tools/mkindex.py`, index checks, and `/bin/pkg`
    with available, install, update, remove and list. See "As built in
    step 4".
-5. Store window and the Settings > UPDATES line.
+5. Done. Store window, `pkg --gui`, `asks:` lines and the Settings >
+   UPDATES line. See "As built in step 5".
 6. First real packages: move `sketch` and `hello` out of the image into
    the repository as examples.
 

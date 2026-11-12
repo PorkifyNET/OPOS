@@ -31,6 +31,23 @@
 
 #define PATH_MAX 256
 
+/*
+ * --gui: for the OPOS Store window (kernel/desktop.c). Nothing is asked;
+ * the window's buttons are the confirmation. Besides the usual text it
+ * prints lines the window reads:
+ *   @phase TEXT        what is happening now
+ *   @item ID\tVERSION\tNAME\tPUBLISHER\tSTATE\tINSTALLED\tNEEDS\tKB\tASKS\tDESCRIPTION
+ *                      one per program (pkg available); STATE is new,
+ *                      installed, update or needsopos; NEEDS is the OPOS
+ *                      version a newer release needs, or empty; ASKS is
+ *                      the index's asks line (capability names or none),
+ *                      or empty in an index without one
+ *   @updates N         how many installed programs have an update
+ *   @done TEXT         what was done
+ * Errors are the lines starting with "pkg: ".
+ */
+static bool gui;
+
 static const char *error_text(long code) {
     switch (-code) {
     case OPOS_PACKAGE_ENOT_INSTALLED:
@@ -212,6 +229,9 @@ static int remove_command(const char *id, bool everyone, bool yes,
         fail(id, result, NULL);
         return 1;
     }
+    if (gui) {
+        printf("@done REMOVED %s.\n", id);
+    }
     printf("Removed %s.\n", id);
     return 0;
 }
@@ -332,6 +352,7 @@ struct entry {
     char file[96];
     unsigned long size;
     char sha256[65];
+    char asks[64];
     char description[160];
 };
 
@@ -572,6 +593,7 @@ static void parse_entries(void) {
                 FIELD("platform", platform)
                 FIELD("requires-opos", requires)
                 FIELD("description", description)
+                FIELD("asks", asks)
 #undef FIELD
                 if (key == 4 && strncmp(text, "file", 4) == 0) {
                     char copy[256];
@@ -600,7 +622,8 @@ static bool load_index(const char *given) {
     if (!pick_source(given)) {
         return false;
     }
-    printf("Reading the OPOS Store index from %s\n", source);
+    printf(gui ? "@phase READING THE STORE INDEX\n"
+               : "Reading the OPOS Store index from %s\n", source);
     uint8_t *data;
     size_t size;
     if (!source_read("index", OPOS_PACKAGE_INDEX_MAX, &data, &size)) {
@@ -742,8 +765,11 @@ static int available_command(const char *given) {
     if (!load_index(given)) {
         return 1;
     }
-    printf("  %-32s %-10s %-24s %s\n", "ID", "VERSION", "NAME", "STATE");
+    if (!gui) {
+        printf("  %-32s %-10s %-24s %s\n", "ID", "VERSION", "NAME", "STATE");
+    }
     int shown = 0;
+    int updates = 0;
     for (size_t i = 0; i < entry_count; i++) {
         const struct entry *e = &entries[i];
         bool first = true;
@@ -772,14 +798,31 @@ static int available_command(const char *given) {
                      "%sneeds OPOS %s for %s", state[0] != '\0' ? "; " : "",
                      blocked->requires, blocked->version);
         }
-        printf("  %-32s %-10s %-24s %s\n", show_entry->id,
-               show_entry->version, show_entry->name, state);
-        if (show_entry->description[0] != '\0') {
-            printf("      %s\n", show_entry->description);
+        if (gui) {
+            bool update = copy.found && best != NULL
+                && compare_versions(best->version, copy.version) > 0;
+            updates += update;
+            printf("@item %s\t%s\t%s\t%s\t%s\t%s\t%s\t%lu\t%s\t%s\n",
+                   show_entry->id, show_entry->version, show_entry->name,
+                   show_entry->publisher,
+                   update ? "update" : copy.found ? "installed"
+                   : best == NULL ? "needsopos" : "new",
+                   copy.found ? copy.version : "",
+                   blocked != NULL ? blocked->requires : "",
+                   (show_entry->size + 1023) / 1024, show_entry->asks,
+                   show_entry->description);
+        } else {
+            printf("  %-32s %-10s %-24s %s\n", show_entry->id,
+                   show_entry->version, show_entry->name, state);
+            if (show_entry->description[0] != '\0') {
+                printf("      %s\n", show_entry->description);
+            }
         }
         shown++;
     }
-    if (shown == 0) {
+    if (gui) {
+        printf("@updates %d\n", updates);
+    } else if (shown == 0) {
         printf("  (nothing this OPOS can run)\n");
     }
     return 0;
@@ -799,7 +842,13 @@ static bool download_package(const struct entry *e, char *path) {
     }
     (void)opos_mkdir(folder);
     snprintf(path, PATH_MAX, "%s/%s", folder, e->file);
-    printf("Downloading %s (%lu KB)...\n", e->file, (e->size + 1023) / 1024);
+    if (gui) {
+        printf("@phase DOWNLOADING %s (%lu KB)\n", e->name,
+               (e->size + 1023) / 1024);
+    } else {
+        printf("Downloading %s (%lu KB)...\n", e->file,
+               (e->size + 1023) / 1024);
+    }
     uint8_t *data;
     size_t size;
     if (!source_read(e->file, DOWNLOAD_MAX, &data, &size)) {
@@ -861,6 +910,9 @@ static int store_install(const struct entry *e, bool everyone,
     memset(&info, 0, sizeof(info));
     uint32_t options = (everyone ? OPOS_PACKAGE_EVERYONE : 0)
         | (ignore_version ? OPOS_PACKAGE_IGNORE_VERSION : 0);
+    if (gui) {
+        printf("@phase INSTALLING %s %s\n", e->name, e->version);
+    }
     long result = opos_package_install_store(path, options, &info, &index);
     if (downloaded) {
         (void)opos_unlink(path);
@@ -868,6 +920,9 @@ static int store_install(const struct entry *e, bool everyone,
     if (result < 0) {
         fail(e->id, result, &info);
         return 1;
+    }
+    if (gui) {
+        printf("@done INSTALLED %s %s.\n", info.name, info.version);
     }
     printf("Installed %s %s from the OPOS Store.%s\n", info.name,
            info.version,
@@ -947,6 +1002,9 @@ static int update_command(const char *only, bool yes, const char *given) {
         for_everyone[count++] = copy.everyone;
     }
     if (count == 0) {
+        if (gui) {
+            printf("@done EVERY PROGRAM IS UP TO DATE.\n");
+        }
         printf("Every program from the OPOS Store is up to date.\n");
         return 0;
     }
@@ -983,6 +1041,12 @@ static bool names_file(const char *operand) {
 }
 
 int main(int argc, char **argv) {
+    /* "pkg --gui COMMAND ...": the flag may come first. */
+    if (argc >= 3 && strcmp(argv[1], "--gui") == 0) {
+        gui = true;
+        argv[1] = argv[2];
+        argv[2] = "--gui";
+    }
     if (argc < 2) {
         return usage();
     }
@@ -1001,6 +1065,9 @@ int main(int argc, char **argv) {
             ignore_version = true;
         } else if (strcmp(argv[i], "--delete-data") == 0) {
             delete_data = true;
+        } else if (strcmp(argv[i], "--gui") == 0) {
+            gui = true;
+            yes = true;
         } else if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
             given_source = argv[++i];
         } else if (operand == NULL && argv[i][0] != '-') {
@@ -1033,6 +1100,11 @@ int main(int argc, char **argv) {
                                     given_source);
     }
     if (strcmp(command, "remove") == 0) {
+        /* The window removes whichever copy this account sees. */
+        if (gui && !everyone) {
+            struct installed copy = installed_copy(operand);
+            everyone = copy.found && copy.everyone;
+        }
         return remove_command(operand, everyone, yes, delete_data);
     }
     return usage();

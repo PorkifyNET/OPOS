@@ -89,10 +89,9 @@ are enforced separately. `uname` returns
 the Linux ABI identity with OPOS-specific release and host fields. The clock
 calls support `CLOCK_MONOTONIC` only and derive time from the 100 Hz PIT;
 `gettimeofday` likewise reports uptime rather than wall-clock epoch time.
-`nanosleep` rounds positive durations up to PIT ticks, puts the calling task on
-a scheduler wake deadline, and lets other tasks run. It does not support signal
-interruption or a remaining-time result. Realtime clock IDs and actual wall-clock
-time are not available. `arch_prctl`
+`nanosleep` rounds positive durations up to PIT ticks and sleeps a tick at a
+time, letting other tasks run; a signal ends it with `EINTR` and writes the
+time left. Realtime clock IDs and actual wall-clock time are not available. `arch_prctl`
 currently supports `ARCH_SET_FS` and `ARCH_GET_FS` only, with nonzero FS bases
 required to refer to a mapped user address.
 
@@ -115,7 +114,9 @@ current directory. Path resolution canonicalizes repeated separators, `.`, and
 Each open creates an open-file description with its own offset and access mode.
 `dup`, `dup2`, and `dup3` descriptors share that description and offset; the
 underlying VFS object remains alive until its final descriptor closes. `dup3`
-accepts `O_CLOEXEC`, while `dup2`/`dup3` can replace slots 0 through 10.
+accepts `O_CLOEXEC`, while `dup2`/`dup3` can replace any slot below 64.
+`F_DUPFD` honors its lowest number. Duplicating the console (0-2 not yet
+redirected) makes an open `/dev/tty`, so a shell can save and restore it.
 Descriptions share one of 32 refcounted open-file records and
 support up to 4 KiB per filesystem I/O
 call, and are closed automatically on process exit or fault. Standard
@@ -367,9 +368,11 @@ stack, heap, and anonymous mappings into an isolated address space; cwd, FS base
 and descriptor table are inherited, while open-file descriptions and offsets
 remain shared. The child resumes after `fork` with return value zero and the
 parent receives its PID. `wait4` blocks for an exact positive PID or any child
-with PID `-1`, returns the reaped PID, and writes the normal Linux exit-status
-encoding. Options and resource usage are currently unsupported and must be zero
-and null. Thread-style Linux `clone` shares VM, files, filesystem state, and
+with PID `-1` (0 and `-pgid` also mean any child, as every process is its own
+group), returns the reaped PID, and writes the normal Linux exit-status
+encoding. `WNOHANG` returns 0 while children run; `WUNTRACED` and `WCONTINUED`
+are accepted (processes never stop); resource usage is reported as zero. A
+child that ends sends `SIGCHLD` to its parent. Thread-style Linux `clone` shares VM, files, filesystem state, and
 signal-handler state while giving each thread its own stack, TLS base, TID,
 signal mask, FPU state, scheduler context, and saved syscall return stack.
 `set_tid_address`, `gettid`, robust-list registration, `rt_sigprocmask`, and

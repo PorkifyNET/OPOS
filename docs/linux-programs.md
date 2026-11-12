@@ -68,9 +68,9 @@ paths, so nothing new is revealed.
 In the order the next programs are likely to hit them.
 
 1. **Devices.** Done in step 3: `/dev/null`, `/dev/zero`, `/dev/full`,
-   `/dev/random` and `/dev/urandom`. Still missing: `/dev/tty` (opening
-   it fails with `ENXIO`, as with no controlling terminal), listing
-   `/dev`, `/proc`.
+   `/dev/random` and `/dev/urandom`; `/dev/tty` in step 6. Still
+   missing: listing `/dev`, and `/proc` (BusyBox `ps`, `top` and `free`
+   need it).
 2. **Identity.** Done in step 3: one non-root uid per account, and
    generated `/etc/passwd` and `/etc/group`.
 3. **Limits.** Raised in step 4 (see there). Still bounded: one
@@ -118,7 +118,7 @@ Proposal:
    stack, heap, `mremap`, `getrlimit`. See "As built in step 4".
 5. Done. Terminal: raw mode, escape sequences in the desktop Terminal,
    Ctrl+C and Ctrl+D. See "As built in step 5".
-6. A larger program as the next test (BusyBox), then dynamic linking.
+6. BusyBox done (see "As built in step 6"). Next: dynamic linking.
 7. Graphics through an SDL2 backend.
 
 ## As built in step 2
@@ -167,7 +167,7 @@ a file on disk. No folder permission is needed, as on Linux.
 | `/dev/zero` | zeros | accepted, discarded | 1:5 |
 | `/dev/full` | zeros | `ENOSPC` | 1:7 |
 | `/dev/random`, `/dev/urandom` | random bytes, as `getrandom` | accepted, discarded | 1:8, 1:9 |
-| `/dev/tty` | open fails with `ENXIO` | | 5:0 |
+| `/dev/tty` | the console, as standard input (step 6) | the console | 5:0 |
 
 `stat`, `access` and `lseek` (always 0) work on them.
 
@@ -316,6 +316,62 @@ Leaving the alternate screen restores the text that was there.
 
 The Lua and SQLite prompts work and Ctrl+D leaves them. The browser
 started from the Terminal leaves the prompt usable.
+
+## As built in step 6
+
+**BusyBox.** `store/linux/busybox/build.sh` builds BusyBox 1.36.1 static
+with musl (the default configuration, without the few parts that need
+glibc or kernel features: `tc`, NFS mounts, RPC, SELinux, PAM,
+systemd). The binary is 1.2 MB. BusyBox is GPL-2.0, so the package
+also carries the exact source release and the configuration used
+(`source/` in the program folder, 3.7 MB in all). It is not in the
+default `STORE_LINUX`; publishing it is a separate decision. To build
+it with the rest of the Store, run `make store STORE_LINUX="lua sqlite busybox"`.
+
+**What works.** Tested from the desktop Terminal:
+- `busybox sh` (ash) with its line editing and history;
+- pipes, redirections, background jobs (`&`, `$!`, `wait`, `kill`);
+- Ctrl+C interrupting a command while the shell keeps running, and
+  `trap`;
+- `vi` editing (insert, arrows, `dd`, `:wq`);
+- `less` paging and search;
+- `ls -l`, `cat`, `seq`, `sort`, `awk`, `grep`, `wc`, `uptime`.
+
+**Kernel fixes and additions it needed:**
+- **Syscall return.** `interrupts.S` read the `bool` results of the
+  syscall dispatch, signal delivery and return check as 64-bit values.
+  Only the low byte is defined, so a normal return could be taken as
+  "exit with the current `rax`". This ended a shell after a signal
+  handler ran, and its behavior changed with unrelated code changes.
+  The results are now zero-extended.
+- **Console copies.** `dup` and `fcntl(F_DUPFD)` of descriptors 0-2 give
+  an open `/dev/tty`, and `/dev/tty` itself opens. Before, ash could not
+  keep its terminal descriptor and turned job control off.
+- **`wait4`.** It accepts `WNOHANG`, `WUNTRACED`, `WCONTINUED` and a
+  resource-usage pointer. Before, ash with job control got `EINVAL` and
+  showed its prompt before commands ended.
+- **`SIGCHLD`.** A parent gets it when a child ends.
+- **`rt_sigsuspend` (130).** Waits with a temporary mask.
+- **`kill` (62).** A process may signal itself and the processes it
+  started.
+- **`nanosleep`.** A signal interrupts it (Ctrl+C on `sleep`).
+- **Process groups.** `getpgrp`, `getpgid`, `getsid`, `setpgid` and
+  `setsid` treat every process as its own group and session.
+- **`getppid` and `sysinfo`.**
+- **Terminal.** After a resize, a full-screen scroll region stays full.
+  Before, it kept the first size of 24 rows, so `less` scrolled inside
+  the top rows.
+
+**Still missing for BusyBox:**
+- `/proc` (`ps`, `top`, `free`);
+- `sendfile` (`cat` falls back to read and write);
+- symbolic links and `readlink`;
+- file times (`ls -l` shows 1970);
+- job control (Ctrl+Z, `fg`, `bg`).
+
+A process killed by a signal is reported as exiting with 128 + the
+signal number, not as signaled, so the shell prints `Done(143)` rather
+than `Terminated`.
 
 ## Tests
 

@@ -133,20 +133,22 @@ syscall_entry:
     andq $-16, %rsp
     movq 120(%r12), %rdi
     call scheduler_linux_syscall_enter
+    /* The C functions return bool: only %al is defined, the rest of
+       %rax is whatever the compiler left there. */
     movq %r12, %rdi
     call user_linux_syscall_dispatch
-    movq %rax, %rbx
-    testq %rbx, %rbx
+    movzbl %al, %ebx
+    testl %ebx, %ebx
     jnz 1f
     movq %r12, %rdi
     call user_linux_signal_deliver
-    movq %rax, %rbx
+    movzbl %al, %ebx
 1:
     /* Never sysret with registers user memory chose unchecked. */
     movq %r12, %rdi
-    movq %rbx, %rsi
+    movl %ebx, %esi
     call user_linux_return_check
-    movq %rax, %rbx
+    movzbl %al, %ebx
     movq 120(%r12), %rdi
     call scheduler_linux_syscall_leave
     movq %rbx, %rax

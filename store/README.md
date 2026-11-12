@@ -17,6 +17,11 @@ checked against its SHA-256) and built with a static musl compiler:
 (`apt install musl-tools`). Override with `LINUX_CC=...` and
 `MUSL_LICENSE=...`.
 
+`linux/busybox/build.sh` is not in the default `STORE_LINUX`. BusyBox
+is GPL-2.0, and its package carries its source release and build
+configuration. Add it with `STORE_LINUX="lua sqlite busybox"`. It needs
+the Linux headers (`apt install linux-libc-dev`) and `bzip2`.
+
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads
 `releases/latest/download/index` from there. See `docs/packages.md`.

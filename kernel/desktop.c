@@ -2075,9 +2075,11 @@ static void draw_terminal(struct rect area, bool focused) {
         screen_columns = TERMINAL_COLUMNS;
     }
     if (screen_rows != term.rows || screen_columns != term.columns) {
+        /* A full-screen scroll region stays full at the new size. */
+        bool full = term_region_full();
         term.rows = screen_rows;
         term.columns = screen_columns;
-        if (term.region_bottom >= term.rows || term_region_full()) {
+        if (full || term.region_bottom >= term.rows) {
             term.region_top = 0;
             term.region_bottom = term.rows - 1;
         }

@@ -3,6 +3,10 @@
 #
 #   make                 builds build/libopos.a and the examples
 #   make APP=myapp       builds build/myapp from myapp.c in this folder
+#   make package PKG=myapp.pkg
+#                        builds the programs, then the package described by
+#                        myapp.pkg (see tools/mkopk.py and
+#                        examples/pickfile.pkg) as build/<id>-<version>.opk
 #
 # Copy the result to an OPOS disk (for example with mtools: mcopy) and run
 # it from the Terminal with "run /disk/hello", or double-click it in Files.
@@ -20,7 +24,7 @@ CFLAGS := -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
 LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
-EXAMPLES := hello permtest sketch notepad fetch update fonttest pickfile sharedread
+EXAMPLES := hello permtest sketch notepad fetch update pkg fonttest pickfile sharedread
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)
@@ -68,6 +72,16 @@ $(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.l
 
 $(BUILD)/%: %.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
+
+PYTHON ?= python3
+
+.PHONY: package package-test
+package: all
+	@test -n "$(PKG)" || { echo "usage: make package PKG=myapp.pkg"; exit 1; }
+	$(PYTHON) tools/mkopk.py build $(PKG) -o $(BUILD)
+
+package-test:
+	$(PYTHON) tools/test_mkopk.py
 
 clean:
 	rm -rf $(BUILD)

@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "package.h"
 #include "permissions.h"
 #include "sha256.h"
 #include "vfs.h"
@@ -25,6 +26,10 @@ enum path_class {
     CLASS_HOME,
     /* <home>/AppData/Permissions.dat: kernel-written capability grants. */
     CLASS_GRANTS,
+    /* An installed package folder; owner says whose (NO_ACCOUNT: everyone). */
+    CLASS_PACKAGE,
+    /* <home>/AppData/Packages: kernel-written package records. */
+    CLASS_RECORDS,
 };
 
 struct path_info {
@@ -97,13 +102,20 @@ bool permission_is_disk_program(const char *path, size_t length) {
 static size_t next_component(const char *path, size_t length, size_t *offset,
                              const char **component);
 
-/* Length of "<volume>/Programs/<folder>" when path is an executable
+/* Length of "<volume>/Programs/<folder>" or
+   "<volume>/Users/<name>/Programs/<folder>" when path is an executable
    somewhere below such a folder, else 0. */
 static size_t program_folder_length(const char *path, size_t length) {
     size_t offset = 0;
     const char *part;
     (void)next_component(path, length, &offset, &part); /* volume */
     size_t programs = next_component(path, length, &offset, &part);
+    if (equal_ignore_case(part, programs, "Users")) {
+        if (next_component(path, length, &offset, &part) == 0) {
+            return 0;
+        }
+        programs = next_component(path, length, &offset, &part);
+    }
     if (!equal_ignore_case(part, programs, "Programs")) {
         return 0;
     }
@@ -115,6 +127,12 @@ static size_t program_folder_length(const char *path, size_t length) {
 
 void permission_confine_disk_program(struct permission_identity *identity,
                                      const char *path, size_t length) {
+    permission_confine_disk_program_named(identity, path, length, NULL);
+}
+
+void permission_confine_disk_program_named(
+    struct permission_identity *identity, const char *path, size_t length,
+    const char *storage) {
     if (identity == NULL || !permission_is_disk_program(path, length)) {
         return;
     }
@@ -161,22 +179,37 @@ void permission_confine_disk_program(struct permission_identity *identity,
     if (used == 0 || !ensure_directory(folder)) {
         return;
     }
-    struct sha256_context hash;
-    uint8_t digest[SHA256_DIGEST_SIZE];
-    sha256_init(&hash);
-    for (size_t i = 0; i < length; i++) {
-        char c = lower(path[i]);
-        sha256_update(&hash, &c, 1);
+    /* A package's storage is named by its id, so an update or a move
+       inside the package keeps it. A loose program's is named by a hash
+       of its path. */
+    size_t storage_length = storage == NULL ? 0 : text_length(storage);
+    char directory[64];
+    if (storage_length != 0) {
+        /* A package id has a dot, so it never looks like a hex folder. */
+        if (!package_id_valid(storage, storage_length)) {
+            return;
+        }
+        for (size_t i = 0; i <= storage_length; i++) {
+            directory[i] = storage[i];
+        }
+    } else {
+        struct sha256_context hash;
+        uint8_t digest[SHA256_DIGEST_SIZE];
+        sha256_init(&hash);
+        for (size_t i = 0; i < length; i++) {
+            char c = lower(path[i]);
+            sha256_update(&hash, &c, 1);
+        }
+        sha256_final(&hash, digest);
+        static const char hex[] = "0123456789abcdef";
+        for (size_t i = 0; i < 8; i++) {
+            directory[i * 2] = hex[digest[i] >> 4];
+            directory[i * 2 + 1] = hex[digest[i] & 15];
+        }
+        directory[16] = '\0';
+        storage_length = 16;
     }
-    sha256_final(&hash, digest);
-    static const char hex[] = "0123456789abcdef";
-    char directory[17];
-    for (size_t i = 0; i < 8; i++) {
-        directory[i * 2] = hex[digest[i] >> 4];
-        directory[i * 2 + 1] = hex[digest[i] & 15];
-    }
-    directory[16] = '\0';
-    used = join(folder, folder, used, directory, 16);
+    used = join(folder, folder, used, directory, storage_length);
     if (used == 0 || used >= sizeof(identity->private_path)
         || !ensure_directory(folder)) {
         return;
@@ -243,6 +276,7 @@ static const struct {
     {"notepad", BUILTIN_BASE},
     {"fetch", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"update", BUILTIN_BASE | PERMISSION_CAP_NET},
+    {"pkg", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"browser", (BUILTIN_BASE & ~PERMISSION_CAP_FILES_SHARED)
                     | PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ},
 };
@@ -317,6 +351,67 @@ static bool canonical(const char *path, size_t length) {
     return true;
 }
 
+/* ---------------------------------------------------- package folders */
+
+static struct {
+    char path[128];
+    size_t owner;
+    uint64_t device;
+    uint64_t inode;
+} package_folders[PERMISSION_PACKAGE_FOLDERS_MAX];
+static size_t package_folder_count;
+
+void permission_package_folders_clear(void) {
+    package_folder_count = 0;
+}
+
+bool permission_package_folder_add(const char *path, size_t owner) {
+    size_t length = path == NULL ? 0 : text_length(path);
+    struct vfs_metadata metadata;
+    if (length == 0 || length >= sizeof(package_folders[0].path)
+        || package_folder_count == PERMISSION_PACKAGE_FOLDERS_MAX
+        || !vfs_stat(path, length, &metadata)
+        || metadata.type != VFS_NODE_DIRECTORY) {
+        return false;
+    }
+    for (size_t i = 0; i <= length; i++) {
+        package_folders[package_folder_count].path[i] = path[i];
+    }
+    package_folders[package_folder_count].owner = owner;
+    package_folders[package_folder_count].device = metadata.device;
+    package_folders[package_folder_count].inode = metadata.inode;
+    package_folder_count++;
+    return true;
+}
+
+/* True when path[0..length) is a listed package folder of owner. The
+   listed path must still be that node, so a folder removed behind the
+   installer's back (and its inode reused) protects nothing. */
+static bool package_folder(const char *path, size_t length, size_t owner) {
+    bool any = false;
+    for (size_t i = 0; i < package_folder_count && !any; i++) {
+        any = package_folders[i].owner == owner;
+    }
+    struct vfs_metadata metadata;
+    if (!any || !vfs_stat(path, length, &metadata)
+        || metadata.type != VFS_NODE_DIRECTORY) {
+        return false;
+    }
+    for (size_t i = 0; i < package_folder_count; i++) {
+        struct vfs_metadata listed;
+        if (package_folders[i].owner == owner
+            && package_folders[i].device == metadata.device
+            && package_folders[i].inode == metadata.inode
+            && vfs_stat(package_folders[i].path,
+                        text_length(package_folders[i].path), &listed)
+            && listed.device == metadata.device
+            && listed.inode == metadata.inode) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static struct path_info classify(const char *path, size_t length) {
     struct path_info info = {CLASS_SHARED, false, PERMISSION_NO_ACCOUNT};
     size_t offset = 0;
@@ -353,6 +448,21 @@ static struct path_info classify(const char *path, size_t length) {
                 info.class = CLASS_SECRET;
                 info.anchor = true;
             }
+        }
+        return info;
+    }
+    if (same_entry(disk, sizeof(disk) - 1, top, top_length, "Programs")) {
+        /* /disk/Programs itself cannot be moved aside: package folders
+           are only protected under this name. */
+        if (second_length == 0) {
+            info.anchor = true;
+            return info;
+        }
+        const char *third;
+        size_t folder_end = offset;
+        if (package_folder(path, folder_end, PERMISSION_NO_ACCOUNT)) {
+            info.class = CLASS_PACKAGE;
+            info.anchor = next_component(path, length, &offset, &third) == 0;
         }
         return info;
     }
@@ -394,6 +504,25 @@ static struct path_info classify(const char *path, size_t length) {
     if (fourth_length == 0
         && same_entry(path, home_length, third, third_length, "AppData")) {
         info.anchor = true;
+    }
+    /* <home>/AppData/Packages and below: the account's package records. */
+    if (fourth_length != 0
+        && same_entry(path, home_length, third, third_length, "AppData")
+        && same_entry(path, third_end, fourth, fourth_length, "Packages")) {
+        info.class = CLASS_RECORDS;
+        info.anchor = true;
+    }
+    /* <home>/Programs: the account's own packages. */
+    if (third_length != 0
+        && same_entry(path, home_length, third, third_length, "Programs")) {
+        if (fourth_length == 0) {
+            info.anchor = true;
+        } else if (info.owner != PERMISSION_NO_ACCOUNT
+                   && package_folder(path, offset, info.owner)) {
+            const char *fifth;
+            info.class = CLASS_PACKAGE;
+            info.anchor = next_component(path, length, &offset, &fifth) == 0;
+        }
     }
     return info;
 }
@@ -544,6 +673,27 @@ bool permission_program_allows(const struct permission_identity *identity,
     case CLASS_SECRET:
     case CLASS_GRANTS:
         return false;
+    case CLASS_RECORDS:
+        /* The account's own unconfined tools may list its packages. */
+        return access == PERMISSION_READ && !identity->confined
+            && info.owner != PERMISSION_NO_ACCOUNT
+            && info.owner == identity->account;
+    case CLASS_PACKAGE:
+        /* Only the installer changes a package. */
+        if (access != PERMISSION_READ) {
+            return false;
+        }
+        if (info.owner == PERMISSION_NO_ACCOUNT) {
+            return !shared_read_needs_capability(identity, path, length)
+                || picked(identity, path, length);
+        }
+        if (info.owner != identity->account) {
+            return false;
+        }
+        return !identity->confined
+            || (identity->program_folder[0] != '\0'
+                && begins_component(path, length, identity->program_folder))
+            || picked(identity, path, length);
     case CLASS_USERS:
         return access == PERMISSION_READ;
     case CLASS_HOME:
@@ -554,6 +704,11 @@ bool permission_program_allows(const struct permission_identity *identity,
         if (identity->confined && access == PERMISSION_READ) {
             if (identity->private_path[0] != '\0'
                 && begins_component(path, length, identity->private_path)) {
+                return true;
+            }
+            /* A program in <home>/Programs/<folder> reads its own files. */
+            if (identity->program_folder[0] != '\0'
+                && begins_component(path, length, identity->program_folder)) {
                 return true;
             }
             return picked(identity, path, length);
@@ -568,9 +723,14 @@ uint32_t permission_program_missing(const struct permission_identity *identity,
                                     enum permission_access access) {
     if (identity == NULL || path == NULL || access != PERMISSION_READ
         || !canonical(path, length)
-        || permission_program_allows(identity, path, length, access)
-        || classify_visible(path, length).class != CLASS_SHARED
-        || !shared_read_needs_capability(identity, path, length)) {
+        || permission_program_allows(identity, path, length, access)) {
+        return 0;
+    }
+    struct path_info info = classify_visible(path, length);
+    bool shared = info.class == CLASS_SHARED
+        || (info.class == CLASS_PACKAGE
+            && info.owner == PERMISSION_NO_ACCOUNT);
+    if (!shared || !shared_read_needs_capability(identity, path, length)) {
         return 0;
     }
     return PERMISSION_CAP_FILES_SHARED;
@@ -635,12 +795,23 @@ bool permission_ui_allows(const char *path, size_t length,
     case CLASS_SECRET:
         return false;
     case CLASS_GRANTS:
+    case CLASS_RECORDS:
         /* Visible so the person can see it exists; changed only through
            the kernel. Other homes stay admin-only, as for CLASS_HOME. */
         return access == PERMISSION_READ
             && (info.owner == identity.account
                     ? info.owner != PERMISSION_NO_ACCOUNT || identity.admin
                     : identity.admin);
+    case CLASS_PACKAGE:
+        if (info.owner == PERMISSION_NO_ACCOUNT) {
+            /* Like system files: an administrator, after confirming. */
+            return access == PERMISSION_READ
+                || (identity.admin
+                    && (access == PERMISSION_WRITE || !info.anchor));
+        }
+        /* An account's own copy changes only through the installer. */
+        return access == PERMISSION_READ
+            && (info.owner == identity.account || identity.admin);
     case CLASS_USERS:
         return access == PERMISSION_READ;
     case CLASS_HOME:
@@ -666,6 +837,9 @@ bool permission_ui_requires_confirmation(const char *path, size_t length,
         || vfs_disk_root_ancestor(path, length)) {
         return false;
     }
-    return identity.admin && info.class == CLASS_SYSTEM
+    bool system = info.class == CLASS_SYSTEM
+        || (info.class == CLASS_PACKAGE
+            && info.owner == PERMISSION_NO_ACCOUNT);
+    return identity.admin && system
         && (access == PERMISSION_WRITE || !info.anchor);
 }

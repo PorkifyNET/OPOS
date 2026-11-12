@@ -40,4 +40,14 @@ struct manifest {
 bool manifest_read(const uint8_t *image, size_t size,
                    struct manifest *manifest);
 
+/*
+ * For a reader that loads one PT_NOTE segment at a time (the package
+ * installer): scans the notes in that segment. found is how many
+ * manifests earlier segments held. Returns -1 when malformed, otherwise
+ * the new total; the first manifest goes to manifest. Exactly one in all
+ * segments means the program has a manifest, as for manifest_read.
+ */
+int manifest_scan_segment(const uint8_t *notes, size_t length,
+                          struct manifest *manifest, int found);
+
 #endif

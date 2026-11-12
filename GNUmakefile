@@ -28,10 +28,11 @@ INITRAMFS := $(BUILD)/initramfs.tar
 SDK_NOTEPAD := sdk/build/notepad
 SDK_FETCH := sdk/build/fetch
 SDK_UPDATE := sdk/build/update
+SDK_PKG := sdk/build/pkg
 SDK_FONTTEST := sdk/build/fonttest
 SDK_BROWSER := sdk/build/browser
 FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt)
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -43,6 +44,10 @@ TEST_DISK := $(BUILD)/fat16-test.img
 OPOS_VERSION := $(shell cat VERSION)
 RELEASE := $(BUILD)/release
 UPDATE_KEY ?= $(HOME)/.opos-signing/update-key.pem
+# The OPOS Store (store/README.md): packages built from the SDK examples.
+STORE := $(BUILD)/store
+STORE_KEY ?= $(HOME)/.opos-signing/store-key.pem
+STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
 # BearSSL files the kernel uses to check update signatures (ECDSA P-256).
 KERNEL_BEARSSL_SOURCES := $(addprefix sdk/bearssl/src/,codec/ccopy.c \
 	ec/ec_p256_m31.c ec/ec_secp256r1.c ec/ec_secp384r1.c ec/ec_secp521r1.c \
@@ -62,7 +67,7 @@ LDFLAGS := -nostdlib -static \
 	-Wl,--build-id=none \
 	-Wl,-T,kernel/linker.ld
 
-.PHONY: all run test-disk persistence-test permissions-test release clean
+.PHONY: all run test-disk persistence-test permissions-test package-test release store clean
 
 all: $(ISO)
 
@@ -77,14 +82,21 @@ persistence-test: $(ISO) $(TEST_DISK)
 
 permissions-test:
 	mkdir -p $(BUILD)
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_app_permissions.c kernel/permissions.c kernel/sha256.c -o $(BUILD)/test_app_permissions
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_app_permissions.c kernel/permissions.c kernel/package.c kernel/sha256.c -o $(BUILD)/test_app_permissions
 	$(BUILD)/test_app_permissions
-	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/permissions.c kernel/manifest.c kernel/sha256.c -o $(BUILD)/test_permission_grants
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_permission_grants.c kernel/permission_grants.c kernel/permissions.c kernel/package.c kernel/manifest.c kernel/sha256.c -o $(BUILD)/test_permission_grants
 	$(BUILD)/test_permission_grants
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel -Isdk/include tools/test_manifest.c kernel/manifest.c -o $(BUILD)/test_manifest
 	$(BUILD)/test_manifest
 	$(CC) -std=gnu11 -O2 -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -Ikernel tools/test_vfs_root_guard.c -o $(BUILD)/test_vfs_root_guard
 	$(BUILD)/test_vfs_root_guard
+
+package-test:
+	mkdir -p $(BUILD)
+	python3 sdk/tools/test_mkopk.py
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Ikernel tools/test_package.c kernel/package.c -o $(BUILD)/test_package
+	$(BUILD)/test_package
+	python3 tools/test_package_parity.py $(BUILD)/test_package
 
 $(BUILD)/mkfat16_test: tools/mkfat16_test.c
 	mkdir -p $(BUILD)
@@ -200,6 +212,9 @@ $(SDK_BROWSER): $(SDK_SOURCES)
 $(SDK_UPDATE): $(SDK_SOURCES)
 	$(MAKE) -C sdk build/update
 
+$(SDK_PKG): $(SDK_SOURCES)
+	$(MAKE) -C sdk build/pkg
+
 # The SDK is self-contained, so it carries copies of the kernel's image
 # decoder; these rules keep them identical.
 sdk/include/opos_image.h: kernel/image.h
@@ -208,7 +223,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
+$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(SDK_PKG) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -225,6 +240,7 @@ $(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE)
 	cp $(SDK_NOTEPAD) $(BUILD)/initramfs_root/bin/notepad
 	cp $(SDK_FETCH) $(BUILD)/initramfs_root/bin/fetch
 	cp $(SDK_UPDATE) $(BUILD)/initramfs_root/bin/update
+	cp $(SDK_PKG) $(BUILD)/initramfs_root/bin/pkg
 	cp $(SDK_BROWSER) $(BUILD)/initramfs_root/bin/browser
 	cp $(SDK_FONTTEST) $(BUILD)/initramfs_root/tests/fonttest
 	mkdir -p $(BUILD)/initramfs_root/share/fonts
@@ -235,8 +251,8 @@ $(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE)
 	cp $(CA_BUNDLE) $(BUILD)/initramfs_root/etc/ssl/certs/
 	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin etc lib share tests
 
-$(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/storage.c kernel/storage.h kernel/optical.c kernel/optical.h kernel/iso9660.c kernel/iso9660.h kernel/xhci.c kernel/xhci.h kernel/usb_storage.c kernel/usb_storage.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/system_root.c kernel/system_root.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/permission_grants.c kernel/permission_grants.h kernel/manifest.c kernel/manifest.h kernel/image.c kernel/image.h kernel/appearance.c kernel/appearance.h kernel/boot_display.c kernel/boot_display.h kernel/sdhci.c kernel/sdhci.h kernel/acpi_dump.c kernel/acpi_dump.h kernel/i2c_hid.c kernel/i2c_hid.h kernel/touchpad_gesture.c kernel/touchpad_gesture.h kernel/e1000.c kernel/e1000.h kernel/vmxnet3.c kernel/vmxnet3.h kernel/pcnet.c kernel/pcnet.h kernel/nic.c kernel/nic.h kernel/net.c kernel/net.h kernel/update.c kernel/update.h kernel/update_key.h VERSION $(KERNEL_BEARSSL_OBJECTS) kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
-	$(CC) $(CFLAGS) -DOPOS_VERSION='"$(OPOS_VERSION)"' -Ikernel -Isdk/bearssl/inc -I$(dir $(LIMINE_HEADER)) $(LDFLAGS) -o $@ kernel/main.c kernel/interrupts.c kernel/interrupts.S kernel/pci.c kernel/ahci.c kernel/ata.c kernel/nvme.c kernel/pvscsi.c kernel/mpt.c kernel/buslogic.c kernel/scsi.c kernel/partition.c kernel/block.c kernel/fat16.c kernel/storage.c kernel/optical.c kernel/iso9660.c kernel/xhci.c kernel/usb_storage.c kernel/vfs.c kernel/keyboard.c kernel/mouse.c kernel/desktop.c kernel/cmos.c kernel/memory.c kernel/paging.c kernel/power.c kernel/scheduler.c kernel/shell.c kernel/timer.c kernel/user.c kernel/elf.c kernel/initramfs.c kernel/font.c kernel/svga.c kernel/vmware.c kernel/installer.c kernel/system_root.c kernel/accounts.c kernel/sha256.c kernel/permissions.c kernel/permission_grants.c kernel/manifest.c kernel/image.c kernel/appearance.c kernel/boot_display.c kernel/sdhci.c kernel/acpi_dump.c kernel/i2c_hid.c kernel/touchpad_gesture.c kernel/e1000.c kernel/vmxnet3.c kernel/pcnet.c kernel/nic.c kernel/net.c kernel/update.c kernel/user.S kernel/vbrstub.S $(KERNEL_BEARSSL_OBJECTS)
+$(KERNEL): kernel/main.c kernel/interrupts.c kernel/interrupts.h kernel/interrupts.S kernel/io.h kernel/pci.c kernel/pci.h kernel/ahci.c kernel/ahci.h kernel/ata.c kernel/ata.h kernel/nvme.c kernel/nvme.h kernel/pvscsi.c kernel/pvscsi.h kernel/mpt.c kernel/mpt.h kernel/buslogic.c kernel/buslogic.h kernel/scsi.c kernel/scsi.h kernel/partition.c kernel/partition.h kernel/block.c kernel/block.h kernel/fat16.c kernel/fat16.h kernel/storage.c kernel/storage.h kernel/optical.c kernel/optical.h kernel/iso9660.c kernel/iso9660.h kernel/xhci.c kernel/xhci.h kernel/usb_storage.c kernel/usb_storage.h kernel/vfs.c kernel/vfs.h kernel/keyboard.c kernel/keyboard.h kernel/mouse.c kernel/mouse.h kernel/desktop.c kernel/desktop.h kernel/cmos.c kernel/cmos.h kernel/memory.c kernel/memory.h kernel/paging.c kernel/paging.h kernel/power.c kernel/power.h kernel/scheduler.c kernel/scheduler.h kernel/shell.c kernel/shell.h kernel/timer.c kernel/timer.h kernel/user.c kernel/user.h kernel/user.S kernel/elf.c kernel/elf.h kernel/initramfs.c kernel/initramfs.h kernel/console.h kernel/font.c kernel/font.h kernel/svga.c kernel/svga.h kernel/vmware.c kernel/vmware.h kernel/installer.c kernel/installer.h kernel/system_root.c kernel/system_root.h kernel/accounts.c kernel/accounts.h kernel/sha256.c kernel/sha256.h kernel/permissions.c kernel/permissions.h kernel/permission_grants.c kernel/permission_grants.h kernel/manifest.c kernel/manifest.h kernel/package.c kernel/package.h kernel/package_install.c kernel/image.c kernel/image.h kernel/appearance.c kernel/appearance.h kernel/boot_display.c kernel/boot_display.h kernel/sdhci.c kernel/sdhci.h kernel/acpi_dump.c kernel/acpi_dump.h kernel/i2c_hid.c kernel/i2c_hid.h kernel/touchpad_gesture.c kernel/touchpad_gesture.h kernel/e1000.c kernel/e1000.h kernel/vmxnet3.c kernel/vmxnet3.h kernel/pcnet.c kernel/pcnet.h kernel/nic.c kernel/nic.h kernel/net.c kernel/net.h kernel/update.c kernel/update.h kernel/update_key.h kernel/signature.c kernel/signature.h kernel/store_key.h VERSION $(KERNEL_BEARSSL_OBJECTS) kernel/vbrstub.S kernel/linker.ld $(LIMINE_HEADER)
+	$(CC) $(CFLAGS) -DOPOS_VERSION='"$(OPOS_VERSION)"' -Ikernel -Isdk/bearssl/inc -I$(dir $(LIMINE_HEADER)) $(LDFLAGS) -o $@ kernel/main.c kernel/interrupts.c kernel/interrupts.S kernel/pci.c kernel/ahci.c kernel/ata.c kernel/nvme.c kernel/pvscsi.c kernel/mpt.c kernel/buslogic.c kernel/scsi.c kernel/partition.c kernel/block.c kernel/fat16.c kernel/storage.c kernel/optical.c kernel/iso9660.c kernel/xhci.c kernel/usb_storage.c kernel/vfs.c kernel/keyboard.c kernel/mouse.c kernel/desktop.c kernel/cmos.c kernel/memory.c kernel/paging.c kernel/power.c kernel/scheduler.c kernel/shell.c kernel/timer.c kernel/user.c kernel/elf.c kernel/initramfs.c kernel/font.c kernel/svga.c kernel/vmware.c kernel/installer.c kernel/system_root.c kernel/accounts.c kernel/sha256.c kernel/permissions.c kernel/permission_grants.c kernel/manifest.c kernel/package.c kernel/package_install.c kernel/image.c kernel/appearance.c kernel/boot_display.c kernel/sdhci.c kernel/acpi_dump.c kernel/i2c_hid.c kernel/touchpad_gesture.c kernel/e1000.c kernel/vmxnet3.c kernel/pcnet.c kernel/nic.c kernel/net.c kernel/update.c kernel/signature.c kernel/user.S kernel/vbrstub.S $(KERNEL_BEARSSL_OBJECTS)
 
 $(BUILD)/kbearssl/%.o: sdk/bearssl/src/%.c
 	@mkdir -p $(dir $@)
@@ -303,6 +319,19 @@ release: $(ISO)
 		$(RELEASE)/opos-release-notes.txt $(BUILD)/iso_extra/
 	$(call make_iso,$(RELEASE)/opos-$(OPOS_VERSION).iso,$(BUILD)/iso_extra)
 	rm -rf $(BUILD)/iso_extra
+
+# Store packages and their signed index in build/store/. Upload them as a
+# release of PorkifyNET/opos-packages (store/README.md).
+store:
+	$(MAKE) -C sdk all
+	rm -rf $(STORE) $(BUILD)/store_opk
+	mkdir -p $(BUILD)/store_opk
+	for package in $(STORE_PACKAGES); do \
+		python3 sdk/tools/mkopk.py build $$package -o $(BUILD)/store_opk || exit 1; \
+	done
+	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
+		--descriptions store/descriptions.txt $(BUILD)/store_opk
+	rm -rf $(BUILD)/store_opk
 
 clean:
 	rm -rf $(BUILD)

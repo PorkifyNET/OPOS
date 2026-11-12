@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.sketch
+name: Sketch
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.1.4
+file: files/sketch ../build/sketch exec
+start: files/sketch Sketch

@@ -68,7 +68,9 @@ bool vfs_stat(const char *path, size_t length, struct vfs_metadata *metadata) {
     for (size_t i = 0; i < directory_count; i++) {
         if (strlen(directories[i]) == length
             && strncmp(path, directories[i], length) == 0) {
-            *metadata = (struct vfs_metadata){.type = VFS_NODE_DIRECTORY};
+            *metadata = (struct vfs_metadata){
+                .type = VFS_NODE_DIRECTORY, .device = 1, .inode = 100 + i
+            };
             return true;
         }
     }
@@ -102,6 +104,27 @@ int main(void) {
     assert(allows(&app, file, PERMISSION_WRITE));
     assert(allows(&app, file, PERMISSION_REMOVE));
     assert(!allows(&app, app.private_path, PERMISSION_REMOVE));
+
+    /* An installed package's storage is named by its id. A name that is
+       not a package id (a path, ".." or a hex folder) gives no storage. */
+    struct permission_identity named = built_in;
+    permission_confine_disk_program_named(
+        &named, "/disk/Programs/org.example.paint/paint", 38,
+        "org.example.paint");
+    assert(strcmp(named.private_path,
+                  "/disk/Users/Alice/AppData/Programs/org.example.paint")
+           == 0);
+    assert(strcmp(named.program_folder,
+                  "/disk/Programs/org.example.paint") == 0);
+    static const char *const bad_names[] = {"..", "../x", "a/b.c",
+                                            "0123456789abcdef", "Org.x"};
+    for (size_t i = 0; i < sizeof(bad_names) / sizeof(bad_names[0]); i++) {
+        struct permission_identity bad = built_in;
+        permission_confine_disk_program_named(
+            &bad, "/disk/Programs/org.example.paint/paint", 38, bad_names[i]);
+        assert(bad.confined && bad.private_path[0] == '\0');
+    }
+
     assert(!allows(&app, "/disk/shared.txt", PERMISSION_WRITE));
     assert(!allows(&app, "/disk2/shared.txt", PERMISSION_WRITE));
     assert(!allows(&app, "/disk/Users/Alice/note.txt", PERMISSION_WRITE));
@@ -351,6 +374,92 @@ int main(void) {
     struct permission_identity parent_suite = suite;
     permission_confine_disk_program(&parent_suite, "/bin/hello", 10);
     assert(strcmp(parent_suite.program_folder, "/disk/Programs/Suite") == 0);
+
+    /* Installed packages (docs/packages.md). */
+    static const char everyone[] = "/disk/Programs/org.example.paint";
+    static const char mine[] = "/disk/Users/Alice/Programs/org.example.mine";
+    assert(vfs_create_directory(everyone, strlen(everyone)));
+    assert(vfs_create_directory(mine, strlen(mine)));
+    assert(vfs_create_directory("/disk/Programs/loose", 20));
+    assert(allows(&built_in, "/disk/Programs/org.example.paint/paint",
+                  PERMISSION_WRITE));
+    permission_package_folders_clear();
+    assert(permission_package_folder_add(everyone, PERMISSION_NO_ACCOUNT));
+    assert(permission_package_folder_add(mine, 0));
+    assert(!permission_package_folder_add("/disk/Programs/missing",
+                                          PERMISSION_NO_ACCOUNT));
+    /* Built-ins read packages but never change them. */
+    assert(allows(&built_in, "/disk/Programs/org.example.paint/paint",
+                  PERMISSION_READ));
+    assert(!allows(&built_in, "/disk/Programs/org.example.paint/paint",
+                   PERMISSION_WRITE));
+    assert(!allows(&built_in, everyone, PERMISSION_REMOVE));
+    assert(!allows(&built_in, "/disk/Programs/org.example.paint/a/b",
+                   PERMISSION_REMOVE));
+    assert(allows(&built_in, "/disk/Programs/loose/x", PERMISSION_WRITE));
+    assert(!allows(&built_in, "/disk/Programs", PERMISSION_REMOVE));
+    assert(allows(&built_in, "/disk/Users/Alice/Programs/org.example.mine/x",
+                  PERMISSION_READ));
+    assert(!allows(&built_in, "/disk/Users/Alice/Programs/org.example.mine/x",
+                   PERMISSION_WRITE));
+    assert(!allows(&built_in, mine, PERMISSION_REMOVE));
+    assert(!allows(&built_in, "/disk/Users/Alice/Programs",
+                   PERMISSION_REMOVE));
+    /* Windows: everyone's copy like system files, an own copy read-only. */
+    assert(permission_ui_allows("/disk/Programs/org.example.paint/paint",
+                                strlen(everyone) + 6, PERMISSION_WRITE));
+    assert(permission_ui_requires_confirmation(
+        "/disk/Programs/org.example.paint/paint", strlen(everyone) + 6,
+        PERMISSION_WRITE));
+    assert(!permission_ui_allows(everyone, strlen(everyone),
+                                 PERMISSION_REMOVE));
+    assert(!permission_ui_allows(mine, strlen(mine), PERMISSION_WRITE));
+    assert(permission_ui_allows(mine, strlen(mine), PERMISSION_READ));
+    /* Bob cannot read Alice's own copy. */
+    struct permission_identity bob = built_in;
+    bob.account = 1;
+    bob.admin = false;
+    assert(!allows(&bob, "/disk/Users/Alice/Programs/org.example.mine/x",
+                   PERMISSION_READ));
+    assert(allows(&bob, "/disk/Programs/org.example.paint/paint",
+                  PERMISSION_READ));
+    /* A packaged program reads its own folder, nothing else in the home. */
+    struct permission_identity packaged = built_in;
+    permission_confine_disk_program(
+        &packaged, "/disk/Users/Alice/Programs/org.example.mine/bin/app",
+        strlen("/disk/Users/Alice/Programs/org.example.mine/bin/app"));
+    assert(strcmp(packaged.program_folder, mine) == 0);
+    assert(allows(&packaged, "/disk/Users/Alice/Programs/org.example.mine/d",
+                  PERMISSION_READ));
+    assert(!allows(&packaged, "/disk/Users/Alice/Programs/org.example.mine/d",
+                   PERMISSION_WRITE));
+    assert(!allows(&packaged, "/disk/Users/Alice/other.txt",
+                   PERMISSION_READ));
+    struct permission_identity everyone_app = built_in;
+    permission_confine_disk_program(
+        &everyone_app, "/disk/Programs/org.example.paint/paint",
+        strlen("/disk/Programs/org.example.paint/paint"));
+    assert(allows(&everyone_app, "/disk/Programs/org.example.paint/brush",
+                  PERMISSION_READ));
+    assert(!allows(&everyone_app, "/disk/Programs/loose/x", PERMISSION_READ));
+    assert(permission_program_missing(&everyone_app, "/disk/Programs/loose/x",
+                                      22, PERMISSION_READ)
+           == PERMISSION_CAP_FILES_SHARED);
+    /* Package records: the account's own tools read, nobody writes. */
+    assert(vfs_create_directory("/disk/Users/Alice/AppData/Packages", 34));
+    assert(allows(&built_in, "/disk/Users/Alice/AppData/Packages/x",
+                  PERMISSION_READ));
+    assert(!allows(&built_in, "/disk/Users/Alice/AppData/Packages/x",
+                   PERMISSION_WRITE));
+    assert(!allows(&built_in, "/disk/Users/Alice/AppData/Packages",
+                   PERMISSION_REMOVE));
+    assert(!allows(&packaged, "/disk/Users/Alice/AppData/Packages/x",
+                   PERMISSION_READ));
+    assert(!permission_ui_allows("/disk/Users/Alice/AppData/Packages/x", 36,
+                                 PERMISSION_WRITE));
+    permission_package_folders_clear();
+    assert(allows(&built_in, "/disk/Programs/org.example.paint/paint",
+                  PERMISSION_WRITE));
 
     assert(permission_is_disk_program("/disk/x", 7));
     assert(permission_is_disk_program("/disk3/x", 8));

@@ -106,6 +106,13 @@ bool permission_grants_load(size_t account, struct permission_grants *grants);
 bool permission_grants_save(size_t account,
                             const struct permission_grants *grants);
 
+/*
+ * Key of a program installed from the OPOS Store: SHA-256 of
+ * "store:<id>". It stays the same across updates, unlike the executable's
+ * hash, and cannot be confused with one.
+ */
+void permission_store_key(const char *id, uint8_t out[SHA256_DIGEST_SIZE]);
+
 /* SHA-256 of the file at path: the key for permission_grants_find. */
 bool permission_program_hash(const char *path, size_t length,
                              uint8_t out[SHA256_DIGEST_SIZE]);

@@ -83,6 +83,9 @@ const char *update_current_version(void);
  */
 bool update_call_enter(void);
 void update_call_leave(void);
+/* True while a program's update call runs. Packages (package.h) and
+   updates refuse to run at the same time: both batch disk flushes. */
+bool update_call_busy(void);
 
 /* On success *file_count is the manifest's file count. */
 enum update_result update_begin(bool admin, uint32_t options,

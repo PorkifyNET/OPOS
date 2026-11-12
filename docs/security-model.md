@@ -61,6 +61,9 @@ kernel resolves them before asking.
 | `/disk/Users/<own name>` | full | full | full |
 | `/disk/Users/<other name>` | no access | no access | full |
 | `/disk/Users/<any name>/AppData/Permissions.dat` | no access | read (own home) | read |
+| `/disk/Programs/<id>` (an installed package) | read | read | read and change contents |
+| `/disk/Users/<own name>/Programs/<id>` (an installed package) | read | read | read |
+| `/disk/Users/<own name>/AppData/Packages` (package records) | read | read | read |
 | everything else (`/disk`, `/disk2`..., the initramfs) | full (initramfs is read-only) | full | full |
 
 `/disk/OPOS.CFG` is a binary settings file. Administrators can change its
@@ -74,6 +77,12 @@ or windows. Homes go away with their account (and are kept on deletion).
 `ACCOUNTS.DAT` is only touched by the account code in the kernel.
 `Permissions.dat` holds per-program capability grants for the application
 sandbox (`docs/app-sandbox.md`). Only the kernel writes it.
+
+Installed packages (`docs/packages.md`) change only through the kernel's
+installer. A package folder is protected only while the installer lists
+it, and is recognised by device and inode. `/disk/Programs` and
+`<home>/Programs` cannot be moved or removed, so a folder cannot be
+moved out from under that check.
 
 When an administrator uses the built-in Files or editor to write, create,
 rename, delete or move something in a protected system location, the desktop

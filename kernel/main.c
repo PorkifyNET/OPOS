@@ -22,6 +22,8 @@
 #include "desktop.h"
 #include "timer.h"
 #include "update.h"
+#include "accounts.h"
+#include "package.h"
 #include "user.h"
 #include "ata.h"
 #include "console.h"
@@ -1300,6 +1302,10 @@ void kmain(void) {
 
     /* An update cut short by a power loss is finished first. */
     update_resume();
+    /* Then a package install or removal; this also lists the installed
+       package folders, including each account's, for permissions.c. */
+    accounts_load();
+    package_resume();
 
     bool root_selection_failed = false;
     const char *cmdline = cmdline_request.response != NULL

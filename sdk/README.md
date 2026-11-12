@@ -64,6 +64,61 @@ Ctrl+Shift+Esc) shows each program's CPU share, memory and threads, and
 ends the selected one. Logging out ends every program. `exit_group` ends
 all of a program's threads.
 
+## Packages
+
+A package (`.opk`) bundles a program and its files so OPOS can install,
+update and remove it (`docs/packages.md` in the OPOS source).
+
+Describe the package in a `.pkg` file next to your program, like
+`examples/pickfile.pkg`:
+
+```
+format: 1
+id: org.example.myapp
+name: My App
+version: 1.0
+publisher: Your Name
+platform: opos
+requires-opos: 0.1.4
+file: files/myapp ../build/myapp exec
+file: files/data/levels.dat levels.dat
+start: files/myapp My App
+```
+
+- `id`: lowercase, reverse-domain (`org.example.myapp`), never changes.
+- `file: <name in package> <file to copy> [exec]`. The name starts with
+  `files/` and has no spaces. The file to copy is relative to the `.pkg`
+  file. Each `exec` program needs an `OPOS_MANIFEST` (see `<opos.h>`).
+- `start` puts the program in Start > Programs with that label.
+
+`examples/hello.pkg` and `examples/sketch.pkg` are the packages the
+OPOS Store publishes (`make store` in the OPOS source).
+
+Then:
+
+```sh
+make package PKG=myapp.pkg              # build/org.example.myapp-1.0.opk
+python3 tools/mkopk.py check build/org.example.myapp-1.0.opk
+```
+
+`tools/mkopk.py` applies the same rules the installer does, and prints
+why it rejects a package. It needs only Python 3.
+
+Copy the package to an installed OPOS and install it in the Terminal:
+
+```sh
+run /bin/pkg install /disk/org.example.myapp-1.0.opk              # for you
+run /bin/pkg install /disk/org.example.myapp-1.0.opk --everyone   # admin
+run /bin/pkg list
+run /bin/pkg remove org.example.myapp
+```
+
+It lands in `<home>/Programs/<id>` (or `/disk/Programs/<id>`), its
+`start` entries appear in Start > Programs, and nothing but the
+installer can change its files. Programs can do the same with
+`opos_package_check`, `opos_package_install` and `opos_package_remove`
+in `<opos.h>`.
+
 ## Windows
 
 A program can open one window. It draws 0x00RRGGBB pixels in its own
@@ -116,7 +171,7 @@ for (;;) {
 Examples built on these calls:
 
 - `examples/sketch.c` is a small drawing program: `run /disk/sketch
-  [width height]`.
+  [width height]`. It is also in the OPOS Store.
 - `examples/notepad.c` is the OPOS text editor. It is built with the OS
   and shipped as `/bin/notepad`. The Start menu's Text Editor and Files
   (for text files) open it. It shows text drawing, keyboard shortcuts

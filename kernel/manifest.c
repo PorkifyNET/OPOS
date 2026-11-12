@@ -101,6 +101,14 @@ static int scan_notes(const uint8_t *image, size_t start, size_t length,
     return found;
 }
 
+int manifest_scan_segment(const uint8_t *notes, size_t length,
+                          struct manifest *manifest, int found) {
+    if (notes == NULL || manifest == NULL || found < 0) {
+        return -1;
+    }
+    return scan_notes(notes, 0, length, manifest, found);
+}
+
 bool manifest_read(const uint8_t *image, size_t size,
                    struct manifest *manifest) {
     if (manifest == NULL) {

@@ -9,6 +9,9 @@
 
 #include <opos.h>
 
+/* Asks for nothing beyond the defaults. Needed in a package. */
+OPOS_MANIFEST("Sketch", "1.0", 0);
+
 #define CANVAS_WIDTH 1024
 #define CANVAS_HEIGHT 768
 #define PALETTE_HEIGHT 28

@@ -24,6 +24,7 @@
 #include "keyboard.h"
 #include "hda.h"
 #include "net.h"
+#include "sound.h"
 
 #define SHELL_LINE_CAPACITY 2048
 #define FAT16_DISPLAY_CAPACITY 1024
@@ -480,6 +481,66 @@ static void shell_print_line(const char *line) {
     console_write_string("\n");
 }
 
+static void shell_write_number(uint32_t value) {
+    char digits[12];
+    size_t count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    char text[12];
+    for (size_t i = 0; i < count; i++) {
+        text[i] = digits[count - 1 - i];
+    }
+    text[count] = '\0';
+    console_write_string(text);
+}
+
+static void shell_sound_status(void) {
+    console_write_string("  Volume ");
+    shell_write_number(sound_volume());
+    console_write_string(sound_muted() ? "% (muted), " : "%, ");
+    shell_write_number((uint32_t)sound_stream_count());
+    console_write_string(" stream(s) open\n");
+}
+
+static bool shell_word_is(const char *text, size_t length, const char *word) {
+    size_t i = 0;
+    for (; i < length && word[i] != '\0'; i++) {
+        if (text[i] != word[i]) {
+            return false;
+        }
+    }
+    return i == length && word[i] == '\0';
+}
+
+static void shell_volume(const char *arguments, size_t length) {
+    if (length == 0) {
+        shell_sound_status();
+        return;
+    }
+    if (shell_word_is(arguments, length, "mute")
+        || shell_word_is(arguments, length, "unmute")) {
+        sound_set_muted(arguments[0] == 'm');
+        shell_sound_status();
+        return;
+    }
+    uint32_t value = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (arguments[i] < '0' || arguments[i] > '9' || value > 100) {
+            console_write_warning("Usage: volume [0-100|mute|unmute]\n");
+            return;
+        }
+        value = value * 10 + (uint32_t)(arguments[i] - '0');
+    }
+    if (value > 100) {
+        console_write_warning("Usage: volume [0-100|mute|unmute]\n");
+        return;
+    }
+    sound_set_volume(value);
+    shell_sound_status();
+}
+
 /* Prints a ping or lookup as it runs; Ctrl+C or Esc stops it. */
 static void shell_net_wait(bool started) {
     char line[128];
@@ -556,6 +617,8 @@ static const struct shell_help_entry shell_help_entries[] = {
     {"net", "net", "Shows network-interface and address status."},
     {"sound", "sound", "Shows the sound output that was found."},
     {"beep", "beep [HZ]", "Plays a short tone (default 750 Hz)."},
+    {"volume", "volume [0-100|mute|unmute]",
+     "Shows or sets the sound volume."},
     {"dhcp", "dhcp", "Restarts DHCP address configuration."},
     {"ping", "ping HOST", "Sends ICMP echo requests to a host."},
     {"lookup", "lookup NAME", "Resolves a DNS name."},
@@ -731,6 +794,9 @@ static void execute_command(void) {
         }
     } else if (command_matches(command, command_length, "sound")) {
         hda_describe(shell_print_line);
+        shell_sound_status();
+    } else if (command_matches(command, command_length, "volume")) {
+        shell_volume(arguments, arguments_length);
     } else if (command_matches(command, command_length, "beep")) {
         uint32_t frequency = 0;
         for (size_t i = 0; i < arguments_length; i++) {

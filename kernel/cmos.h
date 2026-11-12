@@ -59,6 +59,10 @@ uint8_t settings_display_mode(void);
 void settings_set_display_mode(uint8_t mode);
 enum date_format settings_date_format(void);
 void settings_set_date_format(enum date_format format);
+/* Master sound volume, 0-100 (machine-wide). */
+#define SETTINGS_SOUND_VOLUME_DEFAULT 70
+uint8_t settings_sound_volume(void);
+void settings_set_sound_volume(uint8_t volume);
 /* Returns true once if a one-time boot into the shell was requested. */
 bool settings_take_boot_shell_once(void);
 

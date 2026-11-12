@@ -150,19 +150,23 @@ bool rtc_write(const struct rtc_time *time) {
  * boot, so the file wins whenever a disk is mounted.
  *
  * File layout: magic "OPCF", version, flags byte, then (version 2+) the
- * display mode index. Version 1 files have no display byte.
+ * display mode index and (version 3+) the sound volume plus one (0 = not
+ * set, the default volume). Older files lack the later bytes.
  */
 static const uint8_t settings_file_name[11] = {'O', 'P', 'O', 'S', ' ', ' ',
                                                ' ', ' ', 'C', 'F', 'G'};
 static const uint8_t settings_file_magic[4] = {'O', 'P', 'C', 'F'};
-#define SETTINGS_FILE_VERSION 2
+#define SETTINGS_FILE_VERSION 3
 #define SETTINGS_FILE_V1_SIZE 6
-#define SETTINGS_FILE_SIZE 7
+#define SETTINGS_FILE_V2_SIZE 7
+#define SETTINGS_FILE_SIZE 8
 #define CMOS_DISPLAY_MODE_REGISTER 0x4a
+#define CMOS_SOUND_VOLUME_REGISTER 0x4b
 
 struct settings_values {
     uint8_t flags;
     uint8_t display_mode;
+    uint8_t volume; /* volume + 1; 0 = default */
 };
 
 /* Cached file values, so the taskbar does not read the disk every frame. */
@@ -174,6 +178,7 @@ static bool settings_file_read(struct settings_values *values) {
     if (!fat16_lookup_node(0, settings_file_name, &node)
         || (node.attributes & FAT16_ATTRIBUTE_DIRECTORY) != 0
         || (node.size != SETTINGS_FILE_V1_SIZE
+            && node.size != SETTINGS_FILE_V2_SIZE
             && node.size != SETTINGS_FILE_SIZE)) {
         return false;
     }
@@ -191,6 +196,13 @@ static bool settings_file_read(struct settings_values *values) {
     if (data[4] == 1 && node.size == SETTINGS_FILE_V1_SIZE) {
         values->flags = data[5];
         values->display_mode = 0;
+        values->volume = 0;
+        return true;
+    }
+    if (data[4] == 2 && node.size == SETTINGS_FILE_V2_SIZE) {
+        values->flags = data[5];
+        values->display_mode = data[6];
+        values->volume = 0;
         return true;
     }
     if (data[4] != SETTINGS_FILE_VERSION || node.size != SETTINGS_FILE_SIZE) {
@@ -198,6 +210,7 @@ static bool settings_file_read(struct settings_values *values) {
     }
     values->flags = data[5];
     values->display_mode = data[6];
+    values->volume = data[7];
     return true;
 }
 
@@ -214,6 +227,7 @@ static bool settings_file_write(const struct settings_values *values) {
         settings_file_magic[0], settings_file_magic[1],
         settings_file_magic[2], settings_file_magic[3],
         SETTINGS_FILE_VERSION, values->flags, values->display_mode,
+        values->volume,
     };
     size_t written = 0;
     return fat16_write_node_at(&node, 0, data, sizeof(data), &written)
@@ -222,10 +236,11 @@ static bool settings_file_write(const struct settings_values *values) {
 
 static struct settings_values settings_cmos_load(void) {
     if (cmos_read(CMOS_SETTINGS_MAGIC_REGISTER) != CMOS_SETTINGS_MAGIC) {
-        return (struct settings_values){SETTINGS_DEFAULT, 0};
+        return (struct settings_values){SETTINGS_DEFAULT, 0, 0};
     }
     return (struct settings_values){cmos_read(CMOS_SETTINGS_REGISTER),
-                                    cmos_read(CMOS_DISPLAY_MODE_REGISTER)};
+                                    cmos_read(CMOS_DISPLAY_MODE_REGISTER),
+                                    cmos_read(CMOS_SOUND_VOLUME_REGISTER)};
 }
 
 /* A live session (installation media) mounts whatever FAT volume it finds
@@ -256,6 +271,7 @@ static struct settings_values settings_load(void) {
 static void settings_store(struct settings_values values) {
     cmos_write(CMOS_SETTINGS_REGISTER, values.flags);
     cmos_write(CMOS_DISPLAY_MODE_REGISTER, values.display_mode);
+    cmos_write(CMOS_SOUND_VOLUME_REGISTER, values.volume);
     cmos_write(CMOS_SETTINGS_MAGIC_REGISTER, CMOS_SETTINGS_MAGIC);
     if (settings_use_file()) {
         (void)settings_file_write(&values);
@@ -305,6 +321,18 @@ void settings_set(uint8_t setting, bool enabled) {
 
 uint8_t settings_display_mode(void) {
     return settings_load().display_mode;
+}
+
+uint8_t settings_sound_volume(void) {
+    uint8_t stored = settings_load().volume;
+    return stored == 0 || stored > 101 ? SETTINGS_SOUND_VOLUME_DEFAULT
+                                       : (uint8_t)(stored - 1);
+}
+
+void settings_set_sound_volume(uint8_t volume) {
+    struct settings_values values = settings_load();
+    values.volume = (uint8_t)((volume > 100 ? 100 : volume) + 1);
+    settings_store(values);
 }
 
 void settings_set_display_mode(uint8_t mode) {

@@ -95,6 +95,49 @@ the line-in pin is left alone) and `ich9-intel-hda` with `hda-micro`
 (found as speaker). Not yet tried on real hardware, VirtualBox or VMware
 (step 5).
 
+## As built in step 2
+
+`kernel/sound.c` is the mixer. `sound_initialize` makes it the HDA
+driver's source, so the timer interrupt mixes every 10 ms:
+- **Streams.** Up to 8 at a time, across all programs. A stream is a ring
+  of 48 kHz, 16-bit stereo frames whose size the program picks when it
+  opens it (rounded up to a power of two, 1024 to 32768 frames: 21 ms to
+  0.68 s), so a game can keep its latency low and a music player can
+  queue more. The program only moves the write index and the mixer only
+  moves the read index, so writing needs no lock. Closing a stream while
+  another thread of the program copies into it marks the stream closing;
+  the copy frees it when it ends.
+- **Mixing.** The streams are summed in 32 bits, multiplied by the master
+  volume on a squared curve (volume² / 10000, so 50 sounds about half as
+  loud as 100), and clamped to 16 bits. A stream that runs dry just adds
+  nothing.
+- **Calls.** `0x4f500040` open(capacity) returns a handle, or -19 without
+  sound hardware, -24 when all 8 streams are in use. `0x4f500041`
+  write(handle, frames, count) queues every frame, waiting a timer tick
+  at a time while the stream is full; the program's memory is checked
+  again on each pass. `0x4f500042` queued(handle) and `0x4f500043`
+  close(handle). Handles belong to the process that opened them, and its
+  streams are closed when it ends. The SDK wraps them as
+  `opos_sound_open`, `opos_sound_write`, `opos_sound_queued` and
+  `opos_sound_close`. The Linux-side wrapper comes with the SDL driver in
+  step 3: musl programs can already make these calls with `syscall()`.
+- **Volume.** 0 to 100, 70 by default. Kept in `OPOS.CFG` (settings file
+  version 3 adds a volume byte: the volume plus one, 0 meaning "not set";
+  versions 1 and 2 are still read) and in CMOS register 0x4b. The volume
+  keys (scancodes E0 30 up, E0 2E down, E0 20 mute) change it in steps of
+  5 and show a popup over the clock for two seconds. Mute is not saved.
+  The shell has `volume [0-100|mute|unmute]`, and `sound` also prints the
+  volume and how many streams are open. A volume slider in Settings is
+  left for later.
+- **Demo.** `/bin/play` (`sdk/examples/play.c`) plays a 16-bit PCM WAV
+  file, mono or stereo, at any rate (converted to 48 kHz by linear
+  interpolation). With no file it plays 440 Hz and then 880 Hz.
+
+**Test.** `make sound-test` now also runs `/bin/play` and checks for
+440 Hz and 880 Hz after the two beeps. By hand: at volume 70 the tones
+peak at 5879 (12000 × 0.49) and at volume 30 at 1079 (12000 × 0.09), and
+`play` prints "no sound output" on a machine without HDA.
+
 ## Not planned yet
 
 Recording, more than one sound card at a time, sample-rate conversion in

@@ -46,6 +46,7 @@
 #include "sdhci.h"
 #include "hda.h"
 #include "net.h"
+#include "sound.h"
 #include "nic.h"
 
 #define COM1 0x3f8
@@ -1447,6 +1448,7 @@ void kmain(void) {
     if (!hda_initialize()) {
         console_write_string("OPOS: no sound output found\n");
     }
+    sound_initialize();
     /* I2C touchpad (laptops). Its reset waits about 150 ms. */
     if (i2c_hid_initialize()) {
         console_write_string("OPOS: I2C touchpad ready\n");

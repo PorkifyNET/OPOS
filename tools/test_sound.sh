@@ -3,7 +3,8 @@
 #   tools/test_sound.sh [ISO]
 # QEMU records the guest's sound with the monitor's wavcapture (it works
 # with the "none" audio backend), the kernel shell plays "beep" (750 Hz)
-# and "beep 1500", and tools/check_tones.py finds both tones in the file.
+# and "beep 1500" (the driver), then /bin/play plays 440 and 880 Hz through
+# the mixer; tools/check_tones.py finds all four tones in the file.
 # BOOT_WAIT (default 40) is how long to wait for the desktop.
 set -eu
 iso=${1:-build/opos.iso}
@@ -19,6 +20,7 @@ type_text() {
         character=$(printf '%.1s' "$remaining")
         case "$character" in
             ' ') key=spc ;;
+            '/') key=slash ;;
             *) key=$character ;;
         esac
         printf 'sendkey %s 10\n' "$key"
@@ -41,6 +43,8 @@ type_text() {
     sleep 3
     type_text 'beep 1500'
     sleep 3
+    type_text 'run /bin/play'
+    sleep 4
     printf 'stopcapture 0\n'
     sleep 1
     printf 'quit\n'
@@ -49,4 +53,4 @@ type_text() {
     -display none -serial none -monitor stdio -no-reboot >/dev/null 2>&1 \
     || true
 
-python3 tools/check_tones.py "$wav" 750 1500
+python3 tools/check_tones.py "$wav" 750 1500 440 880

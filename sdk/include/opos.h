@@ -42,6 +42,8 @@
 #define OPOS_EFAULT 14
 #define OPOS_EEXIST 17
 #define OPOS_ENOTDIR 20
+#define OPOS_ENODEV 19
+#define OPOS_EMFILE 24
 #define OPOS_EISDIR 21
 #define OPOS_EINVAL 22
 #define OPOS_EROFS 30
@@ -578,6 +580,50 @@ static inline long opos_clipboard_set(const char *text, size_t length) {
    and returns the clipboard's full length, or a negative error. */
 static inline long opos_clipboard_get(char *out, size_t capacity) {
     return opos_syscall2(OPOS_SYS_CLIPBOARD_GET, (long)out, (long)capacity);
+}
+
+/* -------------------------------------------------------------- sound */
+
+/*
+ * Sound output (ABI 1, OPOS with sound). A program opens a stream and
+ * writes frames of 48 kHz, 16-bit stereo sound: left and right samples,
+ * interleaved. OPOS mixes every program's streams and applies the master
+ * volume. Without sound hardware opos_sound_open returns -OPOS_ENODEV.
+ */
+#define OPOS_SYS_SOUND_OPEN 0x4f500040L
+#define OPOS_SYS_SOUND_WRITE 0x4f500041L
+#define OPOS_SYS_SOUND_QUEUED 0x4f500042L
+#define OPOS_SYS_SOUND_CLOSE 0x4f500043L
+#define OPOS_SOUND_RATE 48000
+#define OPOS_SOUND_CHANNELS 2
+
+/* Opens a stream that queues about capacity_frames frames (rounded up to
+   a power of two, 1024 to 32768): the most sound that can wait to be
+   played, so a game keeps it small (2048 is about 43 ms). Returns a
+   handle, or a negative error. */
+static inline long opos_sound_open(uint32_t capacity_frames) {
+    return opos_syscall1(OPOS_SYS_SOUND_OPEN, (long)capacity_frames);
+}
+
+/* Queues count frames, waiting while the stream is full. Returns the
+   frames queued (fewer only when the program is ending), or a negative
+   error. */
+static inline long opos_sound_write(long handle, const int16_t *frames,
+                                    uint32_t count) {
+    return opos_syscall3(OPOS_SYS_SOUND_WRITE, handle, (long)frames,
+                         (long)count);
+}
+
+/* Frames queued and not played yet. */
+static inline long opos_sound_queued(long handle) {
+    return opos_syscall1(OPOS_SYS_SOUND_QUEUED, handle);
+}
+
+/* Closes the stream; frames still queued are dropped (wait until
+   opos_sound_queued is 0 to let them play). Streams also close when the
+   program ends. */
+static inline long opos_sound_close(long handle) {
+    return opos_syscall1(OPOS_SYS_SOUND_CLOSE, handle);
 }
 
 /* ------------------------------------------------------------- memory */

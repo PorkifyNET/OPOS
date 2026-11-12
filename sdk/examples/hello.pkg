@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.hello
+name: Hello
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.1.4
+file: files/hello ../build/hello exec
+start: files/hello Hello

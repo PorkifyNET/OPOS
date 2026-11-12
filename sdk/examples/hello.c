@@ -1,6 +1,9 @@
 /* The smallest OPOS application: greets the account that runs it. */
 #include <opos.h>
 
+/* Asks for nothing beyond the defaults. Needed in a package. */
+OPOS_MANIFEST("Hello", "1.0", 0);
+
 int main(int argc, char **argv, char **envp) {
     (void)argc;
     (void)envp;

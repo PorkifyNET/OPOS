@@ -1,0 +1,4 @@
+# One line per package for the OPOS Store index (tools/mkindex.py
+# --descriptions): "id: description".
+net.porkify.opos.hello: Greets you and shows your account, its home folder and the kernel ABI version.
+net.porkify.opos.sketch: A small drawing program. Left button draws, right button erases, C clears.

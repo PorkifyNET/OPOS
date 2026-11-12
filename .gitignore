@@ -7,5 +7,7 @@
 *.ppm
 /sdk/build/
 
+__pycache__/
+
 # Signing keys never go into the repository.
 *.pem

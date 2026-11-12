@@ -91,6 +91,9 @@ start: files/myapp My App
   file. Each `exec` program needs an `OPOS_MANIFEST` (see `<opos.h>`).
 - `start` puts the program in Start > Programs with that label.
 
+`examples/hello.pkg` and `examples/sketch.pkg` are the packages the
+OPOS Store publishes (`make store` in the OPOS source).
+
 Then:
 
 ```sh
@@ -168,7 +171,7 @@ for (;;) {
 Examples built on these calls:
 
 - `examples/sketch.c` is a small drawing program: `run /disk/sketch
-  [width height]`.
+  [width height]`. It is also in the OPOS Store.
 - `examples/notepad.c` is the OPOS text editor. It is built with the OS
   and shipped as `/bin/notepad`. The Start menu's Text Editor and Files
   (for text files) open it. It shows text drawing, keyboard shortcuts

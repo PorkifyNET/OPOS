@@ -44,6 +44,10 @@ TEST_DISK := $(BUILD)/fat16-test.img
 OPOS_VERSION := $(shell cat VERSION)
 RELEASE := $(BUILD)/release
 UPDATE_KEY ?= $(HOME)/.opos-signing/update-key.pem
+# The OPOS Store (store/README.md): packages built from the SDK examples.
+STORE := $(BUILD)/store
+STORE_KEY ?= $(HOME)/.opos-signing/store-key.pem
+STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
 # BearSSL files the kernel uses to check update signatures (ECDSA P-256).
 KERNEL_BEARSSL_SOURCES := $(addprefix sdk/bearssl/src/,codec/ccopy.c \
 	ec/ec_p256_m31.c ec/ec_secp256r1.c ec/ec_secp384r1.c ec/ec_secp521r1.c \
@@ -63,7 +67,7 @@ LDFLAGS := -nostdlib -static \
 	-Wl,--build-id=none \
 	-Wl,-T,kernel/linker.ld
 
-.PHONY: all run test-disk persistence-test permissions-test package-test release clean
+.PHONY: all run test-disk persistence-test permissions-test package-test release store clean
 
 all: $(ISO)
 
@@ -315,6 +319,19 @@ release: $(ISO)
 		$(RELEASE)/opos-release-notes.txt $(BUILD)/iso_extra/
 	$(call make_iso,$(RELEASE)/opos-$(OPOS_VERSION).iso,$(BUILD)/iso_extra)
 	rm -rf $(BUILD)/iso_extra
+
+# Store packages and their signed index in build/store/. Upload them as a
+# release of PorkifyNET/opos-packages (store/README.md).
+store:
+	$(MAKE) -C sdk all
+	rm -rf $(STORE) $(BUILD)/store_opk
+	mkdir -p $(BUILD)/store_opk
+	for package in $(STORE_PACKAGES); do \
+		python3 sdk/tools/mkopk.py build $$package -o $(BUILD)/store_opk || exit 1; \
+	done
+	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
+		--descriptions store/descriptions.txt $(BUILD)/store_opk
+	rm -rf $(BUILD)/store_opk
 
 clean:
 	rm -rf $(BUILD)

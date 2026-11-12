@@ -528,6 +528,39 @@ holding Memo 1.0 and 1.1 and a package that needs OPOS 9.0:
 - The PROGRAMS line in Settings is filled only after the Store window
   has read the index once.
 
+### As built in step 6
+
+**First packages.** Hello and Sketch, the SDK examples, are the first
+Store packages: `sdk/examples/hello.pkg` (`net.porkify.opos.hello`) and
+`sdk/examples/sketch.pkg` (`net.porkify.opos.sketch`), both version 1.0.
+Each program now carries an `OPOS_MANIFEST` that asks for nothing extra.
+They were never in the system image; they now reach a system only
+through the Store or as loose disk programs.
+
+**make store.** `make store` builds the SDK, every package in
+`STORE_PACKAGES` (in `GNUmakefile`), and an index with the descriptions
+in `store/descriptions.txt`, signed with `STORE_KEY` (default
+`~/.opos-signing/store-key.pem`). The result is `build/store/`: `index`,
+`index.sig` and the `.opk` files. `store/README.md` says how to publish
+it as a release of `PorkifyNET/opos-packages`, and how to test it from a
+disk folder first. Like `make release`, it builds and signs but does not
+upload anything.
+
+**QEMU tests.** `build/store/` on an installed disk, named in
+`/disk/OPOS/PACKAGE-SOURCE.TXT`:
+- The Store window lists Hello and Sketch with "MAY ASK FOR: NOTHING
+  BEYOND ITS OWN FILES". INSTALL installs both.
+- Both appear in Start > Programs. Sketch opens its window. Hello
+  prints its greeting in the Terminal from
+  `/disk/Users/bob/Programs/net.porkify.opos.hello/hello`.
+
+**Not done.**
+- `PorkifyNET/opos-packages` does not exist yet, and no release has been
+  uploaded. Until the owner does both, the GitHub default answers 404.
+- The index lists only the versions built in one `make store`. Keeping
+  older versions in the release needs their `.opk` files passed to
+  `mkindex.py` as well.
+
 ### Store window
 
 A built-in window lists the index: name, publisher, version, size and
@@ -562,8 +595,8 @@ by itself in the first version.
    step 4".
 5. Done. Store window, `pkg --gui`, `asks:` lines and the Settings >
    UPDATES line. See "As built in step 5".
-6. First real packages: move `sketch` and `hello` out of the image into
-   the repository as examples.
+6. Done. First packages: Hello and Sketch, built and signed by
+   `make store`. See "As built in step 6".
 
 Each step keeps ABI version 1. Loose disk programs keep working
 throughout.

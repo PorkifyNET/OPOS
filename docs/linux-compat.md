@@ -107,8 +107,9 @@ wake on PIT deadlines. Keyboard reads atomically block on a scheduler event;
 IRQ1 queues a character and wakes matching tasks without a lost-wakeup window.
 Each user process now has a process control block that owns its PID, lifecycle
 and fault state, address space, bounded image segments and pages, stack page, heap,
-anonymous mappings, current directory, and eleven descriptor slots numbered
-0 through 10. Opens allocate slots 3 through 10. Processes start in `/`; spawned children inherit the parent's
+anonymous mappings, current directory, and 64 descriptor slots numbered
+0 through 63. Opens allocate slots 3 through 63; 128 descriptions are open
+system wide. Processes start in `/`; spawned children inherit the parent's
 current directory. Path resolution canonicalizes repeated separators, `.`, and
 `..` against the global mount namespace without traversing above `/`.
 Each open creates an open-file description with its own offset and access mode.
@@ -246,8 +247,10 @@ exactly one RW, remaining entries R, and at most 16 mapped pages total. File and
 virtual offsets may differ and need only be page-congruent. Process ownership,
 fork cloning, exec replacement, fault cleanup, and normal exit preserve every
 segment's R/RX/RW permissions.
-The current bounded implementation accepts at most 16 arguments, 16 environment
-entries, 1024 total string bytes, a 1 MiB executable file (2 MiB of loaded segments), and a 64 KiB interpreter. The regression
+The current bounded implementation accepts at most 64 arguments, 64 environment
+entries, 2048 total string bytes (all of it must fit the stack's top page with
+the auxiliary vector), a 16 MiB executable file (16 MiB of loaded segments per
+image), and a 64 KiB interpreter. The main stack is 512 KiB. The regression
 executes `/tests/exec-test` and verifies replacement, arguments, descriptor
 inheritance, close-on-exec, FS reset, private file mappings, dynamic-interpreter
 handoff, eager `JUMP_SLOT` relocation, a call into `/lib/libopos-test.so`, and
@@ -338,9 +341,10 @@ lifetime, enumerates the root mount namespace, changes cwd to `/`, and
 verifies read-only initramfs mutation errors and per-mount `st_dev` values. It
 also uses `brk` (12) to allocate,
 verify zeroed pages, write across the heap, shrink back, and check the heap
-limit; the heap is capped at 128 pages. Linux `mmap` (9), `mprotect` (10), and
+limit; the heap is capped at 8192 pages (32 MiB). Linux `mmap` (9), `mprotect` (10), and
 `munmap` (11) support private anonymous mappings and eager private copies of
-regular files in a bounded 1024-page (4 MiB) region. File offsets must be page-aligned;
+regular files in a bounded 16384-page (64 MiB) region; `mremap` (25) shrinks,
+grows in place, or moves pages without copying (`MREMAP_MAYMOVE`). File offsets must be page-aligned;
 bytes beyond EOF are zero-filled. Read-only, writable/non-executable, and
 executable/read-only file mappings are supported without writeback or sharing.
 `MAP_SHARED`, `MAP_FIXED`, demand paging, and writable-executable mappings are

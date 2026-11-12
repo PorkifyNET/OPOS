@@ -73,10 +73,10 @@ In the order the next programs are likely to hit them.
    `/dev`, `/proc`.
 2. **Identity.** Done in step 3: one non-root uid per account, and
    generated `/etc/passwd` and `/etc/group`.
-3. **Limits.** 11 file descriptors per process and 32 open files system
-   wide; a 1 MiB executable; a 4 MiB `mmap` area; 16 arguments and 16
-   environment strings; no `mremap` (Lua's `realloc` falls back to
-   copying). Larger programs (BusyBox, Python) will hit these first.
+3. **Limits.** Raised in step 4 (see there). Still bounded: one
+   argument page (64 arguments, 64 environment strings, 2048 bytes of
+   strings), a 64 MiB `mmap` area, every page allocated at once (no
+   demand paging), no `MAP_SHARED` or `MAP_FIXED`.
 4. **Terminal.** Input is always one line with echo, and the desktop
    Terminal does not interpret escape sequences. Full-screen programs
    (`vi`, `less`, `top`) need raw mode, cursor movement and colors.
@@ -115,8 +115,8 @@ Proposal:
    sources with their licenses. See "As built in step 2".
 3. Done. `/dev` devices and a non-root identity. See "As built in
    step 3".
-4. Higher limits: descriptors, open files, executable size, `mmap`,
-   `mremap`.
+4. Done. Higher limits: descriptors, open files, executable size,
+   stack, heap, `mremap`, `getrlimit`. See "As built in step 4".
 5. Terminal: raw mode, escape sequences in the desktop Terminal,
    Ctrl+C and Ctrl+D.
 6. A larger program as the next test (BusyBox), then dynamic linking.
@@ -199,6 +199,50 @@ package, passes 22 checks:
 
 SQLite runs without errors as a non-root user. No unimplemented system
 call was logged.
+
+## As built in step 4
+
+| Limit | Before | Now |
+| --- | --- | --- |
+| Descriptors per process | 11 | 64 (`RLIMIT_NOFILE`) |
+| Open files system wide | 32 | 128 |
+| Executable file | 1 MiB | 16 MiB |
+| Loaded pages per image | 512 (2 MiB) | 4096 (16 MiB) |
+| Main stack | 128 KiB | 512 KiB (`RLIMIT_STACK`) |
+| `brk` heap | 512 KiB | 32 MiB |
+| Arguments, environment strings | 16, 16, 1024 bytes | 64, 64, 2048 bytes |
+| `mmap` area | 64 MiB | 64 MiB (unchanged) |
+
+- **Executable buffer.** Each task's buffer is allocated at 1 MiB and
+  grows in 1 MiB steps, only when a larger program is started. A
+  replaced buffer's pages are freed. The contiguous allocator carves
+  each buffer from never-used memory, so a very large program can fail
+  with `ENOMEM` once that memory is used up.
+- **`mremap` (25).** Shrinks in place, or grows in place when the pages
+  after the mapping are free. Otherwise, with `MREMAP_MAYMOVE`, it moves
+  the pages to a free run by remapping them, without copying.
+  `MREMAP_FIXED` gives `EINVAL`. musl's `realloc` of large blocks uses it.
+- **`getrlimit` (97) and `prlimit64` (302).** These work for the calling
+  process. `RLIMIT_NOFILE` and `RLIMIT_STACK` report the limits above;
+  the other resources are unlimited. A lower limit is accepted but not
+  enforced. Raising a limit gives `EPERM`.
+- **Kernel memory.** The kernel's static memory grows from about 10 MiB
+  to 14 MiB, mostly per-process page lists. Each process's stack now
+  takes 512 KiB at start.
+
+**QEMU test.** A static musl test program with 3 MiB of data, a 3.1 MB
+executable installed as a Linux package, passes 15 checks:
+- its data loads;
+- `RLIMIT_NOFILE` reports 64;
+- 61 opens succeed, ending at fd 63, and the next open gives `EMFILE`;
+- 400 KiB of stack;
+- 8 MiB of `brk`;
+- `mremap` grows with a move and keeps the data, shrinks, and fails a
+  growth that cannot move;
+- `realloc` grows to 16 MiB;
+- a `fork` and `execv` with 61 arguments.
+
+SQLite, Lua and the browser still run.
 
 ## Tests
 

@@ -157,6 +157,41 @@ Each step is one PR, stacked like the sound work.
   recording was silent. Not tested: clicks on toasts (the QEMU harness
   cannot click), the update, Store and crash notifications.
 
+## As built in step 3
+
+- A bell on the taskbar, left of the network icon (or of the clock), is
+  orange with the unread count beside it ("9+" above nine) and grey when
+  everything is read. On a side taskbar it sits above the network icon.
+  Window buttons stop before it.
+- The bell, Super+N, or a click on a toast opens the Notification Center:
+  a panel by the clock, as wide as a toast, with a NOTIFICATIONS (N)
+  header, a DND ON/OFF button (the same setting as Settings > SOUND) and
+  CLEAR ALL. Entries are listed newest first in toast layout; unread ones
+  have an orange bar on the left. It grows to fit the screen and shows
+  "1-5 OF 9" when they do not all fit; the wheel scrolls.
+- Keys while it is open: Up/Down select, Delete dismisses, Escape closes;
+  other keys are taken by the panel. Mouse: the X on an entry dismisses
+  it, a click outside closes the panel and still reaches what was under
+  it.
+- Closing the panel marks every notification read. While it is open, new
+  notifications go straight into the list (with the sound unless DO NOT
+  DISTURB), without toasts. Opening it hides the toasts.
+- Step 2 fix: a program that ends on a CPU exception exits with
+  128 + the exception vector (`user_exception_dispatch`), not
+  128 + a signal number. Crash notifications now also cover divide
+  errors, stack faults, general protection faults (141), page faults
+  (142), alignment checks and SIMD errors; 134 reads "an invalid
+  instruction or SIGABRT".
+- The desktop Terminal's new `fault` command runs the kernel's page-fault
+  self-test program (the kernel shell's `run fault`), to check the crash
+  notification.
+- Tested in QEMU: after five `notify` commands the bell showed 5; Super+N
+  opened the panel with all five unread; Down then Delete removed
+  "Four" and the bell showed 4; Escape closed it and the bell turned
+  grey. `fault` posted "FAULT-TEST STOPPED UNEXPECTEDLY / IT ENDED WITH A
+  PAGE FAULT". Not tested: mouse clicks (the QEMU harness cannot click)
+  and scrolling past a full panel.
+
 ## Not planned yet
 
 Notification actions (buttons inside a notification), notifications that

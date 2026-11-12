@@ -1502,6 +1502,7 @@ static const struct terminal_help_entry terminal_help_entries[] = {
     {"uptime", "uptime", "Shows time since OPOS started."},
     {"elf", "elf", "Runs the built-in ELF loader test."},
     {"demo", "demo", "Runs the built-in user-program demo."},
+    {"fault", "fault", "Runs a program that crashes (page fault self-test)."},
     {"run", "run PATH [ARGUMENTS]", "Runs an ELF program by path."},
     {"ps", "ps", "Lists running user programs."},
     {"kill", "kill PID", "Ends the program with the given process ID."},
@@ -1631,6 +1632,14 @@ static bool terminal_execute(void) {
     } else if (text_equals(terminal_line, terminal_length, "elf")) {
         enum run_result result =
             app_launch_builtin(USER_PROGRAM_MODULE_ELF, "ELF");
+        if (result != RUN_STARTED) {
+            terminal_print(run_result_text(result));
+        }
+    } else if (text_equals(terminal_line, terminal_length, "fault")) {
+        /* Self-test: the program writes to its read-only code, ends with a
+           page fault (status 142), and OPOS posts a crash notification. */
+        enum run_result result = app_launch_builtin(USER_PROGRAM_FAULT_TEST,
+                                                    "FAULT-TEST");
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
         }
@@ -4725,6 +4734,9 @@ enum setting_row_kind {
 static void volume_step(int delta);
 static bool desktop_power_off(bool restart);
 static void toasts_reset(void);
+static void notifications_session_end(void);
+static bool center_open;
+static void center_show(bool open);
 static void updates_notify_available(void);
 
 /* Settings pages, listed in the window's sidebar. */
@@ -6890,7 +6902,7 @@ static void desktop_session_end(void) {
     }
     accounts_logout();
     notify_clear();
-    toasts_reset();
+    notifications_session_end();
     appearance_load();
     files_places_rebuild();
     files_set_path("/", 1);
@@ -8399,9 +8411,73 @@ static struct rect net_icon_rect(void) {
                          NET_ICON_WIDTH, NET_ICON_HEIGHT};
 }
 
+/* Notification Center bell, left of the network icon (or the clock),
+   with the unread count beside it. Not on the login screen. */
+#define BELL_ICON_WIDTH 26
+#define BELL_ICON_HEIGHT 22
+
+/* "3", "9+" or "" without unread notifications. */
+static void bell_count_text(char *text, size_t capacity) {
+    size_t unread = notify_unread();
+    text[0] = '\0';
+    if (unread > 9) {
+        append_text(text, capacity, 0, "9+");
+    } else if (unread != 0) {
+        char digit[2] = {(char)('0' + unread), '\0'};
+        append_text(text, capacity, 0, digit);
+    }
+}
+
+static struct rect bell_icon_rect(void) {
+    struct rect bar = taskbar_rect();
+    struct rect next = net_icon_visible() ? net_icon_rect() : clock_rect();
+    char count[4];
+    bell_count_text(count, sizeof(count));
+    int64_t width = BELL_ICON_WIDTH;
+    if (count[0] != '\0') {
+        width += (int64_t)text_length(count) * CHAR_WIDTH + 4;
+    }
+    if (taskbar_vertical()) {
+        int64_t room = bar.width - 12;
+        width = width < room ? width : room;
+        return (struct rect){bar.x + (bar.width - width) / 2,
+                             next.y - BELL_ICON_HEIGHT - 8, width,
+                             BELL_ICON_HEIGHT};
+    }
+    return (struct rect){next.x - width - 12,
+                         bar.y + (bar.height - BELL_ICON_HEIGHT) / 2, width,
+                         BELL_ICON_HEIGHT};
+}
+
+static void draw_bell_icon(void) {
+    struct rect icon = bell_icon_rect();
+    if (center_open) {
+        fill(icon, 70, 100, 160);
+    }
+    char count[4];
+    bell_count_text(count, sizeof(count));
+    uint8_t red = count[0] != '\0' ? 255 : 150;
+    uint8_t green = count[0] != '\0' ? 200 : 160;
+    uint8_t blue = count[0] != '\0' ? 90 : 180;
+    int64_t center = icon.x + BELL_ICON_WIDTH / 2;
+    fill((struct rect){center - 1, icon.y + 2, 2, 2}, red, green, blue);
+    for (int64_t row = 0; row < 12; row++) {
+        int64_t half = 3 + row * 5 / 11;
+        fill((struct rect){center - half, icon.y + 4 + row, 2 * half, 1},
+             red, green, blue);
+    }
+    fill((struct rect){center - 10, icon.y + 16, 20, 2}, red, green, blue);
+    fill((struct rect){center - 2, icon.y + 19, 4, 2}, red, green, blue);
+    if (count[0] != '\0') {
+        draw_text_clipped(icon.x + BELL_ICON_WIDTH,
+                          icon.y + (icon.height - CHAR_HEIGHT) / 2,
+                          icon.width - BELL_ICON_WIDTH, count, 255, 200, 90);
+    }
+}
+
 /* False when the button would run into the clock or the status icons. */
 static bool task_button_fits(struct rect button) {
-    struct rect limit = net_icon_visible() ? net_icon_rect() : clock_rect();
+    struct rect limit = bell_icon_rect();
     return taskbar_vertical() ? button.y + button.height <= limit.y - 10
                               : button.x + button.width <= limit.x - 10;
 }
@@ -8646,6 +8722,7 @@ static void draw_taskbar(void) {
         append_two_digits(time, sizeof(time), length, seconds % 60);
     }
     draw_net_icon();
+    draw_bell_icon();
     struct rect clock = clock_rect();
     if (taskbar_vertical()) {
         draw_text_clipped(clock.x + 4, clock.y + 4, clock.width - 8, date,
@@ -8857,6 +8934,12 @@ static void toasts_reset(void) {
     toast_count = 0;
 }
 
+/* Log out: no panel, no toasts. */
+static void notifications_session_end(void) {
+    toast_count = 0;
+    center_open = false;
+}
+
 /* True when the toasts changed. */
 static bool toasts_poll(void) {
     bool changed = false;
@@ -8867,11 +8950,27 @@ static bool toasts_poll(void) {
             changed = true;
         }
     }
+    static uint32_t seen_generation;
+    if (notify_generation() != seen_generation) {
+        seen_generation = notify_generation();
+        changed = true;
+    }
     /* New ones wait while a prompt or the login screen is up. */
     if (login_active || protected_active) {
         return changed;
     }
     bool quiet = appearance_do_not_disturb();
+    if (center_open) {
+        struct notification fresh;
+        bool any = false;
+        while (notify_take_toast(&fresh)) {
+            any = true;
+        }
+        if (any && !quiet) {
+            system_sound_play(SYSTEM_SOUND_NOTIFICATION);
+        }
+        return changed;
+    }
     bool chimed = false;
     struct notification entry;
     while (toast_count < TOAST_MAX && notify_take_toast(&entry)) {
@@ -9004,13 +9103,267 @@ static bool toasts_press(int32_t x, int32_t y) {
         uint32_t id = toasts[i].id;
         if (rect_contains(toast_close_rect(toast), x, y)) {
             (void)notify_dismiss(id);
+            toast_remove(i);
         } else {
-            notify_mark_read(id);
+            center_show(true);
         }
-        toast_remove(i);
         return true;
     }
     return false;
+}
+
+/* --------------------------------------------------- notification center */
+
+/*
+ * A panel by the clock listing the session's notifications, newest first.
+ * The bell on the taskbar, a click on a toast, or Super+N opens it.
+ * Notifications count as read once the panel closes. Up/Down pick one,
+ * Delete dismisses it, Escape closes; the mouse uses the X boxes, CLEAR ALL
+ * and the DO NOT DISTURB button.
+ */
+#define CENTER_GAP 4
+static size_t center_scroll;
+static size_t center_selected;
+
+static int64_t center_header_height(void) {
+    return CHAR_HEIGHT + 22;
+}
+
+static size_t center_fit_rows(void) {
+    int64_t room = screen_height() - TASKBAR_HEIGHT - 40
+                 - center_header_height();
+    int64_t rows = room / (toast_height() + CENTER_GAP);
+    return rows < 1 ? 1 : (size_t)rows;
+}
+
+static size_t center_rows(void) {
+    size_t count = notify_count();
+    size_t fit = center_fit_rows();
+    return count == 0 ? 1 : count < fit ? count : fit;
+}
+
+static struct rect center_rect(void) {
+    struct rect clock = clock_rect();
+    int64_t width = TOAST_COLUMNS * CHAR_WIDTH + 24;
+    if (width > screen_width() - 8) {
+        width = screen_width() - 8;
+    }
+    int64_t height = center_header_height()
+                   + (int64_t)center_rows() * (toast_height() + CENTER_GAP)
+                   + 8;
+    return taskbar_popup_rect(clock.x + clock.width - width, clock.y, width,
+                              height);
+}
+
+static struct rect center_entry_rect(struct rect panel, size_t row) {
+    return (struct rect){panel.x + 6,
+                         panel.y + center_header_height()
+                             + (int64_t)row * (toast_height() + CENTER_GAP),
+                         panel.width - 12, toast_height()};
+}
+
+static struct rect center_clear_rect(struct rect panel) {
+    int64_t width = 9 * CHAR_WIDTH + 24;
+    return (struct rect){panel.x + panel.width - width - 8, panel.y + 7,
+                         width, CHAR_HEIGHT + 8};
+}
+
+static struct rect center_dnd_rect(struct rect panel) {
+    struct rect clear = center_clear_rect(panel);
+    int64_t width = 7 * CHAR_WIDTH + 24;
+    return (struct rect){clear.x - width - 8, clear.y, width, clear.height};
+}
+
+static void center_clamp(void) {
+    size_t count = notify_count();
+    size_t rows = center_fit_rows();
+    if (count == 0) {
+        center_selected = 0;
+        center_scroll = 0;
+        return;
+    }
+    if (center_selected >= count) {
+        center_selected = count - 1;
+    }
+    if (center_scroll + rows > count) {
+        center_scroll = count > rows ? count - rows : 0;
+    }
+    if (center_selected < center_scroll) {
+        center_scroll = center_selected;
+    } else if (center_selected >= center_scroll + rows) {
+        center_scroll = center_selected + 1 - rows;
+    }
+}
+
+static void center_show(bool open) {
+    if (open == center_open) {
+        return;
+    }
+    if (!open) {
+        notify_mark_all_read();
+    } else {
+        start_menu_open = false;
+        taskbar_menu_open = false;
+        net_popup_open = false;
+        toasts_reset();
+        center_selected = 0;
+        center_scroll = 0;
+    }
+    center_open = open;
+}
+
+static void draw_center(void) {
+    if (!center_open) {
+        return;
+    }
+    center_clamp();
+    struct rect panel = center_rect();
+    fill(panel, 110, 160, 255);
+    fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
+                       panel.height - 4}, 20, 26, 40);
+    char title[32];
+    size_t length = append_text(title, sizeof(title), 0, "NOTIFICATIONS");
+    if (notify_count() != 0) {
+        length = append_text(title, sizeof(title), length, " (");
+        length = append_decimal(title, sizeof(title), length, notify_count());
+        append_text(title, sizeof(title), length, ")");
+    }
+    struct rect dnd = center_dnd_rect(panel);
+    draw_text_clipped(panel.x + 12, panel.y + 11, dnd.x - panel.x - 20,
+                      title, 230, 238, 255);
+    draw_button(dnd, appearance_do_not_disturb() ? "DND ON" : "DND OFF",
+                appearance_do_not_disturb());
+    draw_button(center_clear_rect(panel), "CLEAR ALL", false);
+    if (notify_count() == 0) {
+        struct rect entry = center_entry_rect(panel, 0);
+        draw_text_clipped(entry.x + 6,
+                          entry.y + (entry.height - CHAR_HEIGHT) / 2,
+                          entry.width - 12, "NO NOTIFICATIONS", 140, 160, 200);
+        return;
+    }
+    size_t rows = center_rows();
+    for (size_t row = 0; row < rows; row++) {
+        struct notification item;
+        if (!notify_at(center_scroll + row, &item)) {
+            break;
+        }
+        struct rect entry = center_entry_rect(panel, row);
+        bool selected = center_scroll + row == center_selected;
+        /* The selected entry gets a thicker, brighter border. */
+        int64_t border = selected ? 2 : 1;
+        if (selected) {
+            fill(entry, 110, 160, 255);
+        } else {
+            fill(entry, 60, 70, 95);
+        }
+        fill((struct rect){entry.x + border, entry.y + border,
+                           entry.width - 2 * border,
+                           entry.height - 2 * border}, 26, 34, 54);
+        if (!item.read) {
+            fill((struct rect){entry.x + border, entry.y + border, 4,
+                               entry.height - 2 * border}, 255, 200, 90);
+        }
+        draw_notification_text(entry, &item);
+        struct rect close = toast_close_rect(entry);
+        draw_text_clipped(close.x + 6, close.y + 4, CHAR_WIDTH, "X",
+                          200, 210, 230);
+    }
+    if (notify_count() > rows) {
+        char more[24];
+        size_t used = append_decimal(more, sizeof(more), 0,
+                                     center_scroll + 1);
+        used = append_text(more, sizeof(more), used, "-");
+        used = append_decimal(more, sizeof(more), used,
+                              center_scroll + rows);
+        used = append_text(more, sizeof(more), used, " OF ");
+        append_decimal(more, sizeof(more), used, notify_count());
+        struct rect title_area = {panel.x + 12, panel.y + 11,
+                                  dnd.x - panel.x - 20, CHAR_HEIGHT};
+        int64_t title_width = (int64_t)text_length(title) * CHAR_WIDTH;
+        draw_text_clipped(title_area.x + title_width + CHAR_WIDTH,
+                          title_area.y,
+                          title_area.width - title_width - CHAR_WIDTH, more,
+                          140, 160, 200);
+    }
+}
+
+/* Keys while the panel is open; it takes every key. */
+static void center_key(char character) {
+    size_t count = notify_count();
+    if (character == KEY_ESCAPE) {
+        center_show(false);
+    } else if (character == KEY_UP && center_selected > 0) {
+        center_selected--;
+    } else if (character == KEY_DOWN && center_selected + 1 < count) {
+        center_selected++;
+    } else if (character == KEY_DELETE && count != 0) {
+        struct notification item;
+        if (notify_at(center_selected, &item)) {
+            (void)notify_dismiss(item.id);
+        }
+    }
+    center_clamp();
+}
+
+/* A click while the panel is open; false when it was outside (the panel
+   then closes and the click goes on). */
+static bool center_press(int32_t x, int32_t y) {
+    struct rect panel = center_rect();
+    if (!rect_contains(panel, x, y)) {
+        center_show(false);
+        return false;
+    }
+    if (rect_contains(center_clear_rect(panel), x, y)) {
+        notify_clear();
+        center_clamp();
+        return true;
+    }
+    if (rect_contains(center_dnd_rect(panel), x, y)) {
+        appearance_set_do_not_disturb(!appearance_do_not_disturb());
+        return true;
+    }
+    size_t rows = center_rows();
+    for (size_t row = 0; row < rows && row < notify_count(); row++) {
+        struct rect entry = center_entry_rect(panel, row);
+        if (!rect_contains(entry, x, y)) {
+            continue;
+        }
+        center_selected = center_scroll + row;
+        if (rect_contains(toast_close_rect(entry), x, y)) {
+            struct notification item;
+            if (notify_at(center_selected, &item)) {
+                (void)notify_dismiss(item.id);
+            }
+        }
+        break;
+    }
+    center_clamp();
+    return true;
+}
+
+static bool center_wheel(int32_t x, int32_t y, int32_t notches) {
+    if (!center_open || !rect_contains(center_rect(), x, y)) {
+        return false;
+    }
+    size_t count = notify_count();
+    if (notches > 0) {
+        center_scroll = center_scroll > (size_t)notches
+                      ? center_scroll - (size_t)notches : 0;
+    } else {
+        center_scroll += (size_t)-notches;
+    }
+    size_t rows = center_fit_rows();
+    if (count <= rows) {
+        center_scroll = 0;
+    } else if (center_scroll > count - rows) {
+        center_scroll = count - rows;
+    }
+    if (center_selected < center_scroll) {
+        center_selected = center_scroll;
+    } else if (center_selected >= center_scroll + rows) {
+        center_selected = center_scroll + rows - 1;
+    }
+    return true;
 }
 
 static void draw_taskbar_menu(void) {
@@ -9456,6 +9809,7 @@ static void draw_scene(void) {
     draw_taskbar_menu();
     draw_net_popup();
     draw_volume_popup();
+    draw_center();
     draw_toasts();
     draw_protected_confirmation();
     if (buffered) {
@@ -11105,6 +11459,13 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     if (toasts_press(x, y)) {
         return DESKTOP_CONTINUE;
     }
+    if (taskbar_shown() && rect_contains(bell_icon_rect(), x, y)) {
+        center_show(!center_open);
+        return DESKTOP_CONTINUE;
+    }
+    if (center_open && center_press(x, y)) {
+        return DESKTOP_CONTINUE;
+    }
     if (files_menu_press(x, y)) {
         return DESKTOP_CONTINUE;
     }
@@ -11513,6 +11874,10 @@ static enum desktop_result handle_super_key(char character) {
     case 'I':
         window_open(WINDOW_SETTINGS);
         break;
+    case 'n':
+    case 'N':
+        center_show(!center_open);
+        break;
     case KEY_LEFT:
     case KEY_RIGHT:
     case KEY_UP:
@@ -11585,6 +11950,10 @@ static enum desktop_result handle_key(char character, bool super) {
     }
     if (taskbar_menu_open) {
         taskbar_menu_key(character);
+        return DESKTOP_CONTINUE;
+    }
+    if (center_open && !start_menu_open) {
+        center_key(character);
         return DESKTOP_CONTINUE;
     }
     if (start_menu_open) {
@@ -12686,15 +13055,22 @@ static enum run_result app_run_result(enum user_run_result result) {
 }
 
 /* A job ended: say so where the program was started. */
-/* Fault signals (SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV) as exit
-   status 128 + signal. */
+/* Exit statuses that mean a crash. A CPU exception ends a program with
+   128 + the exception vector (user_exception_dispatch); a fatal Linux
+   signal with 128 + the signal number. 134 and 139 can be either. */
 static const char *crash_signal_name(uint64_t exit_status) {
     switch (exit_status) {
+    case 128 + 0: return "A DIVIDE ERROR";
     case 128 + 4: return "SIGILL";
-    case 128 + 6: return "SIGABRT";
+    case 128 + 6: return "AN INVALID INSTRUCTION OR SIGABRT";
     case 128 + 7: return "SIGBUS";
     case 128 + 8: return "SIGFPE";
     case 128 + 11: return "SIGSEGV";
+    case 128 + 12: return "A STACK FAULT";
+    case 128 + 13: return "A GENERAL PROTECTION FAULT";
+    case 128 + 14: return "A PAGE FAULT";
+    case 128 + 17: return "AN ALIGNMENT CHECK";
+    case 128 + 19: return "A SIMD FLOATING-POINT ERROR";
     default: return NULL;
     }
 }
@@ -14062,6 +14438,9 @@ static size_t wheel_scrolled(size_t first, int32_t notches, size_t rows,
 static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
     if (notches == 0 || protected_active || login_active || start_menu_open) {
         return false;
+    }
+    if (center_wheel(x, y, notches)) {
+        return true;
     }
     enum window_kind kind = window_at(x, y);
     if (kind == WINDOW_COUNT) {

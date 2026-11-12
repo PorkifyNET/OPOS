@@ -308,6 +308,7 @@ static enum taskbar_position current_taskbar = TASKBAR_BOTTOM;
 static bool taskbar_autohide;
 /* SYSTEM SOUNDS (system_sounds.c), on unless the account turned them off. */
 static bool system_sounds = true;
+static bool do_not_disturb;
 static const char *const taskbar_names[TASKBAR_POSITION_COUNT] = {
     "BOTTOM", "TOP", "LEFT", "RIGHT",
 };
@@ -352,6 +353,7 @@ static void config_defaults(void) {
     current_taskbar = TASKBAR_BOTTOM;
     taskbar_autohide = false;
     system_sounds = true;
+    do_not_disturb = false;
     append(wallpaper_path, sizeof(wallpaper_path), 0, DEFAULT_WALLPAPER);
 }
 
@@ -403,6 +405,9 @@ static void config_parse(const char *text, size_t size) {
                 current_taskbar = (enum taskbar_position)index;
             } else if (same_ignoring_case(key, key_length, "autohide")) {
                 taskbar_autohide =
+                    same_ignoring_case(value, value_length, "on");
+            } else if (same_ignoring_case(key, key_length, "dnd")) {
+                do_not_disturb =
                     same_ignoring_case(value, value_length, "on");
             } else if (same_ignoring_case(key, key_length, "sounds")) {
                 system_sounds =
@@ -509,6 +514,8 @@ static void config_save(void) {
     used = append(text, sizeof(text), used, taskbar_autohide ? "on" : "off");
     used = append(text, sizeof(text), used, "\nsounds=");
     used = append(text, sizeof(text), used, system_sounds ? "on" : "off");
+    used = append(text, sizeof(text), used, "\ndnd=");
+    used = append(text, sizeof(text), used, do_not_disturb ? "on" : "off");
     used = append(text, sizeof(text), used, "\ntap=");
     used = append(text, sizeof(text), used,
                   touchpad_options.tap_to_click ? "on" : "off");
@@ -577,6 +584,18 @@ void appearance_set_taskbar_autohide(bool hide) {
 
 bool appearance_system_sounds(void) {
     return system_sounds;
+}
+
+bool appearance_do_not_disturb(void) {
+    return do_not_disturb;
+}
+
+void appearance_set_do_not_disturb(bool on) {
+    if (on == do_not_disturb) {
+        return;
+    }
+    do_not_disturb = on;
+    config_save();
 }
 
 void appearance_set_system_sounds(bool on) {

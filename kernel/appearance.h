@@ -89,6 +89,11 @@ void appearance_set_taskbar_autohide(bool hide);
 bool appearance_system_sounds(void);
 void appearance_set_system_sounds(bool on);
 
+/* DO NOT DISTURB: new notifications skip their toast and sound and wait
+   in the Notification Center (docs/notifications.md). Off by default. */
+bool appearance_do_not_disturb(void);
+void appearance_set_do_not_disturb(bool on);
+
 /* Touchpad gestures (tap-to-click, scroll direction, pointer speed),
    saved with the other choices; applied to the touchpad on load. */
 void appearance_touchpad(struct tp_options *options);

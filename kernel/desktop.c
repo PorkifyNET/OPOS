@@ -25,6 +25,7 @@
 #include "storage.h"
 #include "sound.h"
 #include "system_sounds.h"
+#include "notify.h"
 #include "svga.h"
 #include "boot_display.h"
 #include "vmware.h"
@@ -1504,6 +1505,7 @@ static const struct terminal_help_entry terminal_help_entries[] = {
     {"run", "run PATH [ARGUMENTS]", "Runs an ELF program by path."},
     {"ps", "ps", "Lists running user programs."},
     {"kill", "kill PID", "Ends the program with the given process ID."},
+    {"notify", "notify TITLE [BODY]", "Shows a notification (for testing)."},
     {"shell", "shell", "Leaves the desktop for the administrator shell."},
     {"reboot", "reboot", "Restarts the computer."},
     {"shutdown", "shutdown", "Turns off the computer through ACPI."},
@@ -1670,6 +1672,29 @@ static bool terminal_execute(void) {
             terminal_length - i, NULL, 0);
         if (result != RUN_STARTED) {
             terminal_print(run_result_text(result));
+        }
+    } else if (terminal_length > 7
+               && text_equals(terminal_line, 7, "notify ")) {
+        /* notify TITLE [BODY]: the first word is the title. */
+        char title[NOTIFY_TITLE_MAX];
+        char body[NOTIFY_BODY_MAX];
+        size_t i = 7;
+        size_t length = 0;
+        while (i < terminal_length && terminal_line[i] == ' ') {
+            i++;
+        }
+        while (i < terminal_length && terminal_line[i] != ' '
+               && length + 1 < sizeof(title)) {
+            title[length++] = terminal_line[i++];
+        }
+        title[length] = '\0';
+        length = 0;
+        while (i < terminal_length && length + 1 < sizeof(body)) {
+            body[length++] = terminal_line[i++];
+        }
+        body[length] = '\0';
+        if (notify_post("TERMINAL", title, body) == 0) {
+            terminal_print("Usage: notify TITLE [BODY]");
         }
     } else if (text_equals(terminal_line, terminal_length, "net")) {
         net_describe(terminal_print);
@@ -4694,10 +4719,13 @@ enum setting_row_kind {
     ROW_VOLUME,
     ROW_MUTE,
     ROW_SYSTEM_SOUNDS,
+    ROW_DO_NOT_DISTURB,
 };
 
 static void volume_step(int delta);
 static bool desktop_power_off(bool restart);
+static void toasts_reset(void);
+static void updates_notify_available(void);
 
 /* Settings pages, listed in the window's sidebar. */
 enum settings_category {
@@ -4734,6 +4762,8 @@ static const struct setting_row setting_rows[] = {
     {"VOLUME (VOLUME KEYS)", ROW_VOLUME, 0, CATEGORY_SOUND},
     {"MUTE", ROW_MUTE, 0, CATEGORY_SOUND},
     {"SYSTEM SOUNDS", ROW_SYSTEM_SOUNDS, 0, CATEGORY_SOUND},
+    {"DO NOT DISTURB (NO NOTIFICATION POPUPS)", ROW_DO_NOT_DISTURB, 0,
+     CATEGORY_SOUND},
     {"COLOR THEME", ROW_THEME, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND", ROW_WALLPAPER, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0, CATEGORY_APPEARANCE},
@@ -4969,6 +4999,10 @@ static void setting_value_text(const struct setting_row *row,
     case ROW_SYSTEM_SOUNDS:
         length = append_text(text, capacity, length,
                              appearance_system_sounds() ? "ON" : "OFF");
+        break;
+    case ROW_DO_NOT_DISTURB:
+        length = append_text(text, capacity, length,
+                             appearance_do_not_disturb() ? "ON" : "OFF");
         break;
     case ROW_SCROLL_DIRECTION:
         length = append_text(text, capacity, length,
@@ -5272,6 +5306,10 @@ static void settings_change(size_t index, int delta) {
     }
     if (row->kind == ROW_MUTE) {
         sound_set_muted(!sound_muted());
+        return;
+    }
+    if (row->kind == ROW_DO_NOT_DISTURB) {
+        appearance_set_do_not_disturb(!appearance_do_not_disturb());
         return;
     }
     if (row->kind == ROW_SYSTEM_SOUNDS) {
@@ -6467,12 +6505,34 @@ static void updates_line_done(void) {
             updates_status = UPDATES_UP_TO_DATE;
         } else if (text_equals(value, value_length, "available")) {
             updates_status = UPDATES_AVAILABLE;
+            updates_notify_available();
         } else if (text_equals(value, value_length, "installed")) {
             updates_status = UPDATES_INSTALLED;
         } else if (text_equals(value, value_length, "error")) {
             updates_status = UPDATES_ERROR;
         }
     }
+}
+
+/* Once per version, unless the UPDATES page is already in front. */
+static void updates_notify_available(void) {
+    static char notified[sizeof(updates_latest)];
+    if (window_focused(WINDOW_SETTINGS)
+        && settings_category == CATEGORY_UPDATES) {
+        return;
+    }
+    if (updates_latest[0] != '\0'
+        && text_equals(notified, text_length(notified), updates_latest)) {
+        return;
+    }
+    text_copy(notified, sizeof(notified), updates_latest);
+    char title[NOTIFY_TITLE_MAX] = "OPOS ";
+    size_t length = append_text(title, sizeof(title), text_length(title),
+                                updates_latest[0] != '\0' ? updates_latest
+                                                          : "UPDATE");
+    append_text(title, sizeof(title), length, " IS AVAILABLE");
+    notify_post("OPOS UPDATES", title,
+                "OPEN SETTINGS > UPDATES TO INSTALL IT.");
 }
 
 static void updates_feed(char character) {
@@ -6829,6 +6889,8 @@ static void desktop_session_end(void) {
         window_close(z_order[z_count - 1]);
     }
     accounts_logout();
+    notify_clear();
+    toasts_reset();
     appearance_load();
     files_places_rebuild();
     files_set_path("/", 1);
@@ -8765,6 +8827,192 @@ static void draw_volume_popup(void) {
     }
 }
 
+/* ---------------------------------------------------------------- toasts */
+
+/*
+ * New notifications (notify.c) show as toasts by the clock for 5 s, at
+ * most TOAST_MAX at a time, newest nearest the taskbar. Clicking one marks
+ * it read and hides it; its close box dismisses the notification. While
+ * DO NOT DISTURB is on they skip the toast and sound and stay unread.
+ */
+#define TOAST_MAX 3u
+#define TOAST_TICKS 500u
+#define TOAST_COLUMNS 44
+#define TOAST_GAP 6
+struct toast {
+    uint32_t id;
+    uint64_t until;
+};
+static struct toast toasts[TOAST_MAX];
+static size_t toast_count;
+
+static void toast_remove(size_t index) {
+    for (size_t i = index; i + 1 < toast_count; i++) {
+        toasts[i] = toasts[i + 1];
+    }
+    toast_count--;
+}
+
+static void toasts_reset(void) {
+    toast_count = 0;
+}
+
+/* True when the toasts changed. */
+static bool toasts_poll(void) {
+    bool changed = false;
+    uint64_t now = timer_ticks();
+    for (size_t i = toast_count; i-- > 0;) {
+        if (now >= toasts[i].until || !notify_find(toasts[i].id, NULL)) {
+            toast_remove(i);
+            changed = true;
+        }
+    }
+    /* New ones wait while a prompt or the login screen is up. */
+    if (login_active || protected_active) {
+        return changed;
+    }
+    bool quiet = appearance_do_not_disturb();
+    bool chimed = false;
+    struct notification entry;
+    while (toast_count < TOAST_MAX && notify_take_toast(&entry)) {
+        if (quiet) {
+            continue;
+        }
+        toasts[toast_count++] = (struct toast){entry.id, now + TOAST_TICKS};
+        if (!chimed) {
+            system_sound_play(SYSTEM_SOUND_NOTIFICATION);
+            chimed = true;
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+static int64_t toast_height(void) {
+    return 4 * CHAR_HEIGHT + 34;
+}
+
+/* Toast index (0 = oldest); the newest sits by the clock. */
+static struct rect toast_rect(size_t index) {
+    struct rect clock = clock_rect();
+    int64_t width = TOAST_COLUMNS * CHAR_WIDTH + 24;
+    if (width > screen_width() - 8) {
+        width = screen_width() - 8;
+    }
+    int64_t height = toast_height();
+    struct rect first = taskbar_popup_rect(clock.x + clock.width - width,
+                                           clock.y, width, height);
+    if (volume_popup_until != 0) {
+        /* Above (or below) the volume popup. */
+        struct rect volume = volume_popup_rect();
+        first.y += first.y > screen_height() / 2
+                 ? -(volume.height + TOAST_GAP) : volume.height + TOAST_GAP;
+    }
+    int64_t step = (int64_t)(toast_count - 1 - index) * (height + TOAST_GAP);
+    first.y += first.y > screen_height() / 2 ? -step : step;
+    return first;
+}
+
+static struct rect toast_close_rect(struct rect toast) {
+    return (struct rect){toast.x + toast.width - CHAR_WIDTH - 16, toast.y + 4,
+                         CHAR_WIDTH + 12, CHAR_HEIGHT + 8};
+}
+
+/* Splits text at a space so each line fits columns; returns the length
+   of the first line and sets *next to where the rest starts. */
+static size_t wrap_line(const char *text, size_t columns, size_t *next) {
+    size_t length = text_length(text);
+    if (length <= columns) {
+        *next = length;
+        return length;
+    }
+    size_t cut = columns;
+    while (cut > 0 && text[cut] != ' ') {
+        cut--;
+    }
+    if (cut == 0) {
+        cut = columns;
+    }
+    *next = cut;
+    while (text[*next] == ' ') {
+        (*next)++;
+    }
+    return cut;
+}
+
+static void draw_notification_text(struct rect area,
+                                   const struct notification *entry) {
+    char header[NOTIFY_SOURCE_MAX + 16];
+    size_t length = append_text(header, sizeof(header), 0, entry->source);
+    if (entry->has_time) {
+        length = append_text(header, sizeof(header), length, "  ");
+        length = append_hour(header, sizeof(header), length,
+                             entry->time.hour);
+        length = append_text(header, sizeof(header), length, ":");
+        length = append_two_digits(header, sizeof(header), length,
+                                   entry->time.minute);
+    }
+    int64_t x = area.x + 12;
+    int64_t width = area.width - 24 - CHAR_WIDTH - 12;
+    draw_text_clipped(x, area.y + 8, width, header, 140, 160, 200);
+    draw_text_clipped(x, area.y + 14 + CHAR_HEIGHT, area.width - 24,
+                      entry->title, 240, 244, 255);
+    size_t columns = (size_t)((area.width - 24) / CHAR_WIDTH);
+    const char *rest = entry->body;
+    for (int line = 0; line < 2 && *rest != '\0'; line++) {
+        size_t next;
+        size_t cut = wrap_line(rest, columns, &next);
+        char text[NOTIFY_BODY_MAX];
+        size_t copy = cut < sizeof(text) - 1 ? cut : sizeof(text) - 1;
+        for (size_t i = 0; i < copy; i++) {
+            text[i] = rest[i];
+        }
+        text[copy] = '\0';
+        if (line == 1 && rest[next] != '\0' && copy >= 3) {
+            text[copy - 3] = text[copy - 2] = text[copy - 1] = '.';
+        }
+        draw_text_clipped(x, area.y + 20 + (2 + line) * CHAR_HEIGHT,
+                          area.width - 24, text, 200, 210, 230);
+        rest += next;
+    }
+}
+
+static void draw_toasts(void) {
+    for (size_t i = 0; i < toast_count; i++) {
+        struct notification entry;
+        if (!notify_find(toasts[i].id, &entry)) {
+            continue;
+        }
+        struct rect toast = toast_rect(i);
+        fill(toast, 110, 160, 255);
+        fill((struct rect){toast.x + 2, toast.y + 2, toast.width - 4,
+                           toast.height - 4}, 26, 34, 54);
+        draw_notification_text(toast, &entry);
+        struct rect close = toast_close_rect(toast);
+        draw_text_clipped(close.x + 6, close.y + 4, CHAR_WIDTH, "X",
+                          200, 210, 230);
+    }
+}
+
+/* A click on a toast; true when it was on one. */
+static bool toasts_press(int32_t x, int32_t y) {
+    for (size_t i = toast_count; i-- > 0;) {
+        struct rect toast = toast_rect(i);
+        if (!rect_contains(toast, x, y)) {
+            continue;
+        }
+        uint32_t id = toasts[i].id;
+        if (rect_contains(toast_close_rect(toast), x, y)) {
+            (void)notify_dismiss(id);
+        } else {
+            notify_mark_read(id);
+        }
+        toast_remove(i);
+        return true;
+    }
+    return false;
+}
+
 static void draw_taskbar_menu(void) {
     if (!taskbar_menu_open) {
         return;
@@ -9208,6 +9456,7 @@ static void draw_scene(void) {
     draw_taskbar_menu();
     draw_net_popup();
     draw_volume_popup();
+    draw_toasts();
     draw_protected_confirmation();
     if (buffered) {
         console_frame_present();
@@ -10853,6 +11102,9 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         login_press(x, y);
         return DESKTOP_CONTINUE;
     }
+    if (toasts_press(x, y)) {
+        return DESKTOP_CONTINUE;
+    }
     if (files_menu_press(x, y)) {
         return DESKTOP_CONTINUE;
     }
@@ -12434,9 +12686,50 @@ static enum run_result app_run_result(enum user_run_result result) {
 }
 
 /* A job ended: say so where the program was started. */
+/* Fault signals (SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV) as exit
+   status 128 + signal. */
+static const char *crash_signal_name(uint64_t exit_status) {
+    switch (exit_status) {
+    case 128 + 4: return "SIGILL";
+    case 128 + 6: return "SIGABRT";
+    case 128 + 7: return "SIGBUS";
+    case 128 + 8: return "SIGFPE";
+    case 128 + 11: return "SIGSEGV";
+    default: return NULL;
+    }
+}
+
+static void app_notify_crash(const struct app_job *job) {
+    const char *signal = crash_signal_name(job->exit_status);
+    if (signal == NULL) {
+        return;
+    }
+    size_t start = job->path_length;
+    while (start > 0 && job->path[start - 1] != '/') {
+        start--;
+    }
+    char name[NOTIFY_SOURCE_MAX];
+    size_t length = 0;
+    for (size_t i = start; i < job->path_length && length + 1 < sizeof(name);
+         i++) {
+        name[length++] = job->path[i];
+    }
+    name[length] = '\0';
+    char title[NOTIFY_TITLE_MAX];
+    size_t used = append_text(title, sizeof(title), 0,
+                              length != 0 ? name : "A PROGRAM");
+    append_text(title, sizeof(title), used, " STOPPED UNEXPECTEDLY");
+    char body[NOTIFY_BODY_MAX] = "IT ENDED WITH ";
+    append_text(body, sizeof(body), text_length(body), signal);
+    notify_post("OPOS", title, body);
+}
+
 static void app_job_report(struct app_job *job) {
     enum run_result result = app_run_result(job->result);
     bool started = result == RUN_STARTED;
+    if (started && !apps_stopping) {
+        app_notify_crash(job);
+    }
     switch (job->origin) {
     case APP_FROM_TERMINAL:
         /* Its screen, terminal settings and unread typing end with it. */
@@ -13115,6 +13408,9 @@ static void store_line_done(void) {
         store_phase[count] = '\0';
     } else if (text_equals(key, key_length, "done")) {
         store_say(value, (size_t)(end - value), false);
+        if (!window_focused(WINDOW_STORE)) {
+            notify_post("OPOS STORE", store_message, "");
+        }
     } else if (text_equals(key, key_length, "updates")) {
         store_update_count = 0;
         for (const char *c = value; c < end && *c >= '0' && *c <= '9'; c++) {
@@ -13122,6 +13418,19 @@ static void store_line_done(void) {
                                + (size_t)(*c - '0');
         }
         store_loaded = true;
+        static size_t notified_updates;
+        if (store_update_count != 0 && store_update_count != notified_updates
+            && !window_focused(WINDOW_STORE)) {
+            char title[NOTIFY_TITLE_MAX] = "";
+            size_t length = append_decimal(title, sizeof(title), 0,
+                                           store_update_count);
+            append_text(title, sizeof(title), length,
+                        store_update_count == 1 ? " PACKAGE UPDATE"
+                                                : " PACKAGE UPDATES");
+            notify_post("OPOS STORE", title,
+                        "OPEN THE OPOS STORE TO INSTALL THEM.");
+        }
+        notified_updates = store_update_count;
     }
 }
 
@@ -13860,6 +14169,7 @@ static bool desktop_step(void) {
         volume_popup_until = 0;
         redraw = true;
     }
+    redraw |= toasts_poll();
 
     /* The host may resize the screen (VMware "Autofit Guest"). */
     int64_t width_before = screen_width();

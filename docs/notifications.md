@@ -117,6 +117,46 @@ Each step is one PR, stacked like the sound work.
   screenshot. The shutdown sound was not checked automatically (the
   Start menu needs the mouse, which the QEMU harness cannot move).
 
+## As built in step 2
+
+- `kernel/notify.c` keeps the session's last 64 notifications (source up
+  to 31 characters, title 63, body 191; control characters become
+  spaces), each with an id, the RTC time, a read flag and a "toast
+  pending" flag. Changes and copies run with interrupts off, so program
+  threads can post in step 4. Log out clears the list.
+- Toasts (desktop.c "toasts"): at most 3, the newest by the clock, the
+  others stacked away from the taskbar (and clear of the volume popup).
+  Each shows source and time, title, and the body wrapped to two lines
+  (cut with "..."). A toast stays 5 s; a fourth notification waits for a
+  free slot. One notification sound plays per desktop pass, however many
+  toasts it opens. Clicking a toast marks it read and hides it (step 3
+  makes this open the Notification Center); its X dismisses the
+  notification. New toasts wait while the login screen or a password or
+  permission prompt is up.
+- DO NOT DISTURB is on Settings > SOUND, saved as `dnd=on|off` in
+  DESKTOP.CFG. While on, new notifications skip the toast and the sound
+  and stay unread in the list.
+- OPOS notifies:
+  - "OPOS x.y.z IS AVAILABLE" when an update check finds a new version
+    and the UPDATES page is not the front window (once per version);
+  - "N PACKAGE UPDATES" when the Store's list shows updates and the Store
+    is not in front (again only when the number changes);
+  - the Store's result line ("INSTALLED ...") when an install or removal
+    ends while the Store is not in front;
+  - "NAME STOPPED UNEXPECTEDLY" when a program started from the desktop
+    ends on SIGILL, SIGABRT, SIGBUS, SIGFPE or SIGSEGV.
+  No background update check was added: these come from the checks the
+  UPDATES page and the Store already run.
+- The desktop Terminal's `notify TITLE [BODY]` posts a test notification
+  (the first word is the title), from source TERMINAL.
+- Tested in QEMU (KVM, HDA): one long notification wrapped and was cut
+  correctly, the notification sound was recorded (A5 then E6); four
+  quick notifications showed three toasts with the newest by the clock,
+  the fourth appeared when the first expired, and all were gone after
+  5 s. With DO NOT DISTURB on, `notify` showed no toast and the
+  recording was silent. Not tested: clicks on toasts (the QEMU harness
+  cannot click), the update, Store and crash notifications.
+
 ## Not planned yet
 
 Notification actions (buttons inside a notification), notifications that

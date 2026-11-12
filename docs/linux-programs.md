@@ -85,9 +85,9 @@ In the order the next programs are likely to hit them.
 6. **Locks.** Record locks are granted at once and not tracked: two
    processes writing one SQLite database could corrupt it. Fine while
    each program has its own storage; needed before shared files.
-7. **Dynamic linking.** Static musl programs work. Dynamically linked
-   ones need a library search path (`$ORIGIN`, `LD_LIBRARY_PATH`) and
-   more than four libraries; glibc programs need far more.
+7. **Dynamic linking.** Dynamically linked musl programs work since
+   step 6, with musl's own dynamic linker. glibc programs need far
+   more (glibc's loader, `/proc`, and many more system calls).
 8. **Graphics.** Linux GUI programs draw through X11 or Wayland. A
    first step could be a small SDL2 backend that draws into an OPOS
    window, which covers many games and simple programs.
@@ -118,7 +118,7 @@ Proposal:
    stack, heap, `mremap`, `getrlimit`. See "As built in step 4".
 5. Done. Terminal: raw mode, escape sequences in the desktop Terminal,
    Ctrl+C and Ctrl+D. See "As built in step 5".
-6. BusyBox done (see "As built in step 6"). Next: dynamic linking.
+6. BusyBox and dynamic linking done (see "As built in step 6").
 7. Graphics through an SDL2 backend.
 
 ## As built in step 2
@@ -365,13 +365,74 @@ it with the rest of the Store, run `make store STORE_LINUX="lua sqlite busybox"`
 **Still missing for BusyBox:**
 - `/proc` (`ps`, `top`, `free`);
 - `sendfile` (`cat` falls back to read and write);
-- symbolic links and `readlink`;
+- symbolic links (`readlink` now answers, but FAT has no links);
 - file times (`ls -l` shows 1970);
 - job control (Ctrl+Z, `fg`, `bg`).
 
 A process killed by a signal is reported as exiting with 128 + the
 signal number, not as signaled, so the shell prints `Done(143)` rather
 than `Terminated`.
+
+**Dynamic linking.** Programs linked against musl's shared libc run
+with musl's own dynamic linker. The OPOS image carries musl's `libc.so`
+as `/lib/ld-musl-x86_64.so.1` (0.7 MB, with musl's license in
+`/share/licenses/musl.txt`). `make` copies it from `MUSL_LIBC_SO`, by
+default the first of `build/musl-local/lib/x86_64-linux-musl/libc.so`
+and the distribution's paths that exists; without one the image builds
+without it. A package can carry its own shared libraries next to the
+program and find them with an `$ORIGIN` run path
+(`-Wl,-rpath,'$ORIGIN'`), or through `LD_LIBRARY_PATH`. musl's default
+path is `/lib:/usr/local/lib:/usr/lib`.
+
+Kernel changes:
+- **Interpreter size.** The interpreter is read into a per-task buffer
+  that grows like the program buffer, up to 4 MiB. Before, it was a
+  fixed 64 KiB.
+- **`MAP_FIXED`.** `mmap` places a mapping at the given address in the
+  mmap area, replacing pages already there; `MAP_FIXED_NOREPLACE` fails
+  with `EEXIST` instead. Without these flags an address is a hint.
+  `MAP_DENYWRITE`, `MAP_EXECUTABLE`, `MAP_NORESERVE`, `MAP_POPULATE`,
+  `MAP_NONBLOCK` and `MAP_STACK` are accepted and change nothing. musl
+  maps each library's span and then each segment with `MAP_FIXED`.
+- **`mprotect` on the program's segments.** The loader makes the main
+  program's relocated data read-only (RELRO). A page may lose write or
+  execute permission, or get back what its segment had; never more. A
+  forked child maps the segments with their first permissions.
+- **`readlink` and `readlinkat` (89, 267).** `/proc/self/exe` gives the
+  program's path, which musl needs to expand `$ORIGIN`. Other existing
+  paths are not links (`EINVAL`).
+- **`membarrier` (324).** OPOS runs all threads on one CPU, so the
+  barrier commands return at once. musl calls it in `dlopen`.
+- **Faults.** A user page fault also logs the faulting address.
+
+**Toolchain.** Dynamic linking needs the linker to find musl's
+`libc.so`. Debian's musl package links `usr/lib/x86_64-linux-musl/libc.so`
+to `/lib/x86_64-linux-musl/libc.so` with an absolute link, which an
+unpacked copy in `build/musl-local` loses. Without it `-lc` finds
+`libc.a`, and a "dynamic" program has libc linked in. It then needs
+only the interpreter, but a shared library built this way carries its
+own copy of libc, and its thread-local storage fails. A local specs file
+must list `build/musl-local/lib/x86_64-linux-musl` before
+`build/musl-local/usr/lib/x86_64-linux-musl` in `link_libgcc`.
+`readelf -d program | grep NEEDED` shows `libc.so` when it is right.
+
+**Tested** in QEMU, in a test package with three programs and one
+library, each built with `gcc -specs build/musl-local.specs`:
+- a program using only libc: `malloc`, `printf`, arguments and the
+  environment;
+- a program using its own `libgreet.so` through `$ORIGIN`. The library
+  has a constructor, thread-local storage (`__tls_get_addr`) and a
+  shared counter. The program calls it from the main thread and from a
+  second thread, then `dlopen`s the library and calls it through
+  `dlsym` (same symbol), and `dlopen`s a missing library (the error
+  message). The output matches the same program on Linux line for line;
+- from BusyBox `sh`: a program without a run path fails with musl's
+  "Error loading shared library" message, and runs with
+  `LD_LIBRARY_PATH`; `execve` and background jobs start dynamic
+  programs.
+
+The old test interpreter `/lib/opos-ld.so` and its libraries stay for
+the kernel's own regression tests.
 
 ## Tests
 

@@ -58,6 +58,10 @@ STORE_SOURCES ?= $(BUILD)/store_sources
 MUSL_SPECS := $(BUILD)/musl-local.specs
 LINUX_CC ?= $(if $(wildcard $(MUSL_SPECS)),gcc -specs $(abspath $(MUSL_SPECS)),musl-gcc)
 MUSL_LICENSE ?= $(firstword $(wildcard $(BUILD)/musl-local/usr/share/doc/musl/copyright /usr/share/doc/musl/copyright))
+# musl's shared libc, which is also its dynamic linker. OPOS ships it as
+# /lib/ld-musl-x86_64.so.1 so dynamically linked musl programs run
+# (docs/linux-programs.md, step 6). Without it the image still builds.
+MUSL_LIBC_SO ?= $(firstword $(wildcard $(BUILD)/musl-local/lib/x86_64-linux-musl/libc.so /usr/lib/x86_64-linux-musl/libc.so /usr/lib/musl/lib/libc.so))
 # BearSSL files the kernel uses to check update signatures (ECDSA P-256).
 KERNEL_BEARSSL_SOURCES := $(addprefix sdk/bearssl/src/,codec/ccopy.c \
 	ec/ec_p256_m31.c ec/ec_secp256r1.c ec/ec_secp384r1.c ec/ec_secp521r1.c \
@@ -233,7 +237,7 @@ sdk/include/opos_image.h: kernel/image.h
 sdk/lib/image.c: kernel/image.c
 	sed 's|#include "image.h"|#include "opos_image.h"|' $< > $@
 
-$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(SDK_PKG) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF)
+$(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE) $(SDK_NOTEPAD) $(SDK_FETCH) $(SDK_UPDATE) $(SDK_PKG) $(USER_ELF) $(EXEC_TEST_ELF) $(DYNAMIC_MAIN_ELF) $(DYNAMIC_PIE_MAIN_ELF) $(DYNAMIC_INTERPRETER_ELF) $(DYNAMIC_LIBRARY_ELF) $(DYNAMIC_BASE_LIBRARY_ELF) $(MUSL_TEST_ELF) $(MUSL_PTHREAD_TEST_ELF) $(MUSL_SIGNAL_TEST_ELF) $(MUSL_NET_TEST_ELF) $(MUSL_LIBC_SO)
 	rm -rf $(BUILD)/initramfs_root
 	mkdir -p $(BUILD)/initramfs_root/bin $(BUILD)/initramfs_root/lib $(BUILD)/initramfs_root/tests
 	cp $(USER_ELF) $(BUILD)/initramfs_root/tests/elf-test
@@ -257,6 +261,7 @@ $(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE)
 	cp $(FONTS) $(BUILD)/initramfs_root/share/fonts/
 	mkdir -p $(BUILD)/initramfs_root/share/wallpapers
 	cp $(WALLPAPERS) $(BUILD)/initramfs_root/share/wallpapers/
+	if [ -n "$(MUSL_LIBC_SO)" ]; then 		cp $(MUSL_LIBC_SO) $(BUILD)/initramfs_root/lib/ld-musl-x86_64.so.1; 		mkdir -p $(BUILD)/initramfs_root/share/licenses; 		cp $(MUSL_LICENSE) $(BUILD)/initramfs_root/share/licenses/musl.txt; 	fi
 	mkdir -p $(BUILD)/initramfs_root/etc/ssl/certs
 	cp $(CA_BUNDLE) $(BUILD)/initramfs_root/etc/ssl/certs/
 	tar --format=ustar -C $(BUILD)/initramfs_root -cf $@ bin etc lib share tests

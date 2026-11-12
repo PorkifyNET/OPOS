@@ -71,10 +71,11 @@
 /* Sockets move at most this much per call (short reads/writes are
    normal for them). */
 #define USER_SOCKET_IO_MAX 65536
-/* Largest program file; interpreters (ld.so) are smaller. */
+/* Largest program file, and largest interpreter (musl's libc.so is
+   about 0.7 MiB). Buffers grow in steps of USER_EXEC_IMAGE_STEP. */
 #define USER_EXEC_IMAGE_STEP (1024 * 1024)
 #define USER_EXEC_IMAGE_MAX (16 * 1024 * 1024)
-#define USER_INTERPRETER_IMAGE_MAX 65536
+#define USER_INTERPRETER_IMAGE_MAX (4 * 1024 * 1024)
 /* argv, envp and their strings share the stack's top page with the
    auxiliary vector; a set that does not fit gives E2BIG. */
 #define USER_EXEC_VECTOR_MAX 64
@@ -83,6 +84,13 @@
 #define USER_MMAP_MAX_PAGES 16384
 #define USER_MMAP_ANONYMOUS 0x20
 #define USER_MMAP_PRIVATE 0x02
+#define USER_MMAP_FIXED 0x10
+#define USER_MMAP_FIXED_NOREPLACE 0x100000
+/* MAP_DENYWRITE, MAP_EXECUTABLE, MAP_NORESERVE, MAP_POPULATE,
+   MAP_NONBLOCK and MAP_STACK: accepted, nothing to do (pages are
+   allocated at once). */
+#define USER_MMAP_NO_EFFECT (0x800 | 0x1000 | 0x4000 | 0x8000 | 0x10000 \
+                             | 0x20000)
 #define USER_PROT_WRITE 0x02
 #define USER_PROT_EXEC 0x04
 #define USER_PROT_READ 0x01
@@ -349,6 +357,9 @@ struct user_process {
     volatile bool group_exit;
     uint64_t group_status;
     char name[32];
+    /* The program file's path, for readlink("/proc/self/exe"). */
+    char exe_path[USER_FILE_PATH_CAPACITY];
+    size_t exe_path_length;
     bool elf_image;
     uintptr_t initial_break;
     uintptr_t current_break;
@@ -435,26 +446,35 @@ static uint64_t next_process_id = 1;
 static struct user_process process_slots[SCHEDULER_TASK_CAPACITY];
 static struct user_file_descriptor open_files[USER_OPEN_FILE_CAPACITY];
 static struct user_pipe pipes[USER_PIPE_CAPACITY];
-static uint8_t user_interpreter_images[SCHEDULER_TASK_CAPACITY][USER_INTERPRETER_IMAGE_MAX];
-
 /*
- * execve and program starts read the whole executable here. Each task's
- * buffer is allocated on first use with 1 MiB and grows in 1 MiB steps to
- * the largest program the task has loaded, up to USER_EXEC_IMAGE_MAX.
- * The contiguous allocator only carves fresh blocks, so a replaced
- * buffer's pages go back one by one as single pages.
+ * execve and program starts read the whole executable, and its PT_INTERP
+ * interpreter, here. Each task has one buffer of each kind, allocated on
+ * first use with 1 MiB and grown in 1 MiB steps to the largest file the
+ * task has loaded. The contiguous allocator only carves fresh blocks, so
+ * a replaced buffer's pages go back one by one as single pages.
  */
-static uint8_t *user_exec_buffers[SCHEDULER_TASK_CAPACITY];
-static uint64_t user_exec_physical[SCHEDULER_TASK_CAPACITY];
-static size_t user_exec_capacity[SCHEDULER_TASK_CAPACITY];
+enum user_image_kind {
+    USER_IMAGE_PROGRAM,
+    USER_IMAGE_INTERPRETER,
+    USER_IMAGE_KINDS,
+};
+static uint8_t *user_image_buffers[USER_IMAGE_KINDS][SCHEDULER_TASK_CAPACITY];
+static uint64_t user_image_physical[USER_IMAGE_KINDS][SCHEDULER_TASK_CAPACITY];
+static size_t user_image_capacity[USER_IMAGE_KINDS][SCHEDULER_TASK_CAPACITY];
+static const size_t user_image_max[USER_IMAGE_KINDS] = {
+    USER_EXEC_IMAGE_MAX, USER_INTERPRETER_IMAGE_MAX,
+};
 
-static bool user_exec_buffer_reserve(size_t task_slot, size_t needed) {
+static bool user_image_buffer_reserve(enum user_image_kind kind,
+                                      size_t task_slot, size_t needed) {
     if (task_slot >= SCHEDULER_TASK_CAPACITY
-        || needed > USER_EXEC_IMAGE_MAX) {
+        || needed > user_image_max[kind]) {
         return false;
     }
-    if (user_exec_buffers[task_slot] != NULL
-        && user_exec_capacity[task_slot] >= needed) {
+    uint8_t **buffer = &user_image_buffers[kind][task_slot];
+    uint64_t *buffer_physical = &user_image_physical[kind][task_slot];
+    size_t *buffer_capacity = &user_image_capacity[kind][task_slot];
+    if (*buffer != NULL && *buffer_capacity >= needed) {
         return true;
     }
     size_t capacity = (needed + USER_EXEC_IMAGE_STEP - 1)
@@ -466,48 +486,54 @@ static bool user_exec_buffer_reserve(size_t task_slot, size_t needed) {
     if (physical == 0) {
         return false;
     }
-    if (user_exec_buffers[task_slot] != NULL) {
-        for (size_t i = 0; i < user_exec_capacity[task_slot] / PAGE_SIZE;
-             i++) {
-            (void)physical_page_free(user_exec_physical[task_slot]
-                                     + i * PAGE_SIZE);
+    if (*buffer != NULL) {
+        for (size_t i = 0; i < *buffer_capacity / PAGE_SIZE; i++) {
+            (void)physical_page_free(*buffer_physical + i * PAGE_SIZE);
         }
     }
-    user_exec_physical[task_slot] = physical;
-    user_exec_buffers[task_slot] = physical_page_to_hhdm(physical);
-    user_exec_capacity[task_slot] = capacity;
+    *buffer_physical = physical;
+    *buffer = physical_page_to_hhdm(physical);
+    *buffer_capacity = capacity;
     return true;
 }
 
-/* Reads an executable into the task's buffer: 0, or -2 (missing),
-   -7 (larger than USER_EXEC_IMAGE_MAX), -12 (no memory). */
-static int64_t user_read_exec_image(size_t task_slot, const char *path,
-                                    size_t path_length, uint8_t **image,
-                                    size_t *image_size) {
+/* Reads a file into the task's buffer of that kind: 0, or -2 (missing),
+   -7 (larger than the kind's maximum), -12 (no memory). */
+static int64_t user_read_image(enum user_image_kind kind, size_t task_slot,
+                               const char *path, size_t path_length,
+                               uint8_t **image, size_t *image_size) {
     *image = NULL;
     *image_size = 0;
-    if (!user_exec_buffer_reserve(task_slot, USER_EXEC_IMAGE_STEP)) {
+    if (!user_image_buffer_reserve(kind, task_slot, USER_EXEC_IMAGE_STEP)) {
         return -12;
     }
     size_t size = 0;
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (vfs_read_file(path, path_length, user_exec_buffers[task_slot],
-                          user_exec_capacity[task_slot], &size)) {
-            *image = user_exec_buffers[task_slot];
+        if (vfs_read_file(path, path_length,
+                          user_image_buffers[kind][task_slot],
+                          user_image_capacity[kind][task_slot], &size)) {
+            *image = user_image_buffers[kind][task_slot];
             *image_size = size;
             return 0;
         }
-        if (size <= user_exec_capacity[task_slot]) {
+        if (size <= user_image_capacity[kind][task_slot]) {
             return -2;
         }
-        if (size > USER_EXEC_IMAGE_MAX) {
+        if (size > user_image_max[kind]) {
             return -7;
         }
-        if (!user_exec_buffer_reserve(task_slot, size)) {
+        if (!user_image_buffer_reserve(kind, task_slot, size)) {
             return -12;
         }
     }
     return -2;
+}
+
+static int64_t user_read_exec_image(size_t task_slot, const char *path,
+                                    size_t path_length, uint8_t **image,
+                                    size_t *image_size) {
+    return user_read_image(USER_IMAGE_PROGRAM, task_slot, path, path_length,
+                           image, image_size);
 }
 
 struct user_load_pages {
@@ -526,6 +552,13 @@ static uint64_t next_child_handle = 1;
 /* A process's name for the Task Manager: the last part of its path. */
 static void user_set_process_name(struct user_process *process,
                                   const char *path, size_t length) {
+    process->exe_path_length = 0;
+    if (path != NULL && length < sizeof(process->exe_path)) {
+        for (size_t i = 0; i < length; i++) {
+            process->exe_path[i] = path[i];
+        }
+        process->exe_path_length = length;
+    }
     size_t start = 0;
     for (size_t i = 0; i < length; i++) {
         if (path[i] == '/') {
@@ -3265,6 +3298,10 @@ static int64_t user_linux_fork(struct user_process *parent,
     for (size_t i = 0; i < sizeof(child->name); i++) {
         child->name[i] = parent->name[i];
     }
+    for (size_t i = 0; i < parent->exe_path_length; i++) {
+        child->exe_path[i] = parent->exe_path[i];
+    }
+    child->exe_path_length = parent->exe_path_length;
     child->cwd_length = parent->cwd_length;
     for (size_t i = 0; i < parent->cwd_length; i++) {
         child->cwd[i] = parent->cwd[i];
@@ -3397,6 +3434,7 @@ static int64_t user_linux_execve(struct user_process *process,
     }
     struct elf_load_plan interpreter_plan = {0};
     size_t interpreter_size = 0;
+    uint8_t *interpreter_image = NULL;
     if (plan.has_interpreter) {
         if (plan.interpreter_path_length == 0
             || plan.interpreter_path[0] != '/'
@@ -3405,14 +3443,15 @@ static int64_t user_linux_execve(struct user_process *process,
                                   PERMISSION_READ)) {
             return -13;
         }
-        if (!vfs_read_file(plan.interpreter_path,
-                           plan.interpreter_path_length,
-                           user_interpreter_images[task_slot],
-                           USER_INTERPRETER_IMAGE_MAX, &interpreter_size)) {
-            return -2;
+        int64_t read = user_read_image(USER_IMAGE_INTERPRETER, task_slot,
+                                       plan.interpreter_path,
+                                       plan.interpreter_path_length,
+                                       &interpreter_image, &interpreter_size);
+        if (read != 0) {
+            return read == -7 ? -8 : read;
         }
         if (!elf_inspect_user_interpreter(
-                user_interpreter_images[task_slot], interpreter_size,
+                interpreter_image, interpreter_size,
                 PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_BASE,
                 USER_MMAP_BASE + USER_MMAP_MAX_PAGES * PAGE_SIZE,
                 &interpreter_plan)) {
@@ -3449,7 +3488,7 @@ static int64_t user_linux_execve(struct user_process *process,
                              image_buffers, plan.total_page_count, PAGE_SIZE)
         || (plan.has_interpreter
             && !elf_load_user_image(
-                user_interpreter_images[task_slot], interpreter_size,
+                interpreter_image, interpreter_size,
                 &interpreter_plan, interpreter_buffers,
                 interpreter_plan.total_page_count, PAGE_SIZE))) {
         release_user_pages(0, image_physical, plan.total_page_count, 0);
@@ -5454,6 +5493,60 @@ static void user_linux_unimplemented(struct user_process *process,
     console_serial_log(line);
 }
 
+/*
+ * mprotect on pages of the program's loaded segments, as a dynamic
+ * linker does for RELRO. A page may lose write or execute permission,
+ * or get back what its segment has; never more, and never PROT_NONE.
+ * fork maps the child's segments with their original permissions.
+ */
+static int64_t user_protect_image_pages(struct user_process *process,
+                                        uintptr_t address, uint64_t length,
+                                        uint64_t protection) {
+    size_t page_count = (size_t)(length / PAGE_SIZE
+                                 + (length % PAGE_SIZE != 0));
+    if ((protection & USER_PROT_READ) == 0) {
+        return -22;
+    }
+    for (int apply = 0; apply < 2; apply++) {
+        for (size_t page = 0; page < page_count; page++) {
+            uintptr_t page_address = address + page * PAGE_SIZE;
+            const struct user_image_segment *segment = NULL;
+            for (size_t i = 0; i < process->image_segment_count; i++) {
+                const struct user_image_segment *candidate =
+                    &process->image_segments[i];
+                if (page_address >= candidate->base
+                    && page_address - candidate->base
+                        < candidate->page_count * PAGE_SIZE) {
+                    segment = candidate;
+                    break;
+                }
+            }
+            if (segment == NULL) {
+                return -12;
+            }
+            if (((protection & USER_PROT_WRITE) != 0
+                 && (segment->flags & ELF_SEGMENT_WRITE) == 0)
+                || ((protection & USER_PROT_EXEC) != 0
+                    && (segment->flags & ELF_SEGMENT_EXECUTE) == 0)) {
+                return -13;
+            }
+            if (apply == 1) {
+                uint64_t flags = PAGING_USER;
+                if ((protection & USER_PROT_WRITE) != 0) {
+                    flags |= PAGING_WRITABLE;
+                }
+                if ((protection & USER_PROT_EXEC) == 0) {
+                    flags |= PAGING_NO_EXECUTE;
+                }
+                if (!paging_protect_range(page_address, 1, flags)) {
+                    return -12;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 bool user_linux_syscall_dispatch(void *saved_registers) {
     struct linux_syscall_frame *frame = saved_registers;
     struct user_process *process = scheduler_current_context();
@@ -6407,6 +6500,57 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         return false;
     }
 
+    /* readlink and readlinkat. FAT has no symbolic links, so a path that
+       exists is not a link (EINVAL); /proc/self/exe names the program
+       file, which musl's dynamic linker reads to expand $ORIGIN. */
+    if (number == 89 || number == 267) {
+        int64_t directory = number == 267 ? (int64_t)frame->rdi : -100;
+        uintptr_t path_address = number == 267 ? (uintptr_t)frame->rsi
+                                               : (uintptr_t)frame->rdi;
+        uintptr_t buffer = number == 267 ? (uintptr_t)frame->rdx
+                                         : (uintptr_t)frame->rsi;
+        int64_t size = number == 267 ? (int64_t)frame->r10
+                                     : (int64_t)frame->rdx;
+        char path[USER_FILE_PATH_CAPACITY];
+        size_t path_length = 0;
+        int64_t resolved = user_resolve_file_path(process, directory,
+                                                  path_address, path,
+                                                  &path_length);
+        static const char self_exe[] = "/proc/self/exe";
+        bool is_self = resolved == 0
+            && path_length == sizeof(self_exe) - 1;
+        for (size_t i = 0; is_self && i < path_length; i++) {
+            is_self = path[i] == self_exe[i];
+        }
+        struct vfs_metadata metadata;
+        if (resolved != 0) {
+            frame->rax = (uint64_t)resolved;
+        } else if (size <= 0) {
+            frame->rax = (uint64_t)(int64_t)-22;
+        } else if (!is_self) {
+            frame->rax = (uint64_t)(int64_t)(
+                !user_path_allowed(process, path, path_length,
+                                   PERMISSION_READ)
+                    && !user_path_leads_to_own(process, path, path_length)
+                ? -13
+                : vfs_stat(path, path_length, &metadata) ? -22 : -2);
+        } else if (process->exe_path_length == 0) {
+            frame->rax = (uint64_t)(int64_t)-2;
+        } else {
+            size_t copied = process->exe_path_length < (size_t)size
+                ? process->exe_path_length : (size_t)size;
+            if (!paging_user_range_valid(buffer, copied, true, false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+            } else {
+                for (size_t i = 0; i < copied; i++) {
+                    ((char *)buffer)[i] = process->exe_path[i];
+                }
+                frame->rax = copied;
+            }
+        }
+        return false;
+    }
+
     /* rt_sigsuspend: waits with the given mask until a signal it does
        not block arrives; the old mask comes back after the handler. */
     if (number == 130) {
@@ -6515,6 +6659,25 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     }
     if (number == 109) {
         frame->rax = 0;
+        return false;
+    }
+
+    /* membarrier: OPOS runs every thread on one CPU, and a switch between
+       threads is a full barrier, so the barrier commands have nothing to
+       wait for. Supported: GLOBAL (1), PRIVATE_EXPEDITED (8) and its
+       registration (16); command 0 lists them. musl uses it in dlopen. */
+    if (number == 324) {
+        const uint64_t supported = 1 | 8 | 16;
+        if (frame->rsi != 0) {
+            frame->rax = (uint64_t)(int64_t)-22;
+        } else if (frame->rdi == 0) {
+            frame->rax = supported;
+        } else if ((frame->rdi & supported) == frame->rdi
+                   && (frame->rdi & (frame->rdi - 1)) == 0) {
+            frame->rax = 0;
+        } else {
+            frame->rax = (uint64_t)(int64_t)-22;
+        }
         return false;
     }
 
@@ -6860,7 +7023,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             || (frame->rdx & (USER_PROT_WRITE | USER_PROT_EXEC))
                 == (USER_PROT_WRITE | USER_PROT_EXEC)
             || (frame->r10 & ~(uint64_t)(USER_MMAP_PRIVATE
-                                         | USER_MMAP_ANONYMOUS)) != 0
+                                         | USER_MMAP_ANONYMOUS
+                                         | USER_MMAP_FIXED
+                                         | USER_MMAP_FIXED_NOREPLACE
+                                         | USER_MMAP_NO_EFFECT)) != 0
             || (frame->r10 & USER_MMAP_PRIVATE) == 0
             || (anonymous && ((frame->rdx & USER_PROT_EXEC) != 0
                               || frame->r8 != UINT64_MAX || frame->r9 != 0))
@@ -6902,22 +7068,62 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         size_t page_count = (size_t)(frame->rsi / PAGE_SIZE
             + (frame->rsi % PAGE_SIZE != 0));
         size_t first_page = USER_MMAP_MAX_PAGES;
-        size_t consecutive_pages = 0;
-        for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-            if (process->mmap_pages[i] == 0) {
-                if (consecutive_pages == 0) {
-                    first_page = i;
+        /* An address is a hint, or with MAP_FIXED the place to map
+           (replacing what is there; MAP_FIXED_NOREPLACE fails with
+           EEXIST instead). Only addresses in the mmap area work. */
+        bool fixed = (frame->r10 & (USER_MMAP_FIXED
+                                    | USER_MMAP_FIXED_NOREPLACE)) != 0;
+        bool replace = false;
+        uintptr_t wanted = (uintptr_t)frame->rdi;
+        if (fixed || wanted != 0) {
+            const uintptr_t area_end = USER_MMAP_BASE
+                + USER_MMAP_MAX_PAGES * PAGE_SIZE;
+            bool usable = (wanted & (PAGE_SIZE - 1)) == 0
+                && wanted >= USER_MMAP_BASE && wanted < area_end
+                && page_count <= (area_end - wanted) / PAGE_SIZE;
+            if (fixed && !usable) {
+                frame->rax = (uint64_t)(int64_t)(
+                    (wanted & (PAGE_SIZE - 1)) != 0 ? -22 : -12);
+                return false;
+            }
+            if (usable) {
+                size_t at = (wanted - USER_MMAP_BASE) / PAGE_SIZE;
+                bool taken = false;
+                for (size_t i = at; i < at + page_count; i++) {
+                    taken = taken || process->mmap_pages[i] != 0;
                 }
-                consecutive_pages++;
-                if (consecutive_pages == page_count) {
-                    break;
+                if (taken && (frame->r10 & USER_MMAP_FIXED_NOREPLACE) != 0) {
+                    frame->rax = (uint64_t)(int64_t)-17;
+                    return false;
                 }
-            } else {
-                consecutive_pages = 0;
-                first_page = USER_MMAP_MAX_PAGES;
+                if (!taken || fixed) {
+                    first_page = at;
+                    replace = taken;
+                }
             }
         }
-        if (consecutive_pages != page_count) {
+        if (first_page == USER_MMAP_MAX_PAGES) {
+            size_t consecutive_pages = 0;
+            for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
+                if (process->mmap_pages[i] == 0) {
+                    if (consecutive_pages == 0) {
+                        first_page = i;
+                    }
+                    consecutive_pages++;
+                    if (consecutive_pages == page_count) {
+                        break;
+                    }
+                } else {
+                    consecutive_pages = 0;
+                    first_page = USER_MMAP_MAX_PAGES;
+                }
+            }
+            if (consecutive_pages != page_count) {
+                frame->rax = (uint64_t)(int64_t)-12;
+                return false;
+            }
+        }
+        if (replace && !release_mmap_pages(process, first_page, page_count)) {
             frame->rax = (uint64_t)(int64_t)-12;
             return false;
         }
@@ -7208,8 +7414,12 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             frame->rax = (uint64_t)(int64_t)-22;
             return false;
         }
-        if (frame->rdi < USER_MMAP_BASE
-            || frame->rdi >= USER_MMAP_BASE + USER_MMAP_MAX_PAGES * PAGE_SIZE
+        if (frame->rdi < USER_MMAP_BASE) {
+            frame->rax = (uint64_t)user_protect_image_pages(
+                process, (uintptr_t)frame->rdi, frame->rsi, frame->rdx);
+            return false;
+        }
+        if (frame->rdi >= USER_MMAP_BASE + USER_MMAP_MAX_PAGES * PAGE_SIZE
             || frame->rsi > UINTPTR_MAX - frame->rdi) {
             frame->rax = (uint64_t)(int64_t)-12;
             return false;
@@ -7633,6 +7843,7 @@ static bool user_process_run_image(enum user_program program,
     struct elf_load_plan elf_plan = {0};
     struct elf_load_plan interpreter_plan = {0};
     size_t interpreter_size = 0;
+    uint8_t *interpreter_image = NULL;
     if (is_elf_image) {
         if (image_data == NULL) {
             image_data = user_elf_image;
@@ -7652,12 +7863,12 @@ static bool user_process_run_image(enum user_program program,
         if (elf_plan.has_interpreter) {
             /* Dynamically linked images start in their PT_INTERP program,
                exactly as they do after execve. */
-            if (!vfs_read_file(elf_plan.interpreter_path,
-                               elf_plan.interpreter_path_length,
-                               user_interpreter_images[task_slot],
-                               USER_INTERPRETER_IMAGE_MAX, &interpreter_size)
+            if (user_read_image(USER_IMAGE_INTERPRETER, task_slot,
+                                elf_plan.interpreter_path,
+                                elf_plan.interpreter_path_length,
+                                &interpreter_image, &interpreter_size) != 0
                 || !elf_inspect_user_interpreter(
-                    user_interpreter_images[task_slot], interpreter_size,
+                    interpreter_image, interpreter_size,
                     PAGE_SIZE, USER_MMAP_BASE, USER_MMAP_BASE,
                     USER_MMAP_BASE + USER_MMAP_MAX_PAGES * PAGE_SIZE,
                     &interpreter_plan)) {
@@ -7756,7 +7967,7 @@ static bool user_process_run_image(enum user_program program,
                                  PAGE_SIZE)
             || (elf_plan.has_interpreter
                 && !elf_load_user_image(
-                    user_interpreter_images[task_slot], interpreter_size,
+                    interpreter_image, interpreter_size,
                     &interpreter_plan, interpreter_buffers,
                     interpreter_plan.total_page_count, PAGE_SIZE))) {
             release_user_pages(0, image_physical,

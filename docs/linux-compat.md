@@ -183,7 +183,10 @@ anonymous mappings, and constructs a new Linux initial stack containing the
 provided argument and environment vectors plus the supported auxiliary values.
 `AT_EXECFN` preserves the `execve` pathname; direct shell, desktop, and disk
 launches pass their selected filename through the same launch interface.
-An `ET_EXEC` image may name `/lib/opos-ld.so` through one validated `PT_INTERP`.
+An `ET_EXEC` image may name an interpreter through one validated `PT_INTERP`:
+the regression interpreter `/lib/opos-ld.so`, or musl's dynamic linker
+`/lib/ld-musl-x86_64.so.1` for real dynamically linked musl programs
+(docs/linux-programs.md, step 6).
 Main `ET_DYN` PIE images are loaded at the fixed bias `0x04000000`; dynamically
 linked PIEs provide `PT_PHDR` so the interpreter can derive that bias from
 `AT_PHDR`. ASLR and randomized PIE placement are not implemented.
@@ -251,7 +254,7 @@ segment's R/RX/RW permissions.
 The current bounded implementation accepts at most 64 arguments, 64 environment
 entries, 2048 total string bytes (all of it must fit the stack's top page with
 the auxiliary vector), a 16 MiB executable file (16 MiB of loaded segments per
-image), and a 64 KiB interpreter. The main stack is 512 KiB. The regression
+image), and a 4 MiB interpreter. The main stack is 512 KiB. The regression
 executes `/tests/exec-test` and verifies replacement, arguments, descriptor
 inheritance, close-on-exec, FS reset, private file mappings, dynamic-interpreter
 handoff, eager `JUMP_SLOT` relocation, a call into `/lib/libopos-test.so`, and
@@ -348,10 +351,16 @@ regular files in a bounded 16384-page (64 MiB) region; `mremap` (25) shrinks,
 grows in place, or moves pages without copying (`MREMAP_MAYMOVE`). File offsets must be page-aligned;
 bytes beyond EOF are zero-filled. Read-only, writable/non-executable, and
 executable/read-only file mappings are supported without writeback or sharing.
-`MAP_SHARED`, `MAP_FIXED`, demand paging, and writable-executable mappings are
+An address is a hint; `MAP_FIXED` maps at that address in the region,
+replacing what is there, and `MAP_FIXED_NOREPLACE` fails with `EEXIST`
+instead. `MAP_DENYWRITE`, `MAP_EXECUTABLE`, `MAP_NORESERVE`,
+`MAP_POPULATE`, `MAP_NONBLOCK` and `MAP_STACK` are accepted and have no
+effect. `MAP_SHARED`, demand paging, and writable-executable mappings are
 not implemented. `PROT_NONE` reserves physically backed but user-inaccessible
-pages so musl can allocate guarded thread stacks. `mprotect` is restricted to
-those mappings, rejects write-plus-execute, and supports inaccessible, readable,
+pages so musl can allocate guarded thread stacks. `mprotect` works on
+those mappings, and on the main program's loaded segments, where a page
+may only drop write or execute permission or get back its segment's own
+(RELRO). It rejects write-plus-execute, and supports inaccessible, readable,
 writable/non-executable, or executable/read-only page permissions. Anonymous
 executable mappings at allocation time remain rejected. The ELF test verifies
 zeroed pages, private file-copy isolation, RX file mappings, permission

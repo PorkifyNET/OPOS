@@ -200,8 +200,9 @@ left alone, recorded for 75 s:
   plays without gaps.
 - The only gaps (10 ms, 170 ms apart, and one of 0.5 s) come while Doom
   loads the demo's level from disk; the timer missed refills of the
-  170 ms ring then. Without the scheduler change there was also a 106 ms
-  gap in the middle of the demo.
+  170 ms ring then (most likely held off by the disk driver; not
+  measured). Without the scheduler change there was also a 106 ms gap in
+  the middle of the demo.
 - Regressions (musl, signal, pthread, net and dynamic tests, multitest,
   `make sound-test`, host tests) pass with the scheduler change.
 

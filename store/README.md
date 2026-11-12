@@ -28,6 +28,12 @@ packages four of SDL's demo programs (SDL Demos). It also installs the
 library into `build/store_opk/sdl2/` while `make store` runs, for later
 recipes of SDL programs. Add it with `STORE_LINUX="lua sqlite sdl2"`.
 
+`linux/doom/build.sh` (opt-in) builds Chocolate Doom 3.1.1 against that
+SDL (building SDL first if `sdl2` is not listed before it) and packages
+it with Freedoom: Phase 1 as Freedoom, 33 MB. Chocolate Doom is GPL-2.0,
+so the package carries its source release. Add it with
+`STORE_LINUX="lua sqlite sdl2 doom"`.
+
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads
 `releases/latest/download/index` from there. See `docs/packages.md`.

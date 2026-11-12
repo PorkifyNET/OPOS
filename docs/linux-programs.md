@@ -496,7 +496,63 @@ move OPOS's absolute pointer.
 library into `build/store_opk/sdl2/`. A recipe for an SDL program can
 build there with
 `$LINUX_CC -I.../sdl2/include/SDL2 prog.c -L.../sdl2/lib -lSDL2 -static`.
-A real game is the next test.
+
+## Doom
+
+`store/linux/doom/build.sh` builds Chocolate Doom 3.1.1 (GPL-2.0) against
+the SDL library above and packages it with Freedoom: Phase 1 0.13.0
+(BSD-3-Clause), a complete free game for the Doom engine. The package is
+`org.chocolate-doom.freedoom`, named Freedoom, about 33 MB, with one
+Start menu entry. It carries the Chocolate Doom source, the licenses of
+SDL and musl, and Freedoom's COPYING and CREDITS. Like the SDL demos it is
+opt-in: add `doom` to `STORE_LINUX`. The recipe builds SDL itself when it
+was not built yet (`SDL2_LIBRARY_ONLY=1`).
+
+Chocolate Doom normally builds with autotools or CMake. The recipe writes
+the few `config.h` lines they would and compiles the game's source list
+with `$LINUX_CC` directly, without SDL_mixer and SDL_net. There is no
+sound: OPOS has no sound driver yet.
+
+Tested in QEMU: installed with `pkg install`, started from the Terminal,
+it loads `freedoom1.wad` from its folder, opens a window titled
+"Freedoom: Phase 1 - Chocolate Doom" and runs the title demo. The keys
+work: the menus open, and in a game the player walks, turns, fires and
+picks things up. Settings and saves go to
+`$HOME/.local/share/chocolate-doom/` in its AppData folder. Closing the
+window asks Doom to quit; Doom answers with its own "are you sure"
+question, so Super+Q ends it instead.
+
+What it needed from OPOS:
+- **`mkdir` of a folder that exists.** `SDL_GetPrefPath` creates every
+  folder of its path from the root down, as `mkdir -p` does. Linux
+  answers EEXIST for a folder that exists even where the program may not
+  write; OPOS answered EACCES, and SDL gave up. OPOS now answers EEXIST
+  for an existing path the program may see (on the way to its own
+  folders, or readable), and EACCES otherwise.
+- **Faster large writes.** Installing the 33 MB package took about a
+  quarter of an hour. Three changes in the FAT driver and the VFS:
+  - Each read or write at an offset walked the file's cluster chain from
+    the start, and so did finding its end before a write, so copying a
+    file in chunks grew with the square of its size. The driver now
+    remembers where it last walked a few chains to; any change to the FAT
+    other than appending forgets that.
+  - Allocating or freeing a chain wrote each FAT entry on its own: a read
+    and a write of both FAT copies per cluster. Entries that share a FAT
+    sector are now written together, and free clusters are looked for
+    after the last allocation first.
+  - Every sector written sent a cache flush to the disk. Each change to a
+    file or folder (a VFS write, create, remove, rename, resize) now
+    flushes once, when it is done. Batches nest
+    (`block_begin_batch`/`block_end_batch`), so the package installer's
+    own batches still decide when its steps are on the disk.
+
+  Measured in QEMU (KVM under WSL 2, IDE disk): installing the Doom
+  package went from about 15 minutes to about 6, removing it from 3–4
+  minutes to under 40 seconds, and `dd` writing 1.6 MB in 4 KB blocks
+  from 57 seconds to 19. Each disk command there still costs
+  milliseconds of emulated port I/O. Writing several sectors per command
+  would help most; it waits until the drivers that use DMA are checked
+  for buffers that cross pages.
 
 ## Tests
 

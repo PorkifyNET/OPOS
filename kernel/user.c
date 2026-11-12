@@ -2447,10 +2447,17 @@ static int64_t user_linux_make_directory(struct user_process *process,
     if (resolved != 0) {
         return resolved;
     }
-    if (!user_path_allowed(process, path, path_length, PERMISSION_WRITE)) {
-        return -13;
-    }
     struct vfs_metadata metadata;
+    if (!user_path_allowed(process, path, path_length, PERMISSION_WRITE)) {
+        /* As on Linux, an existing directory is EEXIST even where the
+           program may not write; "mkdir -p" and SDL_GetPrefPath create
+           every folder from the root down. Only for paths the program
+           may see, so this does not reveal anything else. */
+        bool visible = user_path_allowed(process, path, path_length,
+                                         PERMISSION_READ)
+            || user_path_leads_to_own(process, path, path_length);
+        return visible && vfs_stat(path, path_length, &metadata) ? -17 : -13;
+    }
     if (vfs_stat(path, path_length, &metadata)) {
         return -17;
     }

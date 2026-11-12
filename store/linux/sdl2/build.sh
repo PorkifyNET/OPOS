@@ -3,7 +3,8 @@
 # (opos/SDL_oposvideo.c), and a package of SDL's own demo programs to
 # show it working. Programs are linked statically with musl.
 # License: zlib (SDL and the OPOS driver). Not built by default: add
-# "sdl2" to STORE_LINUX.
+# "sdl2" to STORE_LINUX. With SDL2_LIBRARY_ONLY=1 it only builds and
+# installs the library (no package).
 #
 # Besides the package, the library is installed into OUT/sdl2 (include/,
 # lib/libSDL2.a, lib/libSDL2main.a, lib/libSDL2_test.a) so recipes for SDL
@@ -63,6 +64,12 @@ make -C "$SRC" -j"$(nproc)" > "$DIR/build.log" 2>&1 \
     tail -30 "$DIR/build.log" >&2
     exit 1
 }
+
+# SDL2_LIBRARY_ONLY=1 stops here: recipes of SDL programs use it when
+# OUT/sdl2 is not built yet.
+if [ "${SDL2_LIBRARY_ONLY:-}" = 1 ]; then
+    exit 0
+fi
 
 # SDL's demos (zlib, from test/). Resources are found next to the program
 # through SDL_GetBasePath.

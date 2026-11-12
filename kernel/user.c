@@ -1094,9 +1094,164 @@ void user_set_console_sink(user_console_sink sink) {
 }
 
 static user_console_input console_input;
+static user_console_pending console_pending;
 
-void user_set_console_input(user_console_input input) {
+void user_set_console_input(user_console_input input,
+                            user_console_pending pending) {
     console_input = input;
+    console_pending = pending;
+}
+
+/*
+ * The console as a Linux terminal (docs/linux-programs.md, step 5): one
+ * set of termios settings shared by every program, as with one tty.
+ * Programs change them with TCSETS; the desktop puts the defaults back
+ * when a program from the Terminal ends.
+ */
+#define LINUX_TTY_ICRNL 0x100u
+#define LINUX_VINTR 0
+#define LINUX_VERASE 2
+#define LINUX_VKILL 3
+#define LINUX_VEOF 4
+#define LINUX_VTIME 5
+#define LINUX_VMIN 6
+#define LINUX_TERMIOS_SIZE 36 /* the kernel's struct termios */
+
+struct linux_termios {
+    uint32_t iflag;
+    uint32_t oflag;
+    uint32_t cflag;
+    uint32_t lflag;
+    uint8_t line;
+    uint8_t cc[19];
+};
+
+static const struct linux_termios user_tty_defaults = {
+    .iflag = 0x0500,  /* ICRNL | IXON */
+    .oflag = 0x0005,  /* OPOST | ONLCR */
+    .cflag = 0x00bf,  /* B38400 | CS8 | CREAD */
+    .lflag = 0x8a3b,  /* ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN */
+    .cc = {3, 0x1c, 127, 21, 4, 0, 1, 0, 17, 19, 26},
+};
+static struct linux_termios user_tty = user_tty_defaults;
+static uint16_t user_tty_rows = 24;
+static uint16_t user_tty_columns = 96;
+
+void user_set_console_size(uint16_t rows, uint16_t columns) {
+    if (rows != 0 && columns != 0) {
+        user_tty_rows = rows;
+        user_tty_columns = columns;
+    }
+}
+
+void user_console_reset(void) {
+    user_tty = user_tty_defaults;
+}
+
+uint32_t user_console_local_flags(void) {
+    return user_tty.lflag;
+}
+
+/* One character from the Terminal, or the keyboard without a desktop
+   (which can only wait). */
+static int user_console_get(char *character, uint64_t deadline) {
+    if (console_input != NULL) {
+        return console_input(character, deadline);
+    }
+    if (deadline != UINT64_MAX) {
+        return 0;
+    }
+    return keyboard_wait_character(character) ? 1 : -1;
+}
+
+static void user_console_write(uint64_t file_descriptor, const char *data,
+                               size_t length);
+
+/*
+ * read() on the console. Line mode (ICANON): editing with Backspace and
+ * Ctrl+U, Ctrl+D ends input, the read returns at the end of a line.
+ * Raw mode: VMIN and VTIME decide how long to wait; each key is returned
+ * as typed. ECHO shows what is typed; ISIG makes Ctrl+C a SIGINT.
+ */
+static int64_t user_console_read(struct user_process *process,
+                                 uintptr_t buffer_address, size_t length) {
+    const struct linux_termios tty = user_tty;
+    bool canonical = (tty.lflag & LINUX_TTY_ICANON) != 0;
+    bool echo = (tty.lflag & LINUX_TTY_ECHO) != 0;
+    char *buffer = (char *)buffer_address;
+    size_t bytes_read = 0;
+    size_t minimum = canonical ? 1 : tty.cc[LINUX_VMIN];
+    uint64_t deadline = UINT64_MAX;
+    if (!canonical && minimum == 0) {
+        /* VTIME is in tenths of a second; timer ticks are hundredths. */
+        deadline = tty.cc[LINUX_VTIME] == 0
+            ? 0 : timer_ticks() + (uint64_t)tty.cc[LINUX_VTIME] * 10;
+    }
+    while (bytes_read < length) {
+        char character;
+        int got = user_console_get(&character, deadline);
+        if (got < 0) {
+            if (bytes_read != 0) {
+                break;
+            }
+            return user_current_signal_pending() ? -4 : -5;
+        }
+        if (got == 0) {
+            break;
+        }
+        uint8_t byte = (uint8_t)character;
+        if (byte == '\r' && (tty.iflag & LINUX_TTY_ICRNL) != 0) {
+            byte = '\n';
+        }
+        if ((tty.lflag & LINUX_TTY_ISIG) != 0 && byte == tty.cc[LINUX_VINTR]
+            && byte != 0) {
+            (void)user_process_signal(process->id, 2);
+            if (echo) {
+                user_console_write(1, "^C", 2);
+            }
+            return -4;
+        }
+        if (canonical) {
+            if (byte == tty.cc[LINUX_VERASE] || byte == '\b') {
+                if (bytes_read != 0) {
+                    bytes_read--;
+                    if (echo) {
+                        user_console_write(1, "\b \b", 3);
+                    }
+                }
+                continue;
+            }
+            if (byte == tty.cc[LINUX_VKILL] && byte != 0) {
+                while (bytes_read != 0) {
+                    bytes_read--;
+                    if (echo) {
+                        user_console_write(1, "\b \b", 3);
+                    }
+                }
+                continue;
+            }
+            if (byte == tty.cc[LINUX_VEOF] && byte != 0) {
+                break; /* Ctrl+D: what was typed, or 0 for end of input */
+            }
+        }
+        /* Another thread may have unmapped it while we waited. */
+        if (!paging_user_range_valid((uintptr_t)(buffer + bytes_read), 1,
+                                     true, false)) {
+            return -14;
+        }
+        buffer[bytes_read++] = (char)byte;
+        if (echo && (byte == '\n' || byte == '\t'
+                     || (byte >= ' ' && byte < 0x7f) || !canonical)) {
+            user_console_write(1, (const char *)&byte, 1);
+        }
+        if (canonical && byte == '\n') {
+            break;
+        }
+        if (!canonical && bytes_read >= minimum) {
+            deadline = 0; /* take what is already typed, then return */
+        }
+    }
+    return (int64_t)bytes_read;
 }
 
 static void user_console_write(uint64_t file_descriptor, const char *data,
@@ -4764,7 +4919,11 @@ static uint32_t user_descriptor_events(struct user_process *process,
         }
         /* The console: output always fits; input readiness is unknown,
            so stdin only reports when polled with a timeout of 0 too. */
-        return descriptor == 0 ? 0 : LINUX_POLLOUT;
+        if (descriptor != 0) {
+            return LINUX_POLLOUT;
+        }
+        return console_pending != NULL && console_pending() != 0
+            ? LINUX_POLLIN : 0;
     }
     struct user_file_descriptor *file = user_file_descriptor(process,
                                                              descriptor);
@@ -5365,39 +5524,8 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-14;
                 return false;
             }
-            char *buffer = (char *)buffer_address;
-            size_t bytes_read = 0;
-            while (bytes_read < length) {
-                char character;
-                if (!(console_input != NULL
-                          ? console_input(&character)
-                          : keyboard_wait_character(&character))) {
-                    frame->rax = (uint64_t)(int64_t)-5;
-                    return false;
-                }
-                if (character == '\b') {
-                    if (bytes_read != 0) {
-                        bytes_read--;
-                        user_console_write(1, &character, 1);
-                    }
-                    continue;
-                }
-                if (character != '\n' && (character < ' ' || character > '~')) {
-                    continue;
-                }
-                /* Another thread may have unmapped it while we waited. */
-                if (!paging_user_range_valid(
-                        (uintptr_t)(buffer + bytes_read), 1, true, false)) {
-                    frame->rax = (uint64_t)(int64_t)-14;
-                    return false;
-                }
-                buffer[bytes_read++] = character;
-                user_console_write(1, &character, 1);
-                if (character == '\n') {
-                    break;
-                }
-            }
-            frame->rax = bytes_read;
+            frame->rax = (uint64_t)user_console_read(process, buffer_address,
+                                                     length);
             return false;
         }
         struct user_file_descriptor *file =
@@ -5967,31 +6095,30 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 user_file_descriptor(process, descriptor) == NULL ? -9 : -25);
             return false;
         }
-        if (request == 0x5401) { /* TCGETS: struct termios, 60 bytes */
-            if (!paging_user_range_valid(argument, 60, true, false)) {
+        if (request == 0x5401) { /* TCGETS */
+            if (!paging_user_range_valid(argument, LINUX_TERMIOS_SIZE, true,
+                                         false)) {
                 frame->rax = (uint64_t)(int64_t)-14;
                 return false;
             }
-            uint8_t *termios = (uint8_t *)argument;
-            for (size_t i = 0; i < 60; i++) {
-                termios[i] = 0;
+            *(struct linux_termios *)argument = user_tty;
+            frame->rax = 0;
+            return false;
+        }
+        if (request >= 0x5402 && request <= 0x5404) {
+            /* TCSETS, TCSETSW (after output: it is written at once) and
+               TCSETSF (also drops typed input not yet read). */
+            if (!paging_user_range_valid(argument, LINUX_TERMIOS_SIZE, false,
+                                         false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return false;
             }
-            uint32_t flags[4] = {
-                0x0500,          /* c_iflag: ICRNL | IXON */
-                0x0005,          /* c_oflag: OPOST | ONLCR */
-                0x00bf,          /* c_cflag: B38400 | CS8 | CREAD */
-                0x8a3b,          /* c_lflag: ISIG ICANON ECHO ECHOE
-                                    ECHOK ECHOCTL ECHOKE IEXTEN */
-            };
-            for (size_t f = 0; f < 4; f++) {
-                for (size_t b = 0; b < 4; b++) {
-                    termios[f * 4 + b] = (uint8_t)(flags[f] >> (8 * b));
+            user_tty = *(const struct linux_termios *)argument;
+            if (request == 0x5404 && console_input != NULL) {
+                char discarded;
+                while (console_input(&discarded, 0) == 1) {
                 }
             }
-            termios[17 + 0] = 3;    /* VINTR ^C */
-            termios[17 + 2] = 127;  /* VERASE */
-            termios[17 + 4] = 4;    /* VEOF ^D */
-            termios[17 + 6] = 1;    /* VMIN */
             frame->rax = 0;
             return false;
         }
@@ -6001,14 +6128,36 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 return false;
             }
             uint16_t *size = (uint16_t *)argument;
-            size[0] = 24; /* rows */
-            size[1] = 96; /* columns, as the desktop Terminal */
+            size[0] = user_tty_rows;
+            size[1] = user_tty_columns;
             size[2] = 0;
             size[3] = 0;
             frame->rax = 0;
             return false;
         }
-        if (request >= 0x5402 && request <= 0x5404) { /* TCSETS* */
+        if (request == 0x541b || request == 0x540f || request == 0x5429) {
+            /* FIONREAD; TIOCGPGRP and TIOCGSID: the process is its own
+               group and session. */
+            if (!paging_user_range_valid(argument, sizeof(int32_t), true,
+                                         false)) {
+                frame->rax = (uint64_t)(int64_t)-14;
+                return false;
+            }
+            *(int32_t *)argument = request == 0x541b
+                ? (int32_t)(console_pending != NULL ? console_pending() : 0)
+                : (int32_t)process->id;
+            frame->rax = 0;
+            return false;
+        }
+        if (request == 0x5409 || request == 0x540a || request == 0x540b
+            || request == 0x5410 || request == 0x5414) {
+            /* TCSBRK (drain), TCXONC, TCFLSH, TIOCSPGRP, TIOCSWINSZ */
+            if (request == 0x540b && frame->rdx != 1
+                && console_input != NULL) {
+                char discarded;
+                while (console_input(&discarded, 0) == 1) {
+                }
+            }
             frame->rax = 0;
             return false;
         }
@@ -7129,7 +7278,7 @@ static void user_build_start_environment(
         (void)user_start_environment(vectors, "LOGNAME=", name, NULL);
     }
     (void)user_start_environment(vectors, "PATH=/bin", NULL, NULL);
-    (void)user_start_environment(vectors, "TERM=dumb", NULL, NULL);
+    (void)user_start_environment(vectors, "TERM=xterm", NULL, NULL);
 }
 
 static bool user_build_start_vectors(struct user_exec_vectors *vectors,
@@ -7617,6 +7766,87 @@ bool user_process_kill(uint64_t process_id) {
         }
     }
     return false;
+}
+
+/* Sets the signal on one thread of the process that does not block it
+   (else the first), and wakes its threads so a wait can end. */
+static bool user_process_signal_one(struct user_process *process,
+                                    uint64_t signal_number) {
+    uint64_t bit = 1ULL << (signal_number - 1);
+    struct user_thread *target = NULL;
+    for (size_t slot = 0; slot < SCHEDULER_TASK_CAPACITY; slot++) {
+        struct user_thread *thread = &user_threads[slot];
+        if (!thread->active || thread->process != process) {
+            continue;
+        }
+        if (target == NULL || ((target->signal_mask & bit) != 0
+                               && (thread->signal_mask & bit) == 0)) {
+            target = thread;
+        }
+    }
+    if (target == NULL) {
+        return false;
+    }
+    __atomic_fetch_or(&target->pending_signals, bit, __ATOMIC_RELAXED);
+    return true;
+}
+
+bool user_process_signal(uint64_t process_id, uint64_t signal_number) {
+    if (process_id == 0 || signal_number == 0
+        || signal_number > LINUX_SIGNAL_COUNT) {
+        return false;
+    }
+    /* The process, then its fork children, theirs, and so on: what a
+       shell would put in the foreground process group. */
+    uint64_t group[SCHEDULER_TASK_CAPACITY];
+    size_t group_count = 0;
+    group[group_count++] = process_id;
+    bool sent = false;
+    for (size_t next = 0; next < group_count; next++) {
+        for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+            if (process_slots[i].state == USER_PROCESS_RUNNING
+                && process_slots[i].id == group[next]
+                && user_process_signal_one(&process_slots[i],
+                                           signal_number)) {
+                sent = true;
+            }
+        }
+        for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY - 1; i++) {
+            if (child_jobs[i].state == USER_CHILD_RUNNING
+                && child_jobs[i].parent_process_id == group[next]
+                && child_jobs[i].process_id != 0
+                && group_count < SCHEDULER_TASK_CAPACITY) {
+                group[group_count++] = child_jobs[i].process_id;
+            }
+        }
+    }
+    return sent;
+}
+
+bool user_process_signal_pending(uint64_t process_id,
+                                 uint64_t signal_number) {
+    if (signal_number == 0 || signal_number > LINUX_SIGNAL_COUNT) {
+        return false;
+    }
+    uint64_t bit = 1ULL << (signal_number - 1);
+    for (size_t slot = 0; slot < SCHEDULER_TASK_CAPACITY; slot++) {
+        const struct user_thread *thread = &user_threads[slot];
+        if (thread->active && thread->process != NULL
+            && thread->process->id == process_id
+            && (__atomic_load_n(&thread->pending_signals, __ATOMIC_RELAXED)
+                & bit) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool user_current_signal_pending(void) {
+    struct user_process *process = scheduler_current_context();
+    struct user_thread *thread = user_current_thread(process);
+    return thread != NULL
+        && (__atomic_load_n(&thread->pending_signals, __ATOMIC_RELAXED)
+            & ~thread->signal_mask) != 0;
 }
 
 size_t user_revoke_capabilities(size_t account,

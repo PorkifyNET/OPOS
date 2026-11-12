@@ -430,7 +430,9 @@ static size_t terminal_length;
 /* Scrollback is a ring: terminal_line_at(0) is the oldest kept line. Every
    line has an absolute number (terminal_dropped + index) so a selection
    survives older lines falling off the front. */
-static char terminal_history[TERMINAL_HISTORY][TERMINAL_COLUMNS];
+static char terminal_history[TERMINAL_HISTORY][TERMINAL_COLUMNS + 1];
+/* Colors of each cell (TERMINAL_ATTR_*), 0 for plain text. */
+static uint16_t terminal_attrs[TERMINAL_HISTORY][TERMINAL_COLUMNS];
 static size_t terminal_history_count;
 static size_t terminal_history_start;
 static uint64_t terminal_dropped;
@@ -448,19 +450,112 @@ static char *terminal_line_at(size_t index) {
                             % TERMINAL_HISTORY];
 }
 
-static void terminal_print(const char *text) {
+static uint16_t *terminal_attrs_at(size_t index) {
+    return terminal_attrs[(terminal_history_start + index)
+                          % TERMINAL_HISTORY];
+}
+
+/*
+ * The Terminal is a small VT100/xterm (docs/linux-programs.md, step 5):
+ * the screen is the last `rows` lines of the scrollback, and programs move
+ * a cursor over it. A cursor line at the end that nothing was written to
+ * yet does not exist; it is made when written. Lines that scroll off the
+ * top of the screen stay in the scrollback, except in the alternate
+ * screen or a scroll region, which scroll in place.
+ */
+#define TERMINAL_SCREEN_MAX 128
+#define TERMINAL_ATTR_FG_SET 0x0010u
+#define TERMINAL_ATTR_BG_SHIFT 5
+#define TERMINAL_ATTR_BG_SET 0x0200u
+#define TERMINAL_ATTR_REVERSE 0x0400u
+#define TERMINAL_ATTR_BOLD 0x0800u
+#define TERMINAL_PARAMETERS 16
+
+enum terminal_parse {
+    TERMINAL_PARSE_TEXT,
+    TERMINAL_PARSE_ESCAPE,
+    TERMINAL_PARSE_CSI,
+    TERMINAL_PARSE_OSC,
+    TERMINAL_PARSE_OSC_ESCAPE,
+    TERMINAL_PARSE_SKIP_ONE,
+};
+
+static struct {
+    uint64_t cursor_line; /* absolute: terminal_dropped + index */
+    size_t column;
+    bool wrap_pending;
+    uint16_t attr;
+    size_t rows;
+    size_t columns;
+    size_t region_top;    /* screen rows, inclusive */
+    size_t region_bottom;
+    bool cursor_hidden;
+    bool application_keys;
+    size_t saved_row;
+    size_t saved_column;
+    uint16_t saved_attr;
+    bool alternate;
+    size_t alternate_rows;
+    size_t alternate_row;
+    size_t alternate_column;
+    enum terminal_parse parse;
+    char private_mark;
+    uint32_t parameters[TERMINAL_PARAMETERS];
+    size_t parameter_count;
+    size_t utf8_skip;
+} term = {.rows = 24, .columns = TERMINAL_COLUMNS, .region_bottom = 23};
+static char term_alternate_lines[TERMINAL_SCREEN_MAX][TERMINAL_COLUMNS + 1];
+static uint16_t term_alternate_attrs[TERMINAL_SCREEN_MAX][TERMINAL_COLUMNS];
+
+/* Adds a line at the end of the scrollback; the oldest falls off. */
+static void terminal_append(const char *text) {
     if (terminal_history_count == TERMINAL_HISTORY) {
         terminal_history_start = (terminal_history_start + 1)
                                % TERMINAL_HISTORY;
         terminal_dropped++;
         terminal_history_count--;
     }
-    text_copy(terminal_line_at(terminal_history_count++), TERMINAL_COLUMNS,
-              text);
+    size_t index = terminal_history_count++;
+    text_copy(terminal_line_at(index), TERMINAL_COLUMNS + 1, text);
+    uint16_t *attrs = terminal_attrs_at(index);
+    for (size_t i = 0; i < TERMINAL_COLUMNS; i++) {
+        attrs[i] = 0;
+    }
     /* A scrolled view stays on the same text while output arrives. */
     if (terminal_scroll != 0 && terminal_scroll + 1 < terminal_history_count) {
         terminal_scroll++;
     }
+}
+
+static uint64_t term_count_end(void) {
+    return terminal_dropped + terminal_history_count;
+}
+
+/* The next line after the scrollback, where printing continues. */
+static void terminal_finish_line(void) {
+    term.cursor_line = term_count_end();
+    term.column = 0;
+    term.wrap_pending = false;
+}
+
+static void terminal_print(const char *text) {
+    terminal_finish_line();
+    terminal_append(text);
+    terminal_finish_line();
+}
+
+static void terminal_state_reset(void) {
+    term.attr = 0;
+    term.wrap_pending = false;
+    term.region_top = 0;
+    term.region_bottom = term.rows - 1;
+    term.cursor_hidden = false;
+    term.application_keys = false;
+    term.saved_row = 0;
+    term.saved_column = 0;
+    term.saved_attr = 0;
+    term.parse = TERMINAL_PARSE_TEXT;
+    term.utf8_skip = 0;
 }
 
 static void terminal_reset(void) {
@@ -471,6 +566,8 @@ static void terminal_reset(void) {
     terminal_history_start = 0;
     terminal_scroll = 0;
     terminal_selecting = false;
+    term.alternate = false;
+    terminal_state_reset();
     terminal_print("OPOS TERMINAL - TYPE HELP");
 }
 
@@ -480,10 +577,27 @@ static size_t terminal_visible_rows(struct rect area) {
     return rows > 0 ? (size_t)rows : 0;
 }
 
+/* While a program runs, the prompt row is part of its screen. */
+static bool terminal_program_running(void);
+
+static size_t terminal_view_rows(struct rect area) {
+    return terminal_visible_rows(area)
+        + (terminal_program_running() ? 1 : 0);
+}
+
+/* Lines the view can show: the scrollback, and a program's cursor line. */
+static size_t terminal_view_lines(void) {
+    if (!terminal_program_running()
+        || term.cursor_line < term_count_end()) {
+        return terminal_history_count;
+    }
+    return (size_t)(term.cursor_line + 1 - terminal_dropped);
+}
+
 static size_t terminal_max_scroll(struct rect area) {
-    size_t visible = terminal_visible_rows(area);
-    return terminal_history_count > visible
-         ? terminal_history_count - visible : 0;
+    size_t visible = terminal_view_rows(area);
+    size_t lines = terminal_view_lines();
+    return lines > visible ? lines - visible : 0;
 }
 
 /* Index of the history line drawn in the top row. */
@@ -504,7 +618,7 @@ static void terminal_scroll_by(struct rect area, int64_t lines) {
 /* Maps a pointer position to (absolute line, column), clamped to the text. */
 static void terminal_hit(struct rect area, int32_t x, int32_t y,
                          uint64_t *line, size_t *column) {
-    size_t visible = terminal_visible_rows(area);
+    size_t visible = terminal_view_rows(area);
     if (terminal_history_count == 0 || visible == 0) {
         *line = terminal_dropped;
         *column = 0;
@@ -608,11 +722,9 @@ static bool terminal_drag_motion(struct rect area, int32_t x, int32_t y) {
 
 /*
  * Programs run next to the desktop (see "program windows" at the end of
- * this file). Their standard output and error land in the Terminal a line
- * at a time; terminal_output collects the current line.
+ * this file). Their standard output and error go through the terminal
+ * emulator below.
  */
-static char terminal_output[TERMINAL_COLUMNS];
-static size_t terminal_output_length;
 static void draw_scene(void);
 static void window_open(enum window_kind kind);
 static void window_raise(enum window_kind kind);
@@ -640,27 +752,655 @@ static void store_click(struct rect area, int32_t x, int32_t y);
 static void store_key(char character);
 static const char *window_title(enum window_kind kind);
 
-static void terminal_output_flush(void) {
-    if (terminal_output_length != 0) {
-        terminal_output[terminal_output_length] = '\0';
-        terminal_print(terminal_output);
-        terminal_output_length = 0;
+static void app_input_push_text(const char *text);
+
+/* First line of the screen (absolute). */
+static uint64_t term_top(void) {
+    uint64_t end = term_count_end();
+    if (term.cursor_line + 1 > end) {
+        end = term.cursor_line + 1;
+    }
+    return end >= terminal_dropped + term.rows ? end - term.rows
+                                               : terminal_dropped;
+}
+
+/* The scrollback index of an absolute line, made (blank) if needed. */
+static size_t term_line(uint64_t line) {
+    if (line < terminal_dropped) {
+        line = terminal_dropped;
+    }
+    while (term_count_end() <= line) {
+        terminal_append("");
+    }
+    if (line < terminal_dropped) {
+        line = terminal_dropped;
+    }
+    return (size_t)(line - terminal_dropped);
+}
+
+/* Screen row of the cursor; moves a cursor lost off the top back on. */
+static size_t term_row(void) {
+    uint64_t top = term_top();
+    if (term.cursor_line < top) {
+        term.cursor_line = top;
+    }
+    size_t row = (size_t)(term.cursor_line - top);
+    return row < term.rows ? row : term.rows - 1;
+}
+
+static void term_set_row(size_t row) {
+    uint64_t top = term_top();
+    term.cursor_line = top + (row < term.rows ? row : term.rows - 1);
+    term.wrap_pending = false;
+}
+
+static void term_set_cell(uint64_t line, size_t column, char character,
+                          uint16_t attr) {
+    if (column >= TERMINAL_COLUMNS) {
+        return;
+    }
+    size_t index = term_line(line);
+    char *text = terminal_line_at(index);
+    uint16_t *attrs = terminal_attrs_at(index);
+    size_t length = text_length(text);
+    while (length < column) {
+        text[length] = ' ';
+        attrs[length] = 0;
+        length++;
+    }
+    text[column] = character;
+    attrs[column] = attr;
+    if (column == length) {
+        text[column + 1] = '\0';
     }
 }
 
-static void terminal_output_put(char c) {
-    if (c == '\n') {
-        terminal_output[terminal_output_length] = '\0';
-        terminal_print(terminal_output);
-        terminal_output_length = 0;
-    } else if (c == '\b') {
-        if (terminal_output_length != 0) {
-            terminal_output_length--;
+/* Clears columns [from, to) of a line; to past the text truncates it.
+   With a background color (or reverse) the cells keep it, as in xterm. */
+static void term_erase_colored(uint64_t line, size_t from, size_t to,
+                               uint16_t attr) {
+    if ((attr & (TERMINAL_ATTR_BG_SET | TERMINAL_ATTR_REVERSE)) != 0) {
+        if (to > term.columns) {
+            to = term.columns;
         }
-    } else if (c == '\t' || (c >= ' ' && c <= '~')) {
-        terminal_output[terminal_output_length++] = c == '\t' ? ' ' : c;
-        if (terminal_output_length + 1 == TERMINAL_COLUMNS) {
-            terminal_output_flush();
+        for (size_t column = from; column < to; column++) {
+            term_set_cell(line, column, ' ', attr);
+        }
+        return;
+    }
+    if (line >= term_count_end() || line < terminal_dropped) {
+        return;
+    }
+    size_t index = (size_t)(line - terminal_dropped);
+    char *text = terminal_line_at(index);
+    uint16_t *attrs = terminal_attrs_at(index);
+    size_t length = text_length(text);
+    if (from >= length) {
+        return;
+    }
+    if (to >= length) {
+        text[from] = '\0';
+        return;
+    }
+    for (size_t i = from; i < to; i++) {
+        text[i] = ' ';
+        attrs[i] = 0;
+    }
+}
+
+static void term_erase(uint64_t line, size_t from, size_t to) {
+    term_erase_colored(line, from, to, 0);
+}
+
+static void term_copy_line(uint64_t to, uint64_t from) {
+    size_t to_index = term_line(to);
+    size_t from_index = term_line(from);
+    text_copy(terminal_line_at(to_index), TERMINAL_COLUMNS + 1,
+              terminal_line_at(from_index));
+    for (size_t i = 0; i < TERMINAL_COLUMNS; i++) {
+        terminal_attrs_at(to_index)[i] = terminal_attrs_at(from_index)[i];
+    }
+}
+
+/* Moves screen rows [top, bottom] up (count > 0) or down, in place. */
+static void term_scroll_region(size_t top, size_t bottom, int64_t count) {
+    if (top > bottom || bottom >= term.rows) {
+        return;
+    }
+    uint64_t first = term_top();
+    (void)term_line(first + bottom);
+    first = term_top();
+    size_t height = bottom - top + 1;
+    size_t amount = (size_t)(count < 0 ? -count : count);
+    if (amount > height) {
+        amount = height;
+    }
+    if (count > 0) {
+        for (size_t row = top; row + amount <= bottom; row++) {
+            term_copy_line(first + row, first + row + amount);
+        }
+        for (size_t row = bottom + 1 - amount; row <= bottom; row++) {
+            term_erase(first + row, 0, TERMINAL_COLUMNS);
+        }
+    } else {
+        for (size_t row = bottom; row >= top + amount; row--) {
+            term_copy_line(first + row, first + row - amount);
+        }
+        for (size_t row = top; row < top + amount; row++) {
+            term_erase(first + row, 0, TERMINAL_COLUMNS);
+        }
+    }
+}
+
+static bool term_region_full(void) {
+    return term.region_top == 0 && term.region_bottom + 1 >= term.rows;
+}
+
+/* Cursor down one line: scroll the region at its bottom, else grow the
+   screen into the scrollback. */
+static void term_line_feed(void) {
+    size_t row = term_row();
+    term.wrap_pending = false;
+    if (row == term.region_bottom && (term.alternate || !term_region_full())) {
+        term_scroll_region(term.region_top, term.region_bottom, 1);
+    } else if (row + 1 < term.rows || (!term.alternate && term_region_full())) {
+        term.cursor_line++;
+    }
+}
+
+static void term_reverse_feed(void) {
+    size_t row = term_row();
+    if (row == term.region_top) {
+        term_scroll_region(term.region_top, term.region_bottom, -1);
+    } else if (row > 0) {
+        term.cursor_line--;
+    }
+}
+
+static void term_put(char character) {
+    if (term.wrap_pending) {
+        term.column = 0;
+        term_line_feed();
+    }
+    term_set_cell(term.cursor_line, term.column, character, term.attr);
+    if (term.column + 1 >= term.columns) {
+        term.wrap_pending = true;
+    } else {
+        term.column++;
+    }
+}
+
+static void term_alternate(bool enter) {
+    if (enter == term.alternate) {
+        return;
+    }
+    size_t rows = term.rows < TERMINAL_SCREEN_MAX ? term.rows
+                                                  : TERMINAL_SCREEN_MAX;
+    if (enter) {
+        (void)term_line(term_top() + rows - 1);
+        uint64_t top = term_top();
+        term.alternate_row = term_row();
+        term.alternate_column = term.column;
+        term.alternate_rows = rows;
+        for (size_t row = 0; row < rows; row++) {
+            size_t index = term_line(top + row);
+            text_copy(term_alternate_lines[row], TERMINAL_COLUMNS + 1,
+                      terminal_line_at(index));
+            for (size_t i = 0; i < TERMINAL_COLUMNS; i++) {
+                term_alternate_attrs[row][i] = terminal_attrs_at(index)[i];
+            }
+            term_erase(top + row, 0, TERMINAL_COLUMNS);
+        }
+        term.alternate = true;
+        term.cursor_line = top;
+        term.column = 0;
+    } else {
+        uint64_t top = term_top();
+        size_t restore = term.alternate_rows < rows ? term.alternate_rows
+                                                    : rows;
+        for (size_t row = 0; row < restore; row++) {
+            size_t index = term_line(top + row);
+            text_copy(terminal_line_at(index), TERMINAL_COLUMNS + 1,
+                      term_alternate_lines[row]);
+            for (size_t i = 0; i < TERMINAL_COLUMNS; i++) {
+                terminal_attrs_at(index)[i] = term_alternate_attrs[row][i];
+            }
+        }
+        term.alternate = false;
+        term.cursor_line = top + term.alternate_row;
+        term.column = term.alternate_column;
+        /* Blank lines the screen added below the old text go again. */
+        while (terminal_history_count != 0
+               && term_count_end() - 1 > term.cursor_line
+               && terminal_line_at(terminal_history_count - 1)[0] == '\0') {
+            terminal_history_count--;
+        }
+    }
+    term.wrap_pending = false;
+    term.region_top = 0;
+    term.region_bottom = term.rows - 1;
+}
+
+static uint32_t term_parameter(size_t index, uint32_t fallback) {
+    return index < term.parameter_count && term.parameters[index] != 0
+        ? term.parameters[index] : fallback;
+}
+
+static void term_select_graphic(void) {
+    if (term.parameter_count == 0) {
+        term.attr = 0;
+        return;
+    }
+    for (size_t i = 0; i < term.parameter_count; i++) {
+        uint32_t value = term.parameters[i];
+        if (value == 0) {
+            term.attr = 0;
+        } else if (value == 1) {
+            term.attr |= TERMINAL_ATTR_BOLD;
+        } else if (value == 22) {
+            term.attr &= (uint16_t)~TERMINAL_ATTR_BOLD;
+        } else if (value == 7) {
+            term.attr |= TERMINAL_ATTR_REVERSE;
+        } else if (value == 27) {
+            term.attr &= (uint16_t)~TERMINAL_ATTR_REVERSE;
+        } else if ((value >= 30 && value <= 37) || (value >= 90 && value <= 97)) {
+            uint16_t color = (uint16_t)(value >= 90 ? value - 90 + 8 : value - 30);
+            term.attr = (uint16_t)((term.attr & ~0x001fu) | color
+                                   | TERMINAL_ATTR_FG_SET);
+        } else if (value == 39) {
+            term.attr &= (uint16_t)~0x001fu;
+        } else if ((value >= 40 && value <= 47)
+                   || (value >= 100 && value <= 107)) {
+            uint16_t color = (uint16_t)(value >= 100 ? value - 100 + 8
+                                                     : value - 40);
+            term.attr = (uint16_t)((term.attr & ~0x03e0u)
+                                   | (color << TERMINAL_ATTR_BG_SHIFT)
+                                   | TERMINAL_ATTR_BG_SET);
+        } else if (value == 49) {
+            term.attr &= (uint16_t)~0x03e0u;
+        } else if ((value == 38 || value == 48) && i + 1 < term.parameter_count) {
+            /* 256 colors (5;n) use the first 16; true color (2;r;g;b) is
+               skipped. */
+            if (term.parameters[i + 1] == 5 && i + 2 < term.parameter_count) {
+                uint16_t color = (uint16_t)(term.parameters[i + 2] & 15);
+                if (term.parameters[i + 2] < 16) {
+                    term.attr = value == 38
+                        ? (uint16_t)((term.attr & ~0x001fu) | color
+                                     | TERMINAL_ATTR_FG_SET)
+                        : (uint16_t)((term.attr & ~0x03e0u)
+                                     | (color << TERMINAL_ATTR_BG_SHIFT)
+                                     | TERMINAL_ATTR_BG_SET);
+                }
+                i += 2;
+            } else if (term.parameters[i + 1] == 2) {
+                i += 4;
+            }
+        }
+    }
+}
+
+static void term_private_mode(bool set) {
+    for (size_t i = 0; i < term.parameter_count; i++) {
+        switch (term.parameters[i]) {
+        case 1:
+            term.application_keys = set;
+            break;
+        case 25:
+            term.cursor_hidden = !set;
+            break;
+        case 47:
+        case 1047:
+        case 1049:
+            term_alternate(set);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static void term_report(const char *prefix, size_t first, size_t second,
+                        const char *suffix) {
+    char text[32];
+    size_t length = append_text(text, sizeof(text), 0, prefix);
+    length = append_decimal(text, sizeof(text), length, first);
+    length = append_text(text, sizeof(text), length, ";");
+    length = append_decimal(text, sizeof(text), length, second);
+    append_text(text, sizeof(text), length, suffix);
+    app_input_push_text(text);
+}
+
+static void term_control_sequence(char final) {
+    /* Cursor operations work on real lines: make the cursor's. */
+    (void)term_line(term.cursor_line);
+    size_t row = term_row();
+    size_t count = term_parameter(0, 1);
+    uint64_t top = term_top();
+    if (term.private_mark == '?') {
+        if (final == 'h' || final == 'l') {
+            term_private_mode(final == 'h');
+        }
+        return;
+    }
+    if (term.private_mark != 0) {
+        return;
+    }
+    switch (final) {
+    case 'A':
+        term_set_row(row > count ? row - count : 0);
+        break;
+    case 'B':
+    case 'e':
+        term_set_row(row + count);
+        break;
+    case 'C':
+    case 'a':
+        term.column = term.column + count < term.columns
+            ? term.column + count : term.columns - 1;
+        term.wrap_pending = false;
+        break;
+    case 'D':
+        term.column = term.column > count ? term.column - count : 0;
+        term.wrap_pending = false;
+        break;
+    case 'E':
+        term_set_row(row + count);
+        term.column = 0;
+        break;
+    case 'F':
+        term_set_row(row > count ? row - count : 0);
+        term.column = 0;
+        break;
+    case 'G':
+    case '`':
+        term.column = count - 1 < term.columns ? count - 1 : term.columns - 1;
+        term.wrap_pending = false;
+        break;
+    case 'H':
+    case 'f':
+        term_set_row(term_parameter(0, 1) - 1);
+        term.column = term_parameter(1, 1) - 1 < term.columns
+            ? term_parameter(1, 1) - 1 : term.columns - 1;
+        break;
+    case 'd':
+        term_set_row(count - 1);
+        break;
+    case 'J': {
+        uint32_t mode = term_parameter(0, 0);
+        size_t from = mode == 0 ? row + 1 : 0;
+        size_t to = mode == 1 ? row : term.rows;
+        if (mode == 0) {
+            term_erase_colored(term.cursor_line, term.column,
+                               TERMINAL_COLUMNS, term.attr);
+        } else if (mode == 1) {
+            term_erase_colored(term.cursor_line, 0, term.column + 1,
+                               term.attr);
+        }
+        for (size_t r = from; r < to; r++) {
+            term_erase_colored(top + r, 0, TERMINAL_COLUMNS, term.attr);
+        }
+        break;
+    }
+    case 'K': {
+        uint32_t mode = term_parameter(0, 0);
+        term_erase_colored(term.cursor_line, mode == 0 ? term.column : 0,
+                           mode == 1 ? term.column + 1 : TERMINAL_COLUMNS,
+                           term.attr);
+        break;
+    }
+    case 'L':
+        if (row >= term.region_top && row <= term.region_bottom) {
+            term_scroll_region(row, term.region_bottom, -(int64_t)count);
+        }
+        break;
+    case 'M':
+        if (row >= term.region_top && row <= term.region_bottom) {
+            term_scroll_region(row, term.region_bottom, (int64_t)count);
+        }
+        break;
+    case 'P':
+    case '@': {
+        size_t index = term_line(term.cursor_line);
+        char *text = terminal_line_at(index);
+        uint16_t *attrs = terminal_attrs_at(index);
+        size_t length = text_length(text);
+        if (term.column >= length) {
+            break;
+        }
+        if (final == 'P') {
+            size_t shift = count < length - term.column
+                ? count : length - term.column;
+            for (size_t i = term.column; i + shift < length; i++) {
+                text[i] = text[i + shift];
+                attrs[i] = attrs[i + shift];
+            }
+            text[length - shift] = '\0';
+        } else {
+            size_t grown = length + count < term.columns
+                ? length + count : term.columns;
+            for (size_t i = grown; i-- > term.column + count;) {
+                text[i] = text[i - count];
+                attrs[i] = attrs[i - count];
+            }
+            for (size_t i = term.column; i < term.column + count && i < grown;
+                 i++) {
+                text[i] = ' ';
+                attrs[i] = 0;
+            }
+            text[grown] = '\0';
+        }
+        break;
+    }
+    case 'X':
+        term_erase_colored(term.cursor_line, term.column,
+                           term.column + count, term.attr);
+        break;
+    case 'S':
+        term_scroll_region(term.region_top, term.region_bottom,
+                           (int64_t)count);
+        break;
+    case 'T':
+        term_scroll_region(term.region_top, term.region_bottom,
+                           -(int64_t)count);
+        break;
+    case 'm':
+        term_select_graphic();
+        break;
+    case 'r': {
+        size_t first = term_parameter(0, 1) - 1;
+        size_t last = term_parameter(1, (uint32_t)term.rows) - 1;
+        if (last >= term.rows) {
+            last = term.rows - 1;
+        }
+        if (first < last) {
+            term.region_top = first;
+            term.region_bottom = last;
+        }
+        term_set_row(0);
+        term.column = 0;
+        break;
+    }
+    case 's':
+        term.saved_row = row;
+        term.saved_column = term.column;
+        term.saved_attr = term.attr;
+        break;
+    case 'u':
+        term_set_row(term.saved_row);
+        term.column = term.saved_column;
+        term.attr = term.saved_attr;
+        break;
+    case 'n':
+        if (term_parameter(0, 0) == 6) {
+            term_report("\x1b[", row + 1, term.column + 1, "R");
+        } else if (term_parameter(0, 0) == 5) {
+            app_input_push_text("\x1b[0n");
+        }
+        break;
+    case 'c':
+        app_input_push_text("\x1b[?1;2c");
+        break;
+    default:
+        break;
+    }
+}
+
+/* One byte of a program's output. */
+static void terminal_output_put(char c) {
+    uint8_t byte = (uint8_t)c;
+    switch (term.parse) {
+    case TERMINAL_PARSE_ESCAPE:
+        term.parse = TERMINAL_PARSE_TEXT;
+        switch (byte) {
+        case '[':
+            term.parse = TERMINAL_PARSE_CSI;
+            term.private_mark = 0;
+            term.parameter_count = 0;
+            for (size_t i = 0; i < TERMINAL_PARAMETERS; i++) {
+                term.parameters[i] = 0;
+            }
+            break;
+        case ']':
+            term.parse = TERMINAL_PARSE_OSC;
+            break;
+        case '(': case ')': case '*': case '+': case '#':
+            term.parse = TERMINAL_PARSE_SKIP_ONE;
+            break;
+        case '7':
+            term.saved_row = term_row();
+            term.saved_column = term.column;
+            term.saved_attr = term.attr;
+            break;
+        case '8':
+            term_set_row(term.saved_row);
+            term.column = term.saved_column;
+            term.attr = term.saved_attr;
+            break;
+        case 'D':
+            (void)term_line(term.cursor_line);
+            term_line_feed();
+            break;
+        case 'E':
+            (void)term_line(term.cursor_line);
+            term.column = 0;
+            term_line_feed();
+            break;
+        case 'M':
+            (void)term_line(term.cursor_line);
+            term_reverse_feed();
+            break;
+        case 'c':
+            term_alternate(false);
+            terminal_state_reset();
+            break;
+        default:
+            break;
+        }
+        return;
+    case TERMINAL_PARSE_CSI:
+        if (byte >= '0' && byte <= '9') {
+            if (term.parameter_count == 0) {
+                term.parameter_count = 1;
+            }
+            uint32_t *value = &term.parameters[term.parameter_count - 1];
+            if (*value < 10000) {
+                *value = *value * 10 + (byte - '0');
+            }
+        } else if (byte == ';' || byte == ':') {
+            if (term.parameter_count == 0) {
+                term.parameter_count = 1;
+            }
+            if (term.parameter_count < TERMINAL_PARAMETERS) {
+                term.parameter_count++;
+            }
+        } else if ((byte == '?' || byte == '>' || byte == '=' || byte == '<')
+                   && term.parameter_count == 0) {
+            term.private_mark = (char)byte;
+        } else if (byte >= 0x40 && byte <= 0x7e) {
+            term.parse = TERMINAL_PARSE_TEXT;
+            term_control_sequence((char)byte);
+        } else if (byte == 0x1b) {
+            term.parse = TERMINAL_PARSE_ESCAPE;
+        } else if (byte < 0x20 || byte > 0x7e) {
+            term.parse = TERMINAL_PARSE_TEXT;
+        }
+        return;
+    case TERMINAL_PARSE_OSC:
+        if (byte == 0x07) {
+            term.parse = TERMINAL_PARSE_TEXT;
+        } else if (byte == 0x1b) {
+            term.parse = TERMINAL_PARSE_OSC_ESCAPE;
+        }
+        return;
+    case TERMINAL_PARSE_OSC_ESCAPE:
+    case TERMINAL_PARSE_SKIP_ONE:
+        term.parse = TERMINAL_PARSE_TEXT;
+        return;
+    case TERMINAL_PARSE_TEXT:
+        break;
+    }
+    if (term.utf8_skip != 0 && byte >= 0x80 && byte < 0xc0) {
+        term.utf8_skip--;
+        return;
+    }
+    term.utf8_skip = 0;
+    switch (byte) {
+    case 0x1b:
+        term.parse = TERMINAL_PARSE_ESCAPE;
+        return;
+    case '\n':
+    case 0x0b:
+    case 0x0c:
+        /* As with ONLCR: a new line starts at the left. */
+        term.column = 0;
+        term_line_feed();
+        return;
+    case '\r':
+        term.column = 0;
+        term.wrap_pending = false;
+        return;
+    case '\b':
+        if (term.column != 0) {
+            term.column--;
+        }
+        term.wrap_pending = false;
+        return;
+    case '\t': {
+        size_t next = (term.column / 8 + 1) * 8;
+        term.column = next < term.columns ? next : term.columns - 1;
+        return;
+    }
+    default:
+        break;
+    }
+    if (byte < 0x20 || byte == 0x7f) {
+        return;
+    }
+    if (byte >= 0x80) {
+        /* UTF-8: one '?' per character the font cannot draw. */
+        term.utf8_skip = byte >= 0xf0 ? 3 : byte >= 0xe0 ? 2
+                       : byte >= 0xc0 ? 1 : 0;
+        term_put('?');
+        return;
+    }
+    term_put((char)byte);
+}
+
+static void terminal_output_text(const char *text) {
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        terminal_output_put(text[i]);
+    }
+}
+
+/* A program from the Terminal ended: leave its screen and settings. */
+static void terminal_output_flush(void) {
+    term_alternate(false);
+    terminal_state_reset();
+    if (term.cursor_line < term_count_end()) {
+        size_t index = (size_t)(term.cursor_line - terminal_dropped);
+        if (term.cursor_line + 1 < term_count_end()
+            || term.column != 0 || text_length(terminal_line_at(index)) != 0) {
+            terminal_finish_line();
         }
     }
 }
@@ -709,7 +1449,7 @@ static const char *run_result_text(enum run_result result) {
     switch (result) {
     case RUN_NOT_FOUND: return "FILE NOT FOUND";
     case RUN_DENIED: return "ACCESS DENIED";
-    case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (1 MIB LIMIT)";
+    case RUN_TOO_LARGE: return "PROGRAM TOO LARGE (16 MIB LIMIT)";
     case RUN_NOT_PROGRAM: return "NOT A PROGRAM (NO ELF HEADER)";
     case RUN_FAILED: return "PROGRAM COULD NOT START";
     case RUN_BUSY: return "TOO MANY PROGRAMS RUNNING";
@@ -863,7 +1603,7 @@ static bool terminal_execute(void) {
     if (text_equals(terminal_line, terminal_length, "help")) {
         terminal_print("HELP LS CLEAR UPTIME ELF DEMO RUN PATH [ARGS]");
         terminal_print("PS KILL PID  SHELL REBOOT SHUTDOWN EXIT");
-        terminal_print("CTRL+C ENDS THE LAST PROGRAM STARTED HERE");
+        terminal_print("CTRL+C INTERRUPTS THE PROGRAM; TWICE ENDS IT");
         terminal_print("NET  DHCP  PING HOST  LOOKUP NAME  HTTP HOST[/PATH]");
         terminal_print("UPDATE [INSTALL]  FETCH URL  (ANY PROGRAM IN /BIN)");
         terminal_print("TYPE HELP COMMAND FOR USAGE AND AN EXPLANATION");
@@ -1247,13 +1987,106 @@ static enum window_kind window_at(int32_t x, int32_t y) {
 
 /* -------------------------------------------------------------- content */
 
+/* The 16 terminal colors, readable on the Terminal's dark background. */
+static const uint8_t terminal_palette[16][3] = {
+    {0, 0, 0}, {205, 49, 49}, {13, 188, 121}, {229, 229, 16},
+    {36, 114, 200}, {188, 63, 188}, {17, 168, 205}, {229, 229, 229},
+    {102, 102, 102}, {241, 76, 76}, {35, 209, 139}, {245, 245, 67},
+    {59, 142, 234}, {214, 112, 214}, {41, 184, 219}, {255, 255, 255},
+};
+
+/* Draws a line whose cells have colors, run by run. */
+static void draw_terminal_cells(int64_t x, int64_t y, int64_t width,
+                                const char *line, const uint16_t *attrs) {
+    size_t length = text_length(line);
+    size_t start = 0;
+    while (start < length) {
+        size_t end = start + 1;
+        while (end < length && attrs[end] == attrs[start]) {
+            end++;
+        }
+        uint16_t attr = attrs[start];
+        uint8_t fg[3] = {220, 228, 240};
+        uint8_t bg[3] = {12, 16, 26};
+        bool background = false;
+        if ((attr & TERMINAL_ATTR_FG_SET) != 0) {
+            size_t color = attr & 15u;
+            if ((attr & TERMINAL_ATTR_BOLD) != 0 && color < 8) {
+                color += 8;
+            }
+            for (size_t i = 0; i < 3; i++) {
+                fg[i] = terminal_palette[color][i];
+            }
+        } else if ((attr & TERMINAL_ATTR_BOLD) != 0) {
+            fg[0] = fg[1] = fg[2] = 255;
+        }
+        if ((attr & TERMINAL_ATTR_BG_SET) != 0) {
+            size_t color = (attr >> TERMINAL_ATTR_BG_SHIFT) & 15u;
+            for (size_t i = 0; i < 3; i++) {
+                bg[i] = terminal_palette[color][i];
+            }
+            background = true;
+        }
+        if ((attr & TERMINAL_ATTR_REVERSE) != 0) {
+            for (size_t i = 0; i < 3; i++) {
+                uint8_t swap = fg[i];
+                fg[i] = bg[i];
+                bg[i] = swap;
+            }
+            background = true;
+        }
+        int64_t left = x + (int64_t)start * CHAR_WIDTH;
+        int64_t room = x + width - left;
+        if (room < CHAR_WIDTH) {
+            break;
+        }
+        if (background) {
+            int64_t span = (int64_t)(end - start) * CHAR_WIDTH;
+            fill((struct rect){left, y, span < room ? span : room,
+                               LINE_HEIGHT}, bg[0], bg[1], bg[2]);
+        }
+        char segment[TERMINAL_COLUMNS + 1];
+        size_t count = 0;
+        for (size_t i = start; i < end; i++) {
+            segment[count++] = line[i];
+        }
+        segment[count] = '\0';
+        draw_text_clipped(left, y, room, segment, fg[0], fg[1], fg[2]);
+        start = end;
+    }
+}
+
 static void draw_terminal(struct rect area, bool focused) {
     fill(area, 12, 16, 26);
     int64_t text_x = area.x + 10;
     int64_t text_width = area.width - 20;
     int64_t prompt_y = area.y + area.height - LINE_HEIGHT - 4;
-    size_t visible = terminal_visible_rows(area);
+    bool program = terminal_program_running();
+    size_t visible = terminal_view_rows(area);
     terminal_page_rows = visible > 1 ? visible - 1 : 1;
+    /* The screen programs see: every row, and columns up to 96. */
+    size_t screen_rows = terminal_visible_rows(area) + 1;
+    size_t screen_columns = text_width > CHAR_WIDTH
+        ? (size_t)(text_width / CHAR_WIDTH) : 1;
+    if (screen_rows > TERMINAL_SCREEN_MAX) {
+        screen_rows = TERMINAL_SCREEN_MAX;
+    }
+    if (screen_columns > TERMINAL_COLUMNS) {
+        screen_columns = TERMINAL_COLUMNS;
+    }
+    if (screen_rows != term.rows || screen_columns != term.columns) {
+        term.rows = screen_rows;
+        term.columns = screen_columns;
+        if (term.region_bottom >= term.rows || term_region_full()) {
+            term.region_top = 0;
+            term.region_bottom = term.rows - 1;
+        }
+        if (term.column >= term.columns) {
+            term.column = term.columns - 1;
+        }
+        user_set_console_size((uint16_t)screen_rows,
+                              (uint16_t)screen_columns);
+    }
     size_t first = terminal_first_row(area);
     int64_t y = area.y + 8;
     bool colors = settings_get(SETTING_TERMINAL_COLORS);
@@ -1264,6 +2097,7 @@ static void draw_terminal(struct rect area, bool focused) {
     for (size_t i = first; i < terminal_history_count && i < first + visible;
          i++) {
         const char *line = terminal_line_at(i);
+        const uint16_t *attrs = terminal_attrs_at(i);
         uint64_t number = terminal_dropped + i;
         if (has_selection && number >= sel_first_line
             && number <= sel_last_line) {
@@ -1288,6 +2122,15 @@ static void draw_terminal(struct rect area, bool focused) {
                 }
             }
         }
+        bool colored = false;
+        for (size_t c = 0; line[c] != '\0'; c++) {
+            colored = colored || attrs[c] != 0;
+        }
+        if (colored) {
+            draw_terminal_cells(text_x, y, text_width, line, attrs);
+            y += LINE_HEIGHT;
+            continue;
+        }
         bool echo = line[0] == 'O' && line[4] == '>';
         uint8_t red = echo ? 120 : 220;
         uint8_t green = echo ? 210 : 228;
@@ -1304,21 +2147,21 @@ static void draw_terminal(struct rect area, bool focused) {
         draw_text_clipped(text_x, y, text_width, line, red, green, blue);
         y += LINE_HEIGHT;
     }
-    if (app_input_readers != 0) {
-        /* A program reads a line: show what it printed and the echo. */
-        char pending[TERMINAL_COLUMNS];
-        for (size_t i = 0; i < terminal_output_length; i++) {
-            pending[i] = terminal_output[i];
-        }
-        pending[terminal_output_length] = '\0';
-        draw_text_clipped(text_x, prompt_y, text_width, pending,
-                          240, 245, 255);
-        int64_t caret_x = text_x
-            + (int64_t)terminal_output_length * CHAR_WIDTH;
-        if (focused && caret_x + CHAR_WIDTH < area.x + area.width
+    if (program) {
+        /* A program's screen: its cursor, unless it hid it. */
+        if (focused && !term.cursor_hidden
+            && term.cursor_line >= terminal_dropped + first
+            && term.cursor_line < terminal_dropped + first + visible
             && (timer_ticks() / 50) % 2 == 0) {
-            fill((struct rect){caret_x, prompt_y, CHAR_WIDTH - 2,
-                               CHAR_HEIGHT}, 120, 210, 170);
+            int64_t caret_y = area.y + 8 + (int64_t)(term.cursor_line
+                - terminal_dropped - first) * LINE_HEIGHT;
+            size_t column = term.column < term.columns ? term.column
+                                                       : term.columns - 1;
+            int64_t caret_x = text_x + (int64_t)column * CHAR_WIDTH;
+            if (caret_x + CHAR_WIDTH < area.x + area.width) {
+                fill((struct rect){caret_x, caret_y, CHAR_WIDTH - 2,
+                                   CHAR_HEIGHT}, 120, 210, 170);
+            }
         }
         return;
     }
@@ -10028,9 +10871,72 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
     return true;
 }
 
+static void app_input_push(char character);
+static uint64_t terminal_job_process(void);
+/* When Ctrl+C last sent SIGINT: a second one soon after ends the program. */
+static uint64_t terminal_interrupt_tick;
+
+/*
+ * A key for the program running in the Terminal, as a Linux terminal
+ * sends it: Enter is CR, Backspace DEL, arrows and the like escape
+ * sequences, Ctrl+letter a control character. Ctrl+V pastes.
+ */
+static void terminal_program_key(char character) {
+    static const char *const cursor[4][2] = {
+        {"\x1b[A", "\x1bOA"}, {"\x1b[B", "\x1bOB"},
+        {"\x1b[D", "\x1bOD"}, {"\x1b[C", "\x1bOC"},
+    };
+    size_t keys = term.application_keys ? 1 : 0;
+    if (keyboard_last_ctrl()) {
+        if (character == 'v' || character == 'V') {
+            for (size_t i = 0; i < clipboard_length; i++) {
+                char c = clipboard[i];
+                if (c == '\r' && i + 1 < clipboard_length
+                    && clipboard[i + 1] == '\n') {
+                    continue;
+                }
+                app_input_push(c == '\n' ? '\r' : c);
+            }
+        } else if ((character >= 'a' && character <= 'z')
+                   || (character >= 'A' && character <= 'Z')) {
+            app_input_push((char)(character & 0x1f));
+        } else if (character == ' ' || character == '2') {
+            app_input_push('\0');
+        }
+        return;
+    }
+    switch (character) {
+    case '\n': app_input_push('\r'); return;
+    case '\b': app_input_push(0x7f); return;
+    case KEY_UP: app_input_push_text(cursor[0][keys]); return;
+    case KEY_DOWN: app_input_push_text(cursor[1][keys]); return;
+    case KEY_LEFT: app_input_push_text(cursor[2][keys]); return;
+    case KEY_RIGHT: app_input_push_text(cursor[3][keys]); return;
+    case KEY_HOME: app_input_push_text("\x1b[H"); return;
+    case KEY_END: app_input_push_text("\x1b[F"); return;
+    case KEY_DELETE: app_input_push_text("\x1b[3~"); return;
+    case KEY_PAGE_UP: app_input_push_text("\x1b[5~"); return;
+    case KEY_PAGE_DOWN: app_input_push_text("\x1b[6~"); return;
+    case KEY_ESCAPE: app_input_push(0x1b); return;
+    case '\t': app_input_push('\t'); return;
+    default:
+        if (character >= ' ' && character <= '~') {
+            app_input_push(character);
+        }
+        return;
+    }
+}
+
 /* Returns true when the focused terminal consumed the character. */
 static bool terminal_key(char character) {
     struct rect terminal_area = content_rect(window_rect(WINDOW_TERMINAL));
+    bool program = terminal_program_running();
+    /* A full-screen program gets Page Up/Down; else they scroll. */
+    if (program && term.alternate && !keyboard_last_ctrl()
+        && (character == KEY_PAGE_UP || character == KEY_PAGE_DOWN)) {
+        terminal_program_key(character);
+        return true;
+    }
     if (character == KEY_PAGE_UP || character == KEY_PAGE_DOWN) {
         terminal_scroll_by(terminal_area, character == KEY_PAGE_UP
                            ? (int64_t)terminal_page_rows
@@ -10063,14 +10969,42 @@ static bool terminal_key(char character) {
         return true;
     }
     if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
+        && program) {
+        uint32_t flags = user_console_local_flags();
+        uint64_t process_id = terminal_job_process();
+        if ((flags & LINUX_TTY_ISIG) == 0) {
+            app_input_push(3); /* raw mode: the program reads ^C itself */
+            return true;
+        }
+        uint64_t now = timer_ticks();
+        /* Again within two seconds, or the last SIGINT is still not
+           delivered (the program makes no system calls): end it. */
+        bool again = (terminal_interrupt_tick != 0
+                      && now - terminal_interrupt_tick < 200)
+            || (process_id != 0
+                && user_process_signal_pending(process_id, 2));
+        if (!again && process_id != 0
+            && user_process_signal(process_id, 2)) {
+            /* SIGINT; a program that ignores it ends on a second Ctrl+C
+               within two seconds. */
+            terminal_interrupt_tick = now;
+            if ((flags & LINUX_TTY_ECHO) != 0) {
+                terminal_output_text("^C");
+            }
+            scheduler_wake_event(&app_input_readers);
+            return true;
+        }
+        terminal_interrupt_tick = 0;
+    }
+    if (keyboard_last_ctrl() && (character == 'c' || character == 'C')
         && app_kill_terminal_job()) {
         terminal_output_flush();
         terminal_print("^C");
         return true;
     }
-    if (app_input_readers != 0) {
-        /* A program waits for a line: typing goes to it (it echoes). */
-        app_input_push(character);
+    if (program) {
+        /* Typing goes to the program (the line discipline echoes). */
+        terminal_program_key(character);
         return true;
     }
     if (line_ctrl_key(terminal_line, &terminal_length,
@@ -11029,16 +11963,15 @@ static void app_output_sink(const char *data, size_t length, bool error) {
  * Standard input: while a program reads it, what is typed into the
  * Terminal goes to the program instead of the command line.
  */
-#define APP_INPUT_CAPACITY 256
+#define APP_INPUT_CAPACITY 4096
 static char app_input[APP_INPUT_CAPACITY];
 static size_t app_input_head;
 static size_t app_input_count;
 static size_t app_input_readers_drawn;
 
+/* Bytes for the program, as a terminal sends them (any value). */
 static void app_input_push(char character) {
-    if ((character != '\n' && character != '\b'
-         && (character < ' ' || character > '~'))
-        || app_input_count == APP_INPUT_CAPACITY) {
+    if (app_input_count == APP_INPUT_CAPACITY) {
         return;
     }
     app_input[(app_input_head + app_input_count) % APP_INPUT_CAPACITY] =
@@ -11047,22 +11980,41 @@ static void app_input_push(char character) {
     scheduler_wake_event(&app_input_readers);
 }
 
-static bool app_console_input(char *character) {
+static void app_input_push_text(const char *text) {
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        app_input_push(text[i]);
+    }
+}
+
+static int app_console_input(char *character, uint64_t deadline) {
     for (;;) {
-        if (user_current_killed() || !desktop_active) {
-            return false;
+        if (user_current_killed() || user_current_signal_pending()
+            || !desktop_active) {
+            return -1;
         }
         if (app_input_count != 0) {
             *character = app_input[app_input_head];
             app_input_head = (app_input_head + 1) % APP_INPUT_CAPACITY;
             app_input_count--;
-            return true;
+            return 1;
+        }
+        uint64_t now = timer_ticks();
+        if (deadline == 0 || now >= deadline) {
+            return 0;
+        }
+        uint64_t until = now + APP_WAIT_RECHECK_TICKS;
+        if (deadline < until) {
+            until = deadline;
         }
         app_input_readers++;
-        (void)scheduler_block_current_until_locked(
-            &app_input_readers, timer_ticks() + APP_WAIT_RECHECK_TICKS);
+        (void)scheduler_block_current_until_locked(&app_input_readers,
+                                                   until);
         app_input_readers--;
     }
+}
+
+static size_t app_console_pending(void) {
+    return app_input_count;
 }
 
 /*
@@ -11215,6 +12167,31 @@ static bool app_current_is_updater(void) {
     return app_current_has_origin(APP_FROM_UPDATES);
 }
 
+/* The newest program started from the Terminal that still runs and has
+   no window of its own: it owns the Terminal's screen and keyboard. A
+   program with a window (the browser, Sketch) leaves the prompt free. */
+static const struct app_job *terminal_job(void) {
+    const struct app_job *newest = NULL;
+    for (size_t i = 0; i < APP_JOB_CAPACITY; i++) {
+        const struct app_job *job = &app_jobs[i];
+        if (job->used && !job->finished && job->origin == APP_FROM_TERMINAL
+            && app_window_of(app_job_process(job)) == NULL
+            && (newest == NULL || job->task_id > newest->task_id)) {
+            newest = job;
+        }
+    }
+    return newest;
+}
+
+static bool terminal_program_running(void) {
+    return terminal_job() != NULL || app_input_readers != 0;
+}
+
+static uint64_t terminal_job_process(void) {
+    const struct app_job *job = terminal_job();
+    return job != NULL ? app_job_process(job) : 0;
+}
+
 /* Ctrl+C in the Terminal: ends the newest program started there. */
 static bool app_kill_terminal_job(void) {
     const struct app_job *newest = NULL;
@@ -11272,7 +12249,11 @@ static void app_job_report(struct app_job *job) {
     bool started = result == RUN_STARTED;
     switch (job->origin) {
     case APP_FROM_TERMINAL:
+        /* Its screen, terminal settings and unread typing end with it. */
         terminal_output_flush();
+        user_console_reset();
+        app_input_count = 0;
+        terminal_interrupt_tick = 0;
         if (started) {
             terminal_report_exit(true, job->exit_status);
         } else {
@@ -12828,7 +13809,7 @@ void desktop_run(void) {
        and programs' output and input go through the Terminal. */
     scheduler_set_kernel_preemption(false);
     user_set_console_sink(app_output_sink);
-    user_set_console_input(app_console_input);
+    user_set_console_input(app_console_input, app_console_pending);
     desktop_active = true;
     draw_scene();
 
@@ -12836,7 +13817,7 @@ void desktop_run(void) {
     }
     apps_stop_all();
     desktop_active = false;
-    user_set_console_input(NULL);
+    user_set_console_input(NULL, NULL);
     user_set_console_sink(NULL);
     scheduler_set_kernel_preemption(true);
     console_clear();

@@ -77,10 +77,9 @@ In the order the next programs are likely to hit them.
    argument page (64 arguments, 64 environment strings, 2048 bytes of
    strings), a 64 MiB `mmap` area, every page allocated at once (no
    demand paging), no `MAP_SHARED` or `MAP_FIXED`.
-4. **Terminal.** Input is always one line with echo, and the desktop
-   Terminal does not interpret escape sequences. Full-screen programs
-   (`vi`, `less`, `top`) need raw mode, cursor movement and colors.
-   Ctrl+C should send `SIGINT`; Ctrl+D should end input.
+4. **Terminal.** Done in step 5 (see there). Still missing: `SIGWINCH`
+   on resize, mouse reporting, Unicode beyond ASCII, function keys,
+   job control (Ctrl+Z, process groups).
 5. **Signals between processes.** `kill` and `tgkill` to other
    processes, process groups, `SIGCHLD`.
 6. **Locks.** Record locks are granted at once and not tracked: two
@@ -117,8 +116,8 @@ Proposal:
    step 3".
 4. Done. Higher limits: descriptors, open files, executable size,
    stack, heap, `mremap`, `getrlimit`. See "As built in step 4".
-5. Terminal: raw mode, escape sequences in the desktop Terminal,
-   Ctrl+C and Ctrl+D.
+5. Done. Terminal: raw mode, escape sequences in the desktop Terminal,
+   Ctrl+C and Ctrl+D. See "As built in step 5".
 6. A larger program as the next test (BusyBox), then dynamic linking.
 7. Graphics through an SDL2 backend.
 
@@ -243,6 +242,80 @@ executable installed as a Linux package, passes 15 checks:
 - a `fork` and `execv` with 61 arguments.
 
 SQLite, Lua and the browser still run.
+
+## As built in step 5
+
+**Line discipline (kernel).** The console has one set of termios
+settings, shared like one tty. `TCGETS`/`TCSETS*` read and change it, and
+the desktop restores the defaults when a program from the Terminal ends.
+- **Line mode (`ICANON`):** Backspace and Ctrl+U edit, and Enter ends
+  the line. Ctrl+D ends input: `read` returns what was typed, or 0.
+- **Raw mode:** `VMIN` and `VTIME` decide how long `read` waits. Bytes
+  arrive as typed. `ICRNL` maps Enter (CR) to LF.
+- **`ECHO`:** shows typed text.
+- **`ISIG`:** Ctrl+C sends `SIGINT` and the waiting `read` returns
+  `EINTR`.
+- **`poll` and `select`:** report standard input readable when keys are
+  waiting.
+- **Other ioctls:** `FIONREAD`, `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`,
+  `TCFLSH`, `TCSBRK` and `TIOCSWINSZ` are accepted.
+- **`TIOCGWINSZ`:** reports the Terminal window's size.
+- **`TERM`:** set to `xterm`.
+
+**Keys.** While a program without its own window runs from the
+Terminal, every key goes to it, as a Linux terminal sends it:
+
+| Key | Sent |
+| --- | --- |
+| Enter | CR |
+| Backspace | DEL |
+| Arrows | `ESC [ A`–`D` (`ESC O A`–`D` in application cursor mode) |
+| Home, End | `ESC [ H`, `ESC [ F` |
+| Delete | `ESC [ 3 ~` |
+| Page Up, Page Down | `ESC [ 5 ~`, `ESC [ 6 ~` (alternate screen only; otherwise they scroll the Terminal) |
+| Esc, Tab | themselves |
+| Ctrl+letter | control character |
+
+Ctrl+V pastes the clipboard. Ctrl+C sends `SIGINT` to the program and
+the processes it forked. A second Ctrl+C ends them if the first came
+less than 2 seconds earlier, or was never delivered because the
+program makes no system calls. A program with a window (the browser,
+Sketch) leaves the prompt free, as before.
+
+**Terminal emulator (desktop).** A VT100/xterm subset:
+- **Screen:** the last rows of the scrollback.
+- **Cursor:** movement and positioning (`CUU`…`CUP`, `HVP`, `VPA`,
+  `CHA`), save and restore.
+- **Erasing:** `ED`, `EL` and `ECH`, keeping the background color.
+- **Editing:** insert and delete lines and characters.
+- **Scrolling:** scroll regions (`DECSTBM`), `SU`/`SD`, index and
+  reverse index.
+- **Colors:** SGR with 16 colors, bold, reverse, and the first 16 of 256
+  colors.
+- **Modes:** the alternate screen (`?1049`, `?1047`, `?47`), cursor
+  hiding (`?25`), application cursor keys (`?1`).
+- **Replies:** cursor position reports (`DSR 6`) and device attributes.
+- **Ignored:** window titles (OSC) and character set selection.
+- **Text:** tabs every 8 columns, and auto-wrap at the right edge.
+- **UTF-8:** each character outside ASCII is drawn as `?`.
+
+The screen has as many rows as the window shows and up to 96 columns.
+Leaving the alternate screen restores the text that was there.
+
+**QEMU test.** A static musl test program checks:
+- `isatty`, the window size and `TERM`;
+- colors, reverse and background, carriage return, tabs, `EL`, and
+  UTF-8 drawn as `?`;
+- a full-screen box in the alternate screen with a full-width
+  reverse-video status line, raw keys (Up arrives as `1b 5b 41`), and
+  `q` quitting back to the old text;
+- Ctrl+D ending input after two lines;
+- a `SIGINT` handler catching Ctrl+C;
+- a busy loop ended by the second Ctrl+C;
+- `poll` on standard input reporting a typed key.
+
+The Lua and SQLite prompts work and Ctrl+D leaves them. The browser
+started from the Terminal leaves the prompt usable.
 
 ## Tests
 

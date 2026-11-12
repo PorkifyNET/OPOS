@@ -275,9 +275,9 @@ and is not driven. The register layout follows Linux's
 - Tested in VMware Workstation (virtual hardware 21, guest OS "Other",
   no `sound.virtualDev`): the card is found and DAC2 keeps playing
   (103,424 frames counted in 200 timer ticks, against 96,000 expected
-  at 48 kHz; the cause of the 8% difference is not known). Whether the
-  sound is heard was not checked by the test, which has no capture.
-  Not tested on a real ES1371.
+  at 48 kHz; the cause of the 8% difference is not known). Listening
+  test on the user's VM (no `.vmx` change): `beep`, `beep 1500` and
+  `/bin/play` tones all played correctly. Not tested on a real ES1371.
 
 ## Not planned yet
 

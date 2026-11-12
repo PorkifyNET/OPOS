@@ -55,7 +55,8 @@ come later. Input (microphones) is out of scope.
    with the sound call. The SDL demos gain `testmultiaudio`.
 4. **Doom with sound.** SDL_mixer (no codec libraries: Doom's effects are
    raw samples and its music is played by Chocolate Doom's own OPL
-   emulator), then Chocolate Doom built with it: effects and music.
+   emulator), then Chocolate Doom built with it: effects and music. Done:
+   see "As built in step 4".
 5. **Real hardware.** Run on real machines and VirtualBox/VMware; fix
    what codecs differ in. Interrupt-driven refill if polling turns out to
    glitch under load.
@@ -165,6 +166,44 @@ recording (monitor `wavcapture`) holds two plays of 10.81 s and 10.94 s
 (the file is 10.96 s; the quiet ends fall under the detector's
 threshold) that correlate at 0.998 with each other, so playback is
 steady.
+
+## As built in step 4
+
+`store/linux/sdl2_mixer/build.sh` builds SDL_mixer 2.8.1 (zlib; pinned
+release, SHA-256 checked and the same from GitHub and libsdl.org) as a
+static library against the SDL from step 3. It has the core mixer and
+WAVE files only: every codec library (MIDI, MOD, Ogg, FLAC, MP3, Opus,
+WavPack, GME) and the external music command are off. Doom needs no
+more: its effects are raw samples, and Chocolate Doom plays its music
+with its own OPL (AdLib/Sound Blaster) emulator, mixed in through
+SDL_mixer. The recipe makes no package; the Doom recipe builds it when
+it is missing and links it, and the Freedoom package now carries
+`LICENSE.sdl_mixer`.
+
+Two more changes were needed:
+- **TMPDIR.** Chocolate Doom converts each song to a MIDI file in
+  `$TMPDIR` (else `/tmp`) before the OPL player loads it. OPOS has no
+  `/tmp`, so music failed ("MIDI_LoadFile: Failed to open
+  '/tmp/doom.mid'"). A confined program now gets `TMPDIR=$HOME/tmp`, made
+  at start in its own storage folder (`docs/linux-programs.md`).
+- **Waking tasks run first.** The scheduler was plain round robin, so a
+  thread that woke from a wait (SDL's audio thread, once the stream had
+  room) queued behind every busy task. `kernel/scheduler.c` now runs a
+  task whose sleep or wait just ended before the others; such a task
+  mostly waits, so it uses little of the CPU. In the Doom test below this
+  removed a 106 ms dropout during the demo.
+
+**Test.** In QEMU with `intel-hda`, Doom started from the Terminal and
+left alone, recorded for 75 s:
+- Doom takes about 30 s to reach its title screen in this setup, and the
+  sound starts with it: the title music, then the demo's effects. It then
+  plays without gaps.
+- The only gaps (10 ms, 170 ms apart, and one of 0.5 s) come while Doom
+  loads the demo's level from disk; the timer missed refills of the
+  170 ms ring then. Without the scheduler change there was also a 106 ms
+  gap in the middle of the demo.
+- Regressions (musl, signal, pthread, net and dynamic tests, multitest,
+  `make sound-test`, host tests) pass with the scheduler change.
 
 ## Not planned yet
 

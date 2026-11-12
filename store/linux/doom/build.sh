@@ -2,10 +2,11 @@
 # Doom for OPOS: Chocolate Doom (the Doom engine, kept faithful to the
 # original) with Freedoom: Phase 1, a complete free game for it.
 # Licenses: Chocolate Doom GPL-2.0 (the package carries its source),
-# Freedoom BSD-3-Clause, SDL zlib, musl MIT. Built against SDL 2 from
-# store/linux/sdl2 (built first when OUT/sdl2 is missing). There is no
-# sound: OPOS has no sound driver yet, and SDL_mixer and SDL_net are left
-# out. Not built by default: add "doom" to STORE_LINUX.
+# Freedoom BSD-3-Clause, SDL and SDL_mixer zlib, musl MIT. Built against
+# SDL 2 and SDL_mixer from store/linux/sdl2 and store/linux/sdl2_mixer
+# (built first when OUT/sdl2 or OUT/sdl2_mixer is missing): sound effects
+# and OPL music through OPOS sound. SDL_net is left out (no multiplayer).
+# Not built by default: add "doom" to STORE_LINUX.
 . "$(dirname "$0")/../common.sh"
 OUT=$1
 CACHE=$2
@@ -22,6 +23,10 @@ WADS=$(fetch "https://github.com/freedoom/freedoom/releases/download/v$FREEDOOM/
 SDL=$OUT/sdl2
 if [ ! -f "$SDL/lib/libSDL2.a" ]; then
     SDL2_LIBRARY_ONLY=1 sh "$HERE/../sdl2/build.sh" "$OUT" "$CACHE"
+fi
+MIXER=$OUT/sdl2_mixer
+if [ ! -f "$MIXER/lib/libSDL2_mixer.a" ]; then
+    sh "$HERE/../sdl2_mixer/build.sh" "$OUT" "$CACHE"
 fi
 
 DIR=$(work doom "$OUT")
@@ -60,11 +65,12 @@ for f in $GAME; do
 done
 FILES="$FILES $SRC/src/doom/*.c $SRC/textscreen/*.c $SRC/pcsound/*.c $SRC/opl/*.c"
 # textscreen/examples and opl/examples are not part of the game.
-$LINUX_CC -O2 -DDISABLE_SDL2MIXER=1 -DDISABLE_SDL2NET=1 \
+$LINUX_CC -O2 -DDISABLE_SDL2NET=1 \
     -I"$DIR" -I"$SRC/src" -I"$SRC/src/doom" -I"$SRC/textscreen" \
-    -I"$SRC/pcsound" -I"$SRC/opl" -I"$SDL/include/SDL2" -D_REENTRANT \
+    -I"$SRC/pcsound" -I"$SRC/opl" -I"$MIXER/include/SDL2" \
+    -I"$SDL/include/SDL2" -D_REENTRANT \
     -o "$DIR/chocolate-doom" $FILES \
-    -L"$SDL/lib" -lSDL2 -lm -static > "$DIR/build.log" 2>&1 || {
+    -L"$MIXER/lib" -lSDL2_mixer -L"$SDL/lib" -lSDL2 -lm -static > "$DIR/build.log" 2>&1 || {
     grep -E "error|undefined" "$DIR/build.log" | head -30 >&2
     exit 1
 }
@@ -85,17 +91,21 @@ with zipfile.ZipFile(archive) as z:
 PY
 cp "$SRC/COPYING.md" "$STAGE/LICENSE"
 SDL_VERSION=$(sed -n 's/^VERSION=//p' "$HERE/../sdl2/build.sh")
+MIXER_VERSION=$(sed -n 's/^VERSION=//p' "$HERE/../sdl2_mixer/build.sh")
 cat >> "$STAGE/LICENSE" <<NOTE
 
 The chocolate-doom program in this package is Chocolate Doom $VERSION
 (GPL-2.0, above), built for OPOS with SDL $SDL_VERSION (zlib license, see
-LICENSE.sdl) and musl libc (LICENSE.musl). Its source is
+LICENSE.sdl), SDL_mixer $MIXER_VERSION (zlib license, see
+LICENSE.sdl_mixer) and musl libc (LICENSE.musl). Its source is
 chocolate-doom-$VERSION.tar.gz in this package. freedoom1.wad is
 Freedoom: Phase 1 $FREEDOOM (BSD-3-Clause, see COPYING.freedoom and
 CREDITS.freedoom).
 NOTE
 tar -xzOf "$CACHE/SDL2-$SDL_VERSION.tar.gz" "SDL2-$SDL_VERSION/LICENSE.txt" \
     > "$STAGE/LICENSE.sdl"
+tar -xzOf "$CACHE/SDL2_mixer-$MIXER_VERSION.tar.gz" \
+    "SDL2_mixer-$MIXER_VERSION/LICENSE.txt" > "$STAGE/LICENSE.sdl_mixer"
 cp "$SOURCE" "$STAGE/chocolate-doom-$VERSION.tar.gz"
 cat > "$STAGE/package.pkg" <<PKG
 format: 1
@@ -109,6 +119,7 @@ file: files/chocolate-doom chocolate-doom exec
 file: files/freedoom1.wad freedoom1.wad
 file: files/LICENSE LICENSE
 file: files/LICENSE.sdl LICENSE.sdl
+file: files/LICENSE.sdl_mixer LICENSE.sdl_mixer
 file: files/LICENSE.musl LICENSE.musl
 file: files/COPYING.freedoom COPYING.freedoom
 file: files/CREDITS.freedoom CREDITS.freedoom

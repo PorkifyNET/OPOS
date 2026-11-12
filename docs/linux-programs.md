@@ -52,6 +52,11 @@ it may write, so dotfiles (`~/.sqliterc`, `~/.luarc`) and relative
 not visible to it, as before. Programs that are not confined (built-in
 ones) get the account's home.
 
+OPOS has no `/tmp`. A confined program also gets `TMPDIR` set to
+`$HOME/tmp` (created at start), which most programs use for temporary
+files instead of `/tmp`; Chocolate Doom writes each song there as a MIDI
+file before playing it.
+
 Programs started from the kernel shell keep an empty environment: its
 self-tests check the exact initial stack.
 
@@ -508,15 +513,16 @@ the SDL library above and packages it with Freedoom: Phase 1 0.13.0
 (BSD-3-Clause), a complete free game for the Doom engine. The package is
 `org.chocolate-doom.freedoom`, named Freedoom, about 33 MB, with one
 Start menu entry. It carries the Chocolate Doom source, the licenses of
-SDL and musl, and Freedoom's COPYING and CREDITS. Like the SDL demos it is
-opt-in: add `doom` to `STORE_LINUX`. The recipe builds SDL itself when it
-was not built yet (`SDL2_LIBRARY_ONLY=1`).
+SDL, SDL_mixer and musl, and Freedoom's COPYING and CREDITS. Like the SDL
+demos it is opt-in: add `doom` to `STORE_LINUX`. The recipe builds SDL
+(`SDL2_LIBRARY_ONLY=1`) and SDL_mixer (`store/linux/sdl2_mixer/build.sh`)
+itself when they were not built yet.
 
 Chocolate Doom normally builds with autotools or CMake. The recipe writes
 the few `config.h` lines they would and compiles the game's source list
-with `$LINUX_CC` directly, without SDL_mixer and SDL_net. There is no
-sound yet: SDL can play sound on OPOS now, but Doom's sound needs
-SDL_mixer (step 4 of `docs/sound.md`).
+with `$LINUX_CC` directly, with SDL_mixer and without SDL_net (no
+multiplayer). Sound effects and music play through OPOS sound (step 4 of
+`docs/sound.md`).
 
 Tested in QEMU: installed with `pkg install`, started from the Terminal,
 it loads `freedoom1.wad` from its folder, opens a window titled

@@ -7809,6 +7809,23 @@ static void user_build_start_environment(
     const char *name = user_identity_name(identity);
     user_identity_home(identity, home, sizeof(home), true);
     (void)user_start_environment(vectors, "HOME=", home, NULL);
+    /* OPOS has no /tmp: a confined program keeps its temporary files in
+       <home>/tmp, which TMPDIR names (programs fall back to /tmp
+       without it). */
+    if (identity->confined && identity->private_path[0] != '\0') {
+        static const char tmp[] = "/tmp";
+        size_t length = 0;
+        while (home[length] != '\0') {
+            length++;
+        }
+        if (length + sizeof(tmp) <= sizeof(home)) {
+            for (size_t i = 0; i < sizeof(tmp); i++) {
+                home[length + i] = tmp[i];
+            }
+            (void)vfs_create_directory(home, length + sizeof(tmp) - 1);
+            (void)user_start_environment(vectors, "TMPDIR=", home, NULL);
+        }
+    }
     if (name != NULL) {
         (void)user_start_environment(vectors, "USER=", name, NULL);
         (void)user_start_environment(vectors, "LOGNAME=", name, NULL);

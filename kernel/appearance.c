@@ -306,6 +306,8 @@ static const char *const style_names[WALLPAPER_STYLE_COUNT] = {
 static enum wallpaper_style current_style = WALLPAPER_FILL;
 static enum taskbar_position current_taskbar = TASKBAR_BOTTOM;
 static bool taskbar_autohide;
+/* SYSTEM SOUNDS (system_sounds.c), on unless the account turned them off. */
+static bool system_sounds = true;
 static const char *const taskbar_names[TASKBAR_POSITION_COUNT] = {
     "BOTTOM", "TOP", "LEFT", "RIGHT",
 };
@@ -349,6 +351,7 @@ static void config_defaults(void) {
     current_style = WALLPAPER_FILL;
     current_taskbar = TASKBAR_BOTTOM;
     taskbar_autohide = false;
+    system_sounds = true;
     append(wallpaper_path, sizeof(wallpaper_path), 0, DEFAULT_WALLPAPER);
 }
 
@@ -401,6 +404,9 @@ static void config_parse(const char *text, size_t size) {
             } else if (same_ignoring_case(key, key_length, "autohide")) {
                 taskbar_autohide =
                     same_ignoring_case(value, value_length, "on");
+            } else if (same_ignoring_case(key, key_length, "sounds")) {
+                system_sounds =
+                    !same_ignoring_case(value, value_length, "off");
             } else if (same_ignoring_case(key, key_length, "tap")) {
                 touchpad_options.tap_to_click =
                     !same_ignoring_case(value, value_length, "off");
@@ -490,7 +496,7 @@ static void config_save(void) {
     if (length == 0 || !ensure_directory(path, parent_length(path, length))) {
         return;
     }
-    char text[384];
+    char text[448];
     size_t used = append(text, sizeof(text), 0, "theme=");
     used = append(text, sizeof(text), used, theme_names[current_theme]);
     used = append(text, sizeof(text), used, "\nwallpaper=");
@@ -501,6 +507,8 @@ static void config_save(void) {
     used = append(text, sizeof(text), used, taskbar_names[current_taskbar]);
     used = append(text, sizeof(text), used, "\nautohide=");
     used = append(text, sizeof(text), used, taskbar_autohide ? "on" : "off");
+    used = append(text, sizeof(text), used, "\nsounds=");
+    used = append(text, sizeof(text), used, system_sounds ? "on" : "off");
     used = append(text, sizeof(text), used, "\ntap=");
     used = append(text, sizeof(text), used,
                   touchpad_options.tap_to_click ? "on" : "off");
@@ -564,6 +572,18 @@ void appearance_set_taskbar_autohide(bool hide) {
         return;
     }
     taskbar_autohide = hide;
+    config_save();
+}
+
+bool appearance_system_sounds(void) {
+    return system_sounds;
+}
+
+void appearance_set_system_sounds(bool on) {
+    if (on == system_sounds) {
+        return;
+    }
+    system_sounds = on;
     config_save();
 }
 

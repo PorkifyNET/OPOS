@@ -83,6 +83,40 @@ sound, so the sounds come first.
 
 Each step is one PR, stacked like the sound work.
 
+## As built in step 1
+
+- `kernel/system_sounds.c` holds six sounds: startup (C5 E5 G5 C6 rising,
+  1.2 s), shutdown (G5 E5 C5 falling, 1.2 s), logout (E5 C5, 0.8 s),
+  notification (A5 E6, 0.8 s), warning (B4 G4, 0.65 s) and volume (a
+  45 ms click at 1600 Hz). Each note is a sine plus a quarter-level
+  second harmonic, with a 5 ms attack, an exponential decay and a 10 ms
+  fade at its end. The sine comes from Bhaskara's approximation in
+  fixed point (the kernel builds with `-mgeneral-regs-only`). A sound is
+  rendered into one 1.3 s buffer when it is played.
+- `kernel/sound.c` mixes the system voice into both channels before the
+  master volume, so muting silences it too. `sound_voice_play` replaces
+  the sound playing; the renderer stops the voice before it reuses the
+  buffer.
+- The desktop plays: startup once per boot when the desktop or login
+  screen first shows; logout before the account's windows close (with
+  that account's setting); shutdown before shutting down or restarting
+  from the Start menu, the login screen or UPDATES > RESTART NOW, waiting
+  for it up to 1.5 s; warning when the administrator password prompt or a
+  program permission prompt opens; volume after each volume step. The
+  kernel shell's `reboot` and `shutdown` stay silent.
+- Settings > SOUND has VOLUME (5% steps, as the volume keys), MUTE and
+  SYSTEM SOUNDS. SYSTEM SOUNDS is saved as `sounds=on|off` in
+  DESKTOP.CFG and plays the notification sound when turned on. The
+  volume stays machine-wide (OPOS.CFG and CMOS, as in step 2 of
+  `docs/sound.md`).
+- Kernel shell: `chime NAME` plays a sound even when SYSTEM SOUNDS is off.
+- Tested in QEMU (KVM, HDA, `wavcapture`): each `chime` was recorded,
+  and every note appears at its frequency and start time (Goertzel
+  filter per 50 ms window), with no clipping at volume 100. Booting to
+  the desktop played the startup sound. Settings > SOUND was checked on a
+  screenshot. The shutdown sound was not checked automatically (the
+  Start menu needs the mouse, which the QEMU harness cannot move).
+
 ## Not planned yet
 
 Notification actions (buttons inside a notification), notifications that

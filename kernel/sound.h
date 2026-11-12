@@ -30,6 +30,15 @@ void sound_poll(void);
    frequency out of range. */
 bool sound_beep(uint32_t frequency, uint32_t milliseconds);
 
+/* The system voice (kernel/system_sounds.c): plays frames mono 48 kHz
+   samples over the program streams, at the master volume. A new sound
+   replaces the one playing. samples must stay valid until
+   sound_voice_playing is false or sound_voice_stop returned. False
+   without sound. */
+bool sound_voice_play(const int16_t *samples, uint32_t frames);
+void sound_voice_stop(void);
+bool sound_voice_playing(void);
+
 /* What the drivers found (kernel shell "sound"). */
 void sound_describe(void (*print)(const char *line));
 

@@ -24,6 +24,7 @@
 #include "scheduler.h"
 #include "storage.h"
 #include "sound.h"
+#include "system_sounds.h"
 #include "svga.h"
 #include "boot_display.h"
 #include "vmware.h"
@@ -4690,13 +4691,20 @@ enum setting_row_kind {
     ROW_LAYOUT,
     ROW_TASKBAR_POSITION,
     ROW_TASKBAR_AUTOHIDE,
+    ROW_VOLUME,
+    ROW_MUTE,
+    ROW_SYSTEM_SOUNDS,
 };
+
+static void volume_step(int delta);
+static bool desktop_power_off(bool restart);
 
 /* Settings pages, listed in the window's sidebar. */
 enum settings_category {
     CATEGORY_SYSTEM,
     CATEGORY_ACCOUNTS,
     CATEGORY_DISPLAY,
+    CATEGORY_SOUND,
     CATEGORY_APPEARANCE,
     CATEGORY_DESKTOP,
     CATEGORY_DATE_TIME,
@@ -4707,7 +4715,7 @@ enum settings_category {
 };
 
 static const char *const category_names[CATEGORY_COUNT] = {
-    "SYSTEM", "ACCOUNTS", "DISPLAY", "APPEARANCE", "DESKTOP", "DATE & TIME", "TOUCHPAD",
+    "SYSTEM", "ACCOUNTS", "DISPLAY", "SOUND", "APPEARANCE", "DESKTOP", "DATE & TIME", "TOUCHPAD",
     "UPDATES", "ABOUT",
 };
 
@@ -4723,6 +4731,9 @@ static const struct setting_row setting_rows[] = {
      CATEGORY_SYSTEM},
     {"COLORED TERMINAL MESSAGES", ROW_TOGGLE, SETTING_TERMINAL_COLORS,
      CATEGORY_SYSTEM},    {"RESOLUTION", ROW_RESOLUTION, 0, CATEGORY_DISPLAY},
+    {"VOLUME (VOLUME KEYS)", ROW_VOLUME, 0, CATEGORY_SOUND},
+    {"MUTE", ROW_MUTE, 0, CATEGORY_SOUND},
+    {"SYSTEM SOUNDS", ROW_SYSTEM_SOUNDS, 0, CATEGORY_SOUND},
     {"COLOR THEME", ROW_THEME, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND", ROW_WALLPAPER, 0, CATEGORY_APPEARANCE},
     {"BACKGROUND STYLE", ROW_WALLPAPER_STYLE, 0, CATEGORY_APPEARANCE},
@@ -4946,6 +4957,18 @@ static void setting_value_text(const struct setting_row *row,
     case ROW_TAP_TO_CLICK:
         length = append_text(text, capacity, length,
                              touchpad.tap_to_click ? "ON" : "OFF");
+        break;
+    case ROW_VOLUME:
+        length = append_decimal(text, capacity, length, sound_volume());
+        length = append_text(text, capacity, length, "%");
+        break;
+    case ROW_MUTE:
+        length = append_text(text, capacity, length,
+                             sound_muted() ? "ON" : "OFF");
+        break;
+    case ROW_SYSTEM_SOUNDS:
+        length = append_text(text, capacity, length,
+                             appearance_system_sounds() ? "ON" : "OFF");
         break;
     case ROW_SCROLL_DIRECTION:
         length = append_text(text, capacity, length,
@@ -5243,6 +5266,20 @@ static void settings_change(size_t index, int delta) {
         taskbar_set_autohide(!appearance_taskbar_autohide());
         return;
     }
+    if (row->kind == ROW_VOLUME) {
+        volume_step(delta);
+        return;
+    }
+    if (row->kind == ROW_MUTE) {
+        sound_set_muted(!sound_muted());
+        return;
+    }
+    if (row->kind == ROW_SYSTEM_SOUNDS) {
+        appearance_set_system_sounds(!appearance_system_sounds());
+        /* Turning them on lets the person hear the level. */
+        system_sound_play(SYSTEM_SOUND_NOTIFICATION);
+        return;
+    }
     if (row->kind == ROW_TAP_TO_CLICK || row->kind == ROW_SCROLL_DIRECTION
         || row->kind == ROW_POINTER_SPEED) {
         struct tp_options touchpad;
@@ -5530,6 +5567,7 @@ static void protected_request(enum protected_action action,
     protected_feedback = "";
     field_reset(&protected_password, ACCOUNT_PASSWORD_MAX, true);
     protected_active = true;
+    system_sound_play(SYSTEM_SOUND_WARNING);
     start_menu_open = false;
     programs_open = false;
 }
@@ -5888,9 +5926,9 @@ static void login_press(int32_t x, int32_t y) {
     if (rect_contains(login_button_rect(0), x, y)) {
         login_attempt();
     } else if (rect_contains(login_button_rect(1), x, y)) {
-        power_reboot();
+        desktop_power_off(true);
     } else if (rect_contains(login_button_rect(2), x, y)) {
-        if (!power_shutdown()) {
+        if (!desktop_power_off(false)) {
             login_message = "ACPI SHUTDOWN UNAVAILABLE";
         }
     }
@@ -6710,7 +6748,7 @@ static void updates_press(size_t button) {
         break;
     case UPDATES_BUTTON_UPDATE:
         if (updates_status == UPDATES_INSTALLED) {
-            power_reboot();
+            desktop_power_off(true);
         } else {
             updates_start(true);
         }
@@ -6747,6 +6785,18 @@ static void updates_click(struct rect area, int32_t x, int32_t y) {
 
 /* -------------------------------------------------------------- session */
 
+/* Shut down (false when ACPI cannot) or restart, after the shutdown sound
+   (at most 1.5 s). The kernel shell's commands stay silent. */
+static bool desktop_power_off(bool restart) {
+    if (system_sound_play(SYSTEM_SOUND_SHUTDOWN)) {
+        system_sound_wait(1500);
+    }
+    if (restart) {
+        power_reboot();
+    }
+    return power_shutdown();
+}
+
 /* After login: the account's places and home folder, default windows. */
 static void desktop_session_start(void) {
     appearance_load();
@@ -6773,6 +6823,7 @@ static void desktop_session_end(void) {
     if (!editor_may_discard()) {
         return;
     }
+    system_sound_play(SYSTEM_SOUND_LOGOUT);
     apps_stop_all(); /* nothing keeps running as the old account */
     while (z_count != 0) {
         window_close(z_order[z_count - 1]);
@@ -8641,15 +8692,22 @@ static void draw_net_popup(void) {
 #define VOLUME_POPUP_TICKS 200u
 static uint64_t volume_popup_until;
 
+/* Raises (delta > 0) or lowers the master volume one step, unmutes, and
+   clicks at the new level (volume keys and Settings > SOUND). */
+static void volume_step(int delta) {
+    uint32_t volume = sound_volume();
+    volume = delta > 0
+        ? (volume + VOLUME_STEP > 100 ? 100 : volume + VOLUME_STEP)
+        : (volume < VOLUME_STEP ? 0 : volume - VOLUME_STEP);
+    sound_set_muted(false);
+    sound_set_volume(volume);
+    system_sound_play(SYSTEM_SOUND_VOLUME);
+}
+
 /* True when key was a volume key (the popup then needs drawing). */
 static bool volume_key(uint8_t key) {
     if (key == VOLUME_KEY_UP || key == VOLUME_KEY_DOWN) {
-        uint32_t volume = sound_volume();
-        volume = key == VOLUME_KEY_UP
-            ? (volume + VOLUME_STEP > 100 ? 100 : volume + VOLUME_STEP)
-            : (volume < VOLUME_STEP ? 0 : volume - VOLUME_STEP);
-        sound_set_muted(false);
-        sound_set_volume(volume);
+        volume_step(key == VOLUME_KEY_UP ? 1 : -1);
     } else if (key == VOLUME_KEY_MUTE) {
         sound_set_muted(!sound_muted());
     } else {
@@ -9285,10 +9343,10 @@ static enum desktop_result menu_activate(enum menu_action action) {
         if (keyboard_ctrl_held()) {
             settings_set(SETTING_BOOT_SHELL_ONCE, true);
         }
-        power_reboot();
+        desktop_power_off(true);
         break;
     case MENU_SHUTDOWN:
-        if (!power_shutdown()) {
+        if (!desktop_power_off(false)) {
             set_status("ACPI SHUTDOWN UNAVAILABLE");
         }
         break;
@@ -13507,6 +13565,7 @@ static bool apps_poll(void) {
         protected_action = PROTECTED_ACTION_APP_PERMISSION;
         protected_grant = PROTECTED_ACTION_NONE;
         protected_active = true;
+        system_sound_play(SYSTEM_SOUND_WARNING);
         start_menu_open = false;
         programs_open = false;
         redraw = true;
@@ -13964,6 +14023,11 @@ void desktop_run(void) {
     user_set_console_input(app_console_input, app_console_pending);
     desktop_active = true;
     draw_scene();
+    static bool startup_played;
+    if (!startup_played) {
+        startup_played = true;
+        system_sound_play(SYSTEM_SOUND_STARTUP);
+    }
 
     while (!desktop_step()) {
     }

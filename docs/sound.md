@@ -206,6 +206,51 @@ left alone, recorded for 75 s:
 - Regressions (musl, signal, pthread, net and dynamic tests, multitest,
   `make sound-test`, host tests) pass with the scheduler change.
 
+## Step 5 so far: ready for real machines
+
+Real machines differ from QEMU in ways the driver now handles:
+- **Several controllers.** Machines with a graphics card have an HDA
+  controller for HDMI next to the chipset's, and on some (AMD boards
+  especially) it comes first in PCI order. The driver tries each HDA
+  controller (up to four) and keeps the first whose codec has an analog
+  output; the others are stopped again.
+- **Caches.** Some chipsets do not snoop the CPU caches for HDA DMA. The
+  driver flushes what it writes for the controller (each command, each
+  block of samples) and drops the cached copy of each answer before
+  reading it (`clflush`). On Intel controllers it also sets traffic
+  class 0 (TCSEL), as Linux does.
+- **32-bit DMA.** A controller without 64-bit addressing (GCAP bit 0) is
+  skipped, with a reason, when the buffers lie above 4 GiB.
+- **Reports.** The probe keeps a few lines (each controller's vendor and
+  device, each codec's vendor, and why one was not used), which `sound`
+  prints when there is no sound. With sound, `sound` also shows the
+  controller's PCI address and the codec's address.
+
+Tested in QEMU: two `intel-hda` controllers with the codec on the second
+(the second is chosen and plays), one controller without a codec
+(`sound` prints "controller 80862668 / no codec"), `ich9-intel-hda` with
+`hda-micro`, and `make sound-test`.
+
+**Testing on a machine.** Boot OPOS, open the Terminal, type `shell`,
+then:
+1. `sound`: note every line it prints.
+2. `beep`, then `beep 1500`: two short tones should play.
+3. `volume 100` and `beep` if they were quiet.
+4. `run /bin/play`: 440 Hz, then 880 Hz, through the mixer.
+5. `desktop` to go back.
+
+Report what `sound` printed and whether each tone played (and from
+which output: speakers, headphones, line out). Notes per machine:
+- **VMware Workstation.** The VM needs the HD Audio device: with the VM
+  powered off, add `sound.virtualDev = "hdaudio"` to its `.vmx`. Without
+  it, a VM whose guest OS is "Other" gets VMware's default card for that
+  type (likely the Sound Blaster AudioPCI, `es1371`), which OPOS has no
+  driver for, and `sound` reports no HDA controller.
+- **VirtualBox.** Settings > Audio > Audio Controller: "Intel HD Audio".
+- **Real hardware.** Headphones and speakers are both driven at once;
+  there is no jack detection yet. HDMI and DisplayPort audio are not
+  used.
+
 ## Not planned yet
 
 Recording, more than one sound card at a time, sample-rate conversion in

@@ -23,13 +23,26 @@
  * graph: from every connected output pin (line out, speaker, headphone)
  * back through mixers and selectors to a converter (DAC), and sets every
  * DAC it reaches to the one stream.
+ *
+ * A machine may have several HDA controllers (the chipset's, and one per
+ * graphics card for HDMI); the first with an analog output is used. What
+ * the probe found is kept as a few lines for the shell's "sound" command,
+ * so a report from a real machine shows why it has no sound.
+ *
+ * Some chipsets do not snoop the CPU caches for HDA DMA, so the driver
+ * flushes what it writes for the controller (CORB, sample ring) and drops
+ * the cached copy of what the controller writes (RIRB) before reading it.
  */
 
 #define HDA_MMIO_BASE 0xffffc00000500000ULL
 #define HDA_MMIO_PAGES 4
+/* Each controller tried gets its own 64 KiB of address space. */
+#define HDA_MMIO_STRIDE 0x10000ULL
+#define MAX_CONTROLLERS 4u
 
 /* Controller registers. */
 #define REG_GCAP 0x00
+#define GCAP_64BIT 0x0001u
 #define REG_VMIN 0x02
 #define REG_VMAJ 0x03
 #define REG_GCTL 0x08
@@ -155,6 +168,13 @@ static uint16_t rirb_read;
 static uint32_t stream_base;
 static uint8_t codec_mask;
 static uint32_t codec_vendor;
+static uint8_t codec_address;
+
+/* What the probe found, for hda_describe. */
+#define PROBE_LINES 12u
+#define PROBE_LINE_BYTES 80u
+static char probe_log[PROBE_LINES][PROBE_LINE_BYTES];
+static size_t probe_count;
 
 static struct widget widgets[MAX_NODES];
 static uint8_t afg_node;
@@ -203,6 +223,16 @@ static void delay_us(uint32_t microseconds) {
 }
 
 /* Waits up to about timeout_us for (read & mask) == value. */
+/* Writes back (and drops) the cache lines of [address, address + size). */
+static void cache_flush(const void *address, size_t size) {
+    uintptr_t line = (uintptr_t)address & ~(uintptr_t)63;
+    uintptr_t end = (uintptr_t)address + size;
+    for (; line < end; line += 64) {
+        __asm__ volatile ("clflush (%0)" : : "r"(line) : "memory");
+    }
+    __asm__ volatile ("mfence" : : : "memory");
+}
+
 static bool wait8(uint32_t offset, uint8_t mask, uint8_t value,
                   uint32_t timeout_us) {
     for (uint32_t i = 0; i < timeout_us; i++) {
@@ -236,9 +266,10 @@ static bool wait32(uint32_t offset, uint32_t mask, uint32_t value,
     return false;
 }
 
-static bool map_registers(uint64_t physical) {
+static bool map_registers(uint64_t physical, size_t slot) {
+    uint64_t base = HDA_MMIO_BASE + slot * HDA_MMIO_STRIDE;
     for (size_t page = 0; page < HDA_MMIO_PAGES; page++) {
-        if (!paging_map_page(HDA_MMIO_BASE + page * 0x1000,
+        if (!paging_map_page(base + page * 0x1000,
                              (physical & ~0xfffULL) + page * 0x1000,
                              PAGING_WRITABLE | PAGING_WRITE_THROUGH
                                  | PAGING_CACHE_DISABLE
@@ -246,7 +277,7 @@ static bool map_registers(uint64_t physical) {
             return false;
         }
     }
-    registers = (volatile uint8_t *)(HDA_MMIO_BASE + (physical & 0xfffULL));
+    registers = (volatile uint8_t *)(base + (physical & 0xfffULL));
     return true;
 }
 
@@ -259,11 +290,13 @@ static bool command(uint8_t codec, uint8_t node, uint32_t verb,
     uint32_t word = (uint32_t)codec << 28 | (uint32_t)node << 20 | verb;
     corb_write = (uint16_t)((corb_write + 1) % CORB_ENTRIES);
     corb[corb_write] = word;
+    cache_flush(&corb[corb_write], sizeof(corb[0]));
     write16(REG_CORBWP, corb_write);
     for (uint32_t i = 0; i < 100000; i++) {
         uint16_t write_pointer = read16(REG_RIRBWP) & 0xff;
         while (rirb_read != write_pointer) {
             rirb_read = (uint16_t)((rirb_read + 1) % RIRB_ENTRIES);
+            cache_flush(&rirb[rirb_read], sizeof(rirb[0]));
             uint64_t entry = rirb[rirb_read];
             uint32_t extended = (uint32_t)(entry >> 32);
             if ((extended & 0x10u) != 0) {
@@ -617,31 +650,70 @@ static void add_beep(int16_t *out, size_t frames) {
     }
 }
 
-bool hda_initialize(void) {
-    ready = false;
-    if (!pci_find_class(0x04, 0x03, 0x00, 0, &controller)) {
-        return false;
+static void probe_line(const char *a, uint32_t hex, int digits,
+                       const char *b) {
+    if (probe_count == PROBE_LINES) {
+        return;
     }
+    char *line = probe_log[probe_count++];
+    size_t used = 0;
+    while (*a != '\0' && used + 1 < PROBE_LINE_BYTES) {
+        line[used++] = *a++;
+    }
+    static const char digit[] = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0 && used + 1 < PROBE_LINE_BYTES; i--) {
+        line[used++] = digit[(hex >> (i * 4)) & 0xfu];
+    }
+    while (b != NULL && *b != '\0' && used + 1 < PROBE_LINE_BYTES) {
+        line[used++] = *b++;
+    }
+    line[used] = '\0';
+}
+
+/* Stops a controller that was not chosen, so it stops reading memory the
+   next one will use. */
+static void stop_controller(void) {
+    write8(REG_CORBCTL, 0);
+    write8(REG_RIRBCTL, 0);
+    write32(REG_GCTL, read32(REG_GCTL) & ~GCTL_RESET);
+}
+
+/* Sets up one controller. memory/physical: the CORB, RIRB, BDL page and
+   then the sample ring. */
+static bool try_controller(size_t slot, uint8_t *memory, uint64_t physical) {
+    probe_line("controller ", (uint32_t)controller.vendor_id << 16
+                   | controller.device_id, 8, NULL);
     bool io_space = false;
     uint64_t bar = pci_bar_address(&controller, 0, &io_space);
     if (bar == 0 || io_space) {
+        probe_line("  no memory BAR", 0, 0, NULL);
         return false;
     }
     (void)pci_set_power_d0(&controller);
     pci_enable_device(&controller);
-    if (!map_registers(bar)) {
-        console_write_string("OPOS: HDA: cannot map registers\n");
+    if (controller.vendor_id == 0x8086) {
+        /* Traffic class 0 (TCSEL, config 0x44 bits 2:0), as Linux sets
+           it on Intel controllers. */
+        uint32_t value = pci_config_read32(&controller, 0x44);
+        pci_config_write32(&controller, 0x44, value & ~0x7u);
+    }
+    if (!map_registers(bar, slot)) {
+        probe_line("  cannot map registers", 0, 0, NULL);
+        return false;
+    }
+    uint16_t caps = read16(REG_GCAP);
+    if ((caps & GCAP_64BIT) == 0
+        && physical + 4096 + RING_BYTES > 0x100000000ULL) {
+        probe_line("  32-bit DMA only, buffers above 4 GiB", 0, 0, NULL);
+        return false;
+    }
+    uint32_t input_streams = (caps >> 8) & 0xfu;
+    uint32_t output_streams = (caps >> 12) & 0xfu;
+    if (output_streams == 0) {
+        probe_line("  no output streams", 0, 0, NULL);
         return false;
     }
 
-    /* One page for the CORB (1 KiB), RIRB (2 KiB) and BDL, then the
-       sample ring. */
-    uint64_t physical =
-        physical_pages_alloc_contiguous(1 + RING_BYTES / 4096);
-    if (physical == 0) {
-        return false;
-    }
-    uint8_t *memory = physical_page_to_hhdm(physical);
     for (size_t i = 0; i < 4096 + RING_BYTES; i++) {
         memory[i] = 0;
     }
@@ -654,51 +726,85 @@ bool hda_initialize(void) {
         bdl[2 * i] = ring_physical + (uint64_t)i * RING_ENTRY_BYTES;
         bdl[2 * i + 1] = RING_ENTRY_BYTES; /* length; no interrupt */
     }
+    cache_flush(memory, 4096 + RING_BYTES);
 
     write32(REG_INTCTL, 0);
     if (!reset_controller()) {
-        console_write_string("OPOS: HDA: controller reset failed\n");
+        probe_line("  reset failed", 0, 0, NULL);
         return false;
     }
     codec_mask = (uint8_t)(read16(REG_STATESTS) & 0x7fffu);
     write16(REG_STATESTS, 0x7fff);
     if (codec_mask == 0) {
-        console_write_string("OPOS: HDA: no codec\n");
+        probe_line("  no codec", 0, 0, NULL);
+        stop_controller();
         return false;
     }
     if (!start_rings(physical, physical + 1024)) {
-        console_write_string("OPOS: HDA: command rings did not start\n");
+        probe_line("  command rings did not start", 0, 0, NULL);
+        stop_controller();
         return false;
     }
     output_count = 0;
     for (uint8_t codec = 0; codec < 15; codec++) {
-        if ((codec_mask & (1u << codec)) != 0 && set_up_codec(codec)) {
+        if ((codec_mask & (1u << codec)) == 0) {
+            continue;
+        }
+        bool found = set_up_codec(codec);
+        uint32_t vendor = parameter(codec, 0, PARAM_VENDOR_ID);
+        probe_line("  codec ", (uint32_t)codec, 1, NULL);
+        probe_line("    vendor ", vendor, 8,
+                   found ? ", analog outputs" : ", no analog output");
+        if (found) {
+            codec_address = codec;
             break; /* first codec with outputs (the onboard one) */
         }
     }
     if (output_count == 0) {
-        console_write_string("OPOS: HDA: no output found\n");
-        return false;
-    }
-    uint16_t caps = read16(REG_GCAP);
-    uint32_t input_streams = (caps >> 8) & 0xfu;
-    uint32_t output_streams = (caps >> 12) & 0xfu;
-    if (output_streams == 0) {
+        stop_controller();
         return false;
     }
     stream_base = REG_STREAMS + input_streams * STREAM_SIZE;
-
     source = silence;
     played_bytes = 0;
     written_bytes = RING_BYTES; /* the ring starts full of silence */
     last_lpib = 0;
     if (!start_stream(physical + 3072)) {
-        console_write_string("OPOS: HDA: output stream did not start\n");
+        probe_line("  output stream did not start", 0, 0, NULL);
+        stop_controller();
         return false;
     }
-    ready = true;
-    console_write_string("OPOS: HDA sound ready\n");
     return true;
+}
+
+bool hda_initialize(void) {
+    ready = false;
+    probe_count = 0;
+    /* One page for the CORB (1 KiB), RIRB (2 KiB) and BDL, then the
+       sample ring; shared by the controllers tried, one at a time. */
+    uint64_t physical =
+        physical_pages_alloc_contiguous(1 + RING_BYTES / 4096);
+    if (physical == 0) {
+        return false;
+    }
+    uint8_t *memory = physical_page_to_hhdm(physical);
+    for (size_t index = 0; index < MAX_CONTROLLERS; index++) {
+        if (!pci_find_class(0x04, 0x03, 0x00, index, &controller)) {
+            break;
+        }
+        if (try_controller(index, memory, physical)) {
+            ready = true;
+            console_write_string("OPOS: HDA sound ready\n");
+            return true;
+        }
+    }
+    for (uint32_t i = 0; i < 1 + RING_BYTES / 4096; i++) {
+        (void)physical_page_free(physical + (uint64_t)i * 4096);
+    }
+    if (probe_count == 0) {
+        probe_line("no HDA controller", 0, 0, NULL);
+    }
+    return false;
 }
 
 bool hda_ready(void) {
@@ -736,6 +842,7 @@ void hda_poll(void) {
         size_t frames = chunk / FRAME_BYTES;
         source(out, frames);
         add_beep(out, frames);
+        cache_flush(out, chunk);
         written_bytes += chunk;
     }
 }
@@ -790,13 +897,24 @@ void hda_describe(void (*print)(const char *line)) {
     size_t used = 0;
     if (!ready) {
         print("Sound: no HDA controller with an output.");
+        for (size_t i = 0; i < probe_count; i++) {
+            print(probe_log[i]);
+        }
         return;
     }
     append(line, &used, sizeof(line), "Sound: HDA controller ");
     append_hex(line, &used, sizeof(line), controller.vendor_id, 4);
     append(line, &used, sizeof(line), ":");
     append_hex(line, &used, sizeof(line), controller.device_id, 4);
+    append(line, &used, sizeof(line), " at ");
+    append_hex(line, &used, sizeof(line), controller.bus, 2);
+    append(line, &used, sizeof(line), ":");
+    append_hex(line, &used, sizeof(line), controller.device, 2);
+    append(line, &used, sizeof(line), ".");
+    append_hex(line, &used, sizeof(line), controller.function, 1);
     append(line, &used, sizeof(line), ", codec ");
+    append_hex(line, &used, sizeof(line), codec_address, 1);
+    append(line, &used, sizeof(line), " ");
     append_hex(line, &used, sizeof(line), codec_vendor, 8);
     print(line);
     static const char *const devices[] = {"line out", "speaker",

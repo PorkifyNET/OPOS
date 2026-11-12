@@ -102,6 +102,26 @@ enum package_result package_parse(const char *text, size_t length,
    each alphanumeric at both ends, at most PACKAGE_ID_MAX characters. */
 bool package_id_valid(const char *text, size_t length);
 
+/*
+ * The OPOS Store index (docs/packages.md, "Index"): "format: 1", then
+ * entries. An entry starts with "entry: <id> <version>" and has exactly
+ * one "package: <SHA-256 of the PACKAGE member>" line. Entries are sorted
+ * by id (bytes) and then version, each once. Every other line is
+ * "key: value" and is ignored here. Lines end with '\n', hold no control
+ * characters and are at most PACKAGE_INDEX_LINE_MAX bytes; empty lines
+ * are allowed. sdk/tools/mkindex.py writes the same format.
+ *
+ * Checks the whole index. With id and version, also finds that entry and
+ * copies its package hash: PACKAGE_NOT_FOUND when it is not listed.
+ * PACKAGE_UNSUPPORTED for a newer index format.
+ */
+#define PACKAGE_INDEX_MAX 262144
+#define PACKAGE_INDEX_LINE_MAX 1024
+#define PACKAGE_SIGNATURE_MAX 128
+enum package_result package_index_find(const char *text, size_t length,
+                                       const char *id, const char *version,
+                                       uint8_t hash[32], char *reason);
+
 /* "1.2.3" against "1.2.10": -1, 0 or 1. Both must be valid versions. */
 int package_compare_versions(const char *a, const char *b);
 bool package_version_valid(const char *text, size_t length);
@@ -132,7 +152,9 @@ bool package_ustar_header(const uint8_t block[512], char *name,
 #define PACKAGE_OPTION_CONFIRMED 2u      /* the person agreed to install a
                                             package from outside the Store */
 #define PACKAGE_OPTION_IGNORE_VERSION 4u /* reinstall or downgrade */
-#define PACKAGE_OPTION_MASK 7u
+#define PACKAGE_OPTION_STORE 16u         /* from the OPOS Store: the caller
+                                            passes the signed index */
+#define PACKAGE_OPTION_MASK 23u
 /* Removal only: also delete the calling account's app storage of the
    program. Removal always forgets its grants in that account. */
 #define PACKAGE_OPTION_REMOVE_DATA 8u
@@ -152,7 +174,7 @@ struct package_info {
     uint32_t start_count;
     uint64_t total_size;
     uint32_t installed;   /* PACKAGE_INSTALLED_*, as this caller sees it */
-    uint32_t store;       /* 1: from the OPOS Store (not yet possible) */
+    uint32_t store;       /* 1: from the OPOS Store */
     char id[64];
     char name[32];
     char version[16];
@@ -180,9 +202,14 @@ bool package_call_busy(void);
    the caller's (for info->installed) or PERMISSION_NO_ACCOUNT. */
 enum package_result package_check(const char *path, size_t length,
                                   size_t account, struct package_info *info);
+/* With PACKAGE_OPTION_STORE, index and signature are the OPOS Store index
+   and its signature (kernel copies); otherwise they are ignored. */
 enum package_result package_install(const char *path, size_t length,
                                     size_t account, bool admin,
-                                    uint32_t options,
+                                    uint32_t options, const char *index,
+                                    size_t index_size,
+                                    const uint8_t *signature,
+                                    size_t signature_size,
                                     struct package_info *info);
 enum package_result package_remove(const char *id, size_t length,
                                    size_t account, bool admin,

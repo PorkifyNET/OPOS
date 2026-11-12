@@ -119,6 +119,134 @@ CASES = [
      for key in ("format", "id", "name", "version", "publisher", "platform")]
 
 
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import mkindex  # noqa: E402
+
+H1 = "00112233445566778899aabbccddeeff" * 2
+H2 = "ffeeddccbbaa99887766554433221100" * 2
+INDEX = f"""format: 1
+
+entry: org.example.paint 1.2.0
+package: {H1}
+file: org.example.paint-1.2.0.opk 100 {H1}
+name: Paint
+description: Draws pictures é
+
+entry: org.example.paint 1.10.0
+package: {H2}
+entry: org.example.zoo 1.0
+signer: someone
+package: {H1}
+"""
+
+
+def index_replace(old, new, base=INDEX):
+    assert old in base, old
+    return base.replace(old, new, 1)
+
+
+ZOO = "entry: org.example.zoo 1.0\nsigner: someone\npackage: " + H1 + "\n"
+INDEX_CASES = [
+    INDEX,
+    "format: 1\n",
+    "format: 1\n\n\n",
+    INDEX[:-1],
+    "",
+    "format: 2\n",
+    "format: 1",
+    "format:  1\n",
+    " format: 1\n",
+    index_replace("format: 1\n", "format: 1\r\n"),
+    index_replace("name: Paint", "name: Pa\tint"),
+    index_replace("name: Paint", "name: Pa\x7fint"),
+    index_replace("name: Paint", "name:"),
+    index_replace("name: Paint", "name: "),
+    index_replace("name: Paint", "name:Paint"),
+    index_replace("name: Paint", "Name: Paint"),
+    index_replace("name: Paint", "-name: Paint"),
+    index_replace("name: Paint", "na-me: Paint"),
+    index_replace("name: Paint", "na me: Paint"),
+    index_replace("name: Paint", "name:: Paint"),
+    index_replace("name: Paint", "name: " + "x" * 1018),
+    index_replace("name: Paint", "name: " + "x" * 1019),
+    index_replace("name: Paint", "just text"),
+    index_replace(f"package: {H2}\n", ""),
+    index_replace(f"package: {H2}\n", f"package: {H2}\npackage: {H2}\n"),
+    index_replace(f"package: {H2}", f"package: {H2.upper()}"),
+    index_replace(f"package: {H2}", f"package: {H2[:-1]}"),
+    index_replace(f"package: {H2}", f"package: {H2}0"),
+    index_replace(f"package: {H2}", f"package:  {H2}"),
+    "format: 1\npackage: " + H1 + "\n",
+    INDEX.replace(ZOO, ""),
+    INDEX + "entry: org.example.zoo 1.0\npackage: " + H1 + "\n",
+    INDEX + "entry: org.example.zoo 0.9\npackage: " + H1 + "\n",
+    INDEX + "entry: org.example.zoo 1.0.1\npackage: " + H1 + "\n",
+    INDEX + "entry: org.example.aaa 1.0\npackage: " + H1 + "\n",
+    INDEX + "entry: org.example.zoo.b 1.0\npackage: " + H1 + "\n",
+    INDEX + "entry: org.example.zoo 1.0.0\npackage: " + H1 + "\n",
+    index_replace("entry: org.example.zoo 1.0", "entry: org.example.zoo"),
+    index_replace("entry: org.example.zoo 1.0", "entry: org.example.zoo 1.0 "),
+    index_replace("entry: org.example.zoo 1.0", "entry: org.example.zoo  1.0"),
+    index_replace("entry: org.example.zoo 1.0", "entry: Org.example.zoo 1.0"),
+    index_replace("entry: org.example.zoo 1.0", "entry: zoo 1.0"),
+    index_replace("entry: org.example.zoo 1.0", "entry: org.example.zoo 1.a"),
+    index_replace("entry: org.example.zoo 1.0",
+                  "entry: org.example.zoo 12345.12345.12345.1"),
+    index_replace("entry: org.example.zoo 1.0",
+                  "entry: org.example.zoo 1234.1234.1234.12"),
+    index_replace("entry: org.example.zoo 1.0",
+                  "entry: org.example.zoo 1.2.3.4.5"),
+    index_replace("entry: org.example.zoo 1.0",
+                  "entry: o" + "a" * 61 + ".b 1.0"),
+    index_replace("entry: org.example.zoo 1.0",
+                  "entry: o" + "a" * 60 + ".b 1.0"),
+    "format: 1\n" + "\n" * (262144 - 10),
+    "format: 1\n" + "\n" * (262145 - 10),
+]
+LOOKUPS = [("org.example.paint", "1.2.0"), ("org.example.paint", "1.10.0"),
+           ("org.example.paint", "1.10"), ("org.example.zoo", "1.0"),
+           ("org.example.pain", "1.2.0"), ("org.example.none", "1.0")]
+
+
+def python_index(data, lookup):
+    try:
+        entries = mkindex.parse_index(data)
+    except mkindex.UnsupportedIndex:
+        return 4, "-"
+    except mkindex.IndexError_:
+        return 3, "-"
+    if lookup is None:
+        return 0, "-"
+    if lookup not in entries:
+        return 10, "-"
+    return 0, entries[lookup]
+
+
+def index_parity(cli, folder):
+    failures = 0
+    count = 0
+    path = os.path.join(folder, "index")
+    for number, text in enumerate(INDEX_CASES):
+        data = text.encode("utf-8")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        for lookup in [None] + LOOKUPS:
+            count += 1
+            command = [cli, "--index", path] + (list(lookup) if lookup
+                                                 else [])
+            output = subprocess.run(command, capture_output=True, text=True,
+                                    errors="replace",
+                                    check=True).stdout
+            kernel_code, kernel_hash = output.split(" ", 2)[:2]
+            expected = python_index(data, lookup)
+            if (int(kernel_code), kernel_hash) != expected:
+                failures += 1
+                print(f"index case {number} {lookup}: kernel {kernel_code} "
+                      f"{kernel_hash}, mkindex {expected}: {output.strip()}"
+                      f"\n{text[:300]!r}")
+    return count, failures
+
+
 def python_result(text):
     try:
         mkopk.parse_package(text, template=False)
@@ -146,7 +274,10 @@ def main():
                 failures += 1
                 print(f"case {number}: kernel {kernel}, mkopk {expected}: "
                       f"{output.strip()}\n{text[:300]}")
-    print(f"test_package_parity: {len(CASES)} cases, {failures} differ")
+        index_count, index_failures = index_parity(cli, folder)
+    failures += index_failures
+    print(f"test_package_parity: {len(CASES)} cases, {index_count} index "
+          f"checks, {failures} differ")
     return 1 if failures else 0
 
 

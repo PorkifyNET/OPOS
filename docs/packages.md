@@ -375,6 +375,97 @@ Sources follow the updater order: `--source`, then media
 `/disk/OPOS/PACKAGE-SOURCE.TXT`, then GitHub. Media let a VM install
 packages without a network.
 
+### As built in step 4
+
+**Key.** `tools/store-keygen.sh` made the store key. Its private half is
+in WSL at `~/.opos-signing/store-key.pem` and its public half is in
+`kernel/store_key.h`. The private key still needs an offline backup.
+`kernel/signature.c` holds the ECDSA P-256 check for the update key and
+the store key.
+
+**Index.** `tools/mkindex.py` writes this text:
+
+    format: 1
+
+    entry: org.example.paint 1.2.0
+    package: <SHA-256 of the package's PACKAGE member>
+    file: org.example.paint-1.2.0.opk 21504 <SHA-256 of the .opk>
+    name: Paint
+    publisher: Example Ltd
+    platform: opos
+    requires-opos: 0.1.4
+    description: Draws pictures.
+
+- Entries are sorted by id, then by version, and each appears once.
+- The kernel (`package_index_find` in `kernel/package.c`) reads only
+  `format`, `entry` and `package`. Every other line must have the form
+  `key: value`, and the kernel ignores it. That leaves room for
+  `signer:` later.
+- The index is at most 256 KB, with lines of at most 1024 bytes.
+- `tools/test_package_parity.py` checks that the kernel parser and
+  `mkindex.parse_index` accept and refuse the same index texts.
+
+**Trust chain.** The index signature covers the index. The index lists
+the SHA-256 of the PACKAGE text, and PACKAGE lists every file's hash.
+The kernel hashes the PACKAGE text that it has itself parsed, on both
+reads of the archive. That leaves no gap between the check and the
+install. A whole-file hash would need a third pass. The `file:` line's
+size and hash are for `pkg`, which checks a download before handing it
+to the kernel.
+
+**Install call.** A Store install is `opos_package_install_store`: the
+install call with `OPOS_PACKAGE_STORE` and a `struct
+opos_package_index`.
+- The kernel copies the index and signature, checks the signature and
+  looks for the package's id and version in the index.
+- No `CONFIRMED` is needed.
+- The record says `origin: store`.
+- A Store copy and a sideloaded copy of the same id refuse to replace
+  each other (`ECONFLICT`).
+
+**pkg commands.**
+- `pkg available` lists what the Store offers.
+- `pkg install ID` installs from the Store.
+- `pkg update [ID]` updates Store copies: the account's own, and
+  everyone's for an administrator.
+- An argument with `/` or ending in `.opk` is a file from outside the
+  Store, as before.
+- `/bin/pkg` now holds `net`.
+
+**Downloads.** Packages from a URL go to
+`<home>/AppData/PackageCache`, or `/disk/PackageCache` without an
+account. `pkg` checks them against the `file:` line and deletes them
+after the install. A download can be at most 64 MB, held in memory.
+
+**Choosing a version.** `pkg` picks the newest version whose platform
+this OPOS runs (`opos` or `linux`) and whose `requires-opos` is met.
+When a newer version needs a newer OPOS, `pkg` says which.
+
+**Host tests.** `make package-test` covers the index parser in C and
+Python, and 350 parity checks.
+
+**QEMU tests.** Done on an installed disk, with test repositories signed
+by the real key:
+- Install from a folder source, and over HTTP from the host.
+- Update from 1.0 to 1.1. A denied network permission stayed denied
+  without a new prompt, so the `store:<id>` key works.
+- A tampered index fails the signature check.
+- A package rebuilt with other bytes under the same id and version is
+  refused. From a folder, the kernel refuses it: "PACKAGE differs from
+  the OPOS Store index". Over HTTP, `pkg` stops first: "the download
+  differs from the index".
+- A sideloaded copy cannot replace a Store copy.
+- Removing a Store copy forgets its grant, so the program asks again.
+
+**Not done.**
+- The repository `PorkifyNET/opos-packages` does not exist yet, so the
+  GitHub default answers 404 until the owner creates it and uploads a
+  release made with `mkindex.py`.
+- No index freshness check: an old signed index can still be served.
+  It cannot downgrade anything, because installs refuse older versions,
+  but it can hide updates.
+- `pkg` has no `--gui` mode yet (step 5).
+
 ### Store window
 
 A built-in window lists the index: name, publisher, version, size and
@@ -404,8 +495,9 @@ by itself in the first version.
 3. Done. Identity: `store:<id>` grants and `<id>` storage. The host test
    shows that an update keeps both. QEMU shows that storage survives an
    update for sideloaded packages.
-4. Store key, `tools/mkindex.py`, index checks, and `/bin/pkg` with
-   install, update, remove and list.
+4. Done. Store key, `tools/mkindex.py`, index checks, and `/bin/pkg`
+   with available, install, update, remove and list. See "As built in
+   step 4".
 5. Store window and the Settings > UPDATES line.
 6. First real packages: move `sketch` and `hello` out of the image into
    the repository as examples.

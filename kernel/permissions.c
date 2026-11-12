@@ -276,6 +276,7 @@ static const struct {
     {"notepad", BUILTIN_BASE},
     {"fetch", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"update", BUILTIN_BASE | PERMISSION_CAP_NET},
+    {"pkg", BUILTIN_BASE | PERMISSION_CAP_NET},
     {"browser", (BUILTIN_BASE & ~PERMISSION_CAP_FILES_SHARED)
                     | PERMISSION_CAP_NET | PERMISSION_CAP_CLIPBOARD_READ},
 };

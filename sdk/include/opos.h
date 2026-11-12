@@ -412,6 +412,39 @@ static inline long opos_package_install(const char *path, uint32_t options,
                          (long)options, (long)info);
 }
 
+/*
+ * Installing from the OPOS Store: the signed index (index and index.sig
+ * of the package repository) goes with the package. The kernel checks
+ * the signature with the Store key and that the package is listed there
+ * at its id and version; no OPOS_PACKAGE_CONFIRMED is needed. A package
+ * installed from the Store is updated only from the Store, and one from
+ * elsewhere only from elsewhere (-OPOS_PACKAGE_ECONFLICT). Kernels before
+ * this call answer -OPOS_PACKAGE_EINVAL.
+ */
+#define OPOS_PACKAGE_STORE 16u
+#define OPOS_PACKAGE_INDEX_MAX 262144
+#define OPOS_PACKAGE_SIGNATURE_MAX 128
+
+struct opos_package_index {
+    const void *index;
+    uint64_t index_size;
+    const void *signature;
+    uint64_t signature_size;
+};
+
+static inline long opos_package_install_store(
+    const char *path, uint32_t options, struct opos_package_info *info,
+    const struct opos_package_index *index) {
+    size_t length = 0;
+    while (path[length] != '\0') {
+        length++;
+    }
+    info->size = sizeof(*info);
+    return opos_syscall5(OPOS_SYS_PACKAGE_INSTALL, (long)path, (long)length,
+                         (long)(options | OPOS_PACKAGE_STORE), (long)info,
+                         (long)index);
+}
+
 static inline long opos_package_remove(const char *id, uint32_t options) {
     size_t length = 0;
     while (id[length] != '\0') {

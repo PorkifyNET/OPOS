@@ -714,3 +714,214 @@ bool package_ustar_header(const uint8_t block[512], char *name,
     }
     return true;
 }
+
+/* -------------------------------------------------------------- index */
+
+/* The value after "key: " when line is that key, else NULL. */
+static const char *index_value(const char *line, size_t length,
+                               const char *key, size_t *value_length) {
+    size_t key_length = text_length(key);
+    if (length < key_length + 2) {
+        return NULL;
+    }
+    for (size_t i = 0; i < key_length; i++) {
+        if (line[i] != key[i]) {
+            return NULL;
+        }
+    }
+    if (line[key_length] != ':' || line[key_length + 1] != ' ') {
+        return NULL;
+    }
+    *value_length = length - key_length - 2;
+    return line + key_length + 2;
+}
+
+/* "key: value": key of a-z and '-' starting with a letter, a value. */
+static bool index_line_shape(const char *line, size_t length) {
+    size_t key = 0;
+    while (key < length && ((line[key] >= 'a' && line[key] <= 'z')
+                            || (key != 0 && line[key] == '-'))) {
+        key++;
+    }
+    return key != 0 && key + 2 < length && line[key] == ':'
+        && line[key + 1] == ' ';
+}
+
+/* Byte order of two ids: -1, 0 or 1. */
+static int compare_ids(const char *a, size_t a_length, const char *b,
+                       size_t b_length) {
+    for (size_t i = 0; i < a_length && i < b_length; i++) {
+        if (a[i] != b[i]) {
+            return (unsigned char)a[i] < (unsigned char)b[i] ? -1 : 1;
+        }
+    }
+    return a_length == b_length ? 0 : (a_length < b_length ? -1 : 1);
+}
+
+static bool same_span(const char *a, size_t a_length, const char *b,
+                      size_t b_length) {
+    if (a_length != b_length) {
+        return false;
+    }
+    for (size_t i = 0; i < a_length; i++) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+enum package_result package_index_find(const char *text, size_t length,
+                                       const char *id, const char *version,
+                                       uint8_t hash[32], char *reason) {
+    if (reason != NULL) {
+        reason[0] = '\0';
+    }
+    if (length > PACKAGE_INDEX_MAX) {
+        return fail(reason, PACKAGE_BAD, "index: larger than 262144 bytes",
+                    "", 0, "");
+    }
+    if (length == 0 || text[length - 1] != '\n') {
+        return fail(reason, PACKAGE_BAD,
+                    "index: must end with a line break", "", 0, "");
+    }
+    static const char format[] = "format: 1\n";
+    if (length < sizeof(format) - 1
+        || !same_span(text, sizeof(format) - 1, format,
+                      sizeof(format) - 1)) {
+        bool other = length >= 8 && same_span(text, 8, "format: ", 8);
+        return fail(reason, other ? PACKAGE_UNSUPPORTED : PACKAGE_BAD,
+                    other ? "index: a newer index format"
+                          : "index: must start with 'format: 1'",
+                    "", 0, "");
+    }
+    size_t id_length = id == NULL ? 0 : text_length(id);
+    size_t version_length = version == NULL ? 0 : text_length(version);
+    bool found = false;
+    /* The current entry: where its id starts, and whether it has its
+       package line yet. */
+    bool in_entry = false;
+    bool has_package = false;
+    bool wanted = false;
+    size_t entry_start = 0;
+    size_t entry_length = 0;
+    for (size_t line = sizeof(format) - 1; line < length;) {
+        size_t end = line;
+        while (text[end] != '\n') {
+            unsigned char c = (unsigned char)text[end];
+            if (c < 0x20 || c == 0x7F) {
+                return fail(reason, PACKAGE_BAD,
+                            "index: a control character in a line", "", 0,
+                            "");
+            }
+            end++;
+        }
+        const char *at = text + line;
+        size_t line_length = end - line;
+        size_t next = end + 1;
+        if (line_length > PACKAGE_INDEX_LINE_MAX) {
+            return fail(reason, PACKAGE_BAD, "index: a line longer than "
+                        "1024 bytes", "", 0, "");
+        }
+        if (line_length == 0) {
+            line = next;
+            continue;
+        }
+        if (!index_line_shape(at, line_length)) {
+            return fail(reason, PACKAGE_BAD, "index: '", at, line_length,
+                        "' is not 'key: value'");
+        }
+        size_t value_length;
+        const char *value = index_value(at, line_length, "entry",
+                                        &value_length);
+        if (value != NULL) {
+            if (in_entry && !has_package) {
+                return fail(reason, PACKAGE_BAD, "index: entry '",
+                            text + entry_start, entry_length,
+                            "' has no package line");
+            }
+            size_t space = 0;
+            while (space < value_length && value[space] != ' ') {
+                space++;
+            }
+            if (space == value_length
+                || !package_id_valid(value, space)
+                || !package_version_valid(value + space + 1,
+                                          value_length - space - 1)) {
+                return fail(reason, PACKAGE_BAD, "index: '", at, line_length,
+                            "' needs an id and a version");
+            }
+            /* Sorted by id, then version, each once, so one version
+               cannot be listed twice with different packages. */
+            if (in_entry) {
+                const char *previous = text + entry_start;
+                size_t previous_space = 0;
+                while (previous[previous_space] != ' ') {
+                    previous_space++;
+                }
+                int order = compare_ids(previous, previous_space, value,
+                                        space);
+                if (order == 0) {
+                    char a[PACKAGE_VERSION_MAX + 1];
+                    char b[PACKAGE_VERSION_MAX + 1];
+                    (void)copy_field(a, sizeof(a),
+                                     previous + previous_space + 1,
+                                     entry_length - previous_space - 1);
+                    (void)copy_field(b, sizeof(b), value + space + 1,
+                                     value_length - space - 1);
+                    order = package_compare_versions(a, b);
+                }
+                if (order >= 0) {
+                    return fail(reason, PACKAGE_BAD, "index: '", value,
+                                value_length,
+                                "' is out of order or listed twice");
+                }
+            }
+            in_entry = true;
+            has_package = false;
+            entry_start = (size_t)(value - text);
+            entry_length = value_length;
+            wanted = id != NULL
+                && same_span(value, space, id, id_length)
+                && same_span(value + space + 1, value_length - space - 1,
+                             version, version_length);
+            line = next;
+            continue;
+        }
+        value = index_value(at, line_length, "package", &value_length);
+        if (value != NULL) {
+            if (!in_entry) {
+                return fail(reason, PACKAGE_BAD,
+                            "index: a package line before any entry", "", 0,
+                            "");
+            }
+            if (has_package) {
+                return fail(reason, PACKAGE_BAD, "index: entry '",
+                            text + entry_start, entry_length,
+                            "' has two package lines");
+            }
+            struct package_file parsed;
+            if (!parse_hash_size(value, value_length, "0", 1, &parsed)) {
+                return fail(reason, PACKAGE_BAD, "index: '", at, line_length,
+                            "' needs 64 lowercase hex digits");
+            }
+            has_package = true;
+            if (wanted) {
+                found = true;
+                for (size_t i = 0; i < 32 && hash != NULL; i++) {
+                    hash[i] = parsed.hash[i];
+                }
+            }
+        }
+        line = next;
+    }
+    if (in_entry && !has_package) {
+        return fail(reason, PACKAGE_BAD, "index: entry '", text + entry_start,
+                    entry_length, "' has no package line");
+    }
+    if (id != NULL && !found) {
+        return fail(reason, PACKAGE_NOT_FOUND, "index: no entry for ", id,
+                    id_length, " at that version");
+    }
+    return PACKAGE_OK;
+}

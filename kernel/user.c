@@ -3400,8 +3400,44 @@ static int64_t user_opos_package(const struct user_process *process,
         && ((const struct package_info *)info_address)->size < sizeof(info)) {
         return -(int64_t)PACKAGE_INVALID;
     }
+    /* From the Store: r8 points at struct opos_package_index. The index
+       and signature are copied, so the program cannot change them while
+       the kernel checks them. */
+    static char store_index[PACKAGE_INDEX_MAX];
+    static uint8_t store_signature[PACKAGE_SIGNATURE_MAX];
+    size_t index_size = 0;
+    size_t signature_size = 0;
+    if (install && (options & PACKAGE_OPTION_STORE) != 0) {
+        uintptr_t source = (uintptr_t)frame->r8;
+        if (!paging_user_range_valid(source, 32, false, false)) {
+            return -14;
+        }
+        const uint64_t *fields = (const uint64_t *)source;
+        uintptr_t index_address = (uintptr_t)fields[0];
+        index_size = (size_t)fields[1];
+        uintptr_t signature_address = (uintptr_t)fields[2];
+        signature_size = (size_t)fields[3];
+        if (index_size == 0 || index_size > sizeof(store_index)
+            || signature_size == 0
+            || signature_size > sizeof(store_signature)) {
+            return -(int64_t)PACKAGE_INVALID;
+        }
+        if (!paging_user_range_valid(index_address, index_size, false, false)
+            || !paging_user_range_valid(signature_address, signature_size,
+                                        false, false)) {
+            return -14;
+        }
+        for (size_t i = 0; i < index_size; i++) {
+            store_index[i] = ((const char *)index_address)[i];
+        }
+        for (size_t i = 0; i < signature_size; i++) {
+            store_signature[i] = ((const uint8_t *)signature_address)[i];
+        }
+    }
     enum package_result result = install
-        ? package_install(path, path_length, account, admin, options, &info)
+        ? package_install(path, path_length, account, admin, options,
+                          store_index, index_size, store_signature,
+                          signature_size, &info)
         : package_check(path, path_length, account, &info);
     if (info_address != 0) {
         *(struct package_info *)info_address = info;

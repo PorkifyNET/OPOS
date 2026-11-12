@@ -13,6 +13,8 @@
 #include "permission_grants.h"
 #include "scheduler.h"
 #include "sha256.h"
+#include "signature.h"
+#include "store_key.h"
 #include "timer.h"
 #include "update.h"
 #include "vfs.h"
@@ -46,6 +48,7 @@
 #define NOTES_MAX 4096
 #define RECORD_PREFIX_MAX 32
 #define ORIGIN_SIDELOADED "origin: sideloaded\n"
+#define ORIGIN_STORE "origin: store\n"
 
 static bool busy;
 static bool may_sleep;
@@ -891,7 +894,7 @@ static bool finish_pending(void) {
 
 /* Refusals that depend on what is installed. Fills target and record. */
 static enum package_result install_allowed(bool everyone, size_t account,
-                                           uint32_t options,
+                                           uint32_t options, bool from_store,
                                            const char *records,
                                            const char *programs,
                                            char *target, char *record) {
@@ -916,9 +919,13 @@ static enum package_result install_allowed(bool everyone, size_t account,
     }
     if (own) {
         char version[PACKAGE_VERSION_MAX + 1];
-        if (store) {
+        /* A Store copy is not replaced by one from elsewhere, or the
+           other way round, without removing it first. */
+        if (store != from_store) {
             copy_text(reason, sizeof(reason),
-                      "installed from the OPOS Store: remove it first");
+                      store ? "installed from the OPOS Store: remove it first"
+                            : "installed from outside the OPOS Store: remove "
+                              "it first");
             return PACKAGE_CONFLICT;
         }
         if ((options & PACKAGE_OPTION_IGNORE_VERSION) == 0
@@ -936,15 +943,65 @@ static enum package_result install_allowed(bool everyone, size_t account,
     return PACKAGE_OK;
 }
 
+/*
+ * With PACKAGE_OPTION_STORE: the package must be listed in the signed
+ * index, at its id and version, with the SHA-256 of the PACKAGE text that
+ * was just parsed. PACKAGE lists every file's hash, so this covers every
+ * file installed.
+ */
+static enum package_result store_listed(const char *index,
+                                        size_t index_size) {
+    uint8_t listed[SHA256_DIGEST_SIZE];
+    enum package_result result = package_index_find(
+        index, index_size, package.id, package.version, listed, reason);
+    if (result == PACKAGE_NOT_FOUND) {
+        copy_text(reason, sizeof(reason),
+                  "this version is not in the OPOS Store index");
+        return PACKAGE_BAD;
+    }
+    if (result != PACKAGE_OK) {
+        return result;
+    }
+    uint8_t digest[SHA256_DIGEST_SIZE];
+    struct sha256_context hash;
+    sha256_init(&hash);
+    sha256_update(&hash, text + RECORD_PREFIX_MAX, package_size);
+    sha256_final(&hash, digest);
+    uint8_t difference = 0;
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; i++) {
+        difference |= (uint8_t)(digest[i] ^ listed[i]);
+    }
+    if (difference != 0) {
+        copy_text(reason, sizeof(reason),
+                  "PACKAGE differs from the OPOS Store index");
+        return PACKAGE_BAD;
+    }
+    return PACKAGE_OK;
+}
+
 enum package_result package_install(const char *path, size_t length,
                                     size_t account, bool admin,
-                                    uint32_t options,
+                                    uint32_t options, const char *index,
+                                    size_t index_size,
+                                    const uint8_t *signature,
+                                    size_t signature_size,
                                     struct package_info *info) {
     (void)length;
     reason[0] = '\0';
     bool everyone = (options & PACKAGE_OPTION_EVERYONE) != 0;
-    if ((options & ~PACKAGE_OPTION_MASK) != 0) {
+    bool from_store = (options & PACKAGE_OPTION_STORE) != 0;
+    if ((options & ~PACKAGE_OPTION_MASK) != 0
+        || (from_store && (index == NULL || signature == NULL))) {
         return PACKAGE_INVALID;
+    }
+    /* The index is checked once: it is a kernel copy and cannot change. */
+    if (from_store
+        && !signature_valid(store_public_key, (const uint8_t *)index,
+                            index_size, signature, signature_size)) {
+        copy_text(reason, sizeof(reason),
+                  "the OPOS Store index signature is not valid");
+        copy_reason(info, reason);
+        return PACKAGE_BAD;
     }
     if (!installed_system()) {
         return PACKAGE_NOT_INSTALLED;
@@ -971,15 +1028,18 @@ enum package_result package_install(const char *path, size_t length,
         || result == PACKAGE_PLATFORM) {
         installed_info(account, info);
     }
-    /* Only packages from outside the Store exist so far. */
-    if (result == PACKAGE_OK && (options & PACKAGE_OPTION_CONFIRMED) == 0) {
+    if (result == PACKAGE_OK && from_store) {
+        result = store_listed(index, index_size);
+    }
+    if (result == PACKAGE_OK && !from_store
+        && (options & PACKAGE_OPTION_CONFIRMED) == 0) {
         copy_text(reason, sizeof(reason),
                   "not from the OPOS Store: the person must agree first");
         result = PACKAGE_NOT_CONFIRMED;
     }
     if (result == PACKAGE_OK) {
-        result = install_allowed(everyone, account, options, records,
-                                 programs, target, record);
+        result = install_allowed(everyone, account, options, from_store,
+                                 records, programs, target, record);
     }
     /* Copy and check every file into the staging folder. The archive is
        read again, and only this read counts: the checks are repeated on
@@ -987,12 +1047,18 @@ enum package_result package_install(const char *path, size_t length,
     if (result == PACKAGE_OK) {
         result = scan_archive(path, SCAN_STAGE, info);
     }
+    if (result == PACKAGE_OK && from_store) {
+        result = store_listed(index, index_size);
+        if (result == PACKAGE_OK && info != NULL) {
+            info->store = 1;
+        }
+    }
     if (result == PACKAGE_OK) {
         result = runnable();
     }
     if (result == PACKAGE_OK) {
-        result = install_allowed(everyone, account, options, records,
-                                 programs, target, record);
+        result = install_allowed(everyone, account, options, from_store,
+                                 records, programs, target, record);
     }
     if (result != PACKAGE_OK) {
         copy_reason(info, reason);
@@ -1000,8 +1066,9 @@ enum package_result package_install(const char *path, size_t length,
         return result;
     }
     /* The record: origin, then PACKAGE as it came. */
-    static const char origin[] = ORIGIN_SIDELOADED;
-    size_t prefix = sizeof(origin) - 1;
+    const char *origin = from_store ? ORIGIN_STORE : ORIGIN_SIDELOADED;
+    size_t prefix = from_store ? sizeof(ORIGIN_STORE) - 1
+                               : sizeof(ORIGIN_SIDELOADED) - 1;
     char *record_start = text + RECORD_PREFIX_MAX - prefix;
     for (size_t i = 0; i < prefix; i++) {
         record_start[i] = origin[i];

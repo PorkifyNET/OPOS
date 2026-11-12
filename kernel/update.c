@@ -12,6 +12,7 @@
 #include "package.h"
 #include "scheduler.h"
 #include "sha256.h"
+#include "signature.h"
 #include "timer.h"
 #include "update.h"
 #include "update_key.h"
@@ -244,18 +245,11 @@ static bool write_text(const char *path, const void *data, size_t length) {
 
 /* ----------------------------------------------------------- manifest */
 
-static bool signature_valid(const uint8_t *text, size_t length,
-                            const uint8_t *signature, size_t sig_length) {
-    uint8_t hash[SHA256_DIGEST_SIZE];
-    struct sha256_context context;
-    sha256_init(&context);
-    sha256_update(&context, text, length);
-    sha256_final(&context, hash);
-    br_ec_public_key key = {
-        BR_EC_secp256r1, (unsigned char *)update_public_key,
-        sizeof(update_public_key)};
-    return br_ecdsa_i31_vrfy_asn1(&br_ec_p256_m31, hash, sizeof(hash), &key,
-                                  signature, sig_length) == 1;
+static bool manifest_signature_valid(const uint8_t *text, size_t length,
+                                     const uint8_t *signature,
+                                     size_t sig_length) {
+    return signature_valid(update_public_key, text, length, signature,
+                           sig_length);
 }
 
 /* "1.2.3": up to four numbers of up to 9 digits; nothing else. */
@@ -501,8 +495,8 @@ static enum update_result parse_manifest(const char *text, size_t length) {
 /* Checks and parses manifest_text/signature_bytes. */
 static enum update_result load_manifest(bool force) {
     if (!force
-        && !signature_valid(manifest_text, manifest_length, signature_bytes,
-                            signature_length)) {
+        && !manifest_signature_valid(manifest_text, manifest_length,
+                                     signature_bytes, signature_length)) {
         return UPDATE_BAD_SIGNATURE;
     }
     return parse_manifest((const char *)manifest_text, manifest_length);

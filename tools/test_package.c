@@ -161,10 +161,82 @@ static int parse_file(const char *path) {
     return 0;
 }
 
+/* "test_package --index FILE [ID VERSION]": "<result> <hash or -> <reason>" */
+static int index_file(const char *path, const char *id, const char *version) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        perror(path);
+        return 2;
+    }
+    static char text[PACKAGE_INDEX_MAX * 2];
+    size_t length = fread(text, 1, sizeof(text), file);
+    fclose(file);
+    uint8_t hash[32] = {0};
+    enum package_result result = package_index_find(text, length, id, version,
+                                                    hash, reason);
+    printf("%d ", (int)result);
+    if (result == PACKAGE_OK && id != NULL) {
+        for (int i = 0; i < 32; i++) {
+            printf("%02x", hash[i]);
+        }
+    } else {
+        printf("-");
+    }
+    printf(" %s\n", reason);
+    return 0;
+}
+
+static void test_index(void) {
+    static const char index[] =
+        "format: 1\n"
+        "\n"
+        "entry: org.example.paint 1.2.0\n"
+        "package: "
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n"
+        "name: Paint\n"
+        "description: Draws pictures \xc3\xa9\n"
+        "entry: org.example.paint 1.10.0\n"
+        "package: "
+        "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\n"
+        "entry: org.example.zoo 1.0\n"
+        "signer: someone\n"
+        "package: "
+        "0000000000000000000000000000000000000000000000000000000000000001\n";
+    uint8_t hash[32];
+    CHECK(package_index_find(index, sizeof(index) - 1, NULL, NULL, NULL,
+                             reason) == PACKAGE_OK);
+    CHECK(package_index_find(index, sizeof(index) - 1, "org.example.paint",
+                             "1.10.0", hash, reason) == PACKAGE_OK);
+    CHECK(hash[0] == 0xff && hash[31] == 0x00);
+    CHECK(package_index_find(index, sizeof(index) - 1, "org.example.paint",
+                             "1.2.0", hash, reason) == PACKAGE_OK);
+    CHECK(hash[0] == 0x00 && hash[31] == 0xff);
+    CHECK(package_index_find(index, sizeof(index) - 1, "org.example.zoo",
+                             "1.0", hash, reason) == PACKAGE_OK);
+    CHECK(hash[31] == 0x01);
+    /* Exact spelling: 1.10 is not 1.10.0, and ids are not prefixes. */
+    CHECK(package_index_find(index, sizeof(index) - 1, "org.example.paint",
+                             "1.10", hash, reason) == PACKAGE_NOT_FOUND);
+    CHECK(package_index_find(index, sizeof(index) - 1, "org.example.pain",
+                             "1.2.0", hash, reason) == PACKAGE_NOT_FOUND);
+    /* A cut index loses its last line break. */
+    CHECK(package_index_find(index, sizeof(index) - 2, NULL, NULL, NULL,
+                             reason) == PACKAGE_BAD);
+    CHECK(package_index_find("format: 2\n", 10, NULL, NULL, NULL, reason)
+          == PACKAGE_UNSUPPORTED);
+    CHECK(package_index_find("format: 1\n", 10, NULL, NULL, NULL, reason)
+          == PACKAGE_OK);
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[1], "--index") == 0) {
+        return index_file(argv[2], argc >= 5 ? argv[3] : NULL,
+                          argc >= 5 ? argv[4] : NULL);
+    }
     if (argc == 2) {
         return parse_file(argv[1]);
     }
+    test_index();
     test_good();
     test_records();
     test_versions();

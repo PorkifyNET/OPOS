@@ -136,6 +136,7 @@ static struct limine_framebuffer boot_framebuffer;
 static struct limine_framebuffer *active_framebuffer;
 /* Set whenever visible pixels change; display drivers poll it. */
 static volatile bool display_dirty;
+static uint64_t mode_changes;
 static uint64_t text_x = TEXT_MARGIN;
 static uint64_t text_y = TEXT_MARGIN;
 static int32_t cursor_x;
@@ -732,7 +733,13 @@ bool console_set_mode(const struct console_mode *mode) {
     text_y = TEXT_MARGIN;
     mouse_set_bounds(mode->width, mode->height);
     framebuffer_cursor_show();
+    __atomic_add_fetch(&mode_changes, 1, __ATOMIC_RELEASE);
     return true;
+}
+
+/* Each mode change clears the text console; the shell redraws after one. */
+uint64_t console_mode_changes(void) {
+    return __atomic_load_n(&mode_changes, __ATOMIC_ACQUIRE);
 }
 
 bool console_take_dirty(void) {
@@ -1340,7 +1347,10 @@ void kmain(void) {
             const char *pin = cmdline + sizeof(root_option) - 1;
             size_t pin_length = 0;
             while (pin[pin_length] != '\0') pin_length++;
-            bool matches = known && pin_length == generation_length;
+            /* A pin may name the generation with or without the
+               "-<archive hash>" suffix that later kernels add. */
+            bool matches = known && (pin_length == generation_length
+                || pin_length + 9 == generation_length);
             for (size_t i = 0; matches && i < pin_length; i++) {
                 matches = pin[i] == generation[i];
             }
@@ -1471,12 +1481,26 @@ void kmain(void) {
         && (settings_get(SETTING_AUTOSTART_DESKTOP) || installer_available())) {
         desktop_run();
     }
+    if (root_selection_failed) {
+        shell_set_notice(
+            "\nRECOVERY: the system files on the disk did not pass verification.\n"
+            "If the boot menu has \"OPOS (previous version)\", restart and choose it.\n\n");
+    }
     shell_initialize();
+    uint64_t shown_mode_changes = console_mode_changes();
     for (;;) {
         __asm__ volatile ("hlt" : : : "memory");
+        uint64_t current_mode_changes = console_mode_changes();
+        if (current_mode_changes != shown_mode_changes) {
+            shown_mode_changes = current_mode_changes;
+            shell_redraw();
+        }
         char character;
         while (keyboard_read_character(&character)) {
             shell_handle_character(character);
+            /* A command such as `desktop` changes modes and then prints
+               its own prompt; do not redraw for that. */
+            shown_mode_changes = console_mode_changes();
         }
         vmware_tools_poll();
         i2c_hid_poll();

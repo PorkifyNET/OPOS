@@ -31,6 +31,7 @@ struct initramfs_directory_entry {
 
 bool initramfs_initialize(const uint8_t *archive, size_t archive_size);
 bool initramfs_find_file(const char *path, struct initramfs_file *file);
+uint32_t initramfs_archive_hash(void);
 size_t initramfs_file_count(void);
 bool initramfs_file_at(size_t index, char *path, size_t path_capacity,
                        size_t *file_size);

@@ -279,7 +279,7 @@ class ExecutableTests(Fixture):
 
     def test_manifest_values(self):
         data = elf(manifest(caps=0xFFFFFFFF, version=b""))
-        self.assertEqual(mkopk.read_manifest_note(data), (0x7F, "Paint", ""))
+        self.assertEqual(mkopk.read_manifest_note(data), (0xFF, "Paint", ""))
 
     def test_linux_needs_x86_64_elf(self):
         self.write("tool", elf(machine=183))      # AArch64

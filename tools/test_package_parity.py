@@ -40,6 +40,7 @@ CASES = [
     replace("requires-opos: 0.1.5\n", ""),
     replace("start: files/paint Paint\n", ""),
     LINUX + "capabilities: net, clipboard.read files.shared\n",
+    LINUX + "capabilities: notifications net\n",
     LINUX + "capabilities: camera\n",
     LINUX + "capabilities: , ,\n",
     GOOD + "capabilities: net\n",

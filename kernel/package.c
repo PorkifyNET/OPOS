@@ -13,6 +13,7 @@
 #define CAP_FILES_SHARED (1u << 2)
 #define CAP_NET (1u << 3)
 #define CAP_CLIPBOARD_READ (1u << 4)
+#define CAP_NOTIFY (1u << 7)
 
 /* ------------------------------------------------------------ helpers */
 
@@ -289,6 +290,8 @@ static enum package_result parse_capabilities(const char *text, size_t length,
             *bits |= CAP_NET;
         } else if (span_is(name, name_length, "clipboard.read")) {
             *bits |= CAP_CLIPBOARD_READ;
+        } else if (span_is(name, name_length, "notifications")) {
+            *bits |= CAP_NOTIFY;
         } else {
             return fail(reason, PACKAGE_BAD,
                         "capabilities: unknown capability '", name,

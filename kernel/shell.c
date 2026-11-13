@@ -24,6 +24,7 @@
 #include "keyboard.h"
 #include "net.h"
 #include "sound.h"
+#include "system_sounds.h"
 
 #define SHELL_LINE_CAPACITY 2048
 #define FAT16_DISPLAY_CAPACITY 1024
@@ -616,6 +617,9 @@ static const struct shell_help_entry shell_help_entries[] = {
     {"net", "net", "Shows network-interface and address status."},
     {"sound", "sound", "Shows the sound output that was found."},
     {"beep", "beep [HZ]", "Plays a short tone (default 750 Hz)."},
+    {"chime", "chime NAME",
+     "Plays a system sound: startup, shutdown, logout, notification, "
+     "warning or volume."},
     {"volume", "volume [0-100|mute|unmute]",
      "Shows or sets the sound volume."},
     {"dhcp", "dhcp", "Restarts DHCP address configuration."},
@@ -813,6 +817,20 @@ static void execute_command(void) {
             console_write_warning(sound_output_ready()
                 ? "Usage: beep [HZ] with HZ from 20 to 20000\n"
                 : "No sound output.\n");
+        }
+    } else if (command_matches(command, command_length, "chime")) {
+        enum system_sound sound = SYSTEM_SOUND_COUNT;
+        for (size_t i = 0; i < SYSTEM_SOUND_COUNT; i++) {
+            if (command_matches(arguments, arguments_length,
+                                system_sound_name((enum system_sound)i))) {
+                sound = (enum system_sound)i;
+            }
+        }
+        if (sound == SYSTEM_SOUND_COUNT) {
+            console_write_warning("Usage: chime startup|shutdown|logout|"
+                                  "notification|warning|volume\n");
+        } else if (!system_sound_play_always(sound)) {
+            console_write_warning("No sound output.\n");
         }
     } else if (command_matches(command, command_length, "net")) {
         net_describe(shell_print_line);

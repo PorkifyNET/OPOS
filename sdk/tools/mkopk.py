@@ -56,8 +56,9 @@ CAPABILITIES = {
     "files.shared": 1 << 2,
     "net": 1 << 3,
     "clipboard.read": 1 << 4,
+    "notifications": 1 << 7,
 }
-CAPS_ALL = 0x7F
+CAPS_ALL = 0xFF
 
 ID_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")

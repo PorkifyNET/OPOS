@@ -54,6 +54,9 @@ uint64_t desktop_app_window_size(uint64_t owner);
    and release (APP_EVENT_KEY_STATE, 8), besides the typed characters.
    Returns 0, -9 without a window, or -22 for unknown options. */
 #define DESKTOP_APP_KEY_STATE 1u
+/* DESKTOP_APP_QUIET: while the window is in front, notifications skip
+   their toast and sound (a game, a presentation). */
+#define DESKTOP_APP_QUIET 2u
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options);
 /* The shared clipboard for programs. Set keeps at most 64 KiB. Get copies
    up to capacity bytes and returns the clipboard's full length. */

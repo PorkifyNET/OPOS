@@ -45,6 +45,11 @@ static int32_t mix[1024 * 2];
 static volatile uint32_t beep_frames_left;
 static uint32_t beep_period;
 static uint32_t beep_phase;
+/* The system voice (system sounds): mono samples mixed into both channels
+   before the volume. The caller keeps the buffer until it stops playing. */
+static const int16_t *voice_samples;
+static volatile uint32_t voice_frames_left;
+static uint32_t voice_position;
 
 static uint64_t interrupts_save(void) {
     uint64_t flags;
@@ -90,6 +95,15 @@ static void sound_mix(int16_t *out, size_t frames) {
             }
             stream->read = read + take;
         }
+        uint32_t voice = voice_frames_left;
+        uint32_t voice_take = voice < chunk ? voice : (uint32_t)chunk;
+        for (uint32_t i = 0; i < voice_take; i++) {
+            int32_t sample = voice_samples[voice_position + i];
+            mix[2 * i] += sample;
+            mix[2 * i + 1] += sample;
+        }
+        voice_position += voice_take;
+        voice_frames_left = voice - voice_take;
         /* Volume on a squared curve: half way sounds about half as loud. */
         int32_t gain = muted ? 0 : (int32_t)(volume * volume);
         for (size_t f = 0; f < chunk; f++) {
@@ -143,6 +157,28 @@ bool sound_beep(uint32_t frequency, uint32_t milliseconds) {
     beep_frames_left = 48u * milliseconds;
     interrupts_restore(flags);
     return true;
+}
+
+bool sound_voice_play(const int16_t *samples, uint32_t frames) {
+    if (!sound_output_ready()) {
+        return false;
+    }
+    uint64_t flags = interrupts_save();
+    voice_samples = samples;
+    voice_position = 0;
+    voice_frames_left = frames;
+    interrupts_restore(flags);
+    return true;
+}
+
+void sound_voice_stop(void) {
+    uint64_t flags = interrupts_save();
+    voice_frames_left = 0;
+    interrupts_restore(flags);
+}
+
+bool sound_voice_playing(void) {
+    return voice_frames_left != 0;
 }
 
 void sound_describe(void (*print)(const char *line)) {

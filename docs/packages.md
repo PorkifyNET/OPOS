@@ -94,7 +94,8 @@ installer's checks):
 - An `opos` executable needs exactly one valid manifest note, checked as
   `manifest_read()` does. A `linux` one must be an x86-64 ELF64, a
   `windows` one must start with `MZ`. `capabilities:` takes
-  `files.shared`, `net` and `clipboard.read`, and is refused in an
+  `files.shared`, `net`, `clipboard.read` and `notifications`, and is
+  refused in an
   `opos` package.
 - The archive is reproducible: times, owners and modes are fixed.
 
@@ -498,7 +499,7 @@ The desktop sends the output of a `pkg` it started to the window
 
 **asks.** `mkindex.py` writes an `asks:` line for each entry: the
 capabilities named in the manifest notes of the package's executables
-(`net`, `clipboard.read`, `files.shared`), or `none`. Other platforms
+(`net`, `clipboard.read`, `files.shared`, `notifications`), or `none`. Other platforms
 use the `capabilities:` line of PACKAGE. The line is covered by the
 index signature. The kernel ignores it; the window shows it as "MAY ASK
 FOR: NETWORK". It only informs the person: each permission is still

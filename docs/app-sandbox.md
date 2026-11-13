@@ -59,6 +59,7 @@ A capability is a named right that the kernel checks. The first set:
 | `clipboard.read` | Read the shared clipboard | denied, asked on first use |
 | `clipboard.write` | Replace the clipboard | granted |
 | `window` | Open windows and receive their events | granted |
+| `notifications` | Post notifications (`opos_notify`, docs/notifications.md) | denied, asked on first use |
 
 Capabilities are added to `struct permission_identity` as a bit set, next
 to `confined`. Child processes inherit the set and can only narrow it, as
@@ -86,7 +87,8 @@ unterminated name, or a control character make the kernel ignore it.
 - With a manifest, a program may ask only for what it lists beyond the
   defaults. That includes `files.shared`, which a new program can get no
   other way. The migration record does not add to it.
-- Without one, it may ask for `net` and `clipboard.read`, plus what
+- Without one, it may ask for `net`, `clipboard.read` and
+  `notifications`, plus what
   migration recorded. Linux programs and older SDK programs work
   unchanged.
 - The prompt shows the manifest name. When it differs from the
@@ -140,7 +142,9 @@ All checks run in the kernel, in the path every syscall already uses.
 - `clipboard.read` and `clipboard.write` (implemented): checked in
   `OPOS_SYSCALL_CLIPBOARD_GET` and `_SET`. `clipboard.write` is a default
   and is only missing if the person refused it.
-- `net` and `clipboard.read` are asked for on first use by every disk
+- `notifications` (implemented): checked in `OPOS_SYSCALL_NOTIFY`
+  (0x4f500050). `/bin/notify` holds it.
+- `net`, `clipboard.read` and `notifications` are asked for on first use by every disk
   program (`PERMISSION_CAPS_ASK_ON_USE`), within what its parent held.
   With no account, the answer lasts for that process only.
 - Linux-compatibility programs use the same identity. The compatibility
@@ -214,6 +218,7 @@ started by a built-in can only narrow it further.
 | notepad | `files.shared` |
 | fetch, update | `files.shared`, `net` |
 | browser | `net`, `clipboard.read` |
+| notify | `files.shared`, `notifications` |
 | any other `/bin` program | `files.shared` |
 | `/tests`, `/lib` | everything (self-tests) |
 | anything else not on a disk (a CD) | nothing |

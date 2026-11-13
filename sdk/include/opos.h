@@ -37,6 +37,7 @@
 #define OPOS_ENOENT 2
 #define OPOS_EIO 5
 #define OPOS_EBADF 9
+#define OPOS_EAGAIN 11
 #define OPOS_ENOMEM 12
 #define OPOS_EACCES 13
 #define OPOS_EFAULT 14
@@ -68,6 +69,7 @@
 #define OPOS_CAP_CLIPBOARD_READ  (1u << 4)
 #define OPOS_CAP_CLIPBOARD_WRITE (1u << 5)
 #define OPOS_CAP_WINDOW          (1u << 6)
+#define OPOS_CAP_NOTIFY          (1u << 7) /* opos_notify */
 
 /*
  * The program's manifest: a display name, a version, and the capabilities
@@ -77,7 +79,8 @@
  *
  * With a manifest, a program can only ask for what it lists, and listing
  * OPOS_CAP_FILES_SHARED lets it ask for that too. Without one, it may ask
- * for OPOS_CAP_NET and OPOS_CAP_CLIPBOARD_READ. Listing a capability never
+ * for OPOS_CAP_NET, OPOS_CAP_CLIPBOARD_READ and OPOS_CAP_NOTIFY. Listing a
+ * capability never
  * grants it. name: 1-31 printable characters; version: up to 15. The
  * prompt shows the name next to the executable's own file name.
  */
@@ -549,6 +552,10 @@ static inline long opos_window_event(struct opos_event *event,
    games. Call after opos_window_create. */
 #define OPOS_SYS_WINDOW_OPTIONS 0x4f500016L
 #define OPOS_WINDOW_KEY_STATE 1u
+/* While this window is in front, notifications neither pop up nor play a
+   sound (a game, a presentation). They still reach the Notification
+   Center. Older OPOS versions refuse it with -OPOS_EINVAL. */
+#define OPOS_WINDOW_QUIET 2u
 static inline long opos_window_options(uint32_t options) {
     return opos_syscall1(OPOS_SYS_WINDOW_OPTIONS, (long)options);
 }
@@ -583,6 +590,22 @@ static inline long opos_clipboard_get(char *out, size_t capacity) {
 }
 
 /* -------------------------------------------------------------- sound */
+
+/*
+ * Notifications (OPOS 0.1.6 and later). Posts one under the program's
+ * name: a title (up to 63 characters) and a body (up to 191; may be
+ * empty). It shows briefly by the clock, unless the person turned on Do
+ * Not Disturb, then stays in the Notification Center. Needs
+ * OPOS_CAP_NOTIFY, which the person is asked for the first time. Returns
+ * the notification's id, or -OPOS_EACCES (refused), -OPOS_EAGAIN (more
+ * than 10 a minute), -OPOS_EINVAL (empty title) or -OPOS_ENOSYS on older OPOS.
+ */
+#define OPOS_SYS_NOTIFY 0x4f500050L
+static inline long opos_notify(const char *title, const char *body) {
+    return opos_syscall4(OPOS_SYS_NOTIFY, (long)title,
+                         (long)opos_strlen(title), (long)body,
+                         (long)(body != NULL ? opos_strlen(body) : 0));
+}
 
 /*
  * Sound output (ABI 1, OPOS with sound). A program opens a stream and

@@ -570,4 +570,5 @@ QEMU on an installed disk, programs installed with `pkg install` as
 expects the argument `run elf` gives it, so run it through `run elf`, not
 on its own. `run filetest` needs the files that
 `tools/test_fat16_persistence.sh` writes first (`disk mkdir docs`, then
-`created.txt` and `persist.txt`).
+`created.txt` and `persist.txt`). `make persistence-test` runs all of
+this on a fresh FAT16 disk and checks the disk image by file name.

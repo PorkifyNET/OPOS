@@ -1,9 +1,9 @@
-OPOS 0.1.4: program permissions.
+OPOS 0.1.5: the OPOS Store, Linux programs and sound.
 
-- Programs installed on a disk can only read your private files when you pick them in Files, and get their own folder under AppData/Programs.
-- OPOS asks before a disk program reads shared files, uses the network or reads the clipboard. Your answer is remembered per program.
-- New Security Center (Start > SECURITY CENTER) lists each program's permissions and lets you change or revoke them.
-- Programs can declare the permissions they may ask for in a manifest (see the SDK).
-- Built-in programs hold only the permissions their job needs. For example, Notepad cannot use the network, and only the browser can read the clipboard.
-- Disk programs installed before this version keep shared-file access after a one-time prompt.
-- Fix: the ATA driver waits 400 ns after each command before reading status, which avoids spurious disk timeouts.
+- New OPOS Store (Start > OPOS STORE): browse, install, update and remove signed `.opk` packages. Package updates also appear in Settings > UPDATES, and `/bin/pkg` does the same from the Terminal.
+- Real Linux programs run on OPOS as packages: Lua, SQLite, BusyBox (shell, vi, less) and SDL 2 programs in their own windows. Dynamically linked musl programs work too.
+- The Terminal is now a VT100 terminal with Ctrl+C, so full-screen Linux programs work in it.
+- Doom runs on OPOS: Chocolate Doom with the free Freedoom game data, packaged as a Linux program.
+- Sound: OPOS plays audio through Intel HD Audio and the Ensoniq AudioPCI 97 (VMware's default sound card). Programs can play sound, SDL programs and Doom included.
+- Master volume: the keyboard's volume keys show a volume popup, and the level is remembered. `/bin/play` plays WAV files.
+- Faster large disk writes.

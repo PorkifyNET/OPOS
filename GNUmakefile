@@ -134,9 +134,9 @@ $(LIMINE_HEADER):
 	mkdir -p $(dir $@)
 	curl -fL "https://raw.githubusercontent.com/Limine-Bootloader/limine-protocol/$(LIMINE_PROTOCOL_COMMIT)/include/limine.h" -o $@
 
-$(BUILD)/user-program.o: kernel/user_elf.S
+$(BUILD)/user-program.o: kernel/user_elf.S VERSION
 	mkdir -p $(BUILD)
-	$(CC) -m64 -ffreestanding -fno-pic -fno-pie -c $< -o $@
+	$(CC) -m64 -ffreestanding -fno-pic -fno-pie -DOPOS_VERSION='"$(OPOS_VERSION)"' -c $< -o $@
 
 $(USER_ELF): $(BUILD)/user-program.o kernel/user_elf.ld
 	ld -nostdlib -static -z max-page-size=0x1000 --build-id=none -T kernel/user_elf.ld -o $@ $(BUILD)/user-program.o

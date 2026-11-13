@@ -566,6 +566,8 @@ QEMU on an installed disk, programs installed with `pkg install` as
 - The built-in `musl-test`, `musl-signal-test`, `musl-pthread-test` and
   `musl-net-test` pass from the desktop and the kernel shell.
 
-`run elf`, `/tests/exec-test`, `filetest` and `proctest` exit with
-status 1 in the kernel shell. They do the same on `main` before these
-changes, so the cause is older; it is recorded in `agents/agent-notes.md`.
+`run elf` and `proctest` pass in the kernel shell. `/tests/exec-test`
+expects the argument `run elf` gives it, so run it through `run elf`, not
+on its own. `run filetest` needs the files that
+`tools/test_fat16_persistence.sh` writes first (`disk mkdir docs`, then
+`created.txt` and `persist.txt`).

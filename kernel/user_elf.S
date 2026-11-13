@@ -230,8 +230,11 @@ page_boundary_test:
     jne 1f
     cmpb $0, utsname_buffer+69(%rip)
     jne 1f
-    movabsq $0x706f2d302e312e30, %rax
-    cmpq %rax, utsname_buffer+130(%rip)
+    /* release is the OPOS version from the VERSION file, NUL included. */
+    leaq utsname_buffer+130(%rip), %rsi
+    leaq expected_release(%rip), %rdi
+    movq $(expected_release_end - expected_release), %rcx
+    repe cmpsb
     jne 1f
     movabsq $0x00534f504f203123, %rax
     cmpq %rax, utsname_buffer+195(%rip)
@@ -672,7 +675,7 @@ page_boundary_test:
     jne 1f
     leaq 4095(%r12), %rdi
     andq $-4096, %rdi
-    addq $(128 * 4096 + 1), %rdi
+    addq $(8192 * 4096 + 1), %rdi /* USER_HEAP_MAX_PAGES */
     movq $12, %rax
     syscall
     cmpq %r12, %rax
@@ -857,6 +860,9 @@ page_boundary_test:
     ud2
 
 .section .rodata
+expected_release:
+    .asciz OPOS_VERSION
+expected_release_end:
 message:
     .ascii "OPOS: ELF64 R/RX/R/RW "
 message_split:

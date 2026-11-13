@@ -7020,12 +7020,15 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             frame->rax = (uint64_t)(int64_t)-14;
             return false;
         }
-        uint64_t per_tick = 1000000000ULL / USER_CLOCK_TICKS_PER_SECOND;
-        uint64_t sleep_ticks = (uint64_t)request->seconds
-                > UINT64_MAX / USER_CLOCK_TICKS_PER_SECOND / 2
-            ? UINT64_MAX / 2
-            : (uint64_t)request->seconds * USER_CLOCK_TICKS_PER_SECOND
-                + ((uint64_t)request->nanoseconds + per_tick - 1) / per_tick;
+        /* Real PIT ticks, so CLOCK_MONOTONIC shows at least the
+           requested time passed. */
+        uint64_t sleep_ticks;
+        if (!timer_duration_ticks((uint64_t)request->seconds,
+                                  (uint64_t)request->nanoseconds,
+                                  &sleep_ticks)
+            || sleep_ticks > UINT64_MAX / 2) {
+            sleep_ticks = UINT64_MAX / 2;
+        }
         uint64_t deadline = timer_ticks() + sleep_ticks;
         frame->rax = 0;
         for (;;) {
@@ -7035,13 +7038,14 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             }
             if (user_current_signal_pending()) {
                 if (remaining_address != 0) {
-                    uint64_t left = deadline - now;
+                    uint64_t left_seconds;
+                    uint64_t left_nanoseconds;
+                    timer_ticks_duration(deadline - now, &left_seconds,
+                                         &left_nanoseconds);
                     struct linux_timespec *remaining =
                         (struct linux_timespec *)remaining_address;
-                    remaining->seconds =
-                        (int64_t)(left / USER_CLOCK_TICKS_PER_SECOND);
-                    remaining->nanoseconds = (int64_t)(
-                        (left % USER_CLOCK_TICKS_PER_SECOND) * per_tick);
+                    remaining->seconds = (int64_t)left_seconds;
+                    remaining->nanoseconds = (int64_t)left_nanoseconds;
                 }
                 frame->rax = (uint64_t)(int64_t)-4;
                 break;

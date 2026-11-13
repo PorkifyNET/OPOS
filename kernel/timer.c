@@ -39,7 +39,11 @@ static bool sleep_ticks(uint64_t sleep_ticks) {
     return scheduler_sleep_until(start_ticks + sleep_ticks);
 }
 
-bool timer_sleep_duration(uint64_t seconds, uint64_t nanoseconds) {
+/* Ticks covering at least the duration. A tick is PIT_DIVISOR input
+   cycles (9.99932 ms), slightly under 10 ms, so a duration counted in
+   nominal 10 ms ticks would come up short on the monotonic clock. */
+bool timer_duration_ticks(uint64_t seconds, uint64_t nanoseconds,
+                          uint64_t *ticks_out) {
     if (nanoseconds >= NANOSECONDS_PER_SECOND) {
         return false;
     }
@@ -72,11 +76,20 @@ bool timer_sleep_duration(uint64_t seconds, uint64_t nanoseconds) {
         return false;
     }
 
-    return sleep_ticks(whole_ticks + fractional_ticks);
+    *ticks_out = whole_ticks + fractional_ticks;
+    return true;
 }
 
-void timer_monotonic_time(uint64_t *seconds, uint64_t *nanoseconds) {
-    uint64_t elapsed_ticks = timer_ticks();
+bool timer_sleep_duration(uint64_t seconds, uint64_t nanoseconds) {
+    uint64_t ticks_needed;
+    if (!timer_duration_ticks(seconds, nanoseconds, &ticks_needed)) {
+        return false;
+    }
+    return sleep_ticks(ticks_needed);
+}
+
+void timer_ticks_duration(uint64_t elapsed_ticks, uint64_t *seconds,
+                          uint64_t *nanoseconds) {
     uint64_t whole_tick_groups = elapsed_ticks / PIT_INPUT_HZ;
     uint64_t remaining_ticks = elapsed_ticks % PIT_INPUT_HZ;
     uint64_t fractional_cycles = remaining_ticks * PIT_DIVISOR;
@@ -85,6 +98,10 @@ void timer_monotonic_time(uint64_t *seconds, uint64_t *nanoseconds) {
         + fractional_cycles / PIT_INPUT_HZ;
     *nanoseconds = (fractional_cycles % PIT_INPUT_HZ) * 1000000000ULL
         / PIT_INPUT_HZ;
+}
+
+void timer_monotonic_time(uint64_t *seconds, uint64_t *nanoseconds) {
+    timer_ticks_duration(timer_ticks(), seconds, nanoseconds);
 }
 
 uint64_t timer_monotonic_resolution_nanoseconds(void) {

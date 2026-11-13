@@ -1,15 +1,16 @@
 #!/bin/sh
 # Boot an OPOS ISO in QEMU, type shell commands through the monitor, and
 # capture the serial log. Usage:
-#   tools/qemu_cmds.sh ISO LOG [-d DISK.img] [-q "QEMU ARGS"] [-k] [-w SECONDS] [-s FILE] "cmd1" "cmd2" ...
+#   tools/qemu_cmds.sh ISO LOG [-d DISK.img] [-q "QEMU ARGS"] [-k] [-w SECONDS] [-s FILE] [-b SECONDS] "cmd1" "cmd2" ...
 # -k enables KVM when /dev/kvm is usable (stricter, closer to VMware).
 # -w sets seconds to wait after each command (default 3).
 # -q appends raw QEMU arguments, for example an NVMe disk:
 #   -q "-drive file=d.img,format=raw,if=none,id=n0 -device nvme,serial=n0,drive=n0"
 # -s FILE saves a monitor screendump (PPM) after the last command.
+# -b sets seconds to wait for the desktop before typing (default 6).
 set -eu
 iso=$1; log=$2; shift 2
-disk=""; extra=""; accel="-accel tcg"; wait_after=3; screendump=""
+disk=""; extra=""; accel="-accel tcg"; wait_after=3; screendump=""; boot_wait=6
 while [ $# -gt 0 ]; do
     case "$1" in
         -d) disk="-drive file=$2,format=raw,if=ide"; shift 2 ;;
@@ -17,6 +18,7 @@ while [ $# -gt 0 ]; do
         -k) [ -w /dev/kvm ] && accel="-accel kvm -cpu host"; shift ;;
         -w) wait_after=$2; shift 2 ;;
         -s) screendump=$2; shift 2 ;;
+        -b) boot_wait=$2; shift 2 ;;
         *) break ;;
     esac
 done
@@ -47,7 +49,7 @@ type_text() {
     printf 'sendkey ret 10\n'
 }
 {
-    sleep 6
+    sleep "$boot_wait"
     # The desktop opens on boot; its terminal command "shell" returns to the
     # kernel shell (in the shell itself it is an unknown command). Super+Enter
     # first focuses the terminal (live media opens the installer instead).

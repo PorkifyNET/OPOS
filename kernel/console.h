@@ -64,5 +64,6 @@ void console_boot_mode(struct console_mode *mode);
 bool console_set_mode(const struct console_mode *mode);
 /* True (once) if visible pixels changed since the last call. */
 bool console_take_dirty(void);
+uint64_t console_mode_changes(void);
 
 #endif

@@ -33,6 +33,8 @@ _Static_assert(sizeof(struct ustar_header) == USTAR_BLOCK_SIZE,
 
 static const uint8_t *archive_bytes;
 static size_t archive_length;
+static uint32_t archive_hash;
+static bool archive_hash_ready;
 
 static bool octal_value(const char *field, size_t field_size, size_t *value) {
     size_t result = 0;
@@ -189,7 +191,24 @@ bool initramfs_initialize(const uint8_t *archive, size_t archive_size) {
             return false;
         }
     }
+    archive_hash_ready = false;
     return true;
+}
+
+/* FNV-1a over the whole archive. Not a security check (the archive is
+   already trusted as the kernel's signed pair); it only tells two builds
+   with the same version number apart. */
+uint32_t initramfs_archive_hash(void) {
+    if (!archive_hash_ready) {
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i < archive_length; i++) {
+            hash ^= archive_bytes[i];
+            hash *= 16777619u;
+        }
+        archive_hash = hash;
+        archive_hash_ready = true;
+    }
+    return archive_hash;
 }
 
 bool initramfs_find_file(const char *path, struct initramfs_file *file) {

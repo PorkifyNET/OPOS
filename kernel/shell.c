@@ -1273,10 +1273,36 @@ static void execute_command(void) {
     }
 }
 
+static const char *shell_notice;
+
+/* Shown in red above the prompt, and again after the screen is cleared. */
+void shell_set_notice(const char *notice) {
+    shell_notice = notice;
+}
+
+static void print_notice(void) {
+    if (shell_notice != NULL) {
+        console_write_error(shell_notice);
+    }
+}
+
+/* A display mode change (such as VMware fitting the guest to its window)
+   clears the text console, which left the recovery shell as an empty
+   screen. Put the notice and the current prompt line back. */
+void shell_redraw(void) {
+    print_notice();
+    if (shell_lock != SHELL_OPEN) {
+        console_write_string(
+            "This computer has accounts. Log in as an administrator.\n");
+    }
+    print_prompt();
+}
+
 void shell_initialize(void) {
     input_length = 0;
     input_overflow = false;
     input_line[0] = '\0';
+    print_notice();
     shell_lock_update();
     if (shell_lock == SHELL_OPEN) {
         console_write_string("OPOS shell ready. Type help for commands.\n");

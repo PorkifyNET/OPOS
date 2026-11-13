@@ -35,6 +35,15 @@ bool system_root_generation(char *name, size_t capacity) {
         name[used++] = c;
     }
     if (used == sizeof(prefix) - 1) return false;
+    /* The archive hash keeps a rebuilt initramfs with an unchanged
+       VERSION from colliding with the ready root of the earlier build,
+       which would fail verification and leave only the recovery shell. */
+    if (used + 10 > capacity) return false;
+    name[used++] = '-';
+    uint32_t hash = initramfs_archive_hash();
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        name[used++] = "0123456789abcdef"[(hash >> shift) & 0xf];
+    }
     name[used] = '\0';
     return true;
 }

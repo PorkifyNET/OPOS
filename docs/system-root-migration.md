@@ -22,13 +22,20 @@ device/inode identity, including through its short-name alias and descendants
 that do not exist yet; `make permissions-test` covers this guard.
 
 New installs copy the complete initramfs tree into
-`/disk/OPOS/roots/generation-<version-with-underscores>`, compare every file
-and reject unexpected entries, then write a versioned `.ready` marker. A boot
-entry may pin `cmdline: opos.root=generation-0_1_3` (for version 0.1.3).
+`/disk/OPOS/roots/generation-<version-with-underscores>-<hash>`, compare
+every file and reject unexpected entries, then write a versioned `.ready`
+marker. `<hash>` is the FNV-1a hash of the booted `initramfs.tar` in 8 hex
+digits, so a rebuilt initramfs with an unchanged `VERSION` stages its own
+generation instead of failing verification against the earlier build's
+tree. Kernels up to 0.1.5 used the name without `-<hash>`. A boot entry may
+pin `cmdline: opos.root=generation-0_1_3` (for version 0.1.3), with or
+without the hash suffix.
 Installed boots automatically stage a missing generation from their paired
 full initramfs, verify the tree, then map it as `/`. A staging failure leaves
 the full initramfs active for retry. A ready but damaged generation enters
-the recovery shell. An old pin left in a menu after an update is ignored only
+the recovery shell. That shell states why it started, and it redraws the
+notice and its prompt after a display mode change, because VMware autofit
+clears the text console. An old pin left in a menu after an update is ignored only
 when a previous kernel exists; the current kernel chooses its own generation.
 The previous menu entry boots its saved kernel/initramfs pair. This is
 payload integrity relative to the booted initramfs, not verified boot or a

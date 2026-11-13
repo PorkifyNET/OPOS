@@ -20,10 +20,10 @@ Development-only flags are available:
 The accepted flags compose. The summary explains every active flag and its risks.
 Using any of them implies `install`, so `update --ignoreversion` is shorthand
 for `update install --ignoreversion`.
-Because root directories are named by version, a same-version build with a
-different `initramfs.tar` cannot replace an already ready generation. Its
-new kernel enters recovery when verification detects the mismatch; boot the
-previous entry, then publish that build with a new version number.
+Root directories are named by version and initramfs hash, so a
+same-version build with a different `initramfs.tar` stages its own
+generation on first boot. Kernels up to 0.1.5 named them by version only,
+so such a build entered the recovery shell instead.
 
 ## Publishing a release
 

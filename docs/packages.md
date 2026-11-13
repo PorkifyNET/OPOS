@@ -491,8 +491,10 @@ window, as `/bin/update --gui` does for Settings > UPDATES:
   DESCRIPTION`, separated by tabs. STATE is `new`, `installed`,
   `update` or `needsopos`.
 - `@progress N`: percent of the running install or update. Downloading
-  is 0-50, saving the download to the package cache 50-75, and the
-  kernel's install step starts at 75. The window shows a bar beside the
+  is 0-75 and the kernel's install step starts at 75. The download goes
+  straight to the package cache through `opos_http_download` and is
+  hashed as it arrives, so a package may be larger than the 32 MB heap
+  of `pkg`. The window shows a bar beside the
   status line, and the program's row shows the phase and percent, such as
   `DOWNLOADING 40%`.
 - `@updates N`: how many installed programs have an update.

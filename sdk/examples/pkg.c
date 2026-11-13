@@ -42,6 +42,8 @@
  *                      version a newer release needs, or empty; ASKS is
  *                      the index's asks line (capability names or none),
  *                      or empty in an index without one
+ *   @progress N        percent of the current install or update (0-100):
+ *                      downloading 0-50, saving 50-75, installing 75-100
  *   @updates N         how many installed programs have an update
  *   @done TEXT         what was done
  * Errors are the lines starting with "pkg: ".
@@ -466,6 +468,24 @@ static void show_progress(void *context, size_t received, size_t total) {
            (unsigned long)(total / 1024));
 }
 
+/* --gui: the Store window's progress bar. A download is 0-50 percent. */
+static void gui_progress(void *context, size_t received, size_t total) {
+    (void)context;
+    static int shown = -1;
+    if (total == 0) {
+        return;
+    }
+    int percent = (int)((uint64_t)(received > total ? total : received) * 50
+                        / total);
+    if (received == 0 || percent < shown) {
+        shown = -1; /* a new download */
+    }
+    if (percent != shown) {
+        shown = percent;
+        printf("@progress %d\n", percent);
+    }
+}
+
 /* Reads name from the source into a malloc'd buffer (NUL-terminated). */
 static bool source_read(const char *name, size_t max, uint8_t **data,
                         size_t *size) {
@@ -476,7 +496,9 @@ static bool source_read(const char *name, size_t max, uint8_t **data,
     }
     if (is_url(location)) {
         struct opos_http_response response;
-        opos_http_set_progress(max > (1u << 20) ? show_progress : NULL, NULL);
+        opos_http_set_progress(gui && max == DOWNLOAD_MAX ? gui_progress
+                               : max > (1u << 20) ? show_progress : NULL,
+                               NULL);
         long result = opos_http_get(location, max, &response);
         opos_http_set_progress(NULL, NULL);
         if (result < 0) {
@@ -845,6 +867,7 @@ static bool download_package(const struct entry *e, char *path) {
     if (gui) {
         printf("@phase DOWNLOADING %s (%lu KB)\n", e->name,
                (e->size + 1023) / 1024);
+        printf("@progress 0\n");
     } else {
         printf("Downloading %s (%lu KB)...\n", e->file,
                (e->size + 1023) / 1024);
@@ -868,8 +891,13 @@ static bool download_package(const struct entry *e, char *path) {
         free(data);
         return false;
     }
+    if (gui) {
+        printf("@phase SAVING %s\n", e->name);
+        printf("@progress 50\n");
+    }
     long fd = opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT | OPOS_O_TRUNC);
     size_t written = 0;
+    int shown = 50;
     while (fd >= 0 && written < size) {
         size_t want = size - written < 4096 ? size - written : 4096;
         long put = opos_write((int)fd, data + written, want);
@@ -877,6 +905,11 @@ static bool download_package(const struct entry *e, char *path) {
             break;
         }
         written += (size_t)put;
+        int percent = 50 + (int)((uint64_t)written * 25 / size);
+        if (gui && percent != shown) {
+            shown = percent;
+            printf("@progress %d\n", percent);
+        }
     }
     if (fd >= 0) {
         opos_close((int)fd);
@@ -912,6 +945,7 @@ static int store_install(const struct entry *e, bool everyone,
         | (ignore_version ? OPOS_PACKAGE_IGNORE_VERSION : 0);
     if (gui) {
         printf("@phase INSTALLING %s %s\n", e->name, e->version);
+        printf("@progress 75\n");
     }
     long result = opos_package_install_store(path, options, &info, &index);
     if (downloaded) {
@@ -922,6 +956,7 @@ static int store_install(const struct entry *e, bool everyone,
         return 1;
     }
     if (gui) {
+        printf("@progress 100\n");
         printf("@done INSTALLED %s %s.\n", info.name, info.version);
     }
     printf("Installed %s %s from the OPOS Store.%s\n", info.name,

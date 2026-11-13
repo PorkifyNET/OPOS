@@ -476,6 +476,12 @@ their own license.
 - The display modes offered for full screen are 1024x768, 800x600 and
   640x480. OPOS does not tell a program the screen size before it opens
   a window.
+- Notifications stay quiet (`OPOS_WINDOW_QUIET`) while the window is in
+  front and full screen, or holds the mouse in relative mode, as a game
+  does while it is being played. Relative mode is only a mark: OPOS has
+  no pointer capture, so SDL works out relative motion from positions.
+  The hint `SDL_OPOS_QUIET` set to 1 or 0 overrides this. Doom asks for
+  full screen by default, so it is quiet whenever its window is in front.
 
 **Kernel additions:**
 - **Key presses and releases.** The keyboard driver now keeps every key

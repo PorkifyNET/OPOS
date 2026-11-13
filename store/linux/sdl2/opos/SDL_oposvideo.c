@@ -52,6 +52,11 @@
 #define OPOS_SYS_WINDOW_EVENT 0x4f500012L
 #define OPOS_SYS_WINDOW_OPTIONS 0x4f500016L
 #define OPOS_WINDOW_KEY_STATE 1u
+#define OPOS_WINDOW_QUIET 2u
+/* "1" keeps notifications quiet while the window is in front, "0" never
+   does; unset, the window is quiet while it is full screen or holds the
+   mouse in relative mode (a game being played). */
+#define OPOS_HINT_QUIET "SDL_OPOS_QUIET"
 
 #define OPOS_EVENT_KEY 1
 #define OPOS_EVENT_MOUSE_DOWN 2
@@ -95,6 +100,63 @@ static SDL_Window *opos_window;
 static SDL_bool opos_opened;
 static SDL_bool opos_key_state;
 static SDL_bool opos_closed;
+static SDL_bool opos_relative;
+static SDL_bool opos_fullscreen;
+static SDL_bool opos_quiet_supported = SDL_TRUE;
+static int opos_quiet_hint = -1; /* -1 unset, 0 or 1 */
+static Uint32 opos_options;
+
+/* Sends the window options when they change. OPOS before 0.1.5 refuses
+   OPOS_WINDOW_QUIET; the window then stays as it was. */
+static void OPOS_UpdateOptions(void)
+{
+    SDL_bool quiet;
+    Uint32 options;
+    if (!opos_opened) {
+        return;
+    }
+    quiet = opos_quiet_hint >= 0 ? (SDL_bool)opos_quiet_hint
+                                 : (SDL_bool)(opos_relative
+                                              || opos_fullscreen);
+    options = opos_key_state ? OPOS_WINDOW_KEY_STATE : 0;
+    if (quiet && opos_quiet_supported) {
+        options |= OPOS_WINDOW_QUIET;
+    }
+    if (options == opos_options) {
+        return;
+    }
+    if (opos_call(OPOS_SYS_WINDOW_OPTIONS, options, 0, 0, 0) < 0) {
+        if (options & OPOS_WINDOW_QUIET) {
+            opos_quiet_supported = SDL_FALSE;
+        }
+        return;
+    }
+    opos_options = options;
+}
+
+static void SDLCALL OPOS_QuietHintChanged(void *userdata, const char *name,
+                                          const char *old_value,
+                                          const char *value)
+{
+    (void)userdata;
+    (void)name;
+    (void)old_value;
+    opos_quiet_hint = (value && *value) ? (SDL_GetStringBoolean(value,
+                                                                SDL_FALSE)
+                                           ? 1 : 0)
+                                        : -1;
+    OPOS_UpdateOptions();
+}
+
+/* OPOS has no pointer capture: motion keeps coming as absolute positions,
+   from which SDL works out the relative motion. Relative mode only marks
+   the window quiet. */
+static int OPOS_SetRelativeMouseMode(SDL_bool enabled)
+{
+    opos_relative = enabled;
+    OPOS_UpdateOptions();
+    return 0;
+}
 
 #define OPOS_SURFACE "_SDL_OposSurface"
 
@@ -280,7 +342,22 @@ static int OPOS_OpenWindow(SDL_Window *window)
     opos_opened = SDL_TRUE;
     opos_key_state = opos_call(OPOS_SYS_WINDOW_OPTIONS,
                                OPOS_WINDOW_KEY_STATE, 0, 0, 0) == 0;
+    opos_options = opos_key_state ? OPOS_WINDOW_KEY_STATE : 0;
+    opos_fullscreen = (window->flags & SDL_WINDOW_FULLSCREEN) != 0;
+    OPOS_UpdateOptions();
     return 0;
+}
+
+static void OPOS_SetWindowFullscreen(_THIS, SDL_Window *window,
+                                     SDL_VideoDisplay *display,
+                                     SDL_bool fullscreen)
+{
+    (void)_this;
+    (void)display;
+    if (window == opos_window) {
+        opos_fullscreen = fullscreen;
+        OPOS_UpdateOptions();
+    }
 }
 
 static void OPOS_DestroyWindow(_THIS, SDL_Window *window)
@@ -369,12 +446,15 @@ static int OPOS_VideoInit(_THIS)
         mode.h = sizes[i][1];
         SDL_AddDisplayMode(&_this->displays[0], &mode);
     }
+    SDL_GetMouse()->SetRelativeMouseMode = OPOS_SetRelativeMouseMode;
+    SDL_AddHintCallback(OPOS_HINT_QUIET, OPOS_QuietHintChanged, NULL);
     return 0;
 }
 
 static void OPOS_VideoQuit(_THIS)
 {
     (void)_this;
+    SDL_DelHintCallback(OPOS_HINT_QUIET, OPOS_QuietHintChanged, NULL);
 }
 
 static void OPOS_DeleteDevice(SDL_VideoDevice *device)
@@ -395,6 +475,7 @@ static SDL_VideoDevice *OPOS_CreateDevice(void)
     device->PumpEvents = OPOS_PumpEvents;
     device->CreateSDLWindow = OPOS_CreateWindow;
     device->DestroyWindow = OPOS_DestroyWindow;
+    device->SetWindowFullscreen = OPOS_SetWindowFullscreen;
     device->CreateWindowFramebuffer = OPOS_CreateWindowFramebuffer;
     device->UpdateWindowFramebuffer = OPOS_UpdateWindowFramebuffer;
     device->DestroyWindowFramebuffer = OPOS_DestroyWindowFramebuffer;

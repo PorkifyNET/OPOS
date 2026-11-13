@@ -218,8 +218,10 @@ Each step is one PR, stacked like the sound work.
   columns were narrowed so all five fit a half-width tile at 1920 pixels.
   The Store's "MAY ASK FOR" line, `mkopk.py`, `mkindex.py` and the
   kernel's PACKAGE parser know the name `notifications`.
-- Not done: SDL's OPOS video driver and the Doom package do not set
-  `OPOS_WINDOW_QUIET` yet. That needs the SDL and Doom recipes rebuilt.
+- SDL's OPOS video driver sets `OPOS_WINDOW_QUIET` while the window is
+  full screen or the mouse is in relative mode; the hint `SDL_OPOS_QUIET`
+  (1 or 0) overrides it. Doom asks for full screen by default, so it is
+  quiet whenever its window is in front (docs/linux-programs.md).
 - Tested in QEMU:
   - Live ISO: `notify Hello From the notify program` showed a toast from
     "notify"; ten more runs within a minute posted ten and the eleventh
@@ -231,7 +233,11 @@ Each step is one PR, stacked like the sound work.
     toast from "Notify (alert)".
   - The shutdown sound (step 1) played from Start > SHUT DOWN, chosen
     with the keyboard, before the machine turned off.
-  - Not tested: `OPOS_WINDOW_QUIET` (no test program sets it yet).
+  - `OPOS_WINDOW_QUIET` from SDL, live ISO: a test program turned on
+    relative mouse mode, then posted a notification: no toast, the bell
+    count went up. After relative mode ended, the next one showed a
+    toast. The same with a full-screen window and
+    `SDL_SetWindowFullscreen(w, 0)`. Doom itself was rebuilt but not run.
 
 ## Not planned yet
 

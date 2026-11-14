@@ -13649,10 +13649,19 @@ static void security_key(char character) {
  * status line, "pkg: " lines are errors. Installing is for the logged-in
  * account; UPDATE ALL also updates programs installed for everyone when
  * the account is an administrator. The kernel checks every package.
+ *
+ * Three pages: HOME (featured programs and categories), LIST (a category,
+ * the installed programs or search results) and ABOUT (one program, with
+ * INSTALL and REMOVE). The search field is above every page; typing
+ * searches. HOME and ABOUT scroll as a whole, LIST by rows.
  */
 #define STORE_ITEMS_MAX 64
-#define STORE_ROW_HEIGHT 24
 #define STORE_TEXT 160
+#define STORE_LINE (CHAR_HEIGHT + 6)
+#define STORE_ROW_HEIGHT (2 * STORE_LINE + 4)
+#define STORE_SEARCH_MAX ACCOUNT_PASSWORD_MAX
+#define STORE_FEATURED_MAX 4
+#define STORE_ERROR_HEIGHT (2 * STORE_LINE + 12)
 
 struct store_item {
     char id[64];
@@ -13664,28 +13673,86 @@ struct store_item {
     char needs[16];
     char size[12];
     char asks[64];
-    char description[160];
+    char category[16];
+    char license[48];
+    char featured[4];
+    char requires[16];
+    char summary[96];
+    char description[1000];
 };
 
-enum store_button {
-    STORE_BUTTON_REFRESH,
-    STORE_BUTTON_ACTION, /* INSTALL, UPDATE or UPDATE OPOS */
-    STORE_BUTTON_REMOVE,
-    STORE_BUTTON_UPDATE_ALL,
-    STORE_BUTTON_COUNT,
+enum store_page {
+    STORE_PAGE_HOME,
+    STORE_PAGE_LIST,
+    STORE_PAGE_ABOUT,
 };
+
+/* Where Tab moves the keyboard: the page, then the bottom buttons. */
+enum store_focus {
+    STORE_FOCUS_PAGE,
+    STORE_FOCUS_REFRESH,
+    STORE_FOCUS_UPDATE_ALL,
+    STORE_FOCUS_COUNT,
+};
+
+/* The categories of store/catalog.txt (tools/mkindex.py). */
+#define STORE_CATEGORIES 8
+static const char *const store_category_ids[STORE_CATEGORIES] = {
+    "games", "internet", "office", "graphics", "sound-video",
+    "programming", "system", "accessories",
+};
+static const char *const store_category_names[STORE_CATEGORIES] = {
+    "GAMES", "INTERNET", "OFFICE", "GRAPHICS", "SOUND AND VIDEO",
+    "PROGRAMMING", "SYSTEM TOOLS", "ACCESSORIES",
+};
+/* Icon colors: one per category, then "other". */
+static const uint8_t store_category_colors[STORE_CATEGORIES + 1][3] = {
+    {190, 74, 74},  {62, 120, 206}, {66, 150, 98},  {176, 92, 190},
+    {206, 134, 50}, {56, 152, 168}, {112, 120, 146}, {146, 136, 78},
+    {92, 102, 136},
+};
+
+/* The lists LIST shows: a category (0-7), then these. */
+enum {
+    STORE_LIST_OTHER = STORE_CATEGORIES, /* no category, or an unknown one */
+    STORE_LIST_ALL,
+    STORE_LIST_INSTALLED,
+};
+/* HOME's category buttons. OTHER is shown only when it has programs. */
+static const size_t store_grid_lists[] = {
+    STORE_LIST_ALL, STORE_LIST_INSTALLED, 0, 1, 2, 3, 4, 5, 6, 7,
+    STORE_LIST_OTHER,
+};
+#define STORE_GRID_MAX (sizeof(store_grid_lists) / sizeof(store_grid_lists[0]))
+#define STORE_GRID_COLUMNS 3
 
 static struct store_item store_items[STORE_ITEMS_MAX];
 static size_t store_item_count;
-static size_t store_selected;
-/* First row shown; the list scrolls with the selection. */
-static size_t store_first;
-static size_t store_button;
+static enum store_page store_page;
+/* The page ABOUT goes back to. */
+static enum store_page store_about_from;
+static size_t store_list = STORE_LIST_ALL;
+static struct text_field store_search;
+/* LIST came from typing a search (not from a category): clearing the
+   search goes back to HOME. */
+static bool store_search_only;
+/* What LIST shows, as store_items indexes sorted by name (store_filter). */
+static size_t store_shown[STORE_ITEMS_MAX];
+static size_t store_shown_count;
+static size_t store_selected; /* in store_shown */
+static size_t store_first;    /* first LIST row shown */
+static char store_about_id[64];
+static size_t store_about_button; /* 0: INSTALL or UPDATE, 1: REMOVE */
+static int64_t store_about_height;
+/* HOME and ABOUT: pixels scrolled. */
+static int64_t store_scroll;
+/* HOME's keyboard choice: the featured tiles, then the category buttons. */
+static size_t store_home_focus;
+static bool store_reveal; /* scroll HOME so store_home_focus shows */
+static size_t store_focus;
 /* After an install, update or removal the list is read again. */
 static bool store_refresh_after;
 static bool store_listing;
-/* The "Installed" view: only programs this account has from the Store. */
-static bool store_installed_only;
 static char store_phase[STORE_TEXT];
 static char store_message[STORE_TEXT];
 static bool store_message_error;
@@ -13694,17 +13761,185 @@ static int store_progress = -1;
 /* The program the running INSTALL, UPDATE or REMOVE is for ("" if none). */
 static char store_busy_id[64];
 static bool store_busy_remove;
-static char store_line[640];
+static char store_line[2048];
 static size_t store_line_length;
 
-static const struct store_item *store_current(void) {
-    return store_selected < store_item_count ? &store_items[store_selected]
-                                             : NULL;
+static char store_upper(char c) {
+    return c >= 'a' && c <= 'z' ? (char)(c - 32) : c;
+}
+
+/* Case-insensitive: whether text contains needle. */
+static bool store_contains(const char *text, const char *needle) {
+    if (needle[0] == '\0') {
+        return true;
+    }
+    for (; *text != '\0'; text++) {
+        size_t i = 0;
+        while (needle[i] != '\0'
+               && store_upper(text[i]) == store_upper(needle[i])) {
+            i++;
+        }
+        if (needle[i] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Case-insensitive order of two names. */
+static int store_compare(const char *a, const char *b) {
+    while (*a != '\0' && store_upper(*a) == store_upper(*b)) {
+        a++;
+        b++;
+    }
+    return (int)(uint8_t)store_upper(*a) - (int)(uint8_t)store_upper(*b);
 }
 
 static bool store_item_is(const struct store_item *item, const char *state) {
     return item != NULL && text_equals(item->state, text_length(item->state),
                                        state);
+}
+
+static size_t store_item_category(const struct store_item *item) {
+    for (size_t i = 0; i < STORE_CATEGORIES; i++) {
+        if (text_equals(item->category, text_length(item->category),
+                        store_category_ids[i])) {
+            return i;
+        }
+    }
+    return STORE_LIST_OTHER;
+}
+
+static const char *store_list_name(size_t list) {
+    if (list < STORE_CATEGORIES) {
+        return store_category_names[list];
+    }
+    return list == STORE_LIST_ALL ? "ALL PROGRAMS"
+         : list == STORE_LIST_INSTALLED ? "INSTALLED"
+         : "OTHER";
+}
+
+static bool store_in_list(const struct store_item *item, size_t list) {
+    if (list == STORE_LIST_ALL) {
+        return true;
+    }
+    if (list == STORE_LIST_INSTALLED) {
+        return store_item_is(item, "installed")
+            || store_item_is(item, "update");
+    }
+    return store_item_category(item) == list;
+}
+
+static size_t store_list_count(size_t list) {
+    size_t count = 0;
+    for (size_t i = 0; i < store_item_count; i++) {
+        count += store_in_list(&store_items[i], list);
+    }
+    return count;
+}
+
+/* How well item matches the search: 0 by its name, summary or category,
+   1 only by its description, publisher or id, 2 not at all. */
+static int store_match(const struct store_item *item, const char *query) {
+    if (store_contains(item->name, query)
+        || store_contains(item->summary, query)
+        || store_contains(store_list_name(store_item_category(item)),
+                          query)) {
+        return 0;
+    }
+    if (store_contains(item->description, query)
+        || store_contains(item->publisher, query)
+        || store_contains(item->id, query)) {
+        return 1;
+    }
+    return 2;
+}
+
+/* Fills store_shown: the programs matching the search, best matches
+   first, or else those of store_list; each group by name. */
+static void store_filter(void) {
+    static int ranks[STORE_ITEMS_MAX];
+    store_shown_count = 0;
+    for (size_t i = 0; i < store_item_count; i++) {
+        const struct store_item *item = &store_items[i];
+        int rank = store_search.length != 0
+            ? store_match(item, store_search.text)
+            : store_in_list(item, store_list) ? 0 : 2;
+        if (rank == 2) {
+            continue;
+        }
+        size_t at = store_shown_count++;
+        while (at > 0
+               && (ranks[at - 1] > rank
+                   || (ranks[at - 1] == rank
+                       && store_compare(store_items[store_shown[at - 1]].name,
+                                        item->name) > 0))) {
+            store_shown[at] = store_shown[at - 1];
+            ranks[at] = ranks[at - 1];
+            at--;
+        }
+        store_shown[at] = i;
+        ranks[at] = rank;
+    }
+    if (store_selected >= store_shown_count) {
+        store_selected = store_shown_count == 0 ? 0 : store_shown_count - 1;
+    }
+}
+
+/* The featured programs by name (at most STORE_FEATURED_MAX). An index
+   without featured lines (made before store/catalog.txt) gives the first
+   programs by name instead. */
+static size_t store_featured(size_t *out) {
+    size_t count = 0;
+    for (int pass = 0; pass < 2 && count == 0; pass++) {
+        for (size_t i = 0; i < store_item_count; i++) {
+            const struct store_item *item = &store_items[i];
+            if (pass == 0 && !text_equals(item->featured,
+                                          text_length(item->featured),
+                                          "yes")) {
+                continue;
+            }
+            size_t at = count;
+            while (at > 0 && store_compare(store_items[out[at - 1]].name,
+                                           item->name) > 0) {
+                if (at < STORE_FEATURED_MAX) {
+                    out[at] = out[at - 1];
+                }
+                at--;
+            }
+            if (at < STORE_FEATURED_MAX) {
+                out[at] = i;
+                if (count < STORE_FEATURED_MAX) {
+                    count++;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+/* How many category buttons HOME shows. */
+static size_t store_grid_count(void) {
+    return store_list_count(STORE_LIST_OTHER) != 0 ? STORE_GRID_MAX
+                                                   : STORE_GRID_MAX - 1;
+}
+
+/* Whether a category button leads anywhere: ALL and INSTALLED always do,
+   so they can say there is nothing. */
+static bool store_grid_enabled(size_t list) {
+    return list == STORE_LIST_ALL || list == STORE_LIST_INSTALLED
+        || store_list_count(list) != 0;
+}
+
+/* The program ABOUT shows, or NULL (not read yet, or gone). */
+static const struct store_item *store_about_item(void) {
+    for (size_t i = 0; i < store_item_count; i++) {
+        if (text_equals(store_items[i].id, text_length(store_items[i].id),
+                        store_about_id)) {
+            return &store_items[i];
+        }
+    }
+    return NULL;
 }
 
 /* Copies the next tab-separated field of value into out. */
@@ -13731,8 +13966,7 @@ static void store_say(const char *text, size_t length, bool error) {
         length = sizeof(store_message) - 1;
     }
     for (size_t i = 0; i < length; i++) {
-        char c = text[i];
-        store_message[i] = c >= 'a' && c <= 'z' ? (char)(c - 32) : c;
+        store_message[i] = store_upper(text[i]);
     }
     store_message[length] = '\0';
     store_message_error = error;
@@ -13771,12 +14005,14 @@ static void store_line_done(void) {
         store_field(&value, end, item->needs, sizeof(item->needs));
         store_field(&value, end, item->size, sizeof(item->size));
         store_field(&value, end, item->asks, sizeof(item->asks));
+        store_field(&value, end, item->category, sizeof(item->category));
+        store_field(&value, end, item->license, sizeof(item->license));
+        store_field(&value, end, item->featured, sizeof(item->featured));
+        store_field(&value, end, item->requires, sizeof(item->requires));
+        store_field(&value, end, item->summary, sizeof(item->summary));
         store_field(&value, end, item->description,
                     sizeof(item->description));
-        if (!store_installed_only || store_item_is(item, "installed")
-            || store_item_is(item, "update")) {
-            store_item_count++;
-        }
+        store_item_count++;
     } else if (text_equals(key, key_length, "phase")) {
         size_t count = (size_t)(end - value);
         if (count >= sizeof(store_phase)) {
@@ -13867,6 +14103,9 @@ static void store_run(const char *command, const char *id) {
 }
 
 static void store_open(void) {
+    if (store_search.limit == 0) {
+        field_reset(&store_search, STORE_SEARCH_MAX, false);
+    }
     window_open(WINDOW_STORE);
     if (!store_running) {
         store_message[0] = '\0';
@@ -13892,14 +14131,72 @@ static void store_finished(bool started, uint64_t exit_status) {
                   exit_status == 128 + 9 ? "PKG WAS ENDED" : "PKG FAILED");
         store_message_error = true;
     }
-    if (store_selected >= store_item_count) {
-        store_selected = store_item_count == 0 ? 0 : store_item_count - 1;
-    }
+    store_filter();
     if (store_refresh_after) {
         store_refresh_after = false;
         store_run("available", NULL);
     }
 }
+
+/* ---- Moving between pages */
+
+static void store_go(enum store_page page) {
+    store_page = page;
+    store_scroll = 0;
+    store_focus = STORE_FOCUS_PAGE;
+    if (!store_running) {
+        store_message[0] = '\0';
+    }
+}
+
+static void store_open_list(size_t list) {
+    store_list = list;
+    store_selected = 0;
+    store_first = 0;
+    store_search_only = false;
+    field_set(&store_search, "");
+    store_go(STORE_PAGE_LIST);
+    store_filter();
+}
+
+static void store_open_about(size_t index) {
+    if (index >= store_item_count) {
+        return;
+    }
+    text_copy(store_about_id, sizeof(store_about_id), store_items[index].id);
+    store_about_from = store_page;
+    store_about_button = 0;
+    store_go(STORE_PAGE_ABOUT);
+}
+
+/* BACK and Escape: ABOUT goes back where it came from, LIST to HOME. */
+static void store_back(void) {
+    if (store_page == STORE_PAGE_ABOUT) {
+        store_go(store_about_from);
+        store_filter();
+        return;
+    }
+    store_search_only = false;
+    field_set(&store_search, "");
+    store_go(STORE_PAGE_HOME);
+    store_reveal = true;
+}
+
+/* The search field changed: typing shows the results on LIST. */
+static void store_searched(void) {
+    store_selected = 0;
+    store_first = 0;
+    if (store_search.length != 0 && store_page != STORE_PAGE_LIST) {
+        store_search_only = true;
+        store_go(STORE_PAGE_LIST);
+    } else if (store_search.length == 0 && store_search_only) {
+        store_search_only = false;
+        store_go(STORE_PAGE_HOME);
+    }
+    store_filter();
+}
+
+/* ---- Buttons */
 
 static const char *store_action_label(const struct store_item *item) {
     if (store_item_is(item, "update")) {
@@ -13914,48 +14211,206 @@ static const char *store_action_label(const struct store_item *item) {
     return "INSTALL";
 }
 
-static bool store_button_enabled(size_t button) {
-    const struct store_item *item = store_current();
-    switch (button) {
-    case STORE_BUTTON_REFRESH:
-        return !store_running;
-    case STORE_BUTTON_ACTION:
-        return !store_running && item != NULL
-            && !store_item_is(item, "installed");
-    case STORE_BUTTON_REMOVE:
-        return !store_running && item != NULL
-            && (store_item_is(item, "installed")
-                || store_item_is(item, "update"));
-    default:
-        return !store_running && store_update_count != 0;
+/* ABOUT's buttons: 0 INSTALL, UPDATE or UPDATE OPOS; 1 REMOVE. */
+static bool store_about_enabled(size_t button) {
+    const struct store_item *item = store_about_item();
+    if (store_running || item == NULL) {
+        return false;
+    }
+    return button == 0 ? !store_item_is(item, "installed")
+                       : store_item_is(item, "installed")
+                             || store_item_is(item, "update");
+}
+
+static void store_about_press(size_t button) {
+    if (!store_about_enabled(button)) {
+        return;
+    }
+    const struct store_item *item = store_about_item();
+    if (button == 0 && store_item_is(item, "needsopos")) {
+        settings_open_category(CATEGORY_UPDATES);
+        return;
+    }
+    char id[64];
+    text_copy(id, sizeof(id), item->id);
+    store_refresh_after = true;
+    store_run(button == 1 ? "remove"
+              : store_item_is(item, "update") ? "update" : "install", id);
+}
+
+static bool store_bar_enabled(size_t focus) {
+    return !store_running
+        && (focus == STORE_FOCUS_REFRESH || store_update_count != 0);
+}
+
+static void store_bar_press(size_t focus) {
+    if (focus == STORE_FOCUS_PAGE || !store_bar_enabled(focus)) {
+        return;
+    }
+    store_message[0] = '\0';
+    if (focus == STORE_FOCUS_UPDATE_ALL) {
+        store_refresh_after = true;
+        store_run("update", NULL);
+    } else {
+        store_run("available", NULL);
     }
 }
 
-static const char *store_button_label(size_t button) {
-    switch (button) {
-    case STORE_BUTTON_REFRESH:
-        return "REFRESH";
-    case STORE_BUTTON_ACTION:
-        return store_action_label(store_current());
-    case STORE_BUTTON_REMOVE:
-        return "REMOVE";
-    default:
-        return "UPDATE ALL";
+/* ---- Layout */
+
+static struct rect store_back_rect(struct rect area) {
+    return (struct rect){area.x + 16, area.y + 8, 6 * CHAR_WIDTH + 20, 30};
+}
+
+static struct rect store_search_rect(struct rect area) {
+    struct rect back = store_back_rect(area);
+    int64_t left = store_page == STORE_PAGE_HOME ? area.x + 16
+                                                 : back.x + back.width + 8;
+    return (struct rect){left, area.y + 8, area.x + area.width - 16 - left,
+                         30};
+}
+
+/* REFRESH and UPDATE ALL, at the bottom right. */
+static struct rect store_bar_rect(struct rect area, size_t focus) {
+    int64_t update_width = 10 * CHAR_WIDTH + 20;
+    int64_t refresh_width = 7 * CHAR_WIDTH + 20;
+    int64_t right = area.x + area.width - 16;
+    int64_t y = area.y + area.height - 42;
+    if (focus == STORE_FOCUS_UPDATE_ALL) {
+        return (struct rect){right - update_width, y, update_width, 32};
+    }
+    return (struct rect){right - update_width - 8 - refresh_width, y,
+                         refresh_width, 32};
+}
+
+static bool store_error_shown(void) {
+    return !store_running && store_message[0] != '\0' && store_message_error;
+}
+
+/* Where a page draws: below the search field, above the bottom bar (and
+   the error box, when there is one). */
+static struct rect store_page_rect(struct rect area) {
+    int64_t top = area.y + 50;
+    int64_t bottom = area.y + area.height - 52;
+    if (store_error_shown()) {
+        bottom -= STORE_ERROR_HEIGHT + 8;
+    }
+    return (struct rect){area.x + 16, top, area.width - 32,
+                         bottom > top ? bottom - top : 0};
+}
+
+/* Drawing clipped to the page: HOME and ABOUT scroll under its edges. */
+static void store_fill(struct rect page, struct rect box, uint8_t red,
+                       uint8_t green, uint8_t blue) {
+    int64_t top = box.y > page.y ? box.y : page.y;
+    int64_t bottom = box.y + box.height < page.y + page.height
+        ? box.y + box.height : page.y + page.height;
+    if (bottom > top) {
+        fill((struct rect){box.x, top, box.width, bottom - top},
+             red, green, blue);
     }
 }
 
-static struct rect store_button_rect(struct rect area, size_t index) {
-    int64_t width = (area.width - 32 - 3 * 8) / STORE_BUTTON_COUNT;
-    return (struct rect){area.x + 16 + (int64_t)index * (width + 8),
-                         area.y + area.height - 48, width, 34};
+static void store_text(struct rect page, int64_t x, int64_t y, int64_t width,
+                       const char *text, uint8_t red, uint8_t green,
+                       uint8_t blue) {
+    if (y >= page.y && y + CHAR_HEIGHT <= page.y + page.height) {
+        draw_text_clipped(x, y, width, text, red, green, blue);
+    }
 }
 
-/* The list, then the selected program's details above the buttons. */
-static int64_t store_details_top(struct rect area) {
-    return store_button_rect(area, 0).y - 5 * (CHAR_HEIGHT + 6) - 24;
+/* Word-wrapped text; returns the y below its last line. */
+static int64_t store_wrapped(struct rect page, int64_t x, int64_t y,
+                             int64_t width, const char *text, uint8_t red,
+                             uint8_t green, uint8_t blue) {
+    char piece[160];
+    size_t columns = width > CHAR_WIDTH ? (size_t)(width / CHAR_WIDTH) : 1;
+    if (columns >= sizeof(piece)) {
+        columns = sizeof(piece) - 1;
+    }
+    size_t length = text_length(text);
+    size_t start = 0;
+    while (start < length) {
+        size_t end = length - start > columns ? start + columns : length;
+        if (end < length) {
+            size_t space = end;
+            while (space > start && text[space] != ' ') {
+                space--;
+            }
+            if (space > start) {
+                end = space;
+            }
+        }
+        for (size_t i = start; i < end; i++) {
+            piece[i - start] = text[i];
+        }
+        piece[end - start] = '\0';
+        store_text(page, x, y, width, piece, red, green, blue);
+        y += STORE_LINE;
+        start = end;
+        while (start < length && text[start] == ' ') {
+            start++;
+        }
+    }
+    return y;
 }
 
-/* "MAY ASK FOR: NETWORK, CLIPBOARD" from the index's asks line. */
+/* A program's icon: its category's color and the first letter of its
+   name. (Packages carry no icons yet.) */
+static void store_icon(struct rect page, struct rect box,
+                       const struct store_item *item) {
+    const uint8_t *color = store_category_colors[store_item_category(item)];
+    store_fill(page, box, color[0], color[1], color[2]);
+    char letter[2] = {store_upper(item->name[0]), '\0'};
+    store_text(page, box.x + (box.width - CHAR_WIDTH) / 2 + 1,
+               box.y + (box.height - CHAR_HEIGHT) / 2, CHAR_WIDTH, letter,
+               255, 255, 255);
+}
+
+/* The state of item in words ("" for one not installed) and its color. */
+static void store_state_text(const struct store_item *item, char *state,
+                             size_t capacity, uint8_t color[3]) {
+    color[0] = 150, color[1] = 160, color[2] = 185;
+    state[0] = '\0';
+    if (store_running && store_busy_id[0] != '\0'
+        && text_equals(item->id, text_length(item->id), store_busy_id)) {
+        /* Being installed, updated or removed: the first word of @phase
+           (DOWNLOADING, SAVING, INSTALLING) and the percent. */
+        size_t used = 0;
+        while (used < 16 && used + 1 < capacity && store_phase[used] >= 'A'
+               && store_phase[used] <= 'Z') {
+            state[used] = store_phase[used];
+            used++;
+        }
+        state[used] = '\0';
+        if (used == 0) {
+            used = append_text(state, capacity, 0,
+                               store_busy_remove ? "REMOVING" : "WORKING");
+        }
+        used = append_text(state, capacity, used,
+                           store_progress >= 0 ? " " : "...");
+        if (store_progress >= 0) {
+            used = append_decimal(state, capacity, used,
+                                  (uint64_t)store_progress);
+            append_text(state, capacity, used, "%");
+        }
+        color[0] = 151, color[1] = 190, color[2] = 255;
+    } else if (store_item_is(item, "update")) {
+        size_t used = append_text(state, capacity, 0, "UPDATE FROM ");
+        append_text(state, capacity, used, item->installed);
+        color[0] = 240, color[1] = 210, color[2] = 120;
+    } else if (store_item_is(item, "installed")) {
+        text_copy(state, capacity, "INSTALLED");
+        color[0] = 120, color[1] = 220, color[2] = 140;
+    } else if (store_item_is(item, "needsopos")) {
+        size_t used = append_text(state, capacity, 0, "NEEDS OPOS ");
+        used = append_text(state, capacity, used, item->needs);
+        append_text(state, capacity, used, " OR NEWER");
+        color[0] = 255, color[1] = 150, color[2] = 120;
+    }
+}
+
+/* "NETWORK, SHARED FILES" from the index's asks line. */
 static void store_asks_text(const char *asks, char *out, size_t capacity) {
     static const char *const names[][2] = {
         {"net", "NETWORK"},
@@ -13963,7 +14418,8 @@ static void store_asks_text(const char *asks, char *out, size_t capacity) {
         {"files.shared", "SHARED FILES"},
         {"notifications", "NOTIFICATIONS"},
     };
-    size_t used = append_text(out, capacity, 0, "MAY ASK FOR: ");
+    size_t used = 0;
+    out[0] = '\0';
     bool any = false;
     const char *word = asks;
     while (*word != '\0') {
@@ -13989,57 +14445,461 @@ static void store_asks_text(const char *asks, char *out, size_t capacity) {
         word = *stop == ' ' ? stop + 1 : stop;
     }
     if (!any) {
-        append_text(out, capacity, used, "NOTHING BEYOND ITS OWN FILES");
+        append_text(out, capacity, used,
+                    asks[0] == '\0' ? "NOT LISTED"
+                                    : "NOTHING BEYOND ITS OWN FILES");
     }
 }
 
-/* ALL and INSTALLED, right of the column headings. */
-static struct rect store_tab_rect(struct rect area, bool installed) {
-    int64_t width = 11 * CHAR_WIDTH;
-    int64_t right = area.x + area.width - 16;
-    return (struct rect){installed ? right - width : right - 2 * width - 8,
-                         area.y + 40, width, CHAR_HEIGHT + 10};
-}
-
-static void store_show_installed(bool installed) {
-    if (store_running || installed == store_installed_only) {
+/* "12 KB", "3.4 MB" from a size in KB. */
+static void store_size_text(const char *kb_text, char *out, size_t capacity) {
+    uint64_t kb = 0;
+    for (const char *c = kb_text; *c >= '0' && *c <= '9'; c++) {
+        kb = kb * 10 + (uint64_t)(*c - '0');
+    }
+    if (kb < 1024) {
+        size_t used = append_decimal(out, capacity, 0, kb);
+        append_text(out, capacity, used, " KB");
         return;
     }
-    store_installed_only = installed;
-    store_selected = 0;
-    store_message[0] = '\0';
-    store_run("available", NULL);
+    uint64_t tenths = (kb * 10 + 512) / 1024;
+    size_t used = append_decimal(out, capacity, 0, tenths / 10);
+    used = append_text(out, capacity, used, ".");
+    used = append_decimal(out, capacity, used, tenths % 10);
+    append_text(out, capacity, used, " MB");
 }
 
-static struct rect store_row_rect(struct rect area, size_t index) {
-    return (struct rect){area.x + 8,
-                         area.y + 72 + (int64_t)index * STORE_ROW_HEIGHT,
-                         area.width - 16, STORE_ROW_HEIGHT};
+/* HOME: a banner for the first featured program, the featured tiles,
+   then the category buttons. Rects are on screen, scrolled. */
+struct store_home {
+    size_t featured[STORE_FEATURED_MAX];
+    size_t featured_count;
+    struct rect banner; /* height 0 without featured programs */
+    int64_t featured_heading;
+    struct rect tiles[STORE_FEATURED_MAX];
+    int64_t grid_heading;
+    size_t grid_count;
+    struct rect grid[STORE_GRID_MAX];
+    int64_t height; /* of everything, unscrolled */
+};
+
+static void store_home_layout(struct rect page, struct store_home *home) {
+    home->featured_count = store_featured(home->featured);
+    int64_t top = page.y - store_scroll;
+    int64_t y = top;
+    home->banner = (struct rect){page.x, y, page.width, 0};
+    if (home->featured_count != 0) {
+        home->banner.height = 2 * STORE_LINE + 32;
+        y += home->banner.height + 12;
+        home->featured_heading = y;
+        y += STORE_LINE + 4;
+        int64_t width = (page.width - (STORE_FEATURED_MAX - 1) * 8)
+                      / STORE_FEATURED_MAX;
+        int64_t height = 32 + STORE_LINE + 22;
+        for (size_t i = 0; i < home->featured_count; i++) {
+            home->tiles[i] = (struct rect){page.x + (int64_t)i * (width + 8),
+                                           y, width, height};
+        }
+        y += height + 14;
+    }
+    home->grid_heading = y;
+    y += STORE_LINE + 4;
+    home->grid_count = store_grid_count();
+    int64_t width = (page.width - (STORE_GRID_COLUMNS - 1) * 8)
+                  / STORE_GRID_COLUMNS;
+    for (size_t i = 0; i < home->grid_count; i++) {
+        home->grid[i] = (struct rect){
+            page.x + (int64_t)(i % STORE_GRID_COLUMNS) * (width + 8),
+            y + (int64_t)(i / STORE_GRID_COLUMNS) * 38, width, 32};
+    }
+    y += (int64_t)((home->grid_count + STORE_GRID_COLUMNS - 1)
+                   / STORE_GRID_COLUMNS) * 38;
+    home->height = y - top;
 }
 
-static size_t store_rows_fit(struct rect area) {
-    int64_t room = store_details_top(area) - 8 - (area.y + 72);
+static struct rect store_home_focus_rect(const struct store_home *home,
+                                         size_t focus) {
+    return focus < home->featured_count
+        ? home->tiles[focus] : home->grid[focus - home->featured_count];
+}
+
+/* Lays HOME out with the scroll kept in range (and the keyboard's choice
+   in view after a key). */
+static void store_home_fit(struct rect page, struct store_home *home) {
+    store_home_layout(page, home);
+    int64_t limit = home->height - page.height;
+    int64_t want = store_scroll;
+    size_t count = home->featured_count + home->grid_count;
+    if (store_home_focus >= count) {
+        store_home_focus = 0;
+    }
+    if (store_reveal && count != 0) {
+        struct rect box = store_home_focus_rect(home, store_home_focus);
+        int64_t over = box.y - (STORE_LINE + 4) - page.y; /* its heading */
+        int64_t under = box.y + box.height - (page.y + page.height);
+        if (store_home_focus == 0 && home->featured_count != 0) {
+            over = home->banner.y - page.y; /* the top: show the banner */
+        }
+        if (over < 0) {
+            want += over;
+        } else if (under > 0) {
+            want += under;
+        }
+    }
+    store_reveal = false;
+    if (want > limit) {
+        want = limit;
+    }
+    if (want < 0) {
+        want = 0;
+    }
+    if (want != store_scroll) {
+        store_scroll = want;
+        store_home_layout(page, home);
+    }
+}
+
+/* LIST: the heading line, then rows. */
+static struct rect store_row_rect(struct rect page, size_t index) {
+    return (struct rect){page.x - 8,
+                         page.y + STORE_LINE + 6
+                             + (int64_t)index * STORE_ROW_HEIGHT,
+                         page.width + 16, STORE_ROW_HEIGHT};
+}
+
+static size_t store_rows_fit(struct rect page) {
+    int64_t room = page.height - STORE_LINE - 6;
     return room > 0 ? (size_t)(room / STORE_ROW_HEIGHT) : 0;
+}
+
+/* ABOUT: icon, name, publisher and summary, then its two buttons. */
+#define STORE_ABOUT_HEADER (3 * STORE_LINE + 8)
+
+static struct rect store_about_button_rect(struct rect page, size_t button) {
+    int64_t y = page.y - store_scroll + STORE_ABOUT_HEADER + 8;
+    int64_t action_width = 11 * CHAR_WIDTH + 20;
+    return button == 0
+        ? (struct rect){page.x, y, action_width, 32}
+        : (struct rect){page.x + action_width + 8, y, 6 * CHAR_WIDTH + 20,
+                        32};
+}
+
+/* ---- Drawing */
+
+static void store_draw_home(struct rect page, bool focused) {
+    struct store_home home;
+    store_home_fit(page, &home);
+    bool keyboard = focused && store_focus == STORE_FOCUS_PAGE;
+    if (home.featured_count != 0) {
+        const struct store_item *item = &store_items[home.featured[0]];
+        const uint8_t *color =
+            store_category_colors[store_item_category(item)];
+        store_fill(page, home.banner, (uint8_t)(color[0] / 3 + 20),
+                   (uint8_t)(color[1] / 3 + 24), (uint8_t)(color[2] / 3 + 36));
+        struct rect icon = {home.banner.x + 16,
+                            home.banner.y + (home.banner.height - 48) / 2, 48,
+                            48};
+        store_icon(page, icon, item);
+        int64_t text_x = icon.x + icon.width + 16;
+        int64_t text_width = home.banner.x + home.banner.width - 16 - text_x;
+        store_text(page, text_x, home.banner.y + 16, text_width, item->name,
+                   255, 255, 255);
+        store_text(page, text_x, home.banner.y + 16 + STORE_LINE, text_width,
+                   item->summary[0] != '\0' ? item->summary
+                                            : item->description,
+                   210, 220, 240);
+        store_text(page, page.x, home.featured_heading, page.width,
+                   "FEATURED", 151, 190, 255);
+        for (size_t i = 0; i < home.featured_count; i++) {
+            const struct store_item *tile_item = &store_items[home.featured[i]];
+            struct rect tile = home.tiles[i];
+            bool chosen = keyboard && store_home_focus == i;
+            store_fill(page, tile, chosen ? 52 : 34, chosen ? 82 : 42,
+                       chosen ? 140 : 64);
+            store_icon(page, (struct rect){tile.x + (tile.width - 32) / 2,
+                                           tile.y + 8, 32, 32},
+                       tile_item);
+            size_t length = text_length(tile_item->name);
+            int64_t name_width = (int64_t)length * CHAR_WIDTH;
+            if (name_width > tile.width - 12) {
+                name_width = tile.width - 12;
+            }
+            store_text(page, tile.x + (tile.width - name_width) / 2,
+                       tile.y + 8 + 32 + 8, tile.width - 12, tile_item->name,
+                       230, 238, 255);
+        }
+    }
+    store_text(page, page.x, home.grid_heading, page.width, "CATEGORIES",
+               151, 190, 255);
+    for (size_t i = 0; i < home.grid_count; i++) {
+        size_t list = store_grid_lists[i];
+        struct rect button = home.grid[i];
+        bool chosen = keyboard
+            && store_home_focus == home.featured_count + i;
+        bool enabled = store_grid_enabled(list);
+        if (!enabled) {
+            store_fill(page, button, chosen ? 62 : 43, chosen ? 70 : 48,
+                       chosen ? 92 : 60);
+        } else {
+            store_fill(page, button, chosen ? 70 : 43, chosen ? 100 : 56,
+                       chosen ? 160 : 84);
+        }
+        char label[48];
+        size_t used = append_text(label, sizeof(label), 0,
+                                  store_list_name(list));
+        size_t count = store_list_count(list);
+        if (count != 0) {
+            used = append_text(label, sizeof(label), used, " (");
+            used = append_decimal(label, sizeof(label), used, count);
+            append_text(label, sizeof(label), used, ")");
+        }
+        store_text(page, button.x + 10,
+                   button.y + (button.height - CHAR_HEIGHT) / 2,
+                   button.width - 20, label, enabled ? 240 : 110,
+                   enabled ? 245 : 118, enabled ? 255 : 135);
+    }
+}
+
+static void store_draw_list(struct rect page, bool focused) {
+    store_filter();
+    char title[96];
+    size_t used;
+    if (store_search.length != 0) {
+        used = append_text(title, sizeof(title), 0, "RESULTS FOR \"");
+        used = append_text(title, sizeof(title), used, store_search.text);
+        used = append_text(title, sizeof(title), used, "\"");
+    } else {
+        used = append_text(title, sizeof(title), 0,
+                           store_list_name(store_list));
+    }
+    used = append_text(title, sizeof(title), used, "  -  ");
+    used = append_decimal(title, sizeof(title), used, store_shown_count);
+    append_text(title, sizeof(title), used,
+                store_shown_count == 1 ? " PROGRAM" : " PROGRAMS");
+    store_text(page, page.x, page.y, page.width, title, 151, 190, 255);
+    size_t fit = store_rows_fit(page);
+    if (store_selected < store_first) {
+        store_first = store_selected;
+    } else if (fit != 0 && store_selected >= store_first + fit) {
+        store_first = store_selected + 1 - fit;
+    }
+    if (store_first >= store_shown_count) {
+        store_first = 0;
+    }
+    for (size_t i = store_first; i < store_shown_count && i - store_first < fit;
+         i++) {
+        const struct store_item *item = &store_items[store_shown[i]];
+        struct rect row = store_row_rect(page, i - store_first);
+        if (i == store_selected) {
+            bool keyboard = focused && store_focus == STORE_FOCUS_PAGE;
+            fill(row, keyboard ? 52 : 40, keyboard ? 82 : 52,
+                 keyboard ? 140 : 80);
+        }
+        store_icon(page, (struct rect){page.x, row.y + (row.height - 32) / 2,
+                                       32, 32},
+                   item);
+        int64_t text_x = page.x + 44;
+        int64_t text_width = page.x + page.width - text_x;
+        char state[48];
+        uint8_t color[3];
+        store_state_text(item, state, sizeof(state), color);
+        int64_t state_width = (int64_t)text_length(state) * CHAR_WIDTH;
+        if (state_width > text_width / 2) {
+            state_width = text_width / 2;
+        }
+        int64_t name_width = text_width - state_width
+                           - (state_width != 0 ? CHAR_WIDTH : 0);
+        draw_text_clipped(text_x, row.y + 4, name_width, item->name, 230, 238,
+                          255);
+        if (state_width != 0) {
+            draw_text_clipped(text_x + text_width - state_width, row.y + 4,
+                              state_width, state, color[0], color[1],
+                              color[2]);
+        }
+        draw_text_clipped(text_x, row.y + 4 + STORE_LINE, text_width,
+                          item->summary[0] != '\0' ? item->summary
+                                                   : item->description,
+                          160, 170, 195);
+    }
+    if (store_shown_count == 0 && !store_running) {
+        store_wrapped(page, page.x, page.y + STORE_LINE + 12, page.width,
+                      store_search.length != 0
+                          ? "NO PROGRAM IN THE STORE MATCHES THAT."
+                      : store_list == STORE_LIST_INSTALLED
+                          ? "YOU HAVE NOTHING FROM THE OPOS STORE YET."
+                          : "NOTHING THIS OPOS CAN RUN IS HERE YET.",
+                      200, 214, 255);
+    }
+}
+
+static void store_draw_about(struct rect page, bool focused) {
+    const struct store_item *item = store_about_item();
+    if (item == NULL) {
+        store_about_height = 0;
+        store_scroll = 0;
+        store_text(page, page.x, page.y, page.width,
+                   store_running ? "READING THE STORE..."
+                                 : "THIS PROGRAM IS NO LONGER IN THE STORE.",
+                   200, 214, 255);
+        return;
+    }
+    int64_t limit = store_about_height - page.height;
+    if (store_scroll > limit) {
+        store_scroll = limit;
+    }
+    if (store_scroll < 0) {
+        store_scroll = 0;
+    }
+    int64_t top = page.y - store_scroll;
+    store_icon(page, (struct rect){page.x, top + 4, 56, 56}, item);
+    int64_t text_x = page.x + 72;
+    int64_t text_width = page.x + page.width - text_x;
+    store_text(page, text_x, top + 4, text_width, item->name, 255, 255, 255);
+    store_text(page, text_x, top + 4 + STORE_LINE, text_width,
+               item->publisher, 170, 180, 205);
+    store_text(page, text_x, top + 4 + 2 * STORE_LINE, text_width,
+               item->summary, 210, 218, 235);
+    for (size_t i = 0; i < 2; i++) {
+        struct rect button = store_about_button_rect(page, i);
+        if (button.y < page.y || button.y + button.height
+                                     > page.y + page.height) {
+            continue;
+        }
+        const char *label = i == 0 ? store_action_label(item) : "REMOVE";
+        if (!store_about_enabled(i)) {
+            draw_text_button(button, label, false);
+        } else {
+            draw_button(button, label, focused
+                        && store_focus == STORE_FOCUS_PAGE
+                        && store_about_button == i);
+        }
+    }
+    struct rect remove = store_about_button_rect(page, 1);
+    char state[48];
+    uint8_t color[3];
+    store_state_text(item, state, sizeof(state), color);
+    if (store_item_is(item, "installed") && !store_running) {
+        /* Its button already says INSTALLED: say which version. */
+        size_t used = append_text(state, sizeof(state), 0, "VERSION ");
+        append_text(state, sizeof(state), used, item->installed);
+    }
+    store_text(page, remove.x + remove.width + 16,
+               remove.y + (remove.height - CHAR_HEIGHT) / 2,
+               page.x + page.width - (remove.x + remove.width + 16), state,
+               color[0], color[1], color[2]);
+    /* The overview: one line per fact. */
+    char size[24];
+    store_size_text(item->size, size, sizeof(size));
+    char requires[32];
+    if (item->requires[0] != '\0') {
+        size_t used = append_text(requires, sizeof(requires), 0, "OPOS ");
+        used = append_text(requires, sizeof(requires), used, item->requires);
+        append_text(requires, sizeof(requires), used, " OR NEWER");
+    } else {
+        text_copy(requires, sizeof(requires), "ANY OPOS");
+    }
+    char asks[128];
+    store_asks_text(item->asks, asks, sizeof(asks));
+    const char *const facts[][2] = {
+        {"CATEGORY", store_list_name(store_item_category(item))},
+        {"VERSION", item->version},
+        {"SIZE", size},
+        {"LICENSE", item->license[0] != '\0' ? item->license : "NOT LISTED"},
+        {"PUBLISHER", item->publisher},
+        {"NEEDS", requires},
+        {"MAY ASK FOR", asks},
+        {"ID", item->id},
+    };
+    size_t fact_count = sizeof(facts) / sizeof(facts[0]);
+    int64_t y = remove.y + remove.height + 16;
+    struct rect box = {page.x, y, page.width,
+                       (int64_t)fact_count * STORE_LINE + 16};
+    store_fill(page, box, 32, 40, 62);
+    int64_t label_width = 12 * CHAR_WIDTH;
+    for (size_t i = 0; i < fact_count; i++) {
+        int64_t line = box.y + 8 + (int64_t)i * STORE_LINE;
+        store_text(page, box.x + 10, line, label_width, facts[i][0], 150, 160,
+                   185);
+        store_text(page, box.x + 10 + label_width, line,
+                   box.width - 20 - label_width, facts[i][1], 225, 232, 248);
+    }
+    y = box.y + box.height + 16;
+    store_text(page, page.x, y, page.width, "ABOUT THIS PROGRAM", 151, 190,
+               255);
+    y += STORE_LINE + 4;
+    y = store_wrapped(page, page.x, y, page.width,
+                      item->description[0] != '\0' ? item->description
+                      : item->summary[0] != '\0' ? item->summary
+                      : "THE STORE HAS NO DESCRIPTION OF THIS PROGRAM.",
+                      210, 218, 235);
+    store_about_height = y + 8 - top;
 }
 
 static void draw_store(struct rect area, bool focused) {
     fill(area, 24, 30, 46);
+    struct rect page = store_page_rect(area);
+    if (store_item_count == 0 && store_page != STORE_PAGE_ABOUT) {
+        store_wrapped(page, page.x, page.y, page.width,
+                      store_running ? "READING THE STORE..."
+                      : store_message_error
+                          ? "THE STORE COULD NOT BE READ. REFRESH TO TRY "
+                            "AGAIN."
+                          : "NOTHING THIS OPOS CAN RUN IS IN THE STORE YET.",
+                      200, 214, 255);
+    } else if (store_page == STORE_PAGE_HOME) {
+        store_draw_home(page, focused);
+    } else if (store_page == STORE_PAGE_LIST) {
+        store_draw_list(page, focused);
+    } else {
+        store_draw_about(page, focused);
+    }
+    /* The search field (and BACK), above the page. */
+    if (store_page != STORE_PAGE_HOME) {
+        draw_button(store_back_rect(area), "< BACK", false);
+    }
+    struct rect search = store_search_rect(area);
+    bool typing = focused && store_focus == STORE_FOCUS_PAGE
+               && store_page != STORE_PAGE_ABOUT;
+    draw_field(search, &store_search, typing);
+    if (store_search.length == 0) {
+        draw_text_clipped(search.x + 8 + (typing ? CHAR_WIDTH : 0),
+                          search.y + (search.height - CHAR_HEIGHT) / 2,
+                          search.width - 16 - CHAR_WIDTH,
+                          "SEARCH THE OPOS STORE", 110, 120, 150);
+    }
+    /* An error, in full above the bottom bar. */
+    struct rect refresh = store_bar_rect(area, STORE_FOCUS_REFRESH);
+    if (store_error_shown()) {
+        struct rect box = {area.x + 16, refresh.y - 8 - STORE_ERROR_HEIGHT,
+                           area.width - 32, STORE_ERROR_HEIGHT};
+        fill(box, 62, 32, 40);
+        (void)draw_wrapped(box.x + 10, box.y + 6, box.width - 20,
+                           box.y + box.height, store_message, 255, 170, 170);
+    }
+    /* The bottom bar: what is happening, REFRESH and UPDATE ALL. */
     int64_t x = area.x + 16;
-    int64_t width = area.width - 32;
-    /* An error is shown in full in the details box instead. */
-    bool error = !store_running && store_message[0] != '\0'
-        && store_message_error;
-    const char *heading = store_running
-        ? (store_phase[0] != '\0' ? store_phase : "WORKING...")
-        : error ? "THAT DID NOT WORK:"
-        : store_message[0] != '\0' ? store_message
-        : "PROGRAMS FROM THE OPOS STORE. INSTALLING IS FOR YOUR ACCOUNT.";
-    int64_t heading_width = width;
-    if (store_running && store_progress >= 0) {
-        /* Progress bar and percent at the right of the status line. */
-        int64_t bar_width = width / 3 < 240 ? width / 3 : 240;
-        struct rect bar = {x + width - bar_width - 6 * CHAR_WIDTH,
-                           area.y + 12, bar_width, CHAR_HEIGHT + 4};
+    int64_t width = refresh.x - 16 - x;
+    int64_t text_y = refresh.y + (refresh.height - CHAR_HEIGHT) / 2;
+    char status[STORE_TEXT];
+    if (store_running) {
+        text_copy(status, sizeof(status),
+                  store_phase[0] != '\0' ? store_phase : "WORKING...");
+    } else if (store_message[0] != '\0' && !store_message_error) {
+        text_copy(status, sizeof(status), store_message);
+    } else if (store_update_count != 0) {
+        size_t used = append_decimal(status, sizeof(status), 0,
+                                     store_update_count);
+        append_text(status, sizeof(status), used,
+                    store_update_count == 1 ? " UPDATE AVAILABLE"
+                                            : " UPDATES AVAILABLE");
+    } else {
+        text_copy(status, sizeof(status), "INSTALLING IS FOR YOUR ACCOUNT.");
+    }
+    if (store_running && store_progress >= 0 && width > 12 * CHAR_WIDTH) {
+        /* A progress bar and the percent at the right of the status. */
+        int64_t bar_width = width / 3 < 200 ? width / 3 : 200;
+        struct rect bar = {x + width - bar_width - 5 * CHAR_WIDTH,
+                           text_y - 2, bar_width, CHAR_HEIGHT + 4};
         fill(bar, 40, 48, 70);
         fill((struct rect){bar.x, bar.y, bar.width * store_progress / 100,
                            bar.height},
@@ -14048,238 +14908,253 @@ static void draw_store(struct rect area, bool focused) {
         size_t used = append_decimal(percent, sizeof(percent), 0,
                                      (uint64_t)store_progress);
         append_text(percent, sizeof(percent), used, "%");
-        draw_text_clipped(bar.x + bar.width + CHAR_WIDTH, area.y + 14,
-                          5 * CHAR_WIDTH, percent, 230, 238, 255);
-        heading_width = bar.x - x - 2 * CHAR_WIDTH;
+        draw_text_clipped(bar.x + bar.width + CHAR_WIDTH, text_y,
+                          4 * CHAR_WIDTH, percent, 230, 238, 255);
+        width = bar.x - x - CHAR_WIDTH;
     }
-    draw_text_clipped(x, area.y + 14, heading_width, heading,
-                      error ? 255 : 151, error ? 120 : 190,
-                      error ? 120 : 255);
-    static const char *const headings[] = {"PROGRAM", "VERSION", "STATE"};
-    static const int64_t columns[] = {0, 28, 40};
-    for (size_t i = 0; i < 3; i++) {
-        draw_text_clipped(x + columns[i] * CHAR_WIDTH, area.y + 46,
-                          width - columns[i] * CHAR_WIDTH, headings[i],
-                          150, 160, 185);
-    }
-    for (int tab = 0; tab < 2; tab++) {
-        struct rect box = store_tab_rect(area, tab == 1);
-        bool chosen = store_installed_only == (tab == 1);
-        fill(box, chosen ? 52 : 32, chosen ? 82 : 40, chosen ? 140 : 62);
-        draw_text_clipped(box.x + 8, box.y + 5, box.width - 16,
-                          tab == 1 ? "INSTALLED" : "ALL",
-                          chosen ? 245 : 170, chosen ? 248 : 180,
-                          chosen ? 255 : 205);
-    }
-    int64_t details = store_details_top(area);
-    /* Scroll so the selected row stays visible. */
-    size_t fit = store_rows_fit(area);
-    if (store_selected < store_first) {
-        store_first = store_selected;
-    } else if (fit != 0 && store_selected >= store_first + fit) {
-        store_first = store_selected + 1 - fit;
-    }
-    if (store_first >= store_item_count) {
-        store_first = 0;
-    }
-    for (size_t i = store_first; i < store_item_count; i++) {
-        struct rect row = store_row_rect(area, i - store_first);
-        if (row.y + row.height > details - 8) {
-            break;
-        }
-        const struct store_item *item = &store_items[i];
-        if (i == store_selected) {
-            fill(row, focused ? 52 : 40, focused ? 82 : 52,
-                 focused ? 140 : 80);
-        }
-        draw_text_clipped(x, row.y + 5, (columns[1] - 1) * CHAR_WIDTH,
-                          item->name, 230, 238, 255);
-        draw_text_clipped(x + columns[1] * CHAR_WIDTH, row.y + 5,
-                          (columns[2] - columns[1] - 1) * CHAR_WIDTH,
-                          item->version, 200, 205, 220);
-        char state[48];
-        uint8_t r = 150, g = 160, b = 185;
-        if (store_running && store_busy_id[0] != '\0'
-            && text_equals(item->id, text_length(item->id), store_busy_id)) {
-            /* The row being installed, updated or removed. */
-            /* The first word of @phase: DOWNLOADING, SAVING, INSTALLING. */
-            size_t used = 0;
-            while (used < 16 && store_phase[used] >= 'A'
-                   && store_phase[used] <= 'Z') {
-                state[used] = store_phase[used];
-                used++;
-            }
-            state[used] = '\0';
-            if (used == 0) {
-                used = append_text(state, sizeof(state), 0,
-                                   store_busy_remove ? "REMOVING"
-                                                     : "WORKING");
-            }
-            used = append_text(state, sizeof(state), used,
-                               store_progress >= 0 ? " " : "...");
-            if (store_progress >= 0) {
-                used = append_decimal(state, sizeof(state), used,
-                                      (uint64_t)store_progress);
-                append_text(state, sizeof(state), used, "%");
-            }
-            r = 151, g = 190, b = 255;
-        } else if (store_item_is(item, "update")) {
-            size_t used = append_text(state, sizeof(state), 0,
-                                      "UPDATE FROM ");
-            append_text(state, sizeof(state), used, item->installed);
-            r = 240, g = 210, b = 120;
-        } else if (store_item_is(item, "installed")) {
-            text_copy(state, sizeof(state), "INSTALLED");
-            r = 120, g = 220, b = 140;
-        } else if (store_item_is(item, "needsopos")) {
-            size_t used = append_text(state, sizeof(state), 0,
-                                      "NEEDS OPOS ");
-            used = append_text(state, sizeof(state), used, item->needs);
-            append_text(state, sizeof(state), used, " OR NEWER");
-            r = 255, g = 150, b = 120;
+    draw_text_clipped(x, text_y, width, status, 151, 190, 255);
+    for (size_t focus = STORE_FOCUS_REFRESH; focus < STORE_FOCUS_COUNT;
+         focus++) {
+        struct rect button = store_bar_rect(area, focus);
+        const char *label = focus == STORE_FOCUS_REFRESH ? "REFRESH"
+                                                         : "UPDATE ALL";
+        if (!store_bar_enabled(focus)) {
+            draw_text_button(button, label, false);
         } else {
-            text_copy(state, sizeof(state), "");
-        }
-        draw_text_clipped(x + columns[2] * CHAR_WIDTH, row.y + 5,
-                          width - columns[2] * CHAR_WIDTH, state, r, g, b);
-    }
-    if (store_item_count == 0 && !store_running) {
-        draw_text_clipped(x, area.y + 77, width,
-                          store_message_error
-                              ? "THE STORE COULD NOT BE READ. REFRESH TO TRY "
-                                "AGAIN."
-                          : store_installed_only
-                              ? "YOU HAVE NOTHING FROM THE OPOS STORE YET."
-                              : "NOTHING THIS OPOS CAN RUN IS IN THE STORE "
-                                "YET.",
-                          200, 214, 255);
-    }
-    const struct store_item *item = store_current();
-    if (error) {
-        struct rect box = {x, details, width,
-                           store_button_rect(area, 0).y - 10 - details};
-        fill(box, 62, 32, 40);
-        (void)draw_wrapped(box.x + 10, box.y + 6, box.width - 20,
-                           box.y + box.height, store_message,
-                           255, 170, 170);
-    } else if (item != NULL) {
-        struct rect box = {x, details, width,
-                           store_button_rect(area, 0).y - 10 - details};
-        fill(box, 32, 40, 62);
-        char title[128];
-        size_t used = append_text(title, sizeof(title), 0, item->name);
-        used = append_text(title, sizeof(title), used, " (");
-        used = append_text(title, sizeof(title), used, item->id);
-        used = append_text(title, sizeof(title), used, ")  ");
-        used = append_text(title, sizeof(title), used, item->size);
-        append_text(title, sizeof(title), used, " KB");
-        draw_text_clipped(box.x + 10, box.y + 6, box.width - 20, title,
-                          230, 238, 255);
-        char publisher[96] = "PUBLISHER: ";
-        append_text(publisher, sizeof(publisher), text_length(publisher),
-                    item->publisher);
-        draw_text_clipped(box.x + 10, box.y + 6 + CHAR_HEIGHT + 6,
-                          box.width - 20, publisher, 170, 180, 205);
-        int64_t line = box.y + 6 + 2 * (CHAR_HEIGHT + 6);
-        if (item->asks[0] != '\0') {
-            char asks[128];
-            store_asks_text(item->asks, asks, sizeof(asks));
-            draw_text_clipped(box.x + 10, line, box.width - 20, asks,
-                              240, 210, 120);
-            line += CHAR_HEIGHT + 6;
-        }
-        (void)draw_wrapped(box.x + 10, line,
-                           box.width - 20, box.y + box.height,
-                           item->description, 210, 218, 235);
-    }
-    for (size_t i = 0; i < STORE_BUTTON_COUNT; i++) {
-        struct rect button = store_button_rect(area, i);
-        if (!store_button_enabled(i)) {
-            draw_text_button(button, store_button_label(i), false);
-        } else {
-            draw_button(button, store_button_label(i),
-                        focused && i == store_button);
+            draw_button(button, label, focused && store_focus == focus);
         }
     }
 }
 
-static void store_press(size_t button) {
-    if (!store_button_enabled(button)) {
+/* ---- Keys, clicks and the wheel */
+
+static void store_home_activate(size_t focus) {
+    size_t featured[STORE_FEATURED_MAX];
+    size_t featured_count = store_featured(featured);
+    if (focus < featured_count) {
+        store_open_about(featured[focus]);
         return;
     }
-    const struct store_item *item = store_current();
-    switch (button) {
-    case STORE_BUTTON_REFRESH:
-        store_message[0] = '\0';
-        store_run("available", NULL);
-        break;
-    case STORE_BUTTON_ACTION:
-        if (store_item_is(item, "needsopos")) {
-            settings_open_category(CATEGORY_UPDATES);
-        } else {
-            char id[64];
-            text_copy(id, sizeof(id), item->id);
-            store_refresh_after = true;
-            store_run(store_item_is(item, "update") ? "update" : "install",
-                      id);
+    focus -= featured_count;
+    if (focus < store_grid_count() && store_grid_enabled(
+                                          store_grid_lists[focus])) {
+        store_open_list(store_grid_lists[focus]);
+    }
+}
+
+/* Arrows on HOME: across the featured tiles, then the category buttons
+   (three to a row). */
+static void store_home_move(char key) {
+    size_t featured[STORE_FEATURED_MAX];
+    size_t tiles = store_featured(featured);
+    size_t count = tiles + store_grid_count();
+    size_t focus = store_home_focus < count ? store_home_focus : 0;
+    if (key == KEY_RIGHT && focus + 1 < count) {
+        focus++;
+    } else if (key == KEY_LEFT && focus > 0) {
+        focus--;
+    } else if (key == KEY_DOWN) {
+        if (focus < tiles) {
+            focus = tiles < count ? tiles : focus;
+        } else if (focus + STORE_GRID_COLUMNS < count) {
+            focus += STORE_GRID_COLUMNS;
         }
-        break;
-    case STORE_BUTTON_REMOVE: {
-        char id[64];
-        text_copy(id, sizeof(id), item->id);
-        store_refresh_after = true;
-        store_run("remove", id);
-        break;
+    } else if (key == KEY_UP) {
+        if (focus >= tiles + STORE_GRID_COLUMNS) {
+            focus -= STORE_GRID_COLUMNS;
+        } else if (focus >= tiles && tiles != 0) {
+            focus = 0;
+        }
     }
-    default:
-        store_refresh_after = true;
-        store_run("update", NULL);
-        break;
+    store_home_focus = focus;
+    store_reveal = true;
+}
+
+static void store_list_move(char key) {
+    store_filter();
+    size_t page = 5;
+    if (key == KEY_UP && store_selected > 0) {
+        store_selected--;
+    } else if (key == KEY_DOWN && store_selected + 1 < store_shown_count) {
+        store_selected++;
+    } else if (key == KEY_PAGE_UP) {
+        store_selected = store_selected > page ? store_selected - page : 0;
+    } else if (key == KEY_PAGE_DOWN && store_shown_count != 0) {
+        store_selected = store_selected + page < store_shown_count
+            ? store_selected + page : store_shown_count - 1;
+    } else if (key == KEY_HOME) {
+        store_selected = 0;
+    } else if (key == KEY_END && store_shown_count != 0) {
+        store_selected = store_shown_count - 1;
     }
+}
+
+static bool store_navigation_key(char key) {
+    return key == KEY_UP || key == KEY_DOWN || key == KEY_LEFT
+        || key == KEY_RIGHT || key == KEY_PAGE_UP || key == KEY_PAGE_DOWN
+        || key == KEY_HOME || key == KEY_END;
 }
 
 static void store_key(char character) {
-    if (character == KEY_UP && store_selected > 0) {
-        store_selected--;
-        store_message[0] = '\0';
-    } else if (character == KEY_DOWN && store_selected + 1 < store_item_count) {
-        store_selected++;
-        store_message[0] = '\0';
-    } else if (character == KEY_LEFT) {
-        store_button = (store_button + STORE_BUTTON_COUNT - 1)
-                     % STORE_BUTTON_COUNT;
-    } else if (character == KEY_RIGHT) {
-        store_button = (store_button + 1) % STORE_BUTTON_COUNT;
-    } else if (character == '\n' || character == ' ') {
-        store_press(store_button);
-    } else if (character == '\t') {
-        store_show_installed(!store_installed_only);
+    if (character == '\t') {
+        store_focus = (store_focus + 1) % STORE_FOCUS_COUNT;
+        return;
+    }
+    if (store_focus != STORE_FOCUS_PAGE) {
+        if (character == '\n' || character == ' ') {
+            store_bar_press(store_focus);
+        } else if (character == KEY_LEFT || character == KEY_RIGHT) {
+            store_focus = store_focus == STORE_FOCUS_REFRESH
+                ? STORE_FOCUS_UPDATE_ALL : STORE_FOCUS_REFRESH;
+        } else if (character == KEY_ESCAPE) {
+            store_focus = STORE_FOCUS_PAGE;
+        }
+        return;
+    }
+    if (character == KEY_ESCAPE) {
+        if (store_page != STORE_PAGE_HOME) {
+            store_back();
+        }
+        return;
+    }
+    if (store_navigation_key(character) || character == '\n') {
+        if (store_page == STORE_PAGE_HOME) {
+            if (character == '\n') {
+                store_home_activate(store_home_focus);
+            } else {
+                store_home_move(character);
+            }
+        } else if (store_page == STORE_PAGE_LIST) {
+            if (character == '\n') {
+                store_filter();
+                if (store_selected < store_shown_count) {
+                    store_open_about(store_shown[store_selected]);
+                }
+            } else {
+                store_list_move(character);
+            }
+        } else if (character == KEY_LEFT || character == KEY_RIGHT) {
+            store_about_button = 1 - store_about_button;
+        } else if (character == '\n') {
+            store_about_press(store_about_button);
+        } else {
+            int64_t step = character == KEY_UP ? -STORE_LINE
+                : character == KEY_DOWN ? STORE_LINE
+                : character == KEY_PAGE_UP ? -8 * STORE_LINE
+                : character == KEY_PAGE_DOWN ? 8 * STORE_LINE
+                : character == KEY_HOME ? -store_about_height
+                : store_about_height;
+            store_scroll += step; /* kept in range when drawn */
+            if (store_scroll < 0) {
+                store_scroll = 0;
+            }
+        }
+        return;
+    }
+    if (character == ' ' && store_search.length == 0) {
+        if (store_page == STORE_PAGE_ABOUT) {
+            store_about_press(store_about_button);
+        }
+        return;
+    }
+    if (field_key(&store_search, character)) {
+        store_searched();
     }
 }
 
 static void store_click(struct rect area, int32_t x, int32_t y) {
-    for (int tab = 0; tab < 2; tab++) {
-        if (rect_contains(store_tab_rect(area, tab == 1), x, y)) {
-            store_show_installed(tab == 1);
+    if (store_page != STORE_PAGE_HOME
+        && rect_contains(store_back_rect(area), x, y)) {
+        store_back();
+        return;
+    }
+    if (rect_contains(store_search_rect(area), x, y)) {
+        store_focus = STORE_FOCUS_PAGE;
+        return;
+    }
+    for (size_t focus = STORE_FOCUS_REFRESH; focus < STORE_FOCUS_COUNT;
+         focus++) {
+        if (rect_contains(store_bar_rect(area, focus), x, y)) {
+            store_focus = focus;
+            store_bar_press(focus);
             return;
         }
     }
-    for (size_t i = 0; i < STORE_BUTTON_COUNT; i++) {
-        if (rect_contains(store_button_rect(area, i), x, y)) {
-            store_button = i;
-            store_press(i);
+    struct rect page = store_page_rect(area);
+    if (!rect_contains(page, x, y) && store_page != STORE_PAGE_LIST) {
+        return;
+    }
+    store_focus = STORE_FOCUS_PAGE;
+    if (store_page == STORE_PAGE_HOME) {
+        struct store_home home;
+        store_home_fit(page, &home);
+        if (home.featured_count != 0 && rect_contains(home.banner, x, y)) {
+            store_open_about(home.featured[0]);
             return;
         }
-    }
-    int64_t details = store_details_top(area);
-    for (size_t i = store_first; i < store_item_count; i++) {
-        struct rect row = store_row_rect(area, i - store_first);
-        if (row.y + row.height <= details - 8 && rect_contains(row, x, y)) {
-            store_selected = i;
-            store_message[0] = '\0';
-            return;
+        for (size_t i = 0; i < home.featured_count + home.grid_count; i++) {
+            if (rect_contains(store_home_focus_rect(&home, i), x, y)) {
+                store_home_focus = i;
+                store_home_activate(i);
+                return;
+            }
+        }
+    } else if (store_page == STORE_PAGE_LIST) {
+        store_filter();
+        size_t fit = store_rows_fit(page);
+        for (size_t i = store_first;
+             i < store_shown_count && i - store_first < fit; i++) {
+            if (rect_contains(store_row_rect(page, i - store_first), x, y)) {
+                store_selected = i;
+                store_open_about(store_shown[i]);
+                return;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(store_about_button_rect(page, i), x, y)) {
+                store_about_button = i;
+                store_about_press(i);
+                return;
+            }
         }
     }
+}
+
+/* The wheel (positive notches scroll up). */
+static bool store_wheel(struct rect area, int32_t notches) {
+    struct rect page = store_page_rect(area);
+    if (store_page == STORE_PAGE_LIST) {
+        store_filter();
+        size_t fit = store_rows_fit(page);
+        if (fit == 0 || store_shown_count <= fit) {
+            return false;
+        }
+        int64_t first = (int64_t)store_first - (int64_t)notches;
+        int64_t last = (int64_t)(store_shown_count - fit);
+        store_first = first < 0 ? 0 : first > last ? (size_t)last
+                                                   : (size_t)first;
+        /* The selection moves along, so drawing keeps this position. */
+        if (store_selected < store_first) {
+            store_selected = store_first;
+        } else if (store_selected >= store_first + fit) {
+            store_selected = store_first + fit - 1;
+        }
+        return true;
+    }
+    int64_t before = store_scroll;
+    store_scroll -= (int64_t)notches * 3 * STORE_LINE;
+    if (store_scroll < 0) {
+        store_scroll = 0;
+    }
+    if (store_page == STORE_PAGE_HOME) {
+        struct store_home home;
+        store_home_fit(page, &home);
+    } else if (store_scroll > store_about_height - page.height) {
+        store_scroll = store_about_height > page.height
+            ? store_about_height - page.height : 0;
+    }
+    return store_scroll != before;
 }
 
 /*
@@ -14528,6 +15403,9 @@ static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
             files_selection = files_scroll + visible - 1;
         }
         return true;
+    }
+    if (kind == WINDOW_STORE) {
+        return store_wheel(area, notches);
     }
     if (kind == WINDOW_TERMINAL) {
         size_t before = terminal_scroll;

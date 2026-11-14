@@ -366,7 +366,7 @@ store:
 	done
 	rm -rf $(BUILD)/store_opk/work-*
 	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
-		--descriptions store/descriptions.txt $(BUILD)/store_opk
+		--catalog store/catalog.txt $(BUILD)/store_opk
 	rm -rf $(BUILD)/store_opk
 
 clean:

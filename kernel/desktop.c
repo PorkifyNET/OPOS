@@ -105,6 +105,11 @@ static const char *window_title(enum window_kind kind) {
 
 struct window {
     bool open;
+    /* A minimized window keeps its taskbar button and its tile slot, but
+       leaves z_order, so it is not drawn, hit or focused. */
+    bool minimized;
+    /* A maximized window covers the whole desktop area, in either layout. */
+    bool maximized;
     struct rect floating;
 };
 
@@ -301,6 +306,16 @@ static void fill(struct rect area, uint8_t red, uint8_t green, uint8_t blue) {
     console_draw_rectangle((uint64_t)area.x, (uint64_t)area.y,
                            (uint64_t)area.width, (uint64_t)area.height,
                            red, green, blue);
+}
+
+/* A grey square outline, 2 px thick at the top like a window's title. */
+static void draw_frame_outline(struct rect area, uint8_t shade) {
+    fill((struct rect){area.x, area.y, area.width, 2}, shade, shade, shade);
+    fill((struct rect){area.x, area.y + area.height - 1, area.width, 1},
+         shade, shade, shade);
+    fill((struct rect){area.x, area.y, 1, area.height}, shade, shade, shade);
+    fill((struct rect){area.x + area.width - 1, area.y, 1, area.height},
+         shade, shade, shade);
 }
 
 static bool rect_contains(struct rect area, int32_t x, int32_t y) {
@@ -1823,10 +1838,28 @@ static struct rect workspace_area(void) {
  * Dwindle layout: each window takes half of the remaining area, split along
  * the longer side, and the last window takes whatever is left.
  */
+/* Minimized windows give their tile to the others. */
+static bool tile_hidden(size_t index) {
+    return windows[tile_order[index]].minimized;
+}
+
+/* True when no shown tile follows tile_order[index]. */
+static bool tile_last(size_t index) {
+    for (size_t i = index + 1; i < tile_count; i++) {
+        if (!tile_hidden(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static struct rect tiled_rect(enum window_kind kind) {
     struct rect area = workspace_area();
     for (size_t i = 0; i < tile_count; i++) {
-        if (i + 1 == tile_count) {
+        if (tile_hidden(i)) {
+            continue;
+        }
+        if (tile_last(i)) {
             return area;
         }
         struct rect first = area;
@@ -1877,6 +1910,9 @@ static void windows_fit_screen(void) {
 }
 
 static struct rect window_rect(enum window_kind kind) {
+    if (windows[kind].maximized) {
+        return desktop_area();
+    }
     return tiled_layout ? tiled_rect(kind) : windows[kind].floating;
 }
 
@@ -1885,9 +1921,23 @@ static struct rect title_rect(struct rect frame) {
                          frame.width - 2 * BORDER, TITLE_HEIGHT};
 }
 
+/* Title bar buttons, right to left: close, maximize, minimize. */
+static struct rect title_button_rect(struct rect frame, int64_t index) {
+    return (struct rect){
+        frame.x + frame.width - BORDER - (index + 1) * TITLE_HEIGHT,
+        frame.y + BORDER, TITLE_HEIGHT, TITLE_HEIGHT};
+}
+
 static struct rect close_rect(struct rect frame) {
-    return (struct rect){frame.x + frame.width - BORDER - TITLE_HEIGHT,
-                         frame.y + BORDER, TITLE_HEIGHT, TITLE_HEIGHT};
+    return title_button_rect(frame, 0);
+}
+
+static struct rect maximize_rect(struct rect frame) {
+    return title_button_rect(frame, 1);
+}
+
+static struct rect minimize_rect(struct rect frame) {
+    return title_button_rect(frame, 2);
 }
 
 static struct rect content_rect(struct rect frame) {
@@ -1901,6 +1951,12 @@ static bool window_focused(enum window_kind kind) {
 }
 
 static void window_raise(enum window_kind kind) {
+    /* Raising a minimized window restores it on top. */
+    if (windows[kind].open && windows[kind].minimized) {
+        windows[kind].minimized = false;
+        z_order[z_count++] = kind;
+        return;
+    }
     size_t index = 0;
     while (index < z_count && z_order[index] != kind) {
         index++;
@@ -1973,6 +2029,8 @@ static void window_close(enum window_kind kind) {
         editor_reset();
     }
     windows[kind].open = false;
+    windows[kind].minimized = false;
+    windows[kind].maximized = false;
     /* Its split goes with it; the other windows keep their sizes. */
     for (size_t i = 0; i < tile_count; i++) {
         if (tile_order[i] == kind) {
@@ -1985,6 +2043,24 @@ static void window_close(enum window_kind kind) {
     remove_from(z_order, &z_count, kind);
     remove_from(tile_order, &tile_count, kind);
     remove_from(bar_order, &bar_count, kind);
+}
+
+/* Hides a window until its taskbar button (or anything that raises it)
+   brings it back; the next window down gets the focus. */
+static void window_minimize(enum window_kind kind) {
+    if (!windows[kind].open || windows[kind].minimized) {
+        return;
+    }
+    windows[kind].minimized = true;
+    remove_from(z_order, &z_count, kind);
+}
+
+static void window_toggle_maximize(enum window_kind kind) {
+    if (!windows[kind].open) {
+        return;
+    }
+    windows[kind].maximized = !windows[kind].maximized;
+    window_raise(kind);
 }
 
 /* Returns the topmost window under the pointer, or WINDOW_COUNT. */
@@ -8282,12 +8358,30 @@ static void draw_window(enum window_kind kind) {
     struct rect title = title_rect(frame);
     fill(title, focused ? 36 : 30, focused ? 52 : 36, focused ? 86 : 52);
     draw_text_clipped(title.x + 10, title.y + 5,
-                      title.width - TITLE_HEIGHT - 20, window_title(kind),
+                      title.width - 3 * TITLE_HEIGHT - 20, window_title(kind),
                       245, 248, 255);
     struct rect close = close_rect(frame);
     fill(close, focused ? 190 : 80, focused ? 70 : 60, focused ? 80 : 70);
     draw_text_clipped(close.x + 8, close.y + 5, CHAR_WIDTH, "X",
                       255, 255, 255);
+    /* Maximize: a square outline; restore: two overlapping ones. */
+    struct rect maximize = maximize_rect(frame);
+    uint8_t icon = focused ? 235 : 170;
+    if (windows[kind].maximized) {
+        draw_frame_outline((struct rect){maximize.x + 11, maximize.y + 7,
+                                         10, 10}, icon);
+        fill((struct rect){maximize.x + 7, maximize.y + 11, 10, 10},
+             focused ? 36 : 30, focused ? 52 : 36, focused ? 86 : 52);
+        draw_frame_outline((struct rect){maximize.x + 7, maximize.y + 11,
+                                         10, 10}, icon);
+    } else {
+        draw_frame_outline((struct rect){maximize.x + 8, maximize.y + 8,
+                                         12, 12}, icon);
+    }
+    /* Minimize: a bar near the bottom. */
+    struct rect minimize = minimize_rect(frame);
+    fill((struct rect){minimize.x + 8, minimize.y + 18, 12, 2},
+         icon, icon, icon);
 
     struct rect content = content_rect(frame);
     switch (kind) {
@@ -11182,6 +11276,13 @@ enum drag_mode {
     DRAG_TERMINAL /* a text selection in the Terminal */
 };
 
+/* A second title bar click this soon (in ticks) toggles maximize. */
+#define TITLE_DOUBLE_CLICK_TICKS 50
+static enum window_kind title_last_kind = WINDOW_COUNT;
+static uint64_t title_last_tick;
+/* Pixels a maximized window's title must be dragged before it restores. */
+#define MAXIMIZED_DRAG_START 6
+
 #define EDGE_LEFT 1
 #define EDGE_RIGHT 2
 #define EDGE_TOP 4
@@ -11253,6 +11354,12 @@ static bool resize_start(int32_t x, int32_t y, struct drag_state *drag) {
     }
     for (size_t i = z_count; i != 0; i--) {
         enum window_kind kind = z_order[i - 1];
+        if (windows[kind].maximized) {
+            if (rect_contains(window_rect(kind), x, y)) {
+                return false;
+            }
+            continue;
+        }
         struct rect frame = windows[kind].floating;
         unsigned edges = resize_edges(frame, x, y);
         if (edges != 0) {
@@ -11340,8 +11447,16 @@ static bool split_start(int32_t x, int32_t y, struct drag_state *drag) {
     if (!tiled_layout || tile_count < 2) {
         return false;
     }
+    /* The gaps are covered while a maximized window is on top. */
+    enum window_kind top = window_at(x, y);
+    if (top != WINDOW_COUNT && windows[top].maximized) {
+        return false;
+    }
     struct rect area = workspace_area();
     for (size_t i = 0; i + 1 < tile_count; i++) {
+        if (tile_hidden(i) || tile_last(i)) {
+            continue;
+        }
         bool vertical = area.width >= area.height;
         struct rect gap;
         struct rect next = area;
@@ -11520,7 +11635,13 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
             for (size_t i = 0; i < bar_count; i++) {
                 if (task_button_fits(task_button_rect(i))
                     && rect_contains(task_button_rect(i), x, y)) {
-                    window_raise(bar_order[i]);
+                    /* The focused window's button minimizes it; any
+                       other button brings its window to the front. */
+                    if (window_focused(bar_order[i])) {
+                        window_minimize(bar_order[i]);
+                    } else {
+                        window_raise(bar_order[i]);
+                    }
                     /* Dragging the button along the bar reorders it. */
                     drag->active = true;
                     drag->mode = DRAG_TASKBAR;
@@ -11543,13 +11664,26 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     struct rect frame = window_rect(kind);
     if (rect_contains(close_rect(frame), x, y)) {
         window_close(kind);
+    } else if (rect_contains(maximize_rect(frame), x, y)) {
+        window_toggle_maximize(kind);
+    } else if (rect_contains(minimize_rect(frame), x, y)) {
+        window_minimize(kind);
     } else if (rect_contains(title_rect(frame), x, y)) {
-        if (!tiled_layout) {
+        uint64_t now = timer_ticks();
+        bool double_click = title_last_kind == kind
+            && now - title_last_tick <= TITLE_DOUBLE_CLICK_TICKS;
+        title_last_kind = double_click ? WINDOW_COUNT : kind;
+        title_last_tick = now;
+        if (double_click) {
+            window_toggle_maximize(kind);
+        } else if (!tiled_layout) {
             drag->active = true;
             drag->mode = DRAG_MOVE;
             drag->kind = kind;
             drag->offset_x = x - (int32_t)frame.x;
             drag->offset_y = y - (int32_t)frame.y;
+            drag->start_x = x;
+            drag->start_y = y;
         }
     } else if (kind == WINDOW_FILES) {
         if (files_click(content_rect(frame), x, y)
@@ -11582,8 +11716,24 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     return DESKTOP_CONTINUE;
 }
 
-static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
+static bool handle_drag(struct drag_state *drag, int32_t x, int32_t y) {
     struct rect *frame = &windows[drag->kind].floating;
+    bool restored = false;
+    if (windows[drag->kind].maximized) {
+        /* Dragging a maximized window's title restores it once the
+           pointer really moves, keeping the grab point's relative spot. */
+        int32_t dx = x - drag->start_x;
+        int32_t dy = y - drag->start_y;
+        if (dx * dx + dy * dy < MAXIMIZED_DRAG_START * MAXIMIZED_DRAG_START) {
+            return false;
+        }
+        struct rect maximized = window_rect(drag->kind);
+        int64_t into = maximized.width > 0
+            ? (int64_t)drag->offset_x * frame->width / maximized.width : 0;
+        windows[drag->kind].maximized = false;
+        restored = true;
+        drag->offset_x = (int32_t)into;
+    }
     int64_t new_x = x - drag->offset_x;
     int64_t new_y = y - drag->offset_y;
     struct rect area = desktop_area();
@@ -11601,7 +11751,7 @@ static bool handle_drag(const struct drag_state *drag, int32_t x, int32_t y) {
     if (new_y > max_y) {
         new_y = max_y;
     }
-    if (new_x == frame->x && new_y == frame->y) {
+    if (new_x == frame->x && new_y == frame->y && !restored) {
         return false;
     }
     frame->x = new_x;
@@ -11816,6 +11966,9 @@ static void resize_focused(char direction) {
     }
     enum window_kind kind = z_order[z_count - 1];
     bool grow = direction == KEY_RIGHT || direction == KEY_DOWN;
+    if (windows[kind].maximized) {
+        return;
+    }
     if (!tiled_layout) {
         struct drag_state drag = {0};
         drag.kind = kind;
@@ -11837,9 +11990,19 @@ static void resize_focused(char direction) {
     if (index == tile_count || tile_count < 2) {
         return;
     }
-    /* The last window has no split; it grows when the one before shrinks. */
-    size_t split = index + 1 < tile_count ? index : index - 1;
-    bool larger = index + 1 < tile_count ? grow : !grow;
+    /* The last shown window has no split; it grows when the shown one
+       before it shrinks. Minimized windows have no tile. */
+    size_t split = index;
+    bool larger = grow;
+    if (tile_last(index)) {
+        do {
+            if (split == 0) {
+                return;
+            }
+            split--;
+        } while (tile_hidden(split));
+        larger = !grow;
+    }
     int ratio = split_ratio[split] + (larger ? SPLIT_KEY_STEP : -SPLIT_KEY_STEP);
     if (ratio < SPLIT_MIN) {
         ratio = SPLIT_MIN;
@@ -11877,6 +12040,18 @@ static enum desktop_result handle_super_key(char character) {
     case 'Q':
         if (z_count != 0) {
             window_close(z_order[z_count - 1]);
+        }
+        break;
+    case 'f':
+    case 'F':
+        if (z_count != 0) {
+            window_toggle_maximize(z_order[z_count - 1]);
+        }
+        break;
+    case 'm':
+    case 'M':
+        if (z_count != 0) {
+            window_minimize(z_order[z_count - 1]);
         }
         break;
     case '\n':
@@ -12252,7 +12427,7 @@ static void apps_mouse_update(int32_t x, int32_t y, uint8_t buttons) {
 /* Tells a program when its content area changes size. */
 static void app_check_resize(size_t slot) {
     struct app_window *window = &app_windows[slot];
-    if (!app_window_live(slot)) {
+    if (!app_window_live(slot) || windows[WINDOW_APP + slot].minimized) {
         return;
     }
     struct rect area = app_content(slot);
@@ -15593,6 +15768,8 @@ void desktop_run(void) {
 
     for (size_t i = 0; i < WINDOW_COUNT; i++) {
         windows[i].open = false;
+        windows[i].minimized = false;
+        windows[i].maximized = false;
         windows[i].floating.width = 0;
         split_ratio[i] = SPLIT_DEFAULT;
     }

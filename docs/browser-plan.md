@@ -9,7 +9,7 @@ The browser is a native SDK program, `/bin/browser`, built from `sdk/browser/`. 
 - The system font is a 5x9 ASCII bitmap at integer scales. The browser uses stb_truetype and the Noto Sans fonts in `/share/fonts/` instead.
 - SDK programs are compiled with SSE enabled, so `float` and `double` work for layout. The SDK `printf` cannot print floating-point numbers.
 - There is no JavaScript engine. Pages that need JavaScript will render poorly or not at all. This is expected, and the plan does not include JavaScript until much later.
-- A program may map at most 64 MiB (`USER_MMAP_MAX_PAGES`).
+- A program may map at most 1 GiB (`USER_MMAP_MAX_PAGES`; 64 MiB before OPOS 0.6.0), as far as free memory allows.
 - The network stack is polled and socket calls move at most 64 KiB each, so large pages load slowly. RX interrupts would help and are a separate task.
 
 ## Milestones

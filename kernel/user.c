@@ -83,7 +83,14 @@
 #define USER_EXEC_VECTOR_MAX 64
 #define USER_EXEC_STRING_MAX 2048
 #define USER_MMAP_BASE 0x10000000ULL
-#define USER_MMAP_MAX_PAGES 16384
+/*
+ * The mmap area: 1 GiB of address space per program. Its page table is
+ * kept in chunk pages, allocated only for the parts a program maps, so
+ * the limit costs no kernel memory until a program uses it.
+ */
+#define USER_MMAP_MAX_PAGES 262144
+#define USER_MMAP_CHUNK_PAGES (PAGE_SIZE / sizeof(struct user_mmap_entry))
+#define USER_MMAP_CHUNKS (USER_MMAP_MAX_PAGES / USER_MMAP_CHUNK_PAGES)
 #define USER_MMAP_ANONYMOUS 0x20
 #define USER_MMAP_PRIVATE 0x02
 #define USER_MMAP_FIXED 0x10
@@ -349,6 +356,13 @@ struct user_signal_frame {
     uint8_t fpu_state[SCHEDULER_FPU_STATE_SIZE] __attribute__((aligned(16)));
 };
 
+/* One page of the mmap area: its physical page (0: free) and paging
+   flags (USER_MMAP_RESERVED: allocated, not mapped). */
+struct user_mmap_entry {
+    uint64_t page;
+    uint64_t flags;
+};
+
 struct user_process {
     uint64_t id;
     enum user_process_state state;
@@ -368,8 +382,9 @@ struct user_process {
     uintptr_t heap_base;
     uint64_t heap_pages[USER_HEAP_MAX_PAGES];
     size_t heap_page_count;
-    uint64_t mmap_pages[USER_MMAP_MAX_PAGES];
-    uint64_t mmap_flags[USER_MMAP_MAX_PAGES];
+    /* Physical addresses of the mmap chunk pages (0: none yet). Read and
+       change entries with user_mmap_page/user_mmap_flags/user_mmap_set. */
+    uint64_t mmap_chunks[USER_MMAP_CHUNKS];
     uint64_t address_space;
     struct user_image_segment image_segments[ELF_MAX_LOAD_SEGMENTS];
     size_t image_segment_count;
@@ -822,6 +837,145 @@ static bool restore_kernel_address_space(uint64_t kernel_address_space,
     return paging_address_space_destroy(process_address_space);
 }
 
+/* The entries of mmap chunk CHUNK, or NULL when it has none yet. */
+static struct user_mmap_entry *user_mmap_chunk(const struct user_process *process,
+                                               size_t chunk) {
+    uint64_t physical = process->mmap_chunks[chunk];
+    return physical == 0 ? NULL
+                         : (struct user_mmap_entry *)physical_page_to_hhdm(physical);
+}
+
+static uint64_t user_mmap_page(const struct user_process *process, size_t index) {
+    const struct user_mmap_entry *chunk =
+        user_mmap_chunk(process, index / USER_MMAP_CHUNK_PAGES);
+    return chunk == NULL ? 0 : chunk[index % USER_MMAP_CHUNK_PAGES].page;
+}
+
+static uint64_t user_mmap_flags(const struct user_process *process, size_t index) {
+    const struct user_mmap_entry *chunk =
+        user_mmap_chunk(process, index / USER_MMAP_CHUNK_PAGES);
+    return chunk == NULL ? 0 : chunk[index % USER_MMAP_CHUNK_PAGES].flags;
+}
+
+/*
+ * Gives every page in [first, first + count) a chunk, so user_mmap_set
+ * cannot fail there. False when out of memory; chunks it added stay and
+ * are freed by user_mmap_trim.
+ */
+static bool user_mmap_prepare(struct user_process *process, size_t first,
+                              size_t count) {
+    if (count == 0) {
+        return true;
+    }
+    for (size_t chunk = first / USER_MMAP_CHUNK_PAGES;
+         chunk <= (first + count - 1) / USER_MMAP_CHUNK_PAGES; chunk++) {
+        if (process->mmap_chunks[chunk] != 0) {
+            continue;
+        }
+        uint64_t physical = physical_page_alloc();
+        uint8_t *bytes = physical == 0 ? NULL : physical_page_to_hhdm(physical);
+        if (bytes == NULL) {
+            if (physical != 0) {
+                (void)physical_page_free(physical);
+            }
+            return false;
+        }
+        for (size_t i = 0; i < PAGE_SIZE; i++) {
+            bytes[i] = 0;
+        }
+        process->mmap_chunks[chunk] = physical;
+    }
+    return true;
+}
+
+/* Sets an entry whose chunk exists (user_mmap_prepare), or clears one. */
+static void user_mmap_set(struct user_process *process, size_t index,
+                          uint64_t page, uint64_t flags) {
+    struct user_mmap_entry *chunk =
+        user_mmap_chunk(process, index / USER_MMAP_CHUNK_PAGES);
+    if (chunk != NULL) {
+        chunk[index % USER_MMAP_CHUNK_PAGES] =
+            (struct user_mmap_entry) { .page = page, .flags = flags };
+    }
+}
+
+/* Frees the chunks in [first, first + count) that hold no pages. */
+static void user_mmap_trim(struct user_process *process, size_t first,
+                           size_t count) {
+    if (count == 0) {
+        return;
+    }
+    for (size_t chunk = first / USER_MMAP_CHUNK_PAGES;
+         chunk <= (first + count - 1) / USER_MMAP_CHUNK_PAGES; chunk++) {
+        const struct user_mmap_entry *entries = user_mmap_chunk(process, chunk);
+        if (entries == NULL) {
+            continue;
+        }
+        bool empty = true;
+        for (size_t i = 0; empty && i < USER_MMAP_CHUNK_PAGES; i++) {
+            empty = entries[i].page == 0 && entries[i].flags == 0;
+        }
+        if (empty && physical_page_free(process->mmap_chunks[chunk])) {
+            process->mmap_chunks[chunk] = 0;
+        }
+    }
+}
+
+/*
+ * The first index of COUNT free pages in a row, or USER_MMAP_MAX_PAGES.
+ * A chunk not allocated yet is free throughout.
+ */
+static size_t user_mmap_find_free(const struct user_process *process,
+                                  size_t count) {
+    size_t run = 0;
+    size_t index = 0;
+    while (index < USER_MMAP_MAX_PAGES) {
+        const struct user_mmap_entry *chunk =
+            user_mmap_chunk(process, index / USER_MMAP_CHUNK_PAGES);
+        if (chunk == NULL) {
+            size_t rest = USER_MMAP_CHUNK_PAGES - index % USER_MMAP_CHUNK_PAGES;
+            run += rest;
+            index += rest;
+        } else {
+            run = chunk[index % USER_MMAP_CHUNK_PAGES].page == 0 ? run + 1 : 0;
+            index++;
+        }
+        if (run >= count) {
+            return index - run;
+        }
+    }
+    return USER_MMAP_MAX_PAGES;
+}
+
+/* An interpreter (ld-musl) is loaded into the mmap area: chunks first. */
+static bool user_mmap_prepare_interpreter(struct user_process *process,
+                                          const struct elf_load_plan *plan) {
+    for (size_t i = 0; i < plan->segment_count; i++) {
+        const struct elf_load_segment *segment = &plan->segments[i];
+        if (!user_mmap_prepare(process,
+                               (segment->mapping_base - USER_MMAP_BASE) / PAGE_SIZE,
+                               segment->page_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Then its pages, once it is mapped. */
+static void user_mmap_record_interpreter(struct user_process *process,
+                                         const struct elf_load_plan *plan,
+                                         const uint64_t physical[]) {
+    for (size_t i = 0; i < plan->segment_count; i++) {
+        const struct elf_load_segment *segment = &plan->segments[i];
+        size_t mmap_index = (segment->mapping_base - USER_MMAP_BASE) / PAGE_SIZE;
+        for (size_t page = 0; page < segment->page_count; page++) {
+            user_mmap_set(process, mmap_index + page,
+                          physical[segment->page_index + page],
+                          user_segment_paging_flags(segment->flags));
+        }
+    }
+}
+
 static bool release_mmap_pages(struct user_process *process, size_t first_page,
                                size_t page_count) {
     if (process == NULL) {
@@ -829,12 +983,17 @@ static bool release_mmap_pages(struct user_process *process, size_t first_page,
     }
     bool released = true;
     for (size_t i = first_page; i < first_page + page_count; i++) {
-        uint64_t physical_page = process->mmap_pages[i];
+        if (user_mmap_chunk(process, i / USER_MMAP_CHUNK_PAGES) == NULL) {
+            /* Nothing mapped in the rest of this chunk. */
+            i |= USER_MMAP_CHUNK_PAGES - 1;
+            continue;
+        }
+        uint64_t physical_page = user_mmap_page(process, i);
         if (physical_page == 0) {
             continue;
         }
         uintptr_t virtual_address = USER_MMAP_BASE + i * PAGE_SIZE;
-        if (process->mmap_flags[i] != USER_MMAP_RESERVED
+        if (user_mmap_flags(process, i) != USER_MMAP_RESERVED
             && !paging_unmap_page(virtual_address, NULL)) {
             released = false;
             continue;
@@ -843,9 +1002,9 @@ static bool release_mmap_pages(struct user_process *process, size_t first_page,
             released = false;
             continue;
         }
-        process->mmap_pages[i] = 0;
-        process->mmap_flags[i] = 0;
+        user_mmap_set(process, i, 0, 0);
     }
+    user_mmap_trim(process, first_page, page_count);
     return released;
 }
 
@@ -853,8 +1012,8 @@ static bool process_mmap_state_clean(const struct user_process *process) {
     if (process == NULL) {
         return false;
     }
-    for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-        if (process->mmap_pages[i] != 0 || process->mmap_flags[i] != 0) {
+    for (size_t chunk = 0; chunk < USER_MMAP_CHUNKS; chunk++) {
+        if (process->mmap_chunks[chunk] != 0) {
             return false;
         }
     }
@@ -2999,15 +3158,30 @@ static uintptr_t user_prepare_exec_stack(
     return USER_STACK_ADDRESS + stack_offset;
 }
 
-static bool user_free_mmap_physical(struct user_process *process) {
+/*
+ * Frees the mmap pages without unmapping them (their address space is
+ * gone or going). With KEEP_CHUNKS the emptied chunk pages stay, so
+ * entries prepared for a new image can still be set.
+ */
+static bool user_free_mmap_physical(struct user_process *process,
+                                    bool keep_chunks) {
     bool released = true;
-    for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-        if (process->mmap_pages[i] != 0) {
-            if (!physical_page_free(process->mmap_pages[i])) {
+    for (size_t chunk = 0; chunk < USER_MMAP_CHUNKS; chunk++) {
+        struct user_mmap_entry *entries = user_mmap_chunk(process, chunk);
+        if (entries == NULL) {
+            continue;
+        }
+        for (size_t i = 0; i < USER_MMAP_CHUNK_PAGES; i++) {
+            if (entries[i].page != 0 && !physical_page_free(entries[i].page)) {
                 released = false;
             }
-            process->mmap_pages[i] = 0;
-            process->mmap_flags[i] = 0;
+            entries[i] = (struct user_mmap_entry) {0};
+        }
+        if (!keep_chunks) {
+            if (!physical_page_free(process->mmap_chunks[chunk])) {
+                released = false;
+            }
+            process->mmap_chunks[chunk] = 0;
         }
     }
     return released;
@@ -3055,7 +3229,7 @@ static void user_discard_cloned_process(struct user_process *process) {
     (void)release_user_pages(0, process->heap_pages,
                              process->heap_page_count, 0);
     process->heap_page_count = 0;
-    (void)user_free_mmap_physical(process);
+    (void)user_free_mmap_physical(process, false);
 }
 
 static bool user_map_cloned_process(struct user_process *process) {
@@ -3081,14 +3255,17 @@ static bool user_map_cloned_process(struct user_process *process) {
             != process->heap_page_count) {
         return false;
     }
-    for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-        if (process->mmap_pages[i] != 0
-            && process->mmap_flags[i] != USER_MMAP_RESERVED
-            && (process->mmap_flags[i] == 0
-                || !paging_map_page(USER_MMAP_BASE + i * PAGE_SIZE,
-                                    process->mmap_pages[i],
-                                    process->mmap_flags[i]))) {
-            return false;
+    for (size_t chunk = 0; chunk < USER_MMAP_CHUNKS; chunk++) {
+        const struct user_mmap_entry *entries = user_mmap_chunk(process, chunk);
+        for (size_t j = 0; entries != NULL && j < USER_MMAP_CHUNK_PAGES; j++) {
+            size_t i = chunk * USER_MMAP_CHUNK_PAGES + j;
+            if (entries[j].page != 0
+                && entries[j].flags != USER_MMAP_RESERVED
+                && (entries[j].flags == 0
+                    || !paging_map_page(USER_MMAP_BASE + i * PAGE_SIZE,
+                                        entries[j].page, entries[j].flags))) {
+                return false;
+            }
         }
     }
     return true;
@@ -3324,9 +3501,6 @@ static int64_t user_linux_fork(struct user_process *parent,
     for (size_t i = 0; i < parent->cwd_length; i++) {
         child->cwd[i] = parent->cwd[i];
     }
-    for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-        child->mmap_flags[i] = parent->mmap_flags[i];
-    }
     bool cloned = user_clone_page_array(parent->image_pages,
                                          parent->image_page_count,
                                          child->image_pages)
@@ -3335,10 +3509,21 @@ static int64_t user_linux_fork(struct user_process *parent,
         && user_clone_page_array(parent->heap_pages,
                                  parent->heap_page_count,
                                  child->heap_pages);
-    for (size_t i = 0; cloned && i < USER_MMAP_MAX_PAGES; i++) {
-        if (parent->mmap_pages[i] != 0) {
-            cloned = user_clone_page_array(&parent->mmap_pages[i], 1,
-                                           &child->mmap_pages[i]);
+    for (size_t chunk = 0; cloned && chunk < USER_MMAP_CHUNKS; chunk++) {
+        const struct user_mmap_entry *source = user_mmap_chunk(parent, chunk);
+        if (source == NULL) {
+            continue;
+        }
+        size_t first = chunk * USER_MMAP_CHUNK_PAGES;
+        cloned = user_mmap_prepare(child, first, USER_MMAP_CHUNK_PAGES);
+        struct user_mmap_entry *destination = cloned
+            ? user_mmap_chunk(child, chunk) : NULL;
+        for (size_t i = 0; cloned && i < USER_MMAP_CHUNK_PAGES; i++) {
+            destination[i].flags = source[i].flags;
+            if (source[i].page != 0) {
+                cloned = user_clone_page_array(&source[i].page, 1,
+                                               &destination[i].page);
+            }
         }
     }
     if (!cloned) {
@@ -3570,7 +3755,8 @@ static int64_t user_linux_execve(struct user_process *process,
         && paging_user_range_valid(USER_STACK_BASE,
                                    USER_STACK_PAGES * PAGE_SIZE, true, false)
         && !paging_user_range_valid(USER_STACK_BASE,
-                                    USER_STACK_PAGES * PAGE_SIZE, false, true);
+                                    USER_STACK_PAGES * PAGE_SIZE, false, true)
+        && user_mmap_prepare_interpreter(process, &interpreter_plan);
     if (!image_valid) {
         (void)scheduler_activate_current_address_space(old_address_space);
         (void)paging_address_space_destroy(new_address_space);
@@ -3590,7 +3776,7 @@ static int64_t user_linux_execve(struct user_process *process,
                                               USER_STACK_PAGES, 0);
     bool old_heap_freed = release_user_pages(
         0, process->heap_pages, process->heap_page_count, 0);
-    bool old_mmap_freed = user_free_mmap_physical(process);
+    bool old_mmap_freed = user_free_mmap_physical(process, true);
     if (!old_image_freed || !old_stack_freed
         || !old_heap_freed || !old_mmap_freed) {
         console_write_string("OPOS: execve leaked old image pages\n");
@@ -3622,19 +3808,11 @@ static int64_t user_linux_execve(struct user_process *process,
         process->image_pages[i] = image_physical[i];
     }
     if (plan.has_interpreter) {
-        for (size_t i = 0; i < interpreter_plan.segment_count; i++) {
-            const struct elf_load_segment *segment =
-                &interpreter_plan.segments[i];
-            size_t mmap_index =
-                (segment->mapping_base - USER_MMAP_BASE) / PAGE_SIZE;
-            for (size_t page = 0; page < segment->page_count; page++) {
-                process->mmap_pages[mmap_index + page] =
-                    interpreter_physical[segment->page_index + page];
-                process->mmap_flags[mmap_index + page] =
-                    user_segment_paging_flags(segment->flags);
-            }
-        }
+        user_mmap_record_interpreter(process, &interpreter_plan,
+                                     interpreter_physical);
     }
+    /* Chunks of the old image that the new one does not use. */
+    user_mmap_trim(process, 0, USER_MMAP_MAX_PAGES);
     for (size_t i = 0; i < USER_STACK_PAGES; i++) {
         process->stack_pages[i] = stack_physical[i];
     }
@@ -7306,8 +7484,8 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             if (usable) {
                 size_t at = (wanted - USER_MMAP_BASE) / PAGE_SIZE;
                 bool taken = false;
-                for (size_t i = at; i < at + page_count; i++) {
-                    taken = taken || process->mmap_pages[i] != 0;
+                for (size_t i = at; !taken && i < at + page_count; i++) {
+                    taken = user_mmap_page(process, i) != 0;
                 }
                 if (taken && (frame->r10 & USER_MMAP_FIXED_NOREPLACE) != 0) {
                     frame->rax = (uint64_t)(int64_t)-17;
@@ -7320,27 +7498,18 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             }
         }
         if (first_page == USER_MMAP_MAX_PAGES) {
-            size_t consecutive_pages = 0;
-            for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-                if (process->mmap_pages[i] == 0) {
-                    if (consecutive_pages == 0) {
-                        first_page = i;
-                    }
-                    consecutive_pages++;
-                    if (consecutive_pages == page_count) {
-                        break;
-                    }
-                } else {
-                    consecutive_pages = 0;
-                    first_page = USER_MMAP_MAX_PAGES;
-                }
-            }
-            if (consecutive_pages != page_count) {
+            first_page = user_mmap_find_free(process, page_count);
+            if (first_page == USER_MMAP_MAX_PAGES) {
                 frame->rax = (uint64_t)(int64_t)-12;
                 return false;
             }
         }
         if (replace && !release_mmap_pages(process, first_page, page_count)) {
+            frame->rax = (uint64_t)(int64_t)-12;
+            return false;
+        }
+        if (!user_mmap_prepare(process, first_page, page_count)) {
+            user_mmap_trim(process, first_page, page_count);
             frame->rax = (uint64_t)(int64_t)-12;
             return false;
         }
@@ -7404,12 +7573,13 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 physical_page_free(physical_page);
                 break;
             }
-            process->mmap_pages[first_page + mapped_pages] = physical_page;
-            process->mmap_flags[first_page + mapped_pages] = mapping_flags;
+            user_mmap_set(process, first_page + mapped_pages, physical_page,
+                          mapping_flags);
         }
         if (mapped_pages != page_count) {
             bool rolled_back = release_mmap_pages(process, first_page,
                                                   mapped_pages);
+            user_mmap_trim(process, first_page, page_count);
             frame->rax = rolled_back ? (uint64_t)(int64_t)-12
                                      : (uint64_t)(int64_t)-5;
             return false;
@@ -7450,7 +7620,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         size_t old_pages = (size_t)((old_size + PAGE_SIZE - 1) / PAGE_SIZE);
         size_t new_pages = (size_t)((new_size + PAGE_SIZE - 1) / PAGE_SIZE);
         for (size_t i = first; i < first + old_pages; i++) {
-            if (process->mmap_pages[i] == 0) {
+            if (user_mmap_page(process, i) == 0) {
                 frame->rax = (uint64_t)(int64_t)-14;
                 return false;
             }
@@ -7461,11 +7631,11 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 ? old_address : (uint64_t)(int64_t)-5;
             return false;
         }
-        uint64_t mapping_flags = process->mmap_flags[first + old_pages - 1];
+        uint64_t mapping_flags = user_mmap_flags(process, first + old_pages - 1);
         bool in_place = first + new_pages <= USER_MMAP_MAX_PAGES;
         for (size_t i = first + old_pages; in_place && i < first + new_pages;
              i++) {
-            in_place = process->mmap_pages[i] == 0;
+            in_place = user_mmap_page(process, i) == 0;
         }
         size_t target = first;
         if (!in_place) {
@@ -7473,19 +7643,16 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-12;
                 return false;
             }
-            size_t run = 0;
-            target = USER_MMAP_MAX_PAGES;
-            for (size_t i = 0; i < USER_MMAP_MAX_PAGES; i++) {
-                run = process->mmap_pages[i] == 0 ? run + 1 : 0;
-                if (run == new_pages) {
-                    target = i + 1 - new_pages;
-                    break;
-                }
-            }
+            target = user_mmap_find_free(process, new_pages);
             if (target == USER_MMAP_MAX_PAGES) {
                 frame->rax = (uint64_t)(int64_t)-12;
                 return false;
             }
+        }
+        if (!user_mmap_prepare(process, target, new_pages)) {
+            user_mmap_trim(process, target, new_pages);
+            frame->rax = (uint64_t)(int64_t)-12;
+            return false;
         }
         /* New zeroed pages after the moved or kept ones, first, so a
            failure leaves the old mapping as it was. */
@@ -7509,18 +7676,18 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 physical_page_free(physical_page);
                 break;
             }
-            process->mmap_pages[i] = physical_page;
-            process->mmap_flags[i] = mapping_flags;
+            user_mmap_set(process, i, physical_page, mapping_flags);
             added++;
         }
         if (added != new_pages - old_pages) {
             (void)release_mmap_pages(process, target + old_pages, added);
+            user_mmap_trim(process, target, new_pages);
             frame->rax = (uint64_t)(int64_t)-12;
             return false;
         }
         for (size_t i = 0; target != first && i < old_pages; i++) {
-            uint64_t physical_page = process->mmap_pages[first + i];
-            uint64_t page_flags = process->mmap_flags[first + i];
+            uint64_t physical_page = user_mmap_page(process, first + i);
+            uint64_t page_flags = user_mmap_flags(process, first + i);
             if (page_flags != USER_MMAP_RESERVED
                 && (!paging_unmap_page(USER_MMAP_BASE + (first + i) * PAGE_SIZE,
                                        NULL)
@@ -7530,10 +7697,11 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-5;
                 return false;
             }
-            process->mmap_pages[target + i] = physical_page;
-            process->mmap_flags[target + i] = page_flags;
-            process->mmap_pages[first + i] = 0;
-            process->mmap_flags[first + i] = 0;
+            user_mmap_set(process, target + i, physical_page, page_flags);
+            user_mmap_set(process, first + i, 0, 0);
+        }
+        if (target != first) {
+            user_mmap_trim(process, first, old_pages);
         }
         frame->rax = USER_MMAP_BASE + target * PAGE_SIZE;
         return false;
@@ -7606,7 +7774,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             return false;
         }
         for (size_t i = first_page; i < first_page + page_count; i++) {
-            if (process->mmap_pages[i] == 0) {
+            if (user_mmap_page(process, i) == 0) {
                 frame->rax = (uint64_t)(int64_t)-22;
                 return false;
             }
@@ -7652,7 +7820,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             return false;
         }
         for (size_t i = first_page; i < first_page + page_count; i++) {
-            if (process->mmap_pages[i] == 0) {
+            if (user_mmap_page(process, i) == 0) {
                 frame->rax = (uint64_t)(int64_t)-12;
                 return false;
             }
@@ -7670,11 +7838,13 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         for (size_t i = first_page; i < first_page + page_count; i++) {
             uintptr_t address = USER_MMAP_BASE + i * PAGE_SIZE;
             bool changed;
+            uint64_t page_flags = user_mmap_flags(process, i);
+            uint64_t physical_page = user_mmap_page(process, i);
             if (flags == USER_MMAP_RESERVED) {
-                changed = process->mmap_flags[i] == USER_MMAP_RESERVED
+                changed = page_flags == USER_MMAP_RESERVED
                     || paging_unmap_page(address, NULL);
-            } else if (process->mmap_flags[i] == USER_MMAP_RESERVED) {
-                changed = paging_map_page(address, process->mmap_pages[i], flags);
+            } else if (page_flags == USER_MMAP_RESERVED) {
+                changed = paging_map_page(address, physical_page, flags);
             } else {
                 changed = paging_protect_range(address, 1, flags);
             }
@@ -7682,7 +7852,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                 frame->rax = (uint64_t)(int64_t)-12;
                 return false;
             }
-            process->mmap_flags[i] = flags;
+            user_mmap_set(process, i, physical_page, flags);
         }
         frame->rax = 0;
         return false;
@@ -8301,7 +8471,12 @@ static bool user_process_run_image(enum user_program program,
                                       USER_MMAP_BASE, NULL, 0)
             : 0;
     }
+    if (initial_stack != 0
+        && !user_mmap_prepare_interpreter(process, &interpreter_plan)) {
+        initial_stack = 0;
+    }
     if (initial_stack == 0) {
+        (void)user_free_mmap_physical(process, false);
         bool image_freed = release_elf_plan_pages(
             &elf_plan, image_physical, image_mapped);
         image_freed = release_elf_plan_pages(
@@ -8344,17 +8519,8 @@ static bool user_process_run_image(enum user_program program,
     for (size_t i = 0; i < elf_plan.total_page_count; i++) {
         process->image_pages[i] = image_physical[i];
     }
-    for (size_t i = 0; i < interpreter_plan.segment_count; i++) {
-        const struct elf_load_segment *segment = &interpreter_plan.segments[i];
-        size_t mmap_index =
-            (segment->mapping_base - USER_MMAP_BASE) / PAGE_SIZE;
-        for (size_t page = 0; page < segment->page_count; page++) {
-            process->mmap_pages[mmap_index + page] =
-                interpreter_physical[segment->page_index + page];
-            process->mmap_flags[mmap_index + page] =
-                user_segment_paging_flags(segment->flags);
-        }
-    }
+    user_mmap_record_interpreter(process, &interpreter_plan,
+                                 interpreter_physical);
     for (size_t i = 0; i < USER_STACK_PAGES; i++) {
         process->stack_pages[i] = stack_physical[i];
     }
@@ -8685,10 +8851,12 @@ size_t user_process_list(struct user_process_info *list, size_t capacity) {
         for (size_t j = 0; j < sizeof(info->name); j++) {
             info->name[j] = process->name[j];
         }
-        for (size_t page = 0; page < USER_MMAP_MAX_PAGES; page++) {
-            if (process->mmap_pages[page] != 0
-                && process->mmap_pages[page] != USER_MMAP_RESERVED) {
-                info->memory_pages++;
+        for (size_t chunk = 0; chunk < USER_MMAP_CHUNKS; chunk++) {
+            const struct user_mmap_entry *entries = user_mmap_chunk(process, chunk);
+            for (size_t j = 0; entries != NULL && j < USER_MMAP_CHUNK_PAGES; j++) {
+                if (entries[j].page != 0 && entries[j].page != USER_MMAP_RESERVED) {
+                    info->memory_pages++;
+                }
             }
         }
         for (size_t slot = 0; slot < SCHEDULER_TASK_CAPACITY; slot++) {

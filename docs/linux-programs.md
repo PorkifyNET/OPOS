@@ -80,8 +80,9 @@ In the order the next programs are likely to hit them.
    generated `/etc/passwd` and `/etc/group`.
 3. **Limits.** Raised in step 4 (see there). Still bounded: one
    argument page (64 arguments, 64 environment strings, 2048 bytes of
-   strings), a 64 MiB `mmap` area, every page allocated at once (no
-   demand paging), no `MAP_SHARED` or `MAP_FIXED`.
+   strings), a 1 GiB `mmap` area (64 MiB until OPOS 0.6.0; its page
+   table now grows only as a program maps), every page allocated at
+   once (no demand paging), no `MAP_SHARED` or `MAP_FIXED`.
 4. **Terminal.** Done in step 5 (see there). Still missing: `SIGWINCH`
    on resize, mouse reporting, Unicode beyond ASCII, function keys,
    job control (Ctrl+Z, process groups).
@@ -218,7 +219,7 @@ call was logged.
 | Main stack | 128 KiB | 512 KiB (`RLIMIT_STACK`) |
 | `brk` heap | 512 KiB | 32 MiB |
 | Arguments, environment strings | 16, 16, 1024 bytes | 64, 64, 2048 bytes |
-| `mmap` area | 64 MiB | 64 MiB (unchanged) |
+| `mmap` area | 64 MiB | 64 MiB (unchanged; 1 GiB since OPOS 0.6.0) |
 
 - **Executable buffer.** Each task's buffer is allocated at 1 MiB and
   grows in 1 MiB steps, only when a larger program is started. A

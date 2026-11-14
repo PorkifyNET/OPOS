@@ -299,7 +299,12 @@ The exec-replacement chain now runs `/tests/exec-test`, dynamically linked
 musl-linked `/tests/musl-test`, which replaces itself with the real
 `/tests/musl-pthread-test`, in sequence. The pthread program creates and joins a
 pair of threads, forces mutex contention while each sleeps, verifies their
-shared-memory result and return values, then exits normally.
+shared-memory result and return values, then checks the scheduling calls
+(`sched_yield`, `getpriority`/`setpriority`, the `sched_*` policy, priority
+and affinity calls) before it exits normally. OPOS has one CPU and one
+round-robin policy, so every thread reports `SCHED_OTHER`, priority 0, nice
+0 and CPU 0 only; real-time policies (`EPERM`) and a lower nice value
+(`EACCES`) are refused as for a normal Linux user.
 The PIE resolves shared-library calls
 at its nonzero bias before replacing itself. The
 static image and dynamic interpreter both validate identity/security entries,

@@ -5837,6 +5837,135 @@ static int64_t user_linux_getrandom(uintptr_t buffer, size_t length) {
     return (int64_t)length;
 }
 
+/* A pid for the sched_* calls: 0 (the caller), or the process or one of
+   its threads. Other processes are out of reach (ESRCH). */
+static bool user_linux_sched_target(const struct user_process *process,
+                                    int64_t pid) {
+    if (pid == 0 || (uint64_t)pid == process->id) {
+        return true;
+    }
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        if (user_threads[i].active && user_threads[i].process == process
+            && user_threads[i].id == (uint64_t)pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The calls of one Linux system call number in 140-148, 203 and 204;
+   see the dispatcher. Returns the result or a negative errno. */
+static int64_t user_linux_scheduling(const struct user_process *process,
+                                     uint64_t number,
+                                     const struct linux_syscall_frame *frame) {
+    enum { SCHED_OTHER = 0, SCHED_FIFO = 1, SCHED_RR = 2, SCHED_BATCH = 3,
+           SCHED_IDLE = 5, SCHED_RESET_ON_FORK = 0x40000000 };
+    /* get_priority_max and get_priority_min take only a policy. */
+    if (number == 146 || number == 147) {
+        uint64_t policy = frame->rdi;
+        if (policy == SCHED_FIFO || policy == SCHED_RR) {
+            return number == 146 ? 99 : 1;
+        }
+        return policy == SCHED_OTHER || policy == SCHED_BATCH
+            || policy == SCHED_IDLE ? 0 : -22;
+    }
+
+    /* getpriority and setpriority: which (process, group, user), who. */
+    if (number == 140 || number == 141) {
+        uint64_t which = frame->rdi;
+        int64_t who = (int64_t)(int32_t)frame->rsi;
+        if (which > 2) {
+            return -22;
+        }
+        if (which == 0 && !user_linux_sched_target(process, who)) {
+            return -3;
+        }
+        if (number == 140) {
+            return 20; /* 20 - nice; the libc turns it into nice 0 */
+        }
+        int32_t nice = (int32_t)frame->rdx;
+        return nice < 0 ? -13 : 0; /* a higher nice is accepted, unused */
+    }
+
+    int64_t pid = (int64_t)(int32_t)frame->rdi;
+    if (pid < 0) {
+        return -22;
+    }
+    if (!user_linux_sched_target(process, pid)) {
+        return -3;
+    }
+
+    switch (number) {
+    case 142:   /* sched_setparam */
+    case 144: { /* sched_setscheduler */
+        uintptr_t param = number == 142 ? (uintptr_t)frame->rsi
+                                        : (uintptr_t)frame->rdx;
+        if (!paging_user_range_valid(param, sizeof(int32_t), false, false)) {
+            return -22;
+        }
+        int32_t priority = *(const int32_t *)param;
+        if (number == 144) {
+            uint64_t policy = frame->rsi & ~(uint64_t)SCHED_RESET_ON_FORK;
+            if (policy == SCHED_FIFO || policy == SCHED_RR) {
+                return priority >= 1 && priority <= 99 ? -1 : -22;
+            }
+            if (policy != SCHED_OTHER && policy != SCHED_BATCH
+                && policy != SCHED_IDLE) {
+                return -22;
+            }
+        }
+        return priority == 0 ? 0 : -22;
+    }
+    case 143: { /* sched_getparam */
+        uintptr_t param = (uintptr_t)frame->rsi;
+        if (!paging_user_range_valid(param, sizeof(int32_t), true, false)) {
+            return -22;
+        }
+        *(int32_t *)param = 0;
+        return 0;
+    }
+    case 145:   /* sched_getscheduler */
+        return SCHED_OTHER;
+    case 148: { /* sched_rr_get_interval: one timer tick */
+        uintptr_t interval = (uintptr_t)frame->rsi;
+        if (!paging_user_range_valid(interval, sizeof(struct linux_timespec),
+                                     true, false)) {
+            return -14;
+        }
+        struct linux_timespec *value = (struct linux_timespec *)interval;
+        uint64_t seconds;
+        uint64_t nanoseconds;
+        timer_ticks_duration(1, &seconds, &nanoseconds);
+        value->seconds = (int64_t)seconds;
+        value->nanoseconds = (int64_t)nanoseconds;
+        return 0;
+    }
+    case 203: { /* sched_setaffinity: the mask must include CPU 0 */
+        uint64_t length = frame->rsi;
+        uintptr_t mask = (uintptr_t)frame->rdx;
+        if (length == 0) {
+            return -22;
+        }
+        if (!paging_user_range_valid(mask, 1, false, false)) {
+            return -14;
+        }
+        return (*(const uint8_t *)mask & 1) != 0 ? 0 : -22;
+    }
+    default: {  /* 204 sched_getaffinity: CPU 0 only, in one long */
+        uint64_t length = frame->rsi;
+        uintptr_t mask = (uintptr_t)frame->rdx;
+        if (length < sizeof(uint64_t) || length % sizeof(uint64_t) != 0) {
+            return -22;
+        }
+        if (!paging_user_range_valid(mask, sizeof(uint64_t), true, false)) {
+            return -14;
+        }
+        *(uint64_t *)mask = 1;
+        return sizeof(uint64_t);
+    }
+    }
+}
+
 /* Serial log of a Linux system call OPOS lacks, once per process and
    number, to find what Linux programs need (docs/linux-programs.md). */
 static void user_linux_unimplemented(struct user_process *process,
@@ -7879,6 +8008,27 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             user_mmap_set(process, i, physical_page, flags);
         }
         frame->rax = 0;
+        return false;
+    }
+
+    /* sched_yield */
+    if (number == 24) {
+        scheduler_yield_current();
+        frame->rax = 0;
+        return false;
+    }
+
+    /*
+     * Scheduling policy and priority (getpriority, setpriority and the
+     * sched_* calls). OPOS has one processor and one round-robin policy,
+     * so every thread runs as SCHED_OTHER with nice 0 on CPU 0. Requests
+     * that keep that are accepted; real-time policies and a lower nice
+     * value are refused as for a normal Linux user.
+     */
+    if ((number >= 140 && number <= 148) || number == 203
+        || number == 204) {
+        frame->rax = (uint64_t)user_linux_scheduling(process, number,
+                                                     frame);
         return false;
     }
 

@@ -1,9 +1,5 @@
-OPOS 0.1.5: the OPOS Store, Linux programs and sound.
+OPOS 0.6.1: a better OPOS Store.
 
-- New OPOS Store (Start > OPOS STORE): browse, install, update and remove signed `.opk` packages. Package updates also appear in Settings > UPDATES, and `/bin/pkg` does the same from the Terminal.
-- Real Linux programs run on OPOS as packages: Lua, SQLite, BusyBox (shell, vi, less) and SDL 2 programs in their own windows. Dynamically linked musl programs work too.
-- The Terminal is now a VT100 terminal with Ctrl+C, so full-screen Linux programs work in it.
-- Doom runs on OPOS: Chocolate Doom with the free Freedoom game data, packaged as a Linux program.
-- Sound: OPOS plays audio through Intel HD Audio and the Ensoniq AudioPCI 97 (VMware's default sound card). Programs can play sound, SDL programs and Doom included.
-- Master volume: the keyboard's volume keys show a volume popup, and the level is remembered. `/bin/play` plays WAV files.
-- Faster large disk writes.
+- The OPOS Store has a start page with featured programs and categories, plus search: start typing anywhere in the Store to find a program by name, summary or category.
+- Every program has an About page with its description, category, version, size, license, publisher, needed OPOS version and permissions.
+- Store downloads and installs are about 4.5 times faster.

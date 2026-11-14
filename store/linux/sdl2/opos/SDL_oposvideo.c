@@ -55,6 +55,7 @@
 #define OPOS_WINDOW_QUIET 2u
 #define OPOS_WINDOW_FULLSCREEN 4u
 #define OPOS_SYS_SCREEN_SIZE 0x4f500017L
+#define OPOS_SYS_WINDOW_RESIZE 0x4f500018L
 /* "1" keeps notifications quiet while the window is in front, "0" never
    does; unset, the window is quiet while it is full screen or holds the
    mouse in relative mode (a game being played). */
@@ -362,6 +363,25 @@ static int OPOS_OpenWindow(SDL_Window *window)
     return 0;
 }
 
+/* The program changed its window size (e.g. another resolution picked in
+   a game's settings). The desktop resizes the window as far as the screen
+   allows and answers with a RESIZE event. Older OPOS versions refuse the
+   call; the window then keeps its size. */
+static void OPOS_RequestSize(int w, int h)
+{
+    if (opos_opened && !opos_closed && w > 0 && h > 0) {
+        (void)opos_call(OPOS_SYS_WINDOW_RESIZE, w, h, 0, 0);
+    }
+}
+
+static void OPOS_SetWindowSize(_THIS, SDL_Window *window)
+{
+    (void)_this;
+    if (window == opos_window) {
+        OPOS_RequestSize(window->w, window->h);
+    }
+}
+
 static void OPOS_SetWindowFullscreen(_THIS, SDL_Window *window,
                                      SDL_VideoDisplay *display,
                                      SDL_bool fullscreen)
@@ -371,6 +391,10 @@ static void OPOS_SetWindowFullscreen(_THIS, SDL_Window *window,
     if (window == opos_window) {
         opos_fullscreen = fullscreen;
         OPOS_UpdateOptions();
+        if (!fullscreen) {
+            /* Back to the size the window had (or was given) before. */
+            OPOS_RequestSize(window->windowed.w, window->windowed.h);
+        }
     }
 }
 
@@ -457,7 +481,12 @@ static int OPOS_VideoInit(_THIS)
     /* The desktop mode is the screen (older OPOS cannot tell; 1024x768
        then). A full-screen window gets the whole screen; a smaller mode
        is scaled up by the desktop, so every mode below works too. */
-    static const int sizes[][2] = { { 1024, 768 }, { 800, 600 }, { 640, 480 } };
+    static const int sizes[][2] = {
+        { 2560, 1600 }, { 2560, 1440 }, { 1920, 1200 }, { 1920, 1080 },
+        { 1680, 1050 }, { 1600, 1200 }, { 1600, 900 }, { 1440, 900 },
+        { 1366, 768 }, { 1280, 1024 }, { 1280, 800 }, { 1280, 720 },
+        { 1024, 768 }, { 800, 600 }, { 640, 480 }
+    };
     SDL_DisplayMode mode;
     long screen = opos_call(OPOS_SYS_SCREEN_SIZE, 0, 0, 0, 0);
     int screen_w, screen_h;
@@ -516,6 +545,7 @@ static SDL_VideoDevice *OPOS_CreateDevice(void)
     device->CreateSDLWindow = OPOS_CreateWindow;
     device->DestroyWindow = OPOS_DestroyWindow;
     device->SetWindowFullscreen = OPOS_SetWindowFullscreen;
+    device->SetWindowSize = OPOS_SetWindowSize;
     device->SetDisplayMode = OPOS_SetDisplayMode;
     device->CreateWindowFramebuffer = OPOS_CreateWindowFramebuffer;
     device->UpdateWindowFramebuffer = OPOS_UpdateWindowFramebuffer;

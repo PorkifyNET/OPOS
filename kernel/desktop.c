@@ -12289,6 +12289,7 @@ struct app_window {
     int64_t reported_width;
     int64_t reported_height;
     uint32_t options;      /* DESKTOP_APP_* */
+    volatile bool resize_pending; /* requested_* changed by the program */
     uint32_t keys_down[8]; /* key-state presses sent, by key number */
 };
 
@@ -12548,8 +12549,60 @@ static bool apps_sync_fullscreen(void) {
     return changed;
 }
 
+/* Applies the programs' size requests (set from their system calls) on the
+   desktop's pass: the floating frame takes the asked content size, as far
+   as the work area allows, and stays where it was if it fits. Maximized,
+   full-screen and tiled windows keep their place; the floating size is
+   used once they are restored. Either way the program hears its real size
+   again. Returns true when one changed. */
+static bool apps_sync_resize(void) {
+    bool changed = false;
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        struct app_window *window = &app_windows[slot];
+        if (!window->resize_pending || !window->opened) {
+            continue;
+        }
+        window->resize_pending = false;
+        if (!app_window_live(slot)) {
+            continue;
+        }
+        struct window *frame = &windows[WINDOW_APP + slot];
+        struct rect area = workspace_area();
+        int64_t width = (int64_t)window->requested_width + 2 * BORDER;
+        int64_t height = (int64_t)window->requested_height + 2 * BORDER
+            + TITLE_HEIGHT;
+        if (width > area.width) {
+            width = area.width;
+        }
+        if (height > area.height) {
+            height = area.height;
+        }
+        int64_t x = frame->floating.x;
+        int64_t y = frame->floating.y;
+        if (x + width > area.x + area.width) {
+            x = area.x + area.width - width;
+        }
+        if (y + height > area.y + area.height) {
+            y = area.y + area.height - height;
+        }
+        if (x < area.x) {
+            x = area.x;
+        }
+        if (y < area.y) {
+            y = area.y;
+        }
+        frame->floating = (struct rect){x, y, width, height};
+        /* Report the size even when it did not change, so a program that
+           asked for more than fits learns what it got. */
+        window->reported_width = -1;
+        changed = true;
+    }
+    return changed;
+}
+
 static bool apps_check_resize(void) {
     bool changed = apps_sync_fullscreen();
+    changed |= apps_sync_resize();
     for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
         app_check_resize(slot);
     }
@@ -12831,6 +12884,22 @@ static bool front_window_quiet(void) {
         &app_windows[z_order[z_count - 1] - WINDOW_APP];
     return window->owner != 0
         && (window->options & DESKTOP_APP_QUIET) != 0;
+}
+
+int64_t desktop_app_window_resize(uint64_t owner, uint32_t width,
+                                  uint32_t height) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
+        return -9;
+    }
+    if (width == 0 || height == 0 || width > APP_SCALE_MAX_WIDTH
+        || height > APP_SCALE_MAX_WIDTH) {
+        return -22;
+    }
+    window->requested_width = width;
+    window->requested_height = height;
+    window->resize_pending = true;
+    return 0;
 }
 
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {

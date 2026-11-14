@@ -62,6 +62,12 @@ uint64_t desktop_app_window_size(uint64_t owner);
    picture is scaled up to fit, keeping its shape. */
 #define DESKTOP_APP_FULLSCREEN 4u
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options);
+/* Asks for a new content size (a game changing its resolution). The
+   floating frame follows on the desktop's next pass, limited to the work
+   area; the program then gets a RESIZE event with the size it really has.
+   Returns 0, -9 without a window, or -22 for a zero or too large size. */
+int64_t desktop_app_window_resize(uint64_t owner, uint32_t width,
+                                  uint32_t height);
 /* The screen size as width << 32 | height (what a full-screen window
    gets), or 0 without a screen. */
 uint64_t desktop_screen_size(void);

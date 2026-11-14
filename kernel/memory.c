@@ -11,6 +11,7 @@ struct usable_range {
     uint64_t start;
     uint64_t end;
     uint64_t next;
+    uint64_t first_index; /* index of this range's first page in free_bitmap */
 };
 
 struct free_page {
@@ -24,6 +25,49 @@ static struct free_page *free_pages;
 static uint64_t direct_map_offset;
 static uint64_t total_pages;
 static uint64_t free_list_pages;
+/*
+ * One bit per usable page, set while the page is on the free list. It lets
+ * physical_page_free() reject double frees in constant time; walking the free
+ * list instead made every free O(free pages), which stalled programs that
+ * unmap large regions.
+ */
+static uint8_t *free_bitmap;
+
+static bool bitmap_carve(void) {
+    uint64_t bytes = (total_pages + 7) / 8;
+    uint64_t pages = (bytes + PAGE_MASK) / PAGE_SIZE;
+    for (size_t i = 0; i < usable_range_count; i++) {
+        struct usable_range *range = &usable_ranges[i];
+        if ((range->end - range->start) / PAGE_SIZE > pages) {
+            /* Move the range start past the bitmap so it is never freed. */
+            free_bitmap = (uint8_t *)(uintptr_t)(direct_map_offset + range->start);
+            range->start += pages * PAGE_SIZE;
+            range->next = range->start;
+            total_pages -= pages;
+            uint64_t index = 0;
+            for (size_t j = 0; j < usable_range_count; j++) {
+                usable_ranges[j].first_index = index;
+                index += (usable_ranges[j].end - usable_ranges[j].start) / PAGE_SIZE;
+            }
+            for (uint64_t b = 0; b < bytes; b++) {
+                free_bitmap[b] = 0;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Returns the bitmap index of an allocated page, or UINT64_MAX if not allocated. */
+static uint64_t allocated_page_index(uint64_t physical_address) {
+    for (size_t i = 0; i < usable_range_count; i++) {
+        const struct usable_range *range = &usable_ranges[i];
+        if (physical_address >= range->start && physical_address < range->next) {
+            return range->first_index + (physical_address - range->start) / PAGE_SIZE;
+        }
+    }
+    return UINT64_MAX;
+}
 
 bool memory_initialize(const struct limine_memmap_response *memory_map,
                        uint64_t hhdm_offset) {
@@ -77,7 +121,7 @@ bool memory_initialize(const struct limine_memmap_response *memory_map,
         total_pages += range_pages;
     }
 
-    return usable_range_count != 0;
+    return usable_range_count != 0 && bitmap_carve();
 }
 
 uint64_t physical_page_alloc(void) {
@@ -85,7 +129,10 @@ uint64_t physical_page_alloc(void) {
         struct free_page *page = free_pages;
         free_pages = page->next;
         free_list_pages--;
-        return (uint64_t)(uintptr_t)page - direct_map_offset;
+        uint64_t physical = (uint64_t)(uintptr_t)page - direct_map_offset;
+        uint64_t index = allocated_page_index(physical);
+        free_bitmap[index / 8] &= (uint8_t)~(1u << (index % 8));
+        return physical;
     }
 
     while (current_range < usable_range_count) {
@@ -107,28 +154,18 @@ bool physical_page_free(uint64_t physical_address) {
         return false;
     }
 
-    bool was_allocated = false;
-    for (size_t i = 0; i < usable_range_count; i++) {
-        const struct usable_range *range = &usable_ranges[i];
-        if (physical_address >= range->start && physical_address < range->next) {
-            was_allocated = true;
-            break;
-        }
-    }
-    if (!was_allocated) {
+    uint64_t index = allocated_page_index(physical_address);
+    if (index == UINT64_MAX) {
         return false;
     }
+    uint8_t bit = (uint8_t)(1u << (index % 8));
+    if ((free_bitmap[index / 8] & bit) != 0) {
+        return false;
+    }
+    free_bitmap[index / 8] |= bit;
 
     struct free_page *page = (struct free_page *)
         (uintptr_t)(direct_map_offset + physical_address);
-    for (struct free_page *free_page = free_pages;
-         free_page != NULL;
-         free_page = free_page->next) {
-        if (free_page == page) {
-            return false;
-        }
-    }
-
     page->next = free_pages;
     free_pages = page;
     free_list_pages++;

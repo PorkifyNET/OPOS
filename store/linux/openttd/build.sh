@@ -24,7 +24,7 @@ CACHE=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 VERSION=14.1
 # The package version: OpenTTD's, plus a fourth number for OPOS rebuilds.
-PACKAGE_VERSION=14.1.0.1
+PACKAGE_VERSION=14.1.0.2
 OPENGFX=7.1
 OPENSFX=1.0.3
 OPENMSX=0.4.2
@@ -170,11 +170,28 @@ strip -o "$STAGE/openttd-start" "$DIR/openttd-start"
 for d in baseset lang ai game; do
     cp -r "$DIR/cross/$d" "$STAGE/"
 done
+# Graphics and sounds stay as .tar files, which OpenTTD reads in place.
+# Music cannot: OpenTTD hands each song's file path to the MIDI player, so
+# the OpenMSX tar is unpacked into baseset/openmsx-$OPENMSX/, as OpenTTD's
+# own content download does.
 python3 -I - "$STAGE/baseset" "$GFX" "$SFX" "$MSX" <<'PY'
-import sys, zipfile
-for archive in sys.argv[2:]:
-    zipfile.ZipFile(archive).extractall(sys.argv[1])
+import io, sys, tarfile, zipfile
+baseset, graphics, sounds, music = sys.argv[1:]
+for archive in (graphics, sounds):
+    zipfile.ZipFile(archive).extractall(baseset)
+with zipfile.ZipFile(music) as z:
+    (name,) = [n for n in z.namelist() if n.endswith(".tar")]
+    with tarfile.open(fileobj=io.BytesIO(z.read(name))) as tar:
+        for member in tar.getmembers():
+            if not (member.isfile() or member.isdir()) or member.name.startswith("/") \
+                    or ".." in member.name.split("/"):
+                raise SystemExit("unexpected entry in the OpenMSX tar: " + member.name)
+        tar.extractall(baseset)
 PY
+if [ ! -f "$STAGE/baseset/openmsx-$OPENMSX/openmsx.obm" ]; then
+    echo "store/linux/openttd: OpenMSX was not unpacked" >&2
+    exit 1
+fi
 cp "$SOUNDFONT" "$STAGE/soundfont/GeneralUser-GS.sf2"
 cp "$SOUNDFONT_LICENSE" "$STAGE/soundfont/LICENSE.txt"
 cp "$SRC/COPYING.md" "$STAGE/LICENSE"
@@ -195,7 +212,8 @@ baseset/ holds OpenGFX $OPENGFX (GPL-2.0; source
 source/opengfx-$OPENGFX-source.tar.xz), OpenSFX $OPENSFX (CC BY-SA 3.0)
 and OpenMSX $OPENMSX (GPL-2.0; source
 source/openmsx-$OPENMSX-source.tar.xz). Each set's license.txt and
-readme.txt with its credits are inside its .tar file.
+readme.txt with its credits are inside its .tar file, or for OpenMSX in
+baseset/openmsx-$OPENMSX/.
 
 soundfont/GeneralUser-GS.sf2 is GeneralUser GS by S. Christian Collins,
 free to use and redistribute under its own license

@@ -1,0 +1,62 @@
+# What the OPOS Store window shows of each package (tools/mkindex.py
+# --catalog). One block per package id:
+#
+#   [id]
+#   category: games | internet | office | graphics | sound-video |
+#             programming | system | accessories
+#   license: SPDX name or a short text (40 characters at most)
+#   featured: yes          (optional: shown on the Store's start page)
+#   summary: one short line (90 characters at most)
+#   description: the About page text, one line (900 characters at most)
+#
+# Every line is optional. Lines go into the signed index.
+
+[net.porkify.opos.hello]
+category: accessories
+license: GPL-3.0
+summary: Greets you and shows who you are logged in as.
+description: Greets you and shows your account, its home folder and the kernel ABI version. Hello is the smallest OPOS program and the first example of the OPOS SDK: read its source in sdk/examples/hello.c to see how an OPOS program opens a window and talks to the system.
+
+[net.porkify.opos.sketch]
+category: graphics
+license: GPL-3.0
+summary: A small drawing program.
+description: A small drawing program. The left mouse button draws, the right button erases and C clears the picture. Sketch is an example of the OPOS SDK: its source is in sdk/examples/sketch.c.
+
+[org.lua.lua]
+category: programming
+license: MIT
+summary: The Lua 5.4 scripting language.
+description: The Lua 5.4 interpreter, a small and fast scripting language used in many games and programs. Run it from the Terminal with a script, or alone for its interactive prompt. This is the unchanged Lua release, built for OPOS through its Linux layer.
+
+[org.sqlite.sqlite3]
+category: programming
+license: Public domain
+summary: The sqlite3 shell for SQLite databases.
+description: The sqlite3 shell for SQLite, the most widely used database engine. Run it from the Terminal with a database file to create tables, run SQL queries and import or export data. This is the unchanged SQLite release, built for OPOS through its Linux layer.
+
+[org.libsdl.sdl2-demos]
+category: graphics
+license: Zlib
+summary: Four demos of SDL 2 drawing in an OPOS window.
+description: Four demos of SDL 2, the library many Linux games use, drawing in an OPOS window: sprites, drawing, rotation and a key tester. They show that SDL programs run on OPOS without changes, using the OPOS video driver for SDL.
+
+[org.chocolate-doom.freedoom]
+category: games
+license: GPL-2.0 and BSD-3-Clause
+featured: yes
+summary: A complete free first-person shooter, with sound.
+description: Freedoom: Phase 1, a complete free first-person shooter, on the Chocolate Doom engine, with sound. Fight your way through 36 levels of monsters and mazes. Chocolate Doom is GPL-2.0 and its source is included in the package; the Freedoom game data is BSD-3-Clause.
+
+[org.openttd.openttd]
+category: games
+license: GPL-2.0
+featured: yes
+summary: Build a transport empire of railways, roads, ships and planes.
+description: OpenTTD, the open-source transport tycoon game: build railways, roads, ships and planes and connect towns and industries. Comes with the OpenGFX graphics, OpenSFX sounds and OpenMSX music, played through the FluidSynth synthesizer. OpenTTD, OpenGFX and OpenMSX are GPL-2.0, OpenSFX is CC BY-SA 3.0 and FluidSynth is LGPL-2.1; their source releases are included in the package.
+
+[net.busybox.busybox]
+category: system
+license: GPL-2.0
+summary: A Unix shell with vi, less and over 300 tools in one program.
+description: BusyBox: a shell (ash) with vi, less and over 300 Unix tools in one program. Run "busybox sh" from the Terminal. BusyBox is GPL-2.0 and its source release and build configuration are included in the package.

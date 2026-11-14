@@ -7,7 +7,8 @@ The packages OPOS publishes in its Store, built from this repository.
 `build/store/`:
 
 - one `<id>-<version>.opk` per package,
-- `index`, listing them with the descriptions in `descriptions.txt`,
+- `index`, listing them with what `catalog.txt` says of each
+  (category, license, summary, description),
 - `index.sig`, signed with the store key
   (`STORE_KEY`, default `~/.opos-signing/store-key.pem`).
 

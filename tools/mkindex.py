@@ -2,7 +2,7 @@
 """Builds and signs the OPOS Store index (docs/packages.md, "Index").
 
     mkindex.py --output DIR [--key KEY] [--unsigned]
-               [--descriptions FILE] OPK_OR_FOLDER...
+               [--catalog FILE] OPK_OR_FOLDER...
 
 Every .opk named (or found in a named folder) is checked with
 sdk/tools/mkopk.py, copied to DIR as <id>-<version>.opk, and listed in
@@ -13,7 +13,9 @@ key must match kernel/store_key.h, or installs would refuse the index.
 The repository release then holds index, index.sig and the .opk files
 (docs/packages.md, "Repository").
 
---descriptions names a text file of "id: one-line description" lines.
+--catalog names the Store catalog (store/catalog.txt): for each package
+id, a "[id]" line and then category, license, featured, summary and
+description lines for the Store window.
 
 The index format, which kernel/package.c checks the same way
 (parse_index below is its twin; tools/test_package_parity.py compares
@@ -27,6 +29,10 @@ them):
     publisher: ...
     platform: opos
     requires-opos: 0.1.4
+    category: games
+    license: GPL-2.0
+    featured: yes
+    summary: ...
     description: ...
 
 The kernel reads only "format", "entry" and "package". The other lines
@@ -146,21 +152,52 @@ def one_line(text):
     return " ".join(text.split())
 
 
-def read_descriptions(path):
-    descriptions = {}
+CATALOG_CATEGORIES = {"games", "internet", "office", "graphics",
+                      "sound-video", "programming", "system", "accessories"}
+CATALOG_LIMITS = {"category": 16, "license": 40, "featured": 3,
+                  "summary": 90, "description": 900}
+
+
+def read_catalog(path):
+    """Reads the Store catalog: {id: {key: value}}."""
+    catalog = {}
     if path is None:
-        return descriptions
+        return catalog
+    current = None
     with open(path, encoding="utf-8") as handle:
         for number, line in enumerate(handle, 1):
             line = line.rstrip("\n")
+            where = f"mkindex: {path}:{number}"
             if not line.strip() or line.startswith("#"):
                 continue
-            ident, separator, text = line.partition(":")
-            if not separator:
-                raise SystemExit(f"mkindex: {path}:{number}: needs "
-                                 "'id: description'")
-            descriptions[ident.strip()] = one_line(text)
-    return descriptions
+            if line.startswith("[") and line.endswith("]"):
+                ident = line[1:-1].strip()
+                if not mkopk.ID_PATTERN.match(ident) or ident in catalog:
+                    raise SystemExit(f"{where}: [{ident}] is not a new "
+                                     "package id")
+                current = catalog[ident] = {}
+                continue
+            key, separator, text = line.partition(":")
+            key, text = key.strip(), one_line(text)
+            if current is None or not separator:
+                raise SystemExit(f"{where}: needs '[id]' and then "
+                                 "'key: value' lines")
+            if key not in CATALOG_LIMITS or key in current:
+                raise SystemExit(f"{where}: {key!r} is not a catalog key "
+                                 "or is given twice")
+            if not text or len(text) > CATALOG_LIMITS[key]:
+                raise SystemExit(f"{where}: {key} must be 1-"
+                                 f"{CATALOG_LIMITS[key]} characters")
+            if not text.isascii() or "\t" in text:
+                raise SystemExit(f"{where}: {key} must be ASCII (the OPOS "
+                                 "font has no other characters)")
+            if key == "category" and text not in CATALOG_CATEGORIES:
+                raise SystemExit(f"{where}: category must be one of "
+                                 + ", ".join(sorted(CATALOG_CATEGORIES)))
+            if key == "featured" and text != "yes":
+                raise SystemExit(f"{where}: featured can only be 'yes'")
+            current[key] = text
+    return catalog
 
 
 def asks(package, data):
@@ -193,7 +230,7 @@ def collect(paths):
     return found
 
 
-def build(paths, output, descriptions):
+def build(paths, output, catalog):
     packages = []
     for path in collect(paths):
         with open(path, "rb") as handle:
@@ -229,8 +266,11 @@ def build(paths, output, descriptions):
         ]
         if package.get("requires-opos"):
             lines.append(f"requires-opos: {package['requires-opos']}")
-        if descriptions.get(ident):
-            lines.append(f"description: {descriptions[ident]}")
+        about = catalog.get(ident, {})
+        for key in ("category", "license", "featured", "summary",
+                    "description"):
+            if about.get(key):
+                lines.append(f"{key}: {about[key]}")
     data = ("\n".join(lines) + "\n").encode("utf-8")
     parse_index(data)
     path = os.path.join(output, "index")
@@ -248,7 +288,7 @@ def main(argv):
         "~/.opos-signing/store-key.pem"))
     parser.add_argument("--unsigned", action="store_true",
                         help="write no index.sig (for tests)")
-    parser.add_argument("--descriptions")
+    parser.add_argument("--catalog")
     args = parser.parse_args(argv)
     if not args.unsigned:
         if not os.path.isfile(args.key):
@@ -258,7 +298,7 @@ def main(argv):
             raise SystemExit("mkindex: the key does not match "
                              "kernel/store_key.h")
     index, count = build(args.paths, args.output,
-                         read_descriptions(args.descriptions))
+                         read_catalog(args.catalog))
     if not args.unsigned:
         signature = os.path.join(args.output, "index.sig")
         subprocess.run(["openssl", "dgst", "-sha256", "-sign", args.key,

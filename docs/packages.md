@@ -396,9 +396,15 @@ the store key.
     platform: opos
     asks: net
     requires-opos: 0.1.4
-    description: Draws pictures.
+    category: graphics
+    license: MIT
+    featured: yes
+    summary: Draws pictures.
+    description: Draws pictures with a pen, shapes and colors.
 
 - Entries are sorted by id, then by version, and each appears once.
+- `category`, `license`, `featured`, `summary` and `description` come
+  from `store/catalog.txt` (see "Store pages"). Each is optional.
 - The kernel (`package_index_find` in `kernel/package.c`) reads only
   `format`, `entry` and `package`. Every other line must have the form
   `key: value`, and the kernel ignores it. That leaves room for
@@ -474,22 +480,23 @@ by the real key:
 (`WINDOW_STORE`, "OPOS Store" in `kernel/desktop.c`).
 - It runs `/bin/pkg --gui available` and lists each program once: name,
   version, and state (installed, update from x, needs OPOS x or newer).
-- The selected program's details box shows its id, size, publisher,
-  description, and what it may ask for.
 - Buttons: REFRESH; INSTALL, UPDATE or UPDATE OPOS; REMOVE; UPDATE ALL.
   UPDATE OPOS opens Settings > UPDATES.
-- ALL and INSTALLED tabs (or Tab) switch to the "Installed" view: the
-  programs this account has from the Store.
 - After an install, update or removal, the list is read again.
-- An error from `pkg` is shown in full in the details box.
+- An error from `pkg` is shown in full.
+- Since the Store pages change (see "Store pages"), the window has a
+  start page, categories, search and an About page per program. The
+  single list with ALL and INSTALLED tabs is gone.
 
 **pkg --gui.** Nothing is asked: the window's buttons are the
 confirmation. Besides its normal text, `pkg` prints lines for the
 window, as `/bin/update --gui` does for Settings > UPDATES:
 - `@phase TEXT`: what is happening now.
 - `@item ID VERSION NAME PUBLISHER STATE INSTALLED NEEDS KB ASKS
-  DESCRIPTION`, separated by tabs. STATE is `new`, `installed`,
-  `update` or `needsopos`.
+  CATEGORY LICENSE FEATURED REQUIRES SUMMARY DESCRIPTION`, separated by
+  tabs. STATE is `new`, `installed`, `update` or `needsopos`. REQUIRES
+  is the shown version's `requires-opos`. The catalog fields are empty
+  when the index has no such line.
 - `@progress N`: percent of the running install or update. Downloading
   is 0-75 and the kernel's install step starts at 75. The download goes
   straight to the package cache through `opos_http_download` and is
@@ -546,8 +553,10 @@ They were never in the system image; they now reach a system only
 through the Store or as loose disk programs.
 
 **make store.** `make store` builds the SDK, every package in
-`STORE_PACKAGES` (in `GNUmakefile`), and an index with the descriptions
-in `store/descriptions.txt`, signed with `STORE_KEY` (default
+`STORE_PACKAGES` (in `GNUmakefile`), and an index with what
+`store/catalog.txt` says of each package (it was
+`store/descriptions.txt` before the Store pages), signed with
+`STORE_KEY` (default
 `~/.opos-signing/store-key.pem`). The result is `build/store/`: `index`,
 `index.sig` and the `.opk` files. `store/README.md` says how to publish
 it as a release of `PorkifyNET/opos-packages`, and how to test it from a
@@ -584,6 +593,73 @@ OPOS cannot run is not listed.
 
 Settings > UPDATES gains a line for package updates. Nothing updates
 by itself in the first version.
+
+### Store pages
+
+The Store window has three pages, below a search field:
+- **HOME**: a banner for the first featured program, up to four
+  FEATURED tiles, and CATEGORIES buttons with counts: ALL PROGRAMS,
+  INSTALLED, the eight categories, and OTHER when some program has no
+  known category. A category without programs is greyed out.
+- **LIST**: one category, the installed programs, or search results.
+  Each row has an icon, the name, the summary and the state. A click or
+  Enter opens the program's About page.
+- **ABOUT**: icon, name, publisher and summary; INSTALL (or UPDATE,
+  UPDATE OPOS, INSTALLED) and REMOVE; an overview of category, version,
+  size, license, publisher, the OPOS version it needs, what it may ask
+  for and its id; then the full description.
+
+**Search.** Typing anywhere in the window searches. Results come first
+by name, summary or category, then by description, publisher or id,
+each group by name. Clearing the search returns to HOME (or to the
+category it was typed from).
+
+**Keys.** Arrows move over the tiles and buttons (HOME), the rows
+(LIST) or the buttons and text (ABOUT). Enter opens or presses. Escape
+or BACK goes back. Tab moves to REFRESH and UPDATE ALL at the bottom
+and back. HOME and ABOUT scroll as a whole (arrows or wheel), LIST by
+rows.
+
+**Catalog.** `store/catalog.txt` holds what the Store shows of each
+package, one block per id:
+
+    [org.openttd.openttd]
+    category: games
+    license: GPL-2.0
+    featured: yes
+    summary: Build a transport empire of railways, roads, ships and planes.
+    description: OpenTTD, the open-source transport tycoon game: ...
+
+- Categories: `games`, `internet`, `office`, `graphics`,
+  `sound-video`, `programming`, `system`, `accessories`.
+- `mkindex.py --catalog` checks every line (known keys and categories,
+  ASCII, length limits: license 40, summary 90, description 900) and
+  copies them into the signed index.
+- An index made before the catalog still works: every program is under
+  OTHER, and HOME features the first four by name.
+
+**QEMU tests.** An installed disk with a signed Store on a CD (eight
+packages, with the catalog):
+- HOME shows Freedoom in the banner, Freedoom and OpenTTD as featured,
+  and the category counts. Arrow keys scroll HOME to the last row.
+- Typing `game` lists Freedoom and OpenTTD first, then Lua and SDL2
+  Demos (their descriptions mention games). Enter opens Freedoom's
+  About page; Page Down shows the description.
+- Escape twice returns to HOME. Typing `hello`, Enter, Enter installs
+  Hello from its About page, which then shows INSTALLED and VERSION 1.0.
+- A click on INSTALLED lists Hello. BACK returns to HOME.
+- The index published before the catalog shows every program under
+  OTHER and features the first four.
+
+**Not done.**
+- Packages carry no icons or screenshots. The icon is the category's
+  color and the first letter of the name.
+- Dependencies between packages do not exist yet (see "Dependencies"),
+  so the About page shows only the OPOS version a program needs.
+- The mouse wheel was not tested in QEMU (its PS/2 mouse sent no wheel
+  events there). It uses the same scrolling as the arrow keys.
+- The published index still lacks the catalog lines until a new
+  `make store` release is uploaded.
 
 ## Order of work
 

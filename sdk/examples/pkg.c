@@ -36,12 +36,17 @@
  * the window's buttons are the confirmation. Besides the usual text it
  * prints lines the window reads:
  *   @phase TEXT        what is happening now
- *   @item ID\tVERSION\tNAME\tPUBLISHER\tSTATE\tINSTALLED\tNEEDS\tKB\tASKS\tDESCRIPTION
+ *   @item ID\tVERSION\tNAME\tPUBLISHER\tSTATE\tINSTALLED\tNEEDS\tKB\tASKS
+ *         \tCATEGORY\tLICENSE\tFEATURED\tREQUIRES\tSUMMARY\tDESCRIPTION
  *                      one per program (pkg available); STATE is new,
  *                      installed, update or needsopos; NEEDS is the OPOS
  *                      version a newer release needs, or empty; ASKS is
  *                      the index's asks line (capability names or none),
- *                      or empty in an index without one
+ *                      or empty in an index without one; CATEGORY,
+ *                      LICENSE, FEATURED (yes or empty) and SUMMARY come
+ *                      from the index (store/catalog.txt) and may be
+ *                      empty; REQUIRES is the OPOS version this release
+ *                      needs, or empty
  *   @progress N        percent of the current install or update (0-100):
  *                      downloading (straight to the cache) 0-75,
  *                      installing 75-100
@@ -356,7 +361,11 @@ struct entry {
     unsigned long size;
     char sha256[65];
     char asks[64];
-    char description[160];
+    char category[16];
+    char license[48];
+    char featured[4];
+    char summary[96];
+    char description[1000];
 };
 
 static struct entry *entries;
@@ -618,6 +627,10 @@ static void parse_entries(void) {
                 FIELD("requires-opos", requires)
                 FIELD("description", description)
                 FIELD("asks", asks)
+                FIELD("category", category)
+                FIELD("license", license)
+                FIELD("featured", featured)
+                FIELD("summary", summary)
 #undef FIELD
                 if (key == 4 && strncmp(text, "file", 4) == 0) {
                     char copy[256];
@@ -826,7 +839,8 @@ static int available_command(const char *given) {
             bool update = copy.found && best != NULL
                 && compare_versions(best->version, copy.version) > 0;
             updates += update;
-            printf("@item %s\t%s\t%s\t%s\t%s\t%s\t%s\t%lu\t%s\t%s\n",
+            printf("@item %s\t%s\t%s\t%s\t%s\t%s\t%s\t%lu\t%s\t%s\t%s\t%s"
+                   "\t%s\t%s\t%s\n",
                    show_entry->id, show_entry->version, show_entry->name,
                    show_entry->publisher,
                    update ? "update" : copy.found ? "installed"
@@ -834,7 +848,9 @@ static int available_command(const char *given) {
                    copy.found ? copy.version : "",
                    blocked != NULL ? blocked->requires : "",
                    (show_entry->size + 1023) / 1024, show_entry->asks,
-                   show_entry->description);
+                   show_entry->category, show_entry->license,
+                   show_entry->featured, show_entry->requires,
+                   show_entry->summary, show_entry->description);
         } else {
             printf("  %-32s %-10s %-24s %s\n", show_entry->id,
                    show_entry->version, show_entry->name, state);

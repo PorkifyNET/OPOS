@@ -6,4 +6,5 @@ org.lua.lua: The Lua 5.4 interpreter, a small fast scripting language. Run it fr
 org.sqlite.sqlite3: The sqlite3 shell for SQLite databases. Run it from the Terminal with a database file.
 org.libsdl.sdl2-demos: Four demos of SDL 2, the library many Linux games use, drawing in an OPOS window: sprites, drawing, rotation and a key tester.
 org.chocolate-doom.freedoom: Freedoom: Phase 1, a complete free first-person shooter, on the Chocolate Doom engine, with sound. Source included (GPL-2.0).
+org.openttd.openttd: OpenTTD, the open-source transport tycoon game: build railways, roads, ships and planes and connect towns and industries. Comes with the OpenGFX graphics. No sound yet. Source included (GPL-2.0).
 net.busybox.busybox: BusyBox: a shell (ash) with vi, less and over 300 Unix tools in one program. Run "busybox sh" from the Terminal. Source included (GPL-2.0).

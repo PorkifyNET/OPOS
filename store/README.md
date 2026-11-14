@@ -34,6 +34,15 @@ it with Freedoom: Phase 1 as Freedoom, 33 MB. Chocolate Doom is GPL-2.0,
 so the package carries its source release. Add it with
 `STORE_LINUX="lua sqlite sdl2 doom"`.
 
+`linux/openttd/build.sh` (opt-in) builds OpenTTD 14.1 against that SDL
+and packages it with the OpenGFX 7.1 graphics, 53 MB. OpenTTD is
+C++, so it needs a musl cross toolchain with `g++` (musl-cross-make)
+instead of `LINUX_CC`: set `MUSL_CROSS` to its prefix (default
+`~/musl-cross/bin/x86_64-linux-musl-`). It also needs `cmake` and a host
+C++ compiler. OpenTTD and OpenGFX are GPL-2.0, so the package carries
+both source releases. It needs OPOS 0.6.0. Add it with
+`STORE_LINUX="lua sqlite sdl2 openttd"`.
+
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads
 `releases/latest/download/index` from there. See `docs/packages.md`.

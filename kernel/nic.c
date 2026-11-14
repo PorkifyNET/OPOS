@@ -79,6 +79,10 @@ bool nic_link_up(void) {
     }
 }
 
+size_t nic_receive_frames(void) {
+    return driver == NIC_E1000 ? E1000_RX_FRAMES : 32;
+}
+
 bool nic_send(const void *frame, size_t length) {
     switch (driver) {
     case NIC_E1000:

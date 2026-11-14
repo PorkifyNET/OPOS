@@ -855,28 +855,50 @@ static int available_command(const char *given) {
 /* Downloads e's package to a cache file and checks its size and SHA-256
    against the index, so a broken download is reported before the kernel
    reads it. */
-/* opos_http_download's sink: saves and hashes each piece as it arrives. */
+/* opos_http_download's sink: hashes each piece as it arrives and saves
+   it in 256 KiB writes. TLS hands over pieces of any size; writing each
+   at once cost the disk a partial-sector read and a FAT and directory
+   update per piece. */
+#define DOWNLOAD_CHUNK 262144
 struct download_file {
     long fd;
     br_sha256_context hash;
     size_t size;
     bool write_failed;
+    size_t pending; /* bytes waiting in download_chunk */
 };
+static uint8_t download_chunk[DOWNLOAD_CHUNK];
+
+static bool download_flush(struct download_file *file) {
+    size_t written = 0;
+    while (written < file->pending) {
+        long put = opos_write((int)file->fd, download_chunk + written,
+                              file->pending - written);
+        if (put <= 0) {
+            file->write_failed = true;
+            return false;
+        }
+        written += (size_t)put;
+    }
+    file->pending = 0;
+    return true;
+}
 
 static long download_write(void *context, const uint8_t *data,
                            size_t length) {
     struct download_file *file = context;
     br_sha256_update(&file->hash, data, length);
     file->size += length;
-    size_t written = 0;
-    while (written < length) {
-        size_t want = length - written < 4096 ? length - written : 4096;
-        long put = opos_write((int)file->fd, data + written, want);
-        if (put <= 0) {
-            file->write_failed = true;
+    while (length != 0) {
+        size_t room = DOWNLOAD_CHUNK - file->pending;
+        size_t take = length < room ? length : room;
+        memcpy(download_chunk + file->pending, data, take);
+        file->pending += take;
+        data += take;
+        length -= take;
+        if (file->pending == DOWNLOAD_CHUNK && !download_flush(file)) {
             return -OPOS_EIO;
         }
-        written += (size_t)put;
     }
     return 0;
 }
@@ -908,7 +930,7 @@ static bool download_package(const struct entry *e, char *path) {
     }
     struct download_file file = {
         opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT | OPOS_O_TRUNC),
-        {0}, 0, false,
+        {0}, 0, false, 0,
     };
     if (file.fd < 0) {
         printf("pkg: %s: could not save the download\n", path);
@@ -924,6 +946,9 @@ static bool download_package(const struct entry *e, char *path) {
     long result = opos_http_download(location, e->size, download_write,
                                      &file, &response);
     opos_http_set_progress(NULL, NULL);
+    if (!file.write_failed) {
+        (void)download_flush(&file);
+    }
     opos_close((int)file.fd);
     bool ok = false;
     if (file.write_failed) {

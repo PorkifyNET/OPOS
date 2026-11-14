@@ -59,7 +59,9 @@
 #define DESC_DD 0x01
 #define RX_STATUS_EOP 0x02
 
-#define RING_SIZE 32
+/* 256 descriptors fill each ring's page; a 256 KiB TCP window arrives
+   in bursts of up to about 180 frames between polls. */
+#define RING_SIZE E1000_RX_FRAMES
 #define BUFFER_SIZE 2048
 #define MAX_FRAME 1514
 
@@ -203,7 +205,7 @@ bool e1000_initialize(void) {
     bool e1000e = device.device_id == 0x10d3;
     pci_id = (uint32_t)device.vendor_id << 16 | device.device_id;
 
-    /* Ring and buffer memory: 1 page per ring, 16 pages per buffer set. */
+    /* Ring and buffer memory: 1 page per ring, 128 pages per buffer set. */
     uint64_t pages = 2 + 2 * (RING_SIZE * BUFFER_SIZE / 0x1000);
     uint64_t physical = physical_pages_alloc_contiguous(pages);
     if (physical == 0) {

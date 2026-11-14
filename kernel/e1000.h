@@ -18,6 +18,8 @@ bool e1000_ready(void);
 uint32_t e1000_pci_id(void);
 void e1000_mac_address(uint8_t mac[6]);
 bool e1000_link_up(void);
+/* Receive (and transmit) ring entries. */
+#define E1000_RX_FRAMES 256
 /* Sends one frame (14-byte header + payload, at most 1514 bytes). Returns
    false when the card is missing or the transmit ring stays full. */
 bool e1000_send(const void *frame, size_t length);

@@ -13,6 +13,9 @@ CACHE=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 VERSION=3.1.1
 FREEDOOM=0.13.0
+# The package version: Freedoom's, plus a fourth number for OPOS rebuilds
+# (0.13.0.1: SDL with full-screen windows).
+PACKAGE_VERSION=0.13.0.1
 SOURCE=$(fetch "https://github.com/chocolate-doom/chocolate-doom/archive/refs/tags/chocolate-doom-$VERSION.tar.gz" \
     1edcc41254bdc194beb0d33e267fae306556c4d24110a1d3d3f865717f25da23 \
     "$CACHE")
@@ -111,7 +114,7 @@ cat > "$STAGE/package.pkg" <<PKG
 format: 1
 id: org.chocolate-doom.freedoom
 name: Freedoom
-version: $FREEDOOM
+version: $PACKAGE_VERSION
 publisher: Chocolate Doom and Freedoom (built for OPOS)
 platform: linux
 requires-opos: 0.1.5

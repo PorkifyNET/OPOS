@@ -556,8 +556,22 @@ static inline long opos_window_event(struct opos_event *event,
    sound (a game, a presentation). They still reach the Notification
    Center. Older OPOS versions refuse it with -OPOS_EINVAL. */
 #define OPOS_WINDOW_QUIET 2u
+/* The window covers the whole screen without a frame; the taskbar stays
+   hidden while it is in front. The content size becomes the screen size
+   (a RESIZE event follows); a smaller picture is scaled up to fit, its
+   shape kept, and mouse positions arrive in the picture's pixels. Older
+   OPOS versions refuse it with -OPOS_EINVAL. */
+#define OPOS_WINDOW_FULLSCREEN 4u
 static inline long opos_window_options(uint32_t options) {
     return opos_syscall1(OPOS_SYS_WINDOW_OPTIONS, (long)options);
+}
+
+/* The screen size as width << 32 | height, also before a window opens
+   (what OPOS_WINDOW_FULLSCREEN gives). Older OPOS versions return a
+   negative error. */
+#define OPOS_SYS_SCREEN_SIZE 0x4f500017L
+static inline long opos_screen_size(void) {
+    return opos_syscall0(OPOS_SYS_SCREEN_SIZE);
 }
 
 /* The content area's current size. */

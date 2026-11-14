@@ -53,6 +53,8 @@
 #define OPOS_SYS_WINDOW_OPTIONS 0x4f500016L
 #define OPOS_WINDOW_KEY_STATE 1u
 #define OPOS_WINDOW_QUIET 2u
+#define OPOS_WINDOW_FULLSCREEN 4u
+#define OPOS_SYS_SCREEN_SIZE 0x4f500017L
 /* "1" keeps notifications quiet while the window is in front, "0" never
    does; unset, the window is quiet while it is full screen or holds the
    mouse in relative mode (a game being played). */
@@ -103,11 +105,13 @@ static SDL_bool opos_closed;
 static SDL_bool opos_relative;
 static SDL_bool opos_fullscreen;
 static SDL_bool opos_quiet_supported = SDL_TRUE;
+static SDL_bool opos_fullscreen_supported = SDL_TRUE;
 static int opos_quiet_hint = -1; /* -1 unset, 0 or 1 */
 static Uint32 opos_options;
 
 /* Sends the window options when they change. OPOS before 0.1.5 refuses
-   OPOS_WINDOW_QUIET; the window then stays as it was. */
+   OPOS_WINDOW_QUIET and before 0.6.2 OPOS_WINDOW_FULLSCREEN; the window
+   then goes without that option. */
 static void OPOS_UpdateOptions(void)
 {
     SDL_bool quiet;
@@ -122,12 +126,22 @@ static void OPOS_UpdateOptions(void)
     if (quiet && opos_quiet_supported) {
         options |= OPOS_WINDOW_QUIET;
     }
+    if (opos_fullscreen && opos_fullscreen_supported) {
+        options |= OPOS_WINDOW_FULLSCREEN;
+    }
     if (options == opos_options) {
         return;
     }
     if (opos_call(OPOS_SYS_WINDOW_OPTIONS, options, 0, 0, 0) < 0) {
-        if (options & OPOS_WINDOW_QUIET) {
+        /* Find out which option this OPOS lacks, then send the rest. */
+        if ((options & OPOS_WINDOW_FULLSCREEN)
+            && opos_call(OPOS_SYS_WINDOW_OPTIONS,
+                         options & ~OPOS_WINDOW_FULLSCREEN, 0, 0, 0) == 0) {
+            opos_fullscreen_supported = SDL_FALSE;
+            opos_options = options & ~OPOS_WINDOW_FULLSCREEN;
+        } else if (options & OPOS_WINDOW_QUIET) {
             opos_quiet_supported = SDL_FALSE;
+            opos_fullscreen_supported = SDL_FALSE;
         }
         return;
     }
@@ -360,6 +374,18 @@ static void OPOS_SetWindowFullscreen(_THIS, SDL_Window *window,
     }
 }
 
+/* OPOS never changes the screen mode: a full-screen window smaller than
+   the screen is scaled up by the desktop. Accepting the mode lets
+   exclusive full-screen requests (e.g. 640x480) work. */
+static int OPOS_SetDisplayMode(_THIS, SDL_VideoDisplay *display,
+                               SDL_DisplayMode *mode)
+{
+    (void)_this;
+    (void)display;
+    (void)mode;
+    return 0;
+}
+
 static void OPOS_DestroyWindow(_THIS, SDL_Window *window)
 {
     (void)_this;
@@ -428,20 +454,34 @@ static void OPOS_DestroyWindowFramebuffer(_THIS, SDL_Window *window)
 
 static int OPOS_VideoInit(_THIS)
 {
-    /* OPOS does not tell programs the screen size before a window opens;
-       these modes are what a full-screen request may pick. */
+    /* The desktop mode is the screen (older OPOS cannot tell; 1024x768
+       then). A full-screen window gets the whole screen; a smaller mode
+       is scaled up by the desktop, so every mode below works too. */
     static const int sizes[][2] = { { 1024, 768 }, { 800, 600 }, { 640, 480 } };
     SDL_DisplayMode mode;
+    long screen = opos_call(OPOS_SYS_SCREEN_SIZE, 0, 0, 0, 0);
+    int screen_w, screen_h;
     size_t i;
     SDL_zero(mode);
     mode.format = SDL_PIXELFORMAT_RGB888;
     mode.w = sizes[0][0];
     mode.h = sizes[0][1];
+    if (screen > 0 && (screen >> 32) > 0 && (screen & 0xffffffffL) > 0) {
+        mode.w = (int)(screen >> 32);
+        mode.h = (int)(screen & 0xffffffffL);
+    }
     mode.refresh_rate = 60;
     if (SDL_AddBasicVideoDisplay(&mode) < 0) {
         return -1;
     }
+    SDL_AddDisplayMode(&_this->displays[0], &mode);
+    screen_w = mode.w;
+    screen_h = mode.h;
     for (i = 0; i < SDL_arraysize(sizes); i++) {
+        if (sizes[i][0] > screen_w || sizes[i][1] > screen_h
+            || (sizes[i][0] == screen_w && sizes[i][1] == screen_h)) {
+            continue;
+        }
         mode.w = sizes[i][0];
         mode.h = sizes[i][1];
         SDL_AddDisplayMode(&_this->displays[0], &mode);
@@ -476,6 +516,7 @@ static SDL_VideoDevice *OPOS_CreateDevice(void)
     device->CreateSDLWindow = OPOS_CreateWindow;
     device->DestroyWindow = OPOS_DestroyWindow;
     device->SetWindowFullscreen = OPOS_SetWindowFullscreen;
+    device->SetDisplayMode = OPOS_SetDisplayMode;
     device->CreateWindowFramebuffer = OPOS_CreateWindowFramebuffer;
     device->UpdateWindowFramebuffer = OPOS_UpdateWindowFramebuffer;
     device->DestroyWindowFramebuffer = OPOS_DestroyWindowFramebuffer;

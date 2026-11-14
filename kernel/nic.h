@@ -24,5 +24,8 @@ bool nic_send(const void *frame, size_t length);
 size_t nic_receive(void *buffer, size_t capacity);
 uint64_t nic_sent_count(void);
 uint64_t nic_received_count(void);
+/* Frames the card can hold between two polls; TCP keeps its window to
+   about this many full segments so a burst does not overflow the ring. */
+size_t nic_receive_frames(void);
 
 #endif

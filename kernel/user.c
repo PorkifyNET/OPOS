@@ -70,6 +70,10 @@
 #define USER_PIPE_BUFFER_CAPACITY 4096
 #define USER_FILE_PATH_CAPACITY 256
 #define USER_FILE_IO_MAX 4096
+/* Reads and writes of disk files move up to this much per call. Each
+   write call also updates the FAT, the directory entry and flushes the
+   disk cache once, so 4 KiB calls made large files slow to save. */
+#define USER_DISK_IO_MAX (1024 * 1024)
 /* Sockets move at most this much per call (short reads/writes are
    normal for them). */
 #define USER_SOCKET_IO_MAX 65536
@@ -6014,7 +6018,12 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             && length > USER_SOCKET_IO_MAX) {
             length = USER_SOCKET_IO_MAX;
         }
+        if (file != NULL && file->kind == USER_OPEN_FILE_VFS
+            && length > USER_DISK_IO_MAX) {
+            length = USER_DISK_IO_MAX;
+        }
         if (file != NULL && file->kind != USER_OPEN_FILE_SOCKET
+            && file->kind != USER_OPEN_FILE_VFS
             && length > USER_FILE_IO_MAX) {
             length = USER_FILE_IO_MAX;
         }
@@ -6083,7 +6092,12 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
             length = USER_SOCKET_IO_MAX;
         }
         /* A larger read returns fewer bytes, which read() may always do. */
+        if (file != NULL && file->kind == USER_OPEN_FILE_VFS
+            && length > USER_DISK_IO_MAX) {
+            length = USER_DISK_IO_MAX;
+        }
         if (file != NULL && file->kind != USER_OPEN_FILE_SOCKET
+            && file->kind != USER_OPEN_FILE_VFS
             && length > USER_FILE_IO_MAX) {
             length = USER_FILE_IO_MAX;
         }

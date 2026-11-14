@@ -900,7 +900,11 @@ static void dns_poll(void) {
 #define IP_PROTOCOL_TCP 6
 #define TCP_CONNECTIONS 8
 #define TCP_SEND_CAPACITY 16384
-#define TCP_RECEIVE_CAPACITY 32768
+/* 256 KiB with window scaling: a 64 KiB window over a 30 ms path allows
+   only about 2 MB/s. */
+#define TCP_RECEIVE_CAPACITY 262144
+#define TCP_WINDOW_SHIFT 3 /* 65535 << 3 covers TCP_RECEIVE_CAPACITY */
+#define TCP_WSCALE_MAX 14
 #define TCP_MSS 1460
 #define TCP_HEADER 20
 #define TCP_RTO_START TICKS_PER_SECOND
@@ -947,6 +951,9 @@ struct tcp_connection {
     bool fin_sent;
     bool remote_closed;
     uint32_t advertised; /* window in the last segment we sent */
+    bool wscale;         /* both sides sent the window scale option */
+    uint8_t snd_shift;   /* the peer's window scale */
+    uint8_t rcv_shift;   /* ours: TCP_WINDOW_SHIFT once agreed, else 0 */
     uint64_t retransmit_at; /* 0: no timer */
     uint64_t rto;
     int retries;
@@ -1009,30 +1016,49 @@ static bool seq_le(uint32_t a, uint32_t b) {
     return (int32_t)(a - b) <= 0;
 }
 
+/* Free receive space in bytes, as far as the window field can say it. */
 static uint32_t tcp_window(const struct tcp_connection *c) {
     size_t free = TCP_RECEIVE_CAPACITY - c->receive_length;
-    return free > 65535 ? 65535 : (uint32_t)free;
+    size_t most = (size_t)65535 << c->rcv_shift;
+    size_t ring = nic_receive_frames() * TCP_MSS;
+    if (most > ring) {
+        most = ring;
+    }
+    return free > most ? (uint32_t)most : (uint32_t)free;
 }
 
 /* Sends one segment; data may be NULL when length is 0. */
 static void tcp_segment(struct tcp_connection *c, uint32_t seq, uint8_t flags,
                         const uint8_t *data, size_t length) {
     uint8_t *tcp = frame_out + ETHERNET_HEADER + IP_HEADER;
-    size_t header = TCP_HEADER + ((flags & TCP_SYN) != 0 ? 4 : 0);
+    bool syn = (flags & TCP_SYN) != 0;
+    /* A SYN offers window scaling; a SYN+ACK only answers an offer. */
+    bool offer_scale = syn && ((flags & TCP_ACK) == 0 || c->wscale);
+    size_t header = TCP_HEADER + (syn ? 4 : 0) + (offer_scale ? 4 : 0);
     put16(tcp, c->local_port);
     put16(tcp + 2, c->remote_port);
     put32(tcp + 4, seq);
     put32(tcp + 8, (flags & TCP_ACK) != 0 ? c->rcv_nxt : 0);
     tcp[12] = (uint8_t)(header / 4 << 4);
     tcp[13] = flags;
-    c->advertised = tcp_window(c);
-    put16(tcp + 14, (uint16_t)c->advertised);
+    /* The window in a SYN is never scaled. */
+    uint32_t window = tcp_window(c);
+    uint32_t field = syn ? (window > 65535 ? 65535 : window)
+                         : window >> c->rcv_shift;
+    c->advertised = syn ? field : field << c->rcv_shift;
+    put16(tcp + 14, (uint16_t)field);
     put16(tcp + 16, 0);
     put16(tcp + 18, 0);
-    if ((flags & TCP_SYN) != 0) {
+    if (syn) {
         tcp[20] = 2; /* maximum segment size */
         tcp[21] = 4;
         put16(tcp + 22, TCP_MSS);
+    }
+    if (offer_scale) {
+        tcp[24] = 1; /* no-operation, for alignment */
+        tcp[25] = 3; /* window scale */
+        tcp[26] = 3;
+        tcp[27] = TCP_WINDOW_SHIFT;
     }
     if (length != 0) {
         copy(tcp + header, data, length);
@@ -1153,6 +1179,39 @@ static uint32_t tcp_option_mss(const uint8_t *tcp, size_t header) {
     return mss > TCP_MSS ? TCP_MSS : mss < 64 ? 64 : mss;
 }
 
+/* The window scale option of a SYN, or -1 when it has none. */
+static int tcp_option_wscale(const uint8_t *tcp, size_t header) {
+    for (size_t i = TCP_HEADER; i + 1 < header;) {
+        uint8_t kind = tcp[i];
+        if (kind == 0) {
+            break;
+        }
+        if (kind == 1) {
+            i++;
+            continue;
+        }
+        uint8_t size = tcp[i + 1];
+        if (size < 2 || i + size > header) {
+            break;
+        }
+        if (kind == 3 && size == 3) {
+            uint8_t shift = tcp[i + 2];
+            return shift > TCP_WSCALE_MAX ? TCP_WSCALE_MAX : shift;
+        }
+        i += size;
+    }
+    return -1;
+}
+
+/* Agrees on window scaling from the peer's SYN or SYN+ACK. */
+static void tcp_agree_wscale(struct tcp_connection *c, const uint8_t *tcp,
+                             size_t header) {
+    int shift = tcp_option_wscale(tcp, header);
+    c->wscale = shift >= 0;
+    c->snd_shift = c->wscale ? (uint8_t)shift : 0;
+    c->rcv_shift = c->wscale ? TCP_WINDOW_SHIFT : 0;
+}
+
 /* Starts an incoming connection: answers the SYN with SYN+ACK. */
 static bool tcp_accept_syn(struct tcp_listener *listener, const uint8_t *ip,
                            const uint8_t *tcp, size_t header, uint32_t seq,
@@ -1175,6 +1234,7 @@ static bool tcp_accept_syn(struct tcp_listener *listener, const uint8_t *ip,
         c->rcv_nxt = seq + 1;
         c->snd_wnd = window;
         c->mss = tcp_option_mss(tcp, header);
+        tcp_agree_wscale(c, tcp, header);
         c->rto = TCP_RTO_START;
         c->state = TCP_SYN_RECEIVED;
         tcp_segment(c, c->iss, TCP_SYN | TCP_ACK, NULL, 0);
@@ -1263,7 +1323,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
             return;
         }
         c->snd_una = ack;
-        c->snd_wnd = window;
+        c->snd_wnd = window << c->snd_shift;
         c->state = TCP_ESTABLISHED;
         c->retransmit_at = 0;
         c->retries = 0;
@@ -1319,6 +1379,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
         if (c->mss < 64) {
             c->mss = 64;
         }
+        tcp_agree_wscale(c, tcp, header);
         c->state = TCP_ESTABLISHED;
         c->retransmit_at = 0;
         c->retries = 0;
@@ -1384,7 +1445,7 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
         }
     }
     if (seq_le(c->snd_una, ack)) {
-        c->snd_wnd = window;
+        c->snd_wnd = window << c->snd_shift;
     }
 
     /* Data, in order only. */
@@ -2327,7 +2388,7 @@ void net_poll(void) {
         }
         link_was_up = link;
     }
-    for (int frames = 0; frames < 32; frames++) {
+    for (int frames = 0; frames < 256; frames++) {
         size_t length = nic_receive(frame_in, sizeof(frame_in));
         if (length == 0) {
             break;

@@ -41,6 +41,7 @@
 #define NVME_IDENTIFY_CONTROLLER 0x01
 #define NVME_IDENTIFY_ACTIVE_NAMESPACES 0x02
 #define NVME_IDENTIFY_VOLATILE_WRITE_CACHE 525
+#define NVME_IDENTIFY_MDTS 77
 #define NVME_POLL_LIMIT 20000000u
 
 struct nvme_submission_entry {
@@ -85,8 +86,16 @@ static volatile uint8_t *nvme_registers;
 static uint32_t doorbell_stride;
 static struct nvme_queue admin_queue;
 static struct nvme_queue io_queue;
+/* Bounce buffer: data_pages contiguous pages (one if a contiguous run
+   could not be had), so a read or write moves up to 64 KiB per command
+   instead of one page. prp_list names its pages after the first. */
+#define NVME_DATA_PAGES 16
 static uint64_t data_physical;
 static uint8_t *data_page;
+static uint32_t data_pages;
+static uint32_t transfer_pages; /* data_pages, or less under MDTS */
+static uint64_t prp_list_physical;
+static uint64_t *prp_list;
 static uint16_t next_command_id;
 static bool volatile_write_cache;
 static struct nvme_status controller_status;
@@ -265,8 +274,41 @@ static bool map_nvme_registers(uint64_t physical_address) {
 static void release_controller(void) {
     release_queue(&admin_queue);
     release_queue(&io_queue);
+    for (uint32_t i = 1; i < data_pages; i++) {
+        (void)physical_page_free(data_physical + (uint64_t)i * PAGE_SIZE);
+    }
     release_page(&data_physical);
+    release_page(&prp_list_physical);
     data_page = NULL;
+    prp_list = NULL;
+    data_pages = 0;
+    transfer_pages = 0;
+}
+
+/* The bounce buffer: NVME_DATA_PAGES contiguous pages, else one. */
+static bool allocate_data_pages(void) {
+    void *list;
+    if (!allocate_page(&prp_list_physical, &list)) {
+        return false;
+    }
+    prp_list = list;
+    data_physical = physical_pages_alloc_contiguous(NVME_DATA_PAGES);
+    if (data_physical != 0) {
+        data_pages = NVME_DATA_PAGES;
+        data_page = physical_page_to_hhdm(data_physical);
+        /* The list starts at the second page; the first is PRP1. */
+        for (uint32_t i = 1; i < data_pages; i++) {
+            prp_list[i - 1] = data_physical + (uint64_t)i * PAGE_SIZE;
+        }
+        return true;
+    }
+    void *page;
+    if (!allocate_page(&data_physical, &page)) {
+        return false;
+    }
+    data_pages = 1;
+    data_page = page;
+    return true;
 }
 
 static bool fail_controller(void) {
@@ -312,14 +354,12 @@ bool nvme_initialize(void) {
         mmio_write32(NVME_REGISTER_CONFIGURATION,
                      configuration & ~NVME_CONFIGURATION_ENABLE);
     }
-    void *page;
     if (!wait_ready(false)
         || !allocate_queue(&admin_queue, NVME_ADMIN_QUEUE)
         || !allocate_queue(&io_queue, NVME_IO_QUEUE)
-        || !allocate_page(&data_physical, &page)) {
+        || !allocate_data_pages()) {
         return fail_controller();
     }
-    data_page = page;
 
     mmio_write32(NVME_REGISTER_INTERRUPT_MASK_SET, 0xffffffffu);
     mmio_write32(NVME_REGISTER_ADMIN_QUEUE_ATTRIBUTES,
@@ -339,6 +379,13 @@ bool nvme_initialize(void) {
     }
     volatile_write_cache =
         (data_page[NVME_IDENTIFY_VOLATILE_WRITE_CACHE] & 1u) != 0;
+    /* Maximum data transfer size: 2^MDTS minimum-size (4 KiB) pages,
+       0 for no limit. */
+    uint8_t mdts = data_page[NVME_IDENTIFY_MDTS];
+    transfer_pages = data_pages;
+    if (mdts != 0 && mdts < 31 && (1u << mdts) < transfer_pages) {
+        transfer_pages = 1u << mdts;
+    }
 
     /* Model number: identify-controller bytes 24-63, space padded. */
     size_t model_length = 0;
@@ -470,9 +517,12 @@ static bool transfer(size_t disk, uint32_t first_sector, uint8_t sector_count,
     uint32_t done = 0;
     while (done < sector_count) {
         uint32_t chunk = sector_count - done;
-        if (chunk > SECTORS_PER_PAGE) {
-            chunk = SECTORS_PER_PAGE;
+        uint32_t most = (transfer_pages != 0 ? transfer_pages : 1)
+            * SECTORS_PER_PAGE;
+        if (chunk > most) {
+            chunk = most;
         }
+        uint32_t pages = (chunk + SECTORS_PER_PAGE - 1) / SECTORS_PER_PAGE;
         size_t bytes = (size_t)chunk * SECTOR_SIZE;
         uint8_t *part = buffer + (size_t)done * SECTOR_SIZE;
         if (write) {
@@ -485,6 +535,9 @@ static bool transfer(size_t disk, uint32_t first_sector, uint8_t sector_count,
             .command = write ? NVME_IO_WRITE : NVME_IO_READ,
             .namespace_id = namespaces[disk].id,
             .prp1 = data_physical,
+            /* A second page directly; more through the PRP list. */
+            .prp2 = pages == 2 ? data_physical + PAGE_SIZE
+                  : pages > 2 ? prp_list_physical : 0,
             .dword10 = (uint32_t)lba,
             .dword11 = (uint32_t)(lba >> 32),
             .dword12 = chunk - 1,

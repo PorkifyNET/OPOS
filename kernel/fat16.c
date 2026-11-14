@@ -52,8 +52,19 @@ static bool fsinfo_invalidated;
 static size_t preferred_partition;
 static uint32_t cached_root_sector;
 static bool cached_root_sector_valid;
-static uint32_t cached_fat_sector;
-static bool cached_fat_sector_valid;
+/* A few FAT sectors stay cached: copying a file reads one chain while it
+   writes another, and with one cached sector each evicted the other. */
+#define FAT_CACHE_SECTORS 8
+static uint8_t fat_cache[FAT_CACHE_SECTORS][SECTOR_SIZE];
+static uint32_t fat_cache_lba[FAT_CACHE_SECTORS];
+static bool fat_cache_valid[FAT_CACHE_SECTORS];
+static size_t fat_cache_next;
+
+static void fat_cache_forget(void) {
+    for (size_t i = 0; i < FAT_CACHE_SECTORS; i++) {
+        fat_cache_valid[i] = false;
+    }
+}
 
 /*
  * Reading or writing a file at an offset walks its cluster chain, and so
@@ -64,7 +75,9 @@ static bool cached_fat_sector_valid;
  * chain forgets them. free_hint is where the last allocation ended; free
  * clusters are looked for after it first.
  */
-#define CHAIN_POSITIONS 4
+/* Installing a package reads one long chain while it writes many new
+   files; with 4 the package's position was soon pushed out. */
+#define CHAIN_POSITIONS 64
 struct chain_position {
     uint32_t first;
     uint32_t index;
@@ -110,11 +123,12 @@ static void chain_position_store(uint32_t first, uint32_t index,
     chain_position_next = (chain_position_next + 1) % CHAIN_POSITIONS;
 }
 static uint8_t root_sector_buffer[SECTOR_SIZE];
-static uint8_t fat_sector_buffer[SECTOR_SIZE];
+/* The FAT sector fat16_load_fat_sector loaded last (a fat_cache slot). */
+static uint8_t *fat_sector_buffer = fat_cache[0];
 static uint8_t file_sector_buffer[SECTOR_SIZE];
 /* Directory reads go through a one-sector cache (directory listings and
-   lookups read entry by entry). Every write through fat_write_sectors
-   drops it if it covers the cached sector. */
+   lookups read entry by entry). A write through fat_write_sectors that
+   covers the cached sector updates it. */
 static uint8_t directory_sector_buffer[SECTOR_SIZE];
 static uint32_t directory_cached_sector;
 static bool directory_cache_valid;
@@ -123,9 +137,19 @@ static bool fat_write_sectors(uint32_t first_sector, uint8_t sector_count,
                               const uint8_t *buffer) {
     if (directory_cache_valid && directory_cached_sector >= first_sector
         && directory_cached_sector - first_sector < sector_count) {
-        directory_cache_valid = false;
+        const uint8_t *source = (const uint8_t *)buffer
+            + (size_t)(directory_cached_sector - first_sector) * SECTOR_SIZE;
+        if (source != directory_sector_buffer) {
+            for (size_t i = 0; i < SECTOR_SIZE; i++) {
+                directory_sector_buffer[i] = source[i];
+            }
+        }
     }
-    return block_write_sectors(first_sector, sector_count, buffer);
+    if (!block_write_sectors(first_sector, sector_count, buffer)) {
+        directory_cache_valid = false;
+        return false;
+    }
+    return true;
 }
 
 static bool directory_read_sector(uint32_t sector) {
@@ -338,7 +362,7 @@ bool fat16_initialize(void) {
     volume = (struct fat16_volume){0};
     fsinfo_invalidated = false;
     cached_root_sector_valid = false;
-    cached_fat_sector_valid = false;
+    fat_cache_forget();
     fat16_forget_positions();
     disk_state = FAT_DISK_NO_DEVICE;
     uint64_t disk_sectors = block_sector_count();
@@ -465,19 +489,25 @@ bool fat16_root_entry_at(size_t index, struct fat16_directory_entry *entry) {
     return true;
 }
 
-/* All FAT sector reads and writes go through fat_sector_buffer, which caches
-   the most recently transferred FAT sector so that scans for free clusters
-   read each sector once instead of once per entry. */
+/* All FAT sector reads and writes go through fat_sector_buffer, which
+   points at the cached copy of lba, so that scans for free clusters read
+   each sector once instead of once per entry. */
 static bool fat16_load_fat_sector(uint32_t lba) {
-    if (cached_fat_sector_valid && cached_fat_sector == lba) {
-        return true;
+    for (size_t i = 0; i < FAT_CACHE_SECTORS; i++) {
+        if (fat_cache_valid[i] && fat_cache_lba[i] == lba) {
+            fat_sector_buffer = fat_cache[i];
+            return true;
+        }
     }
-    cached_fat_sector_valid = false;
+    size_t slot = fat_cache_next;
+    fat_cache_next = (fat_cache_next + 1) % FAT_CACHE_SECTORS;
+    fat_cache_valid[slot] = false;
+    fat_sector_buffer = fat_cache[slot];
     if (!block_read_sectors(lba, 1, fat_sector_buffer)) {
         return false;
     }
-    cached_fat_sector = lba;
-    cached_fat_sector_valid = true;
+    fat_cache_lba[slot] = lba;
+    fat_cache_valid[slot] = true;
     return true;
 }
 
@@ -547,22 +577,26 @@ static bool fat16_write_fat_entry(uint32_t cluster, uint32_t value) {
         return false;
     }
 
+    /* The copies mirror the first FAT: change it and write the same
+       sector to each copy, so the cache keeps the sector reads use. */
+    uint32_t first_lba = volume.first_sector + volume.reserved_sectors
+        + fat_sector;
+    if (!fat16_load_fat_sector(first_lba)) {
+        return false;
+    }
+    if (volume.fat32) {
+        uint32_t preserved = read_le32(fat_sector_buffer + entry_offset)
+            & ~FAT32_ENTRY_MASK;
+        write_le32(fat_sector_buffer + entry_offset,
+                   preserved | (value & FAT32_ENTRY_MASK));
+    } else {
+        write_le16(fat_sector_buffer + entry_offset, (uint16_t)value);
+    }
     for (uint8_t copy = 0; copy < volume.fat_count; copy++) {
-        uint32_t lba = volume.first_sector + volume.reserved_sectors
-            + (uint32_t)copy * volume.sectors_per_fat + fat_sector;
-        if (!fat16_load_fat_sector(lba)) {
-            return false;
-        }
-        if (volume.fat32) {
-            uint32_t preserved = read_le32(fat_sector_buffer + entry_offset)
-                & ~FAT32_ENTRY_MASK;
-            write_le32(fat_sector_buffer + entry_offset,
-                       preserved | (value & FAT32_ENTRY_MASK));
-        } else {
-            write_le16(fat_sector_buffer + entry_offset, (uint16_t)value);
-        }
-        if (!fat_write_sectors(lba, 1, fat_sector_buffer)) {
-            cached_fat_sector_valid = false;
+        if (!fat_write_sectors(first_lba
+                                   + (uint32_t)copy * volume.sectors_per_fat,
+                               1, fat_sector_buffer)) {
+            fat_cache_forget();
             return false;
         }
     }
@@ -594,32 +628,36 @@ static bool fat_batch_flush(void) {
     if (!fat16_invalidate_fsinfo()) {
         return false;
     }
-    for (uint8_t copy = 0; copy < volume.fat_count; copy++) {
-        uint32_t lba = volume.first_sector + volume.reserved_sectors
-            + (uint32_t)copy * volume.sectors_per_fat + fat_batch.sector;
-        if (!fat16_load_fat_sector(lba)) {
+    /* As in fat16_write_fat_entry: change the first FAT's sector once,
+       then write it to every copy. */
+    uint32_t first_lba = volume.first_sector + volume.reserved_sectors
+        + fat_batch.sector;
+    if (!fat16_load_fat_sector(first_lba)) {
+        return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+        uint32_t fat_sector;
+        size_t entry_offset;
+        if (!fat16_fat_entry_location(fat_batch.clusters[i], &fat_sector,
+                                      &entry_offset)) {
+            fat_cache_forget();
             return false;
         }
-        for (size_t i = 0; i < count; i++) {
-            uint32_t fat_sector;
-            size_t entry_offset;
-            if (!fat16_fat_entry_location(fat_batch.clusters[i], &fat_sector,
-                                          &entry_offset)) {
-                return false;
-            }
-            uint32_t value = fat_batch.values[i];
-            if (volume.fat32) {
-                uint32_t preserved = read_le32(fat_sector_buffer
-                                               + entry_offset)
-                    & ~FAT32_ENTRY_MASK;
-                write_le32(fat_sector_buffer + entry_offset,
-                           preserved | (value & FAT32_ENTRY_MASK));
-            } else {
-                write_le16(fat_sector_buffer + entry_offset, (uint16_t)value);
-            }
+        uint32_t value = fat_batch.values[i];
+        if (volume.fat32) {
+            uint32_t preserved = read_le32(fat_sector_buffer + entry_offset)
+                & ~FAT32_ENTRY_MASK;
+            write_le32(fat_sector_buffer + entry_offset,
+                       preserved | (value & FAT32_ENTRY_MASK));
+        } else {
+            write_le16(fat_sector_buffer + entry_offset, (uint16_t)value);
         }
-        if (!fat_write_sectors(lba, 1, fat_sector_buffer)) {
-            cached_fat_sector_valid = false;
+    }
+    for (uint8_t copy = 0; copy < volume.fat_count; copy++) {
+        if (!fat_write_sectors(first_lba
+                                   + (uint32_t)copy * volume.sectors_per_fat,
+                               1, fat_sector_buffer)) {
+            fat_cache_forget();
             return false;
         }
     }
@@ -1175,11 +1213,13 @@ static bool fat16_ensure_chain_capacity(uint32_t first_cluster,
         free_hint = current;
         current = next;
     }
-    if (!fat_batch_flush()) {
+    /* The old tail's link goes last, after the new chain; usually it
+       shares their FAT sector and is written with them. */
+    if (existing_clusters != 0 && !fat_batch_add(existing_tail, first_new)) {
+        fat_batch.count = 0;
         return false;
     }
-    if (existing_clusters != 0
-        && !fat16_write_fat_entry(existing_tail, first_new)) {
+    if (!fat_batch_flush()) {
         return false;
     }
     /* Appending leaves every walked position valid. */
@@ -1190,6 +1230,9 @@ static bool fat16_ensure_chain_capacity(uint32_t first_cluster,
         ? first_new : first_cluster;
     return true;
 }
+
+/* One read or write command covers at most this many sectors (64 KiB). */
+#define RUN_SECTORS 128
 
 static bool fat16_write_chain_range(uint32_t first_cluster, size_t offset,
                                     const uint8_t *buffer, size_t length,
@@ -1216,16 +1259,61 @@ static bool fat16_write_chain_range(uint32_t first_cluster, size_t offset,
         uint32_t lba = volume.first_data_sector
             + (uint32_t)(cluster - 2) * volume.sectors_per_cluster
             + sector_in_cluster;
-        if ((within_sector != 0 || amount != SECTOR_SIZE)
-            && !block_read_sectors(lba, 1, file_sector_buffer)) {
-            return false;
-        }
-        for (size_t i = 0; i < amount; i++) {
-            file_sector_buffer[within_sector + i] = zero_fill
-                ? 0 : buffer[input_offset + i];
-        }
-        if (!fat_write_sectors(lba, 1, file_sector_buffer)) {
-            return false;
+        /* Whole sectors go in one command of up to RUN_SECTORS,
+           across clusters that follow each other on the disk. */
+        size_t whole = remaining / SECTOR_SIZE;
+        if (!zero_fill && within_sector == 0 && whole > 1) {
+            size_t per_cluster = volume.sectors_per_cluster;
+            size_t run = per_cluster - sector_in_cluster;
+            if (run > whole) {
+                run = whole;
+            }
+            uint32_t last = cluster;
+            size_t in_last = sector_in_cluster + run;
+            while (in_last == per_cluster && run < whole
+                   && run + per_cluster <= RUN_SECTORS) {
+                uint32_t next;
+                bool end_of_chain;
+                if (!fat16_get_next_cluster(last, &next, &end_of_chain)
+                    || end_of_chain || next != last + 1) {
+                    break;
+                }
+                last = next;
+                in_last = whole - run < per_cluster ? whole - run
+                                                    : per_cluster;
+                run += in_last;
+            }
+            if (!fat_write_sectors(lba, (uint8_t)run,
+                                   buffer + input_offset)) {
+                return false;
+            }
+            input_offset += run * SECTOR_SIZE;
+            remaining -= run * SECTOR_SIZE;
+            cluster = last;
+            within_cluster = in_last * SECTOR_SIZE;
+            if (remaining != 0 && within_cluster == cluster_bytes) {
+                uint32_t next;
+                bool end_of_chain;
+                if (!fat16_get_next_cluster(cluster, &next, &end_of_chain)
+                    || end_of_chain) {
+                    return false;
+                }
+                cluster = next;
+                within_cluster = 0;
+            }
+            continue;
+        } else {
+            if ((within_sector != 0 || amount != SECTOR_SIZE)
+                && !block_read_sectors(lba, 1, file_sector_buffer)) {
+                return false;
+            }
+            for (size_t i = 0; i < amount; i++) {
+                file_sector_buffer[within_sector + i] = zero_fill
+                    ? 0 : buffer[input_offset + i];
+            }
+            if (!fat_write_sectors(lba, 1, file_sector_buffer)) {
+                return false;
+            }
         }
         input_offset += amount;
         remaining -= amount;
@@ -2403,17 +2491,19 @@ bool fat16_rename_named(struct fat16_node *source, uint32_t source_parent,
 
 static bool fat16_update_node(struct fat16_node *node, uint32_t first_cluster,
                               uint32_t size) {
+    /* Through the directory cache: a file written piece by piece updates
+       the same entry each time. */
     if (node == NULL || node->entry_offset > SECTOR_SIZE - FAT16_DIRECTORY_ENTRY_SIZE
-        || !block_read_sectors(node->entry_sector, 1, file_sector_buffer)) {
+        || !directory_read_sector(node->entry_sector)) {
         return false;
     }
-    uint8_t *raw = file_sector_buffer + node->entry_offset;
+    uint8_t *raw = directory_sector_buffer + node->entry_offset;
     if (!names_equal(raw, node->name)) {
         return false;
     }
     write_cluster(raw, first_cluster);
     write_le32(raw + 28, size);
-    if (!fat_write_sectors(node->entry_sector, 1, file_sector_buffer)) {
+    if (!fat_write_sectors(node->entry_sector, 1, directory_sector_buffer)) {
         return false;
     }
     cached_root_sector_valid = false;
@@ -2515,6 +2605,50 @@ bool fat16_read_node_at(const struct fat16_node *node, size_t offset,
         uint32_t sector = volume.first_data_sector
             + (uint32_t)(cluster - 2) * volume.sectors_per_cluster
             + sector_in_cluster;
+        /* Whole sectors go straight into the buffer, up to
+           RUN_SECTORS per command across clusters that follow each
+           other on the disk. */
+        size_t whole = remaining / SECTOR_SIZE;
+        if (within_sector == 0 && whole > 1) {
+            size_t per_cluster = volume.sectors_per_cluster;
+            size_t run = per_cluster - sector_in_cluster;
+            if (run > whole) {
+                run = whole;
+            }
+            uint32_t last = cluster;
+            size_t in_last = sector_in_cluster + run;
+            while (in_last == per_cluster && run < whole
+                   && run + per_cluster <= RUN_SECTORS) {
+                uint32_t next;
+                bool end_of_chain;
+                if (!fat16_get_next_cluster(last, &next, &end_of_chain)
+                    || end_of_chain || next != last + 1) {
+                    break;
+                }
+                last = next;
+                in_last = whole - run < per_cluster ? whole - run
+                                                    : per_cluster;
+                run += in_last;
+            }
+            if (!block_read_sectors(sector, (uint8_t)run,
+                                    buffer + output_offset)) {
+                return false;
+            }
+            output_offset += run * SECTOR_SIZE;
+            remaining -= run * SECTOR_SIZE;
+            cluster = last;
+            within_cluster = in_last * SECTOR_SIZE;
+            if (remaining != 0 && within_cluster == cluster_bytes) {
+                uint32_t next;
+                bool end;
+                if (!fat16_get_next_cluster(cluster, &next, &end) || end) {
+                    return false;
+                }
+                cluster = next;
+                within_cluster = 0;
+            }
+            continue;
+        }
         if (!block_read_sectors(sector, 1, file_sector_buffer)) {
             return false;
         }
@@ -2848,7 +2982,7 @@ static void forget_volume(void) {
     directory_cache_valid = false;
     volume = (struct fat16_volume){0};
     cached_root_sector_valid = false;
-    cached_fat_sector_valid = false;
+    fat_cache_forget();
     fat16_forget_positions();
 }
 
@@ -3003,7 +3137,7 @@ static void slot_load(size_t index) {
     fsinfo_invalidated = slot->fsinfo_invalidated;
     directory_cache_valid = false;
     cached_root_sector_valid = false;
-    cached_fat_sector_valid = false;
+    fat_cache_forget();
     fat16_forget_positions();
 }
 

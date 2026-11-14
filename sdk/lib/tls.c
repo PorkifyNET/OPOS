@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #include <bearssl.h>
+#include <opos_http.h>
 #include <opos_tls.h>
 #include <stdlib.h>
 #include <string.h>
@@ -373,6 +374,8 @@ const char *opos_tls_error_text(long error) {
         return "network is down";
     case OPOS_ENOMEM:
         return "out of memory";
+    case OPOS_EFBIG:
+        return "larger than expected";
     default:
         return "network error";
     }

@@ -110,6 +110,9 @@ struct window {
     bool minimized;
     /* A maximized window covers the whole desktop area, in either layout. */
     bool maximized;
+    /* A full-screen program window (DESKTOP_APP_FULLSCREEN) covers the
+       whole screen; its frame lies outside it. */
+    bool fullscreen;
     struct rect floating;
 };
 
@@ -1910,6 +1913,12 @@ static void windows_fit_screen(void) {
 }
 
 static struct rect window_rect(enum window_kind kind) {
+    if (windows[kind].fullscreen) {
+        /* The content area is the screen; border and title are off it. */
+        return (struct rect){-BORDER, -BORDER - TITLE_HEIGHT,
+                             screen_width() + 2 * BORDER,
+                             screen_height() + 2 * BORDER + TITLE_HEIGHT};
+    }
     if (windows[kind].maximized) {
         return desktop_area();
     }
@@ -2031,6 +2040,7 @@ static void window_close(enum window_kind kind) {
     windows[kind].open = false;
     windows[kind].minimized = false;
     windows[kind].maximized = false;
+    windows[kind].fullscreen = false;
     /* Its split goes with it; the other windows keep their sizes. */
     for (size_t i = 0; i < tile_count; i++) {
         if (tile_order[i] == kind) {
@@ -8347,6 +8357,14 @@ static void draw_window(enum window_kind kind) {
     if (clip_right <= clip_x || clip_bottom <= clip_y) {
         return;
     }
+    if (windows[kind].fullscreen && window_is_app(kind)) {
+        /* No frame: the program's picture is the whole screen. */
+        console_set_clip(0, 0, (uint64_t)screen_width(),
+                         (uint64_t)screen_height());
+        draw_app(kind - WINDOW_APP, content_rect(frame));
+        console_clear_clip();
+        return;
+    }
     console_set_clip((uint64_t)clip_x, (uint64_t)clip_y,
                      (uint64_t)(clip_right - clip_x),
                      (uint64_t)(clip_bottom - clip_y));
@@ -8672,7 +8690,18 @@ static bool taskbar_pointer_reveal;
 /* The network popup (click on the network icon). */
 static bool net_popup_open;
 
+static bool front_window_fullscreen(void) {
+    return z_count != 0 && windows[z_order[z_count - 1]].fullscreen;
+}
+
+/* A full-screen window in front hides the taskbar as auto-hide does, but
+   the pointer at the screen edge does not bring it back (games move the
+   pointer there); Super or the Start menu does. */
 static bool taskbar_shown(void) {
+    if (front_window_fullscreen()) {
+        return start_menu_open || taskbar_menu_open || net_popup_open
+            || keyboard_super_held();
+    }
     return !appearance_taskbar_autohide() || start_menu_open
         || taskbar_menu_open || net_popup_open || taskbar_pointer_reveal
         || keyboard_super_held();
@@ -11354,7 +11383,7 @@ static bool resize_start(int32_t x, int32_t y, struct drag_state *drag) {
     }
     for (size_t i = z_count; i != 0; i--) {
         enum window_kind kind = z_order[i - 1];
-        if (windows[kind].maximized) {
+        if (windows[kind].maximized || windows[kind].fullscreen) {
             if (rect_contains(window_rect(kind), x, y)) {
                 return false;
             }
@@ -11449,7 +11478,8 @@ static bool split_start(int32_t x, int32_t y, struct drag_state *drag) {
     }
     /* The gaps are covered while a maximized window is on top. */
     enum window_kind top = window_at(x, y);
-    if (top != WINDOW_COUNT && windows[top].maximized) {
+    if (top != WINDOW_COUNT && (windows[top].maximized
+                              || windows[top].fullscreen)) {
         return false;
     }
     struct rect area = workspace_area();
@@ -11966,7 +11996,7 @@ static void resize_focused(char direction) {
     }
     enum window_kind kind = z_order[z_count - 1];
     bool grow = direction == KEY_RIGHT || direction == KEY_DOWN;
-    if (windows[kind].maximized) {
+    if (windows[kind].maximized || windows[kind].fullscreen) {
         return;
     }
     if (!tiled_layout) {
@@ -12229,6 +12259,8 @@ static void handle_right_press(int32_t x, int32_t y) {
 #define APP_CLOSE_GRACE_TICKS 300
 /* Waiting programs look at least this often whether they were ended. */
 #define APP_WAIT_RECHECK_TICKS 10
+/* Widest screen a full-screen picture is scaled up to. */
+#define APP_SCALE_MAX_WIDTH 8192
 
 struct app_window {
     uint64_t owner;        /* process ID; 0: the slot is free */
@@ -12257,6 +12289,7 @@ struct app_window {
     int64_t reported_width;
     int64_t reported_height;
     uint32_t options;      /* DESKTOP_APP_* */
+    volatile bool resize_pending; /* requested_* changed by the program */
     uint32_t keys_down[8]; /* key-state presses sent, by key number */
 };
 
@@ -12312,6 +12345,55 @@ static struct rect app_content(size_t slot) {
     return content_rect(window_rect(WINDOW_APP + slot));
 }
 
+/*
+ * Where the program's picture appears. Normally at the content's top left
+ * at its own size. A full-screen window whose picture is smaller than the
+ * screen (a game that keeps its size) shows it scaled up, as large as
+ * fits with its shape kept, centred.
+ */
+static struct rect app_view(size_t slot) {
+    const struct app_window *window = &app_windows[slot];
+    struct rect area = app_content(slot);
+    int64_t width = window->width;
+    int64_t height = window->height;
+    if (!windows[WINDOW_APP + slot].fullscreen || width == 0 || height == 0
+        || (width >= area.width && height >= area.height)) {
+        return (struct rect){area.x, area.y, width, height};
+    }
+    struct rect view = area;
+    if (area.width * height <= area.height * width) {
+        view.height = height * area.width / width;
+    } else {
+        view.width = width * area.height / height;
+    }
+    if (view.width == width && view.height == height) {
+        return (struct rect){area.x, area.y, width, height};
+    }
+    view.x = area.x + (area.width - view.width) / 2;
+    view.y = area.y + (area.height - view.height) / 2;
+    return view;
+}
+
+/* A screen point in the program's pixels (through any scaling). */
+static void app_local(size_t slot, int32_t x, int32_t y,
+                      int32_t *local_x, int32_t *local_y) {
+    const struct app_window *window = &app_windows[slot];
+    struct rect view = app_view(slot);
+    if ((view.width == (int64_t)window->width
+         && view.height == (int64_t)window->height)
+        || view.width <= 0 || view.height <= 0) {
+        *local_x = x - (int32_t)view.x;
+        *local_y = y - (int32_t)view.y;
+        return;
+    }
+    int64_t dx = x - view.x;
+    int64_t dy = y - view.y;
+    dx = dx < 0 ? 0 : dx >= view.width ? view.width - 1 : dx;
+    dy = dy < 0 ? 0 : dy >= view.height ? view.height - 1 : dy;
+    *local_x = (int32_t)(dx * (int64_t)window->width / view.width);
+    *local_y = (int32_t)(dy * (int64_t)window->height / view.height);
+}
+
 static void app_key(size_t slot, char character) {
     /* For keys, buttons holds the modifiers: 1 Ctrl, 2 Shift. */
     struct desktop_app_event event = {
@@ -12358,8 +12440,7 @@ static void app_mouse_press(size_t slot, int32_t x, int32_t y,
         return;
     }
     window->buttons_down |= button;
-    window->mouse_x = x - (int32_t)area.x;
-    window->mouse_y = y - (int32_t)area.y;
+    app_local(slot, x, y, &window->mouse_x, &window->mouse_y);
     struct desktop_app_event event = {
         .type = APP_EVENT_MOUSE_DOWN, .x = window->mouse_x,
         .y = window->mouse_y, .button = button,
@@ -12377,8 +12458,9 @@ static void app_mouse_update(size_t slot, int32_t x, int32_t y,
         return;
     }
     struct rect area = app_content(slot);
-    int32_t local_x = x - (int32_t)area.x;
-    int32_t local_y = y - (int32_t)area.y;
+    int32_t local_x;
+    int32_t local_y;
+    app_local(slot, x, y, &local_x, &local_y);
     for (uint32_t button = 1; button <= 2; button <<= 1) {
         if ((window->buttons_down & button) != 0 && (buttons & button) == 0) {
             window->buttons_down &= ~button;
@@ -12410,9 +12492,12 @@ static void app_wheel(size_t slot, int32_t x, int32_t y, int32_t notches) {
     if (!app_window_live(slot) || !rect_contains(area, x, y)) {
         return;
     }
+    int32_t local_x;
+    int32_t local_y;
+    app_local(slot, x, y, &local_x, &local_y);
     struct desktop_app_event event = {
         .type = APP_EVENT_WHEEL, .key = (uint32_t)notches,
-        .x = x - (int32_t)area.x, .y = y - (int32_t)area.y,
+        .x = local_x, .y = local_y,
         .buttons = window->buttons_down,
     };
     app_push(slot, &event);
@@ -12444,10 +12529,84 @@ static void app_check_resize(size_t slot) {
     }
 }
 
-static void apps_check_resize(void) {
+/* Applies the programs' full-screen requests (set from their system
+   calls) on the desktop's pass. Returns true when one changed. */
+static bool apps_sync_fullscreen(void) {
+    bool changed = false;
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        struct window *frame = &windows[WINDOW_APP + slot];
+        bool wanted = frame->open && app_window_live(slot)
+            && (app_windows[slot].options & DESKTOP_APP_FULLSCREEN) != 0;
+        if (frame->fullscreen != wanted) {
+            frame->fullscreen = wanted;
+            changed = true;
+            if (wanted) {
+                /* Entering full screen brings the game to the front. */
+                window_raise(WINDOW_APP + slot);
+            }
+        }
+    }
+    return changed;
+}
+
+/* Applies the programs' size requests (set from their system calls) on the
+   desktop's pass: the floating frame takes the asked content size, as far
+   as the work area allows, and stays where it was if it fits. Maximized,
+   full-screen and tiled windows keep their place; the floating size is
+   used once they are restored. Either way the program hears its real size
+   again. Returns true when one changed. */
+static bool apps_sync_resize(void) {
+    bool changed = false;
+    for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+        struct app_window *window = &app_windows[slot];
+        if (!window->resize_pending || !window->opened) {
+            continue;
+        }
+        window->resize_pending = false;
+        if (!app_window_live(slot)) {
+            continue;
+        }
+        struct window *frame = &windows[WINDOW_APP + slot];
+        struct rect area = workspace_area();
+        int64_t width = (int64_t)window->requested_width + 2 * BORDER;
+        int64_t height = (int64_t)window->requested_height + 2 * BORDER
+            + TITLE_HEIGHT;
+        if (width > area.width) {
+            width = area.width;
+        }
+        if (height > area.height) {
+            height = area.height;
+        }
+        int64_t x = frame->floating.x;
+        int64_t y = frame->floating.y;
+        if (x + width > area.x + area.width) {
+            x = area.x + area.width - width;
+        }
+        if (y + height > area.y + area.height) {
+            y = area.y + area.height - height;
+        }
+        if (x < area.x) {
+            x = area.x;
+        }
+        if (y < area.y) {
+            y = area.y;
+        }
+        frame->floating = (struct rect){x, y, width, height};
+        /* Report the size even when it did not change, so a program that
+           asked for more than fits learns what it got. */
+        window->reported_width = -1;
+        changed = true;
+    }
+    return changed;
+}
+
+static bool apps_check_resize(void) {
+    bool changed = apps_sync_fullscreen();
+    changed |= apps_sync_resize();
     for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
         app_check_resize(slot);
     }
+    return changed;
 }
 
 static void draw_app(size_t slot, struct rect area) {
@@ -12455,6 +12614,34 @@ static void draw_app(size_t slot, struct rect area) {
     fill(area, 12, 16, 26);
     if (window->surface == NULL || window->width == 0
         || window->height == 0) {
+        return;
+    }
+    struct rect view = app_view(slot);
+    if (view.width != (int64_t)window->width
+        || view.height != (int64_t)window->height) {
+        /* Full screen, scaled up: nearest pixel, one screen row at a
+           time; the bars around it stay black. */
+        fill(area, 0, 0, 0);
+        static uint32_t scaled_row[APP_SCALE_MAX_WIDTH];
+        if (view.width > APP_SCALE_MAX_WIDTH) {
+            return;
+        }
+        int64_t last_source = -1;
+        for (int64_t row = 0; row < view.height; row++) {
+            int64_t source = row * (int64_t)window->height / view.height;
+            if (source != last_source) {
+                const uint32_t *line = window->surface
+                    + source * window->surface_width;
+                for (int64_t column = 0; column < view.width; column++) {
+                    scaled_row[column] = line[column
+                        * (int64_t)window->width / view.width];
+                }
+                last_source = source;
+            }
+            console_draw_pixels((uint64_t)view.x, (uint64_t)(view.y + row),
+                                (uint64_t)view.width, 1, scaled_row,
+                                (uint64_t)view.width);
+        }
         return;
     }
     int64_t skip_x = area.x < 0 ? -area.x : 0;
@@ -12680,6 +12867,15 @@ uint64_t desktop_app_window_size(uint64_t owner) {
         | (uint64_t)window->reported_height;
 }
 
+uint64_t desktop_screen_size(void) {
+    int64_t width = screen_width();
+    int64_t height = screen_height();
+    if (width <= 0 || height <= 0) {
+        return 0;
+    }
+    return (uint64_t)width << 32 | (uint64_t)height;
+}
+
 static bool front_window_quiet(void) {
     if (z_count == 0 || !window_is_app(z_order[z_count - 1])) {
         return false;
@@ -12690,13 +12886,29 @@ static bool front_window_quiet(void) {
         && (window->options & DESKTOP_APP_QUIET) != 0;
 }
 
+int64_t desktop_app_window_resize(uint64_t owner, uint32_t width,
+                                  uint32_t height) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
+        return -9;
+    }
+    if (width == 0 || height == 0 || width > APP_SCALE_MAX_WIDTH
+        || height > APP_SCALE_MAX_WIDTH) {
+        return -22;
+    }
+    window->requested_width = width;
+    window->requested_height = height;
+    window->resize_pending = true;
+    return 0;
+}
+
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {
     struct app_window *window = app_window_of(owner);
     if (window == NULL) {
         return -9;
     }
-    if ((options & ~(uint32_t)(DESKTOP_APP_KEY_STATE | DESKTOP_APP_QUIET))
-        != 0) {
+    if ((options & ~(uint32_t)(DESKTOP_APP_KEY_STATE | DESKTOP_APP_QUIET
+                               | DESKTOP_APP_FULLSCREEN)) != 0) {
         return -22;
     }
     window->options = options;
@@ -15730,7 +15942,7 @@ static bool desktop_step(void) {
         }
         redraw |= handle_wheel(mouse.x, mouse.y, mouse_take_wheel());
     }
-    apps_check_resize();
+    redraw |= apps_check_resize();
     redraw |= programs_close_check();
     /* Holding or releasing Super shows or hides an auto-hidden taskbar. */
     bool taskbar_now = taskbar_shown();
@@ -15770,6 +15982,7 @@ void desktop_run(void) {
         windows[i].open = false;
         windows[i].minimized = false;
         windows[i].maximized = false;
+        windows[i].fullscreen = false;
         windows[i].floating.width = 0;
         split_ratio[i] = SPLIT_DEFAULT;
     }

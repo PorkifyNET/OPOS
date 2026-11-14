@@ -24,7 +24,7 @@ CACHE=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
 VERSION=14.1
 # The package version: OpenTTD's, plus a fourth number for OPOS rebuilds.
-PACKAGE_VERSION=14.1.0.2
+PACKAGE_VERSION=14.1.0.3
 OPENGFX=7.1
 OPENSFX=1.0.3
 OPENMSX=0.4.2

@@ -916,10 +916,12 @@ static bool download_package(const struct entry *e, char *path) {
     }
     br_sha256_init(&file.hash);
     /* Streamed to the cache file: a package can be larger than this
-       program's heap (Freedoom is over 32 MB). */
+       program's heap (Freedoom is over 32 MB). The limit is the size the
+       signed index gives, so any package size works (OpenTTD is over
+       100 MB) and a longer answer stops at once. */
     struct opos_http_response response;
     opos_http_set_progress(gui ? gui_progress : show_progress, NULL);
-    long result = opos_http_download(location, DOWNLOAD_MAX, download_write,
+    long result = opos_http_download(location, e->size, download_write,
                                      &file, &response);
     opos_http_set_progress(NULL, NULL);
     opos_close((int)file.fd);

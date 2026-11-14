@@ -59,4 +59,16 @@ write its path (for example `/disk/store/`) into
 
 To publish a new version of a package, raise `version` in its `.pkg`
 file and in its `OPOS_MANIFEST`, then run `make store` again. The
-index keeps only the versions built this time.
+index keeps only the packages of this run: a program that is published
+but not built this time (Freedoom and OpenTTD are opt-in) drops out of
+the Store. To keep such packages without rebuilding them, put their
+published `.opk` files in a folder and name it in `STORE_PREBUILT`, for
+example:
+
+    make store STORE_PREBUILT=~/store-prebuilt
+
+`~/store-prebuilt` then holds `org.chocolate-doom.freedoom-0.13.0.opk`
+and `org.openttd.openttd-14.1.0.2.opk`, downloaded from the current
+release. They are checked and listed as they are, with what
+`catalog.txt` says of them. Upload only the files that changed: the
+index, its signature and any new `.opk` files.

@@ -4,6 +4,7 @@
 
 #include "block.h"
 #include "fat16.h"
+#include "memory.h"
 #include "partition.h"
 
 #define SECTOR_SIZE 512
@@ -132,6 +133,200 @@ static uint8_t file_sector_buffer[SECTOR_SIZE];
 static uint8_t directory_sector_buffer[SECTOR_SIZE];
 static uint32_t directory_cached_sector;
 static bool directory_cache_valid;
+/* Behind it sits a cache of recently read disk sectors in lines of one
+   page (CACHE_LINE_SECTORS sectors), direct-mapped by sector number.
+   Directory reads, FAT reads and file reads all go through it, and a miss
+   reads CACHE_READAHEAD sectors with one command. Every path lookup walks
+   each directory on the path from its first entry, programs read data
+   files in small pieces (stdio uses 1 KiB buffers), and games read the
+   same files twice (a checksum pass, then the real load). Without the
+   cache, OpenTTD's start-up spent about 60000 one-sector commands on
+   directories alone and re-read about 90 MB.
+   The lines come from free memory the first time the cache is used:
+   1/CACHE_MEMORY_SHARE of the free pages, at most CACHE_MAX_LINES; with
+   too little memory it falls back to static lines. Every FAT write goes
+   through fat_write_sectors, which refreshes cached copies, so the cache
+   always matches the disk. */
+#define CACHE_LINE_SECTORS 8
+#define CACHE_LINE_BYTES (CACHE_LINE_SECTORS * SECTOR_SIZE)
+#define CACHE_READAHEAD 64
+#define CACHE_MAX_LINES 32768
+#define CACHE_STATIC_LINES 64
+#define CACHE_MEMORY_SHARE 16
+static uint8_t *cache_line_data[CACHE_MAX_LINES];
+static uint32_t cache_line_tag[CACHE_MAX_LINES];
+static bool cache_line_valid[CACHE_MAX_LINES];
+static uint8_t cache_static_lines[CACHE_STATIC_LINES][CACHE_LINE_BYTES];
+static uint8_t cache_staging[CACHE_READAHEAD * SECTOR_SIZE];
+/* A power of two; 0 until the first store. */
+static size_t cache_lines;
+
+static void copy_bytes(uint8_t *destination, const uint8_t *source,
+                       size_t length) {
+    size_t i = 0;
+    if ((((uintptr_t)destination | (uintptr_t)source) & 7) == 0) {
+        for (; i + 8 <= length; i += 8) {
+            *(uint64_t *)(destination + i) = *(const uint64_t *)(source + i);
+        }
+    }
+    for (; i < length; i++) {
+        destination[i] = source[i];
+    }
+}
+
+static void copy_sector(uint8_t *destination, const uint8_t *source) {
+    copy_bytes(destination, source, SECTOR_SIZE);
+}
+
+static void cache_free_lines(size_t from, size_t to) {
+    uintptr_t offset = (uintptr_t)physical_page_to_hhdm(0);
+    for (size_t i = from; i < to; i++) {
+        (void)physical_page_free((uint64_t)((uintptr_t)cache_line_data[i]
+                                            - offset));
+    }
+}
+
+static void cache_setup(void) {
+    size_t wanted = (size_t)(memory_free_pages() / CACHE_MEMORY_SHARE);
+    if (wanted > CACHE_MAX_LINES) {
+        wanted = CACHE_MAX_LINES;
+    }
+    size_t lines = 0;
+    while (lines < wanted) {
+        uint64_t page = physical_page_alloc();
+        if (page == 0) {
+            break;
+        }
+        cache_line_data[lines++] = physical_page_to_hhdm(page);
+    }
+    size_t usable = CACHE_STATIC_LINES;
+    while (usable * 2 <= lines) {
+        usable *= 2;
+    }
+    if (lines < usable) {
+        cache_free_lines(0, lines);
+        for (size_t i = 0; i < CACHE_STATIC_LINES; i++) {
+            cache_line_data[i] = cache_static_lines[i];
+        }
+    } else {
+        cache_free_lines(usable, lines);
+    }
+    cache_lines = usable;
+}
+
+static void directory_cache_forget(void) {
+    directory_cache_valid = false;
+    for (size_t i = 0; i < cache_lines; i++) {
+        cache_line_valid[i] = false;
+    }
+}
+
+/* The cached copy of sector, or NULL. */
+static uint8_t *cache_lookup(uint32_t sector) {
+    if (cache_lines == 0) {
+        return NULL;
+    }
+    uint32_t line = sector / CACHE_LINE_SECTORS;
+    size_t slot = line & (cache_lines - 1);
+    if (!cache_line_valid[slot] || cache_line_tag[slot] != line) {
+        return NULL;
+    }
+    return cache_line_data[slot]
+        + (size_t)(sector % CACHE_LINE_SECTORS) * SECTOR_SIZE;
+}
+
+/* Keeps the whole lines found in sectors [first, first + count). */
+static void cache_store(uint32_t first, uint32_t count, const uint8_t *data) {
+    if (cache_lines == 0) {
+        cache_setup();
+    }
+    uint32_t sector = (first + CACHE_LINE_SECTORS - 1) / CACHE_LINE_SECTORS
+        * CACHE_LINE_SECTORS;
+    for (; sector + CACHE_LINE_SECTORS <= first + count;
+         sector += CACHE_LINE_SECTORS) {
+        uint32_t line = sector / CACHE_LINE_SECTORS;
+        size_t slot = line & (cache_lines - 1);
+        copy_bytes(cache_line_data[slot],
+                   data + (size_t)(sector - first) * SECTOR_SIZE,
+                   CACHE_LINE_BYTES);
+        cache_line_tag[slot] = line;
+        cache_line_valid[slot] = true;
+    }
+}
+
+/* Refreshes cached copies of sectors a write covers. */
+static void sector_cache_written(uint32_t first_sector, uint8_t sector_count,
+                                 const uint8_t *buffer) {
+    for (uint32_t i = 0; i < sector_count; i++) {
+        uint8_t *cached = cache_lookup(first_sector + i);
+        if (cached != NULL) {
+            copy_sector(cached, buffer + (size_t)i * SECTOR_SIZE);
+        }
+    }
+}
+
+/* True when the lines holding [first, first + count) lie in the volume. */
+static bool cache_range_cacheable(uint32_t first, uint32_t count) {
+    uint64_t volume_end = (uint64_t)volume.first_sector + volume.total_sectors;
+    uint64_t start = first - first % CACHE_LINE_SECTORS;
+    uint64_t last = (uint64_t)first + count - 1;
+    uint64_t end = last - last % CACHE_LINE_SECTORS + CACHE_LINE_SECTORS;
+    return volume.total_sectors != 0 && count != 0
+        && start >= volume.first_sector && end <= volume_end;
+}
+
+/* Reads one sector through the cache. A miss reads the aligned group of
+   CACHE_READAHEAD sectors around it, clipped to the volume, with one
+   command. */
+static bool cached_read_sector(uint32_t sector, uint8_t *out) {
+    const uint8_t *cached = cache_lookup(sector);
+    if (cached != NULL) {
+        copy_sector(out, cached);
+        return true;
+    }
+    if (!cache_range_cacheable(sector, 1)) {
+        return block_read_sectors(sector, 1, out);
+    }
+    uint32_t volume_end = volume.first_sector + volume.total_sectors;
+    uint32_t group_end = sector - sector % CACHE_READAHEAD + CACHE_READAHEAD;
+    uint32_t first = sector - sector % CACHE_READAHEAD;
+    while (first < volume.first_sector) {
+        first += CACHE_LINE_SECTORS;
+    }
+    if (group_end > volume_end) {
+        group_end = volume_end;
+    }
+    uint32_t count = group_end - first;
+    if (!block_read_sectors(first, (uint8_t)count, cache_staging)) {
+        return block_read_sectors(sector, 1, out);
+    }
+    cache_store(first, count, cache_staging);
+    copy_sector(out, cache_staging + (size_t)(sector - first) * SECTOR_SIZE);
+    return true;
+}
+
+/* Reads count whole sectors into buffer: from the cache when it holds all
+   of them, otherwise with one command, keeping a copy. */
+static bool cached_read_run(uint32_t first, uint8_t count, uint8_t *buffer) {
+    bool all_cached = count != 0;
+    for (uint32_t i = 0; i < count && all_cached; i++) {
+        all_cached = cache_lookup(first + i) != NULL;
+    }
+    if (all_cached) {
+        for (uint32_t i = 0; i < count; i++) {
+            copy_sector(buffer + (size_t)i * SECTOR_SIZE,
+                        cache_lookup(first + i));
+        }
+        return true;
+    }
+    if (!block_read_sectors(first, count, buffer)) {
+        return false;
+    }
+    if (cache_range_cacheable(first, count)) {
+        cache_store(first, count, buffer);
+    }
+    return true;
+}
 
 static bool fat_write_sectors(uint32_t first_sector, uint8_t sector_count,
                               const uint8_t *buffer) {
@@ -146,9 +341,10 @@ static bool fat_write_sectors(uint32_t first_sector, uint8_t sector_count,
         }
     }
     if (!block_write_sectors(first_sector, sector_count, buffer)) {
-        directory_cache_valid = false;
+        directory_cache_forget();
         return false;
     }
+    sector_cache_written(first_sector, sector_count, buffer);
     return true;
 }
 
@@ -157,7 +353,7 @@ static bool directory_read_sector(uint32_t sector) {
         return true;
     }
     directory_cache_valid = false;
-    if (!block_read_sectors(sector, 1, directory_sector_buffer)) {
+    if (!cached_read_sector(sector, directory_sector_buffer)) {
         return false;
     }
     directory_cached_sector = sector;
@@ -358,7 +554,7 @@ static bool mount_volume(uint32_t first_sector, uint32_t sectors) {
 
 bool fat16_initialize(void) {
     volume_ready = false;
-    directory_cache_valid = false;
+    directory_cache_forget();
     volume = (struct fat16_volume){0};
     fsinfo_invalidated = false;
     cached_root_sector_valid = false;
@@ -503,7 +699,7 @@ static bool fat16_load_fat_sector(uint32_t lba) {
     fat_cache_next = (fat_cache_next + 1) % FAT_CACHE_SECTORS;
     fat_cache_valid[slot] = false;
     fat_sector_buffer = fat_cache[slot];
-    if (!block_read_sectors(lba, 1, fat_sector_buffer)) {
+    if (!cached_read_sector(lba, fat_sector_buffer)) {
         return false;
     }
     fat_cache_lba[slot] = lba;
@@ -2630,8 +2826,8 @@ bool fat16_read_node_at(const struct fat16_node *node, size_t offset,
                                                     : per_cluster;
                 run += in_last;
             }
-            if (!block_read_sectors(sector, (uint8_t)run,
-                                    buffer + output_offset)) {
+            if (!cached_read_run(sector, (uint8_t)run,
+                                 buffer + output_offset)) {
                 return false;
             }
             output_offset += run * SECTOR_SIZE;
@@ -2649,7 +2845,7 @@ bool fat16_read_node_at(const struct fat16_node *node, size_t offset,
             }
             continue;
         }
-        if (!block_read_sectors(sector, 1, file_sector_buffer)) {
+        if (!cached_read_sector(sector, file_sector_buffer)) {
             return false;
         }
         size_t amount = SECTOR_SIZE - within_sector;
@@ -2979,7 +3175,7 @@ static bool format_write_mbr(const struct format_layout *layout,
 /* Drops the mounted volume and every cached sector before a format. */
 static void forget_volume(void) {
     volume_ready = false;
-    directory_cache_valid = false;
+    directory_cache_forget();
     volume = (struct fat16_volume){0};
     cached_root_sector_valid = false;
     fat_cache_forget();
@@ -3135,7 +3331,7 @@ static void slot_load(size_t index) {
     volume_ready = slot->volume_ready;
     disk_state = slot->disk_state;
     fsinfo_invalidated = slot->fsinfo_invalidated;
-    directory_cache_valid = false;
+    directory_cache_forget();
     cached_root_sector_valid = false;
     fat_cache_forget();
     fat16_forget_positions();

@@ -9,6 +9,12 @@
 
 #define PAGE_SIZE 4096
 #define PAGE_MASK (PAGE_SIZE - 1)
+/* Each disk gets a physically contiguous transfer buffer of this many
+   pages, so one command moves up to AHCI_DATA_PAGES * 8 sectors. With one
+   sector per command, reading a program's data cost one command per
+   512 bytes. Falls back to one page when no contiguous run is free. */
+#define AHCI_DATA_PAGES 16
+#define AHCI_SECTORS_PER_PAGE (PAGE_SIZE / 512)
 #define AHCI_MMIO_BASE 0xffffc00000002000ULL
 #define AHCI_MMIO_PAGES 2
 #define AHCI_HOST_CAPABILITY 0x00
@@ -104,6 +110,8 @@ struct ahci_disk {
     uint8_t *received_fis;
     struct ahci_command_table *command_table;
     uint8_t *data_buffer;
+    /* Pages in data_buffer (contiguous). */
+    uint32_t data_pages;
     uint32_t port;
     char model[AHCI_MODEL_LENGTH + 1];
 };
@@ -166,13 +174,19 @@ static void release_disk_pages(struct ahci_disk *disk) {
     uint64_t physical_pages[] = {
         disk->command_list_physical,
         disk->received_fis_physical,
-        disk->command_table_physical,
-        disk->data_physical
+        disk->command_table_physical
     };
     for (size_t i = 0; i < sizeof(physical_pages) / sizeof(physical_pages[0]);
          i++) {
         if (physical_pages[i] != 0) {
             (void)physical_page_free(physical_pages[i]);
+        }
+    }
+    if (disk->data_physical != 0) {
+        uint32_t pages = disk->data_pages != 0 ? disk->data_pages : 1;
+        for (uint32_t i = 0; i < pages; i++) {
+            (void)physical_page_free(disk->data_physical
+                                     + (uint64_t)i * PAGE_SIZE);
         }
     }
     *disk = (struct ahci_disk){0};
@@ -193,7 +207,28 @@ static bool allocate_disk_pages(struct ahci_disk *disk, uint32_t capability) {
     };
 
     for (size_t i = 0; i < 4; i++) {
-        *physical_pages[i] = physical_page_alloc();
+        uint32_t pages = 1;
+        if (i == 3) {
+            pages = AHCI_DATA_PAGES;
+            *physical_pages[i] = physical_pages_alloc_contiguous(pages);
+            if (*physical_pages[i] != 0
+                && ((capability & AHCI_CAP_64BIT_ADDRESSING) == 0)
+                && *physical_pages[i] + (uint64_t)pages * PAGE_SIZE - 1
+                    > UINT32_MAX) {
+                for (uint32_t p = 0; p < pages; p++) {
+                    (void)physical_page_free(*physical_pages[i]
+                                             + (uint64_t)p * PAGE_SIZE);
+                }
+                *physical_pages[i] = 0;
+            }
+            if (*physical_pages[i] == 0) {
+                pages = 1;
+                *physical_pages[i] = physical_page_alloc();
+            }
+            disk->data_pages = pages;
+        } else {
+            *physical_pages[i] = physical_page_alloc();
+        }
         if (*physical_pages[i] == 0
             || (((capability & AHCI_CAP_64BIT_ADDRESSING) == 0)
                 && *physical_pages[i] > UINT32_MAX)) {
@@ -205,16 +240,36 @@ static bool allocate_disk_pages(struct ahci_disk *disk, uint32_t capability) {
             release_disk_pages(disk);
             return false;
         }
-        zero_dma_page(*virtual_pages[i]);
+        for (uint32_t p = 0; p < pages; p++) {
+            zero_dma_page((uint8_t *)*virtual_pages[i] + (size_t)p * PAGE_SIZE);
+        }
     }
     return true;
 }
 
+static void copy_bytes(uint8_t *destination, const uint8_t *source,
+                       size_t length) {
+    size_t i = 0;
+    if ((((uintptr_t)destination | (uintptr_t)source) & 7) == 0) {
+        for (; i + 8 <= length; i += 8) {
+            *(uint64_t *)(destination + i) = *(const uint64_t *)(source + i);
+        }
+    }
+    for (; i < length; i++) {
+        destination[i] = source[i];
+    }
+}
+
+/* Moves sector_count sectors (at most data_pages * 8) through the disk's
+   transfer buffer with one command. */
 static bool issue_ahci_command(struct ahci_disk *disk, uint8_t command, uint64_t lba,
-                               void *buffer, bool write) {
-    if (!disk->ready || buffer == NULL) {
+                               uint32_t sector_count, void *buffer, bool write) {
+    if (!disk->ready || buffer == NULL || sector_count == 0
+        || sector_count > (disk->data_pages != 0 ? disk->data_pages : 1)
+            * AHCI_SECTORS_PER_PAGE) {
         return false;
     }
+    uint32_t bytes = sector_count * 512;
 
     uint32_t port_offset = disk->port_offset;
     if (!wait_task_file_ready(port_offset)) {
@@ -228,12 +283,8 @@ static bool issue_ahci_command(struct ahci_disk *disk, uint8_t command, uint64_t
     for (size_t i = 0; i < sizeof(*disk->command_table); i++) {
         ((uint8_t *)disk->command_table)[i] = 0;
     }
-    zero_dma_page(disk->data_buffer);
     if (write) {
-        const uint8_t *source = buffer;
-        for (size_t i = 0; i < 512; i++) {
-            disk->data_buffer[i] = source[i];
-        }
+        copy_bytes(disk->data_buffer, buffer, bytes);
     }
 
     header->flags = AHCI_COMMAND_FIS_LENGTH_DWORDS
@@ -257,28 +308,26 @@ static bool issue_ahci_command(struct ahci_disk *disk, uint8_t command, uint64_t
         fis->lba3 = (uint8_t)(lba >> 24);
         fis->lba4 = (uint8_t)(lba >> 32);
         fis->lba5 = (uint8_t)(lba >> 40);
-        fis->count_low = 1;
+        fis->count_low = (uint8_t)sector_count;
+        fis->count_high = (uint8_t)(sector_count >> 8);
     }
     disk->command_table->prdt[0].data_base =
         (uint32_t)disk->data_physical;
     disk->command_table->prdt[0].data_base_upper =
         (uint32_t)(disk->data_physical >> 32);
-    disk->command_table->prdt[0].byte_count_and_interrupt = 511;
+    disk->command_table->prdt[0].byte_count_and_interrupt = bytes - 1;
 
     mmio_write32(port_offset + AHCI_PORT_INTERRUPT_STATUS, 0xffffffff);
     mmio_write32(port_offset + AHCI_PORT_SERIAL_ERROR, 0xffffffff);
     __asm__ volatile ("" : : : "memory");
     mmio_write32(port_offset + AHCI_PORT_COMMAND_ISSUE, 1);
     if (!wait_command_complete(port_offset)
-        || disk->command_list[0].bytes_transferred < 512) {
+        || disk->command_list[0].bytes_transferred < bytes) {
         return false;
     }
 
     if (!write) {
-        uint8_t *destination = buffer;
-        for (size_t i = 0; i < 512; i++) {
-            destination[i] = disk->data_buffer[i];
-        }
+        copy_bytes(buffer, disk->data_buffer, bytes);
     }
     return true;
 }
@@ -345,7 +394,8 @@ static bool configure_sata_port(struct ahci_disk *disk, uint32_t port_offset,
         return false;
     }
     uint8_t identify_data[512];
-    if (!issue_ahci_command(disk, AHCI_COMMAND_IDENTIFY, 0, identify_data, false)) {
+    if (!issue_ahci_command(disk, AHCI_COMMAND_IDENTIFY, 0, 1, identify_data,
+                            false)) {
         disk->ready = false;
         release_disk_pages(disk);
         return false;
@@ -425,7 +475,7 @@ static bool configure_atapi_port(struct ahci_disk *drive,
         return false;
     }
     uint8_t identify_data[512];
-    if (!issue_ahci_command(drive, AHCI_COMMAND_IDENTIFY_PACKET, 0,
+    if (!issue_ahci_command(drive, AHCI_COMMAND_IDENTIFY_PACKET, 0, 1,
                             identify_data, false)) {
         drive->ready = false;
         release_disk_pages(drive);
@@ -667,12 +717,18 @@ bool ahci_read_sectors(size_t index, uint32_t first_sector,
     }
 
     uint8_t *destination = buffer;
-    for (uint16_t sector = 0; sector < sector_count; sector++) {
+    uint32_t chunk_max = disk->data_pages * AHCI_SECTORS_PER_PAGE;
+    for (uint32_t done = 0; done < sector_count;) {
+        uint32_t chunk = sector_count - done;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
         if (!issue_ahci_command(disk, AHCI_COMMAND_READ_DMA_EXT,
-                                (uint64_t)first_sector + sector,
-                                destination + (size_t)sector * 512, false)) {
+                                (uint64_t)first_sector + done, chunk,
+                                destination + (size_t)done * 512, false)) {
             return false;
         }
+        done += chunk;
     }
     return true;
 }
@@ -685,12 +741,18 @@ bool ahci_write_sectors(size_t index, uint32_t first_sector,
     }
 
     const uint8_t *source = buffer;
-    for (uint16_t sector = 0; sector < sector_count; sector++) {
+    uint32_t chunk_max = disk->data_pages * AHCI_SECTORS_PER_PAGE;
+    for (uint32_t done = 0; done < sector_count;) {
+        uint32_t chunk = sector_count - done;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
         if (!issue_ahci_command(disk, AHCI_COMMAND_WRITE_DMA_EXT,
-                                (uint64_t)first_sector + sector,
-                                (void *)(source + (size_t)sector * 512), true)) {
+                                (uint64_t)first_sector + done, chunk,
+                                (void *)(source + (size_t)done * 512), true)) {
             return false;
         }
+        done += chunk;
     }
     return true;
 }

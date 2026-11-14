@@ -234,8 +234,9 @@ music. OPOS mixes all programs' streams at the master volume.
 
 Memory: `opos_alloc(size)` returns zeroed memory (`mmap`);
 `opos_free(address, size)` returns it. `malloc` takes its memory from
-there too. A program has 64 MiB of such memory in total, including its
-128 KiB stack.
+there too. A program has up to 1 GiB of such memory in total (64 MiB
+before OPOS 0.6.0), as far as free memory allows, including its 128 KiB
+stack.
 
 ## The ABI
 
@@ -332,6 +333,7 @@ carry one.
 - The C library is small. It has no floating-point formatting, no
   `FILE` streams and no `qsort`, `time` or `locale`.
 - Program files over 1 MiB do not load. Memory from `opos_alloc`,
-  `malloc` and the stack shares 64 MiB per program.
+  `malloc` and the stack shares 1 GiB per program (64 MiB before OPOS
+  0.6.0).
 - Programs share the desktop text clipboard through `opos_clipboard_set` and
   `opos_clipboard_get`.

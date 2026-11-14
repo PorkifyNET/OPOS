@@ -349,7 +349,8 @@ also uses `brk` (12) to allocate,
 verify zeroed pages, write across the heap, shrink back, and check the heap
 limit; the heap is capped at 8192 pages (32 MiB). Linux `mmap` (9), `mprotect` (10), and
 `munmap` (11) support private anonymous mappings and eager private copies of
-regular files in a bounded 16384-page (64 MiB) region; `mremap` (25) shrinks,
+regular files in a bounded 262144-page (1 GiB) region, whose page table
+is kept in chunk pages allocated as the program maps; `mremap` (25) shrinks,
 grows in place, or moves pages without copying (`MREMAP_MAYMOVE`). File offsets must be page-aligned;
 bytes beyond EOF are zero-filled. Read-only, writable/non-executable, and
 executable/read-only file mappings are supported without writeback or sharing.

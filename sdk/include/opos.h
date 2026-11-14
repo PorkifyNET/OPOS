@@ -651,8 +651,9 @@ static inline long opos_sound_close(long handle) {
 
 /* ------------------------------------------------------------- memory */
 
-/* Zero-filled, readable and writable memory; up to 64 MiB in total per
-   program. Returns NULL on failure. */
+/* Zero-filled, readable and writable memory; up to 1 GiB in total per
+   program (64 MiB before OPOS 0.6.0), as far as free memory allows.
+   Returns NULL on failure. */
 static inline void *opos_alloc(size_t size) {
     long address = opos_syscall6(9, 0, (long)size, 3 /* read, write */,
                                  0x22 /* private, anonymous */, -1, 0);

@@ -57,6 +57,10 @@ STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
 # distribution's musl-gcc (Ubuntu/Debian: apt install musl-tools).
 STORE_LINUX ?= lua sqlite
 STORE_SOURCES ?= $(BUILD)/store_sources
+# Already-built .opk files, or folders of them, that `make store` lists in
+# the index as they are, without rebuilding them: for example the
+# published Freedoom and OpenTTD packages (store/README.md).
+STORE_PREBUILT ?=
 MUSL_SPECS := $(BUILD)/musl-local.specs
 LINUX_CC ?= $(if $(wildcard $(MUSL_SPECS)),gcc -specs $(abspath $(MUSL_SPECS)),musl-gcc)
 MUSL_LICENSE ?= $(firstword $(wildcard $(BUILD)/musl-local/usr/share/doc/musl/copyright /usr/share/doc/musl/copyright))
@@ -366,7 +370,7 @@ store:
 	done
 	rm -rf $(BUILD)/store_opk/work-*
 	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
-		--catalog store/catalog.txt $(BUILD)/store_opk
+		--catalog store/catalog.txt $(BUILD)/store_opk $(STORE_PREBUILT)
 	rm -rf $(BUILD)/store_opk
 
 clean:

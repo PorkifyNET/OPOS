@@ -3,7 +3,9 @@
  *
  * One request per connection ("Connection: close"). The response body is
  * read into memory, chunked coding is removed while reading, and gzip or
- * deflate content coding is undone afterwards.
+ * deflate content coding is undone afterwards. opos_http_download instead
+ * passes a successful body to a sink as it arrives and asks for no
+ * content coding.
  */
 #include <ctype.h>
 #include <stdbool.h>
@@ -317,13 +319,20 @@ struct body {
     size_t capacity;
     size_t max;
     size_t total; /* announced size or 0 */
+    opos_http_sink sink; /* opos_http_download: bytes go here, not data */
+    void *sink_context;
 };
 
 static long body_add(struct body *b, const uint8_t *data, size_t length) {
     if (length > b->max - b->length) {
         return -OPOS_EFBIG;
     }
-    if (b->length + length > b->capacity) {
+    if (b->sink != NULL) {
+        long result = b->sink(b->sink_context, data, length);
+        if (result < 0) {
+            return result;
+        }
+    } else if (b->length + length > b->capacity) {
         size_t capacity = b->capacity == 0 ? 16384 : b->capacity;
         while (capacity < b->length + length) {
             capacity *= 2;
@@ -338,7 +347,9 @@ static long body_add(struct body *b, const uint8_t *data, size_t length) {
         b->data = grown;
         b->capacity = capacity;
     }
-    memcpy(b->data + b->length, data, length);
+    if (b->sink == NULL) {
+        memcpy(b->data + b->length, data, length);
+    }
     b->length += length;
     if (progress_callback != NULL) {
         progress_callback(progress_context, b->length, b->total);
@@ -449,7 +460,8 @@ void opos_http_free(struct opos_http_response *response) {
    redirect repeats the POST. */
 static long http_request(const char *address, const char *post_type,
                          const void *post_body, size_t post_length,
-                         size_t max_body,
+                         size_t max_body, opos_http_sink sink,
+                         void *sink_context,
                          struct opos_http_response *response) {
     memset(response, 0, sizeof(*response));
     if (strlen(address) >= OPOS_HTTP_URL_MAX) {
@@ -462,7 +474,7 @@ static long http_request(const char *address, const char *post_type,
     char *request = malloc(OPOS_HTTP_URL_MAX + 512);
     struct url *url = malloc(sizeof(*url));
     long result = -OPOS_ENOMEM;
-    struct body body = {NULL, 0, 0, max_body, 0};
+    struct body body = {NULL, 0, 0, max_body, 0, NULL, NULL};
     if (c == NULL || line == NULL || request == NULL || url == NULL) {
         goto done;
     }
@@ -499,11 +511,13 @@ static long http_request(const char *address, const char *post_type,
                               "%s %s HTTP/1.1\r\nHost: %s\r\n"
                               "User-Agent: " USER_AGENT "\r\n"
                               "Accept: text/html,*/*;q=0.8\r\n"
-                              "Accept-Encoding: gzip\r\n"
+                              "Accept-Encoding: %s\r\n"
                               "%s"
                               "Connection: close\r\n\r\n",
                               post_type != NULL ? "POST" : "GET", url->path,
-                              host_header, post_headers);
+                              host_header,
+                              sink != NULL ? "identity" : "gzip",
+                              post_headers);
         if (length <= 0 || length >= OPOS_HTTP_URL_MAX + 512
             || raw_write(c, request, (size_t)length) != length
             || (post_type != NULL && post_length > 0
@@ -576,6 +590,17 @@ static long http_request(const char *address, const char *post_type,
             goto done;
         }
         body.total = content_length > 0 ? (size_t)content_length : 0;
+        /* Only a successful body is streamed; an error page stays in
+           memory so the caller can show it. */
+        if (sink != NULL && status >= 200 && status < 300) {
+            if (gzip || deflate) {
+                connection_close(c);
+                result = -OPOS_EINVAL; /* asked for identity */
+                goto done;
+            }
+            body.sink = sink;
+            body.sink_context = sink_context;
+        }
         result = chunked ? read_chunked(c, &body)
                          : read_body(c, content_length, &body);
         connection_close(c);
@@ -600,7 +625,8 @@ static long http_request(const char *address, const char *post_type,
                 goto done;
             }
         }
-        body.data[body.length] = '\0';
+        /* A streamed body has no bytes in data: it stays empty. */
+        body.data[body.sink != NULL ? 0 : body.length] = '\0';
         response->status = status;
         strcpy(response->url, location);
         response->body = body.data;
@@ -620,11 +646,22 @@ done:
 
 long opos_http_get(const char *url, size_t max_body,
                    struct opos_http_response *response) {
-    return http_request(url, NULL, NULL, 0, max_body, response);
+    return http_request(url, NULL, NULL, 0, max_body, NULL, NULL, response);
+}
+
+long opos_http_download(const char *url, size_t max_body,
+                        opos_http_sink sink, void *context,
+                        struct opos_http_response *response) {
+    if (sink == NULL) {
+        return -OPOS_EINVAL;
+    }
+    return http_request(url, NULL, NULL, 0, max_body, sink, context,
+                        response);
 }
 
 long opos_http_post(const char *url, const char *content_type,
                     const void *body, size_t length, size_t max_body,
                     struct opos_http_response *response) {
-    return http_request(url, content_type, body, length, max_body, response);
+    return http_request(url, content_type, body, length, max_body, NULL, NULL,
+                        response);
 }

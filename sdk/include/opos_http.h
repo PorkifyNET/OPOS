@@ -48,6 +48,20 @@ long opos_http_post(const char *url, const char *content_type,
                     const void *body, size_t length, size_t max_body,
                     struct opos_http_response *response);
 
+/* Receives a downloaded body piece by piece. A negative result stops the
+   download, and opos_http_download returns it. */
+typedef long (*opos_http_sink)(void *context, const uint8_t *data,
+                               size_t length);
+
+/* Like opos_http_get, but a 2xx body goes to sink as it arrives instead
+   of into memory, so files larger than the heap can be downloaded. It asks
+   for no content coding (gzip is not undone here). response->body is then
+   empty and response->length is the number of bytes sent to sink. A
+   non-2xx body (an error page) is still read into response->body. */
+long opos_http_download(const char *url, size_t max_body,
+                        opos_http_sink sink, void *context,
+                        struct opos_http_response *response);
+
 void opos_http_free(struct opos_http_response *response);
 
 /* Optional progress report while the body arrives: bytes so far and the

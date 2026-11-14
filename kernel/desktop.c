@@ -13689,6 +13689,11 @@ static bool store_installed_only;
 static char store_phase[STORE_TEXT];
 static char store_message[STORE_TEXT];
 static bool store_message_error;
+/* @progress of the running install or update, or -1 when there is none. */
+static int store_progress = -1;
+/* The program the running INSTALL, UPDATE or REMOVE is for ("" if none). */
+static char store_busy_id[64];
+static bool store_busy_remove;
 static char store_line[640];
 static size_t store_line_length;
 
@@ -13781,6 +13786,13 @@ static void store_line_done(void) {
             store_phase[i] = value[i];
         }
         store_phase[count] = '\0';
+    } else if (text_equals(key, key_length, "progress")) {
+        int percent = 0;
+        for (const char *c = value; c < end && *c >= '0' && *c <= '9'
+                                    && percent < 1000; c++) {
+            percent = percent * 10 + (*c - '0');
+        }
+        store_progress = percent > 100 ? 100 : percent;
     } else if (text_equals(key, key_length, "done")) {
         store_say(value, (size_t)(end - value), false);
         if (!window_focused(WINDOW_STORE)) {
@@ -13837,6 +13849,9 @@ static void store_run(const char *command, const char *id) {
         store_message[0] = '\0';
     }
     store_phase[0] = '\0';
+    store_progress = -1;
+    text_copy(store_busy_id, sizeof(store_busy_id), id != NULL ? id : "");
+    store_busy_remove = text_equals(command, text_length(command), "remove");
     store_line_length = 0;
     static const char program[] = "/bin/pkg";
     enum run_result result = app_launch(APP_FROM_STORE, program,
@@ -13866,6 +13881,8 @@ static void store_finished(bool started, uint64_t exit_status) {
     }
     store_running = false;
     store_phase[0] = '\0';
+    store_progress = -1;
+    store_busy_id[0] = '\0';
     if (!started) {
         text_copy(store_message, sizeof(store_message),
                   "/BIN/PKG COULD NOT START");
@@ -14017,7 +14034,25 @@ static void draw_store(struct rect area, bool focused) {
         : error ? "THAT DID NOT WORK:"
         : store_message[0] != '\0' ? store_message
         : "PROGRAMS FROM THE OPOS STORE. INSTALLING IS FOR YOUR ACCOUNT.";
-    draw_text_clipped(x, area.y + 14, width, heading,
+    int64_t heading_width = width;
+    if (store_running && store_progress >= 0) {
+        /* Progress bar and percent at the right of the status line. */
+        int64_t bar_width = width / 3 < 240 ? width / 3 : 240;
+        struct rect bar = {x + width - bar_width - 6 * CHAR_WIDTH,
+                           area.y + 12, bar_width, CHAR_HEIGHT + 4};
+        fill(bar, 40, 48, 70);
+        fill((struct rect){bar.x, bar.y, bar.width * store_progress / 100,
+                           bar.height},
+             90, 160, 240);
+        char percent[8];
+        size_t used = append_decimal(percent, sizeof(percent), 0,
+                                     (uint64_t)store_progress);
+        append_text(percent, sizeof(percent), used, "%");
+        draw_text_clipped(bar.x + bar.width + CHAR_WIDTH, area.y + 14,
+                          5 * CHAR_WIDTH, percent, 230, 238, 255);
+        heading_width = bar.x - x - 2 * CHAR_WIDTH;
+    }
+    draw_text_clipped(x, area.y + 14, heading_width, heading,
                       error ? 255 : 151, error ? 120 : 190,
                       error ? 120 : 255);
     static const char *const headings[] = {"PROGRAM", "VERSION", "STATE"};
@@ -14064,7 +14099,31 @@ static void draw_store(struct rect area, bool focused) {
                           item->version, 200, 205, 220);
         char state[48];
         uint8_t r = 150, g = 160, b = 185;
-        if (store_item_is(item, "update")) {
+        if (store_running && store_busy_id[0] != '\0'
+            && text_equals(item->id, text_length(item->id), store_busy_id)) {
+            /* The row being installed, updated or removed. */
+            /* The first word of @phase: DOWNLOADING, SAVING, INSTALLING. */
+            size_t used = 0;
+            while (used < 16 && store_phase[used] >= 'A'
+                   && store_phase[used] <= 'Z') {
+                state[used] = store_phase[used];
+                used++;
+            }
+            state[used] = '\0';
+            if (used == 0) {
+                used = append_text(state, sizeof(state), 0,
+                                   store_busy_remove ? "REMOVING"
+                                                     : "WORKING");
+            }
+            used = append_text(state, sizeof(state), used,
+                               store_progress >= 0 ? " " : "...");
+            if (store_progress >= 0) {
+                used = append_decimal(state, sizeof(state), used,
+                                      (uint64_t)store_progress);
+                append_text(state, sizeof(state), used, "%");
+            }
+            r = 151, g = 190, b = 255;
+        } else if (store_item_is(item, "update")) {
             size_t used = append_text(state, sizeof(state), 0,
                                       "UPDATE FROM ");
             append_text(state, sizeof(state), used, item->installed);

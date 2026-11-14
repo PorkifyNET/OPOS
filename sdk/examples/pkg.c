@@ -42,6 +42,9 @@
  *                      version a newer release needs, or empty; ASKS is
  *                      the index's asks line (capability names or none),
  *                      or empty in an index without one
+ *   @progress N        percent of the current install or update (0-100):
+ *                      downloading (straight to the cache) 0-75,
+ *                      installing 75-100
  *   @updates N         how many installed programs have an update
  *   @done TEXT         what was done
  * Errors are the lines starting with "pkg: ".
@@ -466,6 +469,25 @@ static void show_progress(void *context, size_t received, size_t total) {
            (unsigned long)(total / 1024));
 }
 
+/* --gui: the Store window's progress bar. A download (saved to the
+   package cache as it arrives) is 0-75 percent. */
+static void gui_progress(void *context, size_t received, size_t total) {
+    (void)context;
+    static int shown = -1;
+    if (total == 0) {
+        return;
+    }
+    int percent = (int)((uint64_t)(received > total ? total : received) * 75
+                        / total);
+    if (received == 0 || percent < shown) {
+        shown = -1; /* a new download */
+    }
+    if (percent != shown) {
+        shown = percent;
+        printf("@progress %d\n", percent);
+    }
+}
+
 /* Reads name from the source into a malloc'd buffer (NUL-terminated). */
 static bool source_read(const char *name, size_t max, uint8_t **data,
                         size_t *size) {
@@ -476,7 +498,9 @@ static bool source_read(const char *name, size_t max, uint8_t **data,
     }
     if (is_url(location)) {
         struct opos_http_response response;
-        opos_http_set_progress(max > (1u << 20) ? show_progress : NULL, NULL);
+        opos_http_set_progress(gui && max == DOWNLOAD_MAX ? gui_progress
+                               : max > (1u << 20) ? show_progress : NULL,
+                               NULL);
         long result = opos_http_get(location, max, &response);
         opos_http_set_progress(NULL, NULL);
         if (result < 0) {
@@ -831,6 +855,32 @@ static int available_command(const char *given) {
 /* Downloads e's package to a cache file and checks its size and SHA-256
    against the index, so a broken download is reported before the kernel
    reads it. */
+/* opos_http_download's sink: saves and hashes each piece as it arrives. */
+struct download_file {
+    long fd;
+    br_sha256_context hash;
+    size_t size;
+    bool write_failed;
+};
+
+static long download_write(void *context, const uint8_t *data,
+                           size_t length) {
+    struct download_file *file = context;
+    br_sha256_update(&file->hash, data, length);
+    file->size += length;
+    size_t written = 0;
+    while (written < length) {
+        size_t want = length - written < 4096 ? length - written : 4096;
+        long put = opos_write((int)file->fd, data + written, want);
+        if (put <= 0) {
+            file->write_failed = true;
+            return -OPOS_EIO;
+        }
+        written += (size_t)put;
+    }
+    return 0;
+}
+
 static bool download_package(const struct entry *e, char *path) {
     struct opos_user_info user;
     char folder[PATH_MAX];
@@ -845,49 +895,62 @@ static bool download_package(const struct entry *e, char *path) {
     if (gui) {
         printf("@phase DOWNLOADING %s (%lu KB)\n", e->name,
                (e->size + 1023) / 1024);
+        printf("@progress 0\n");
     } else {
         printf("Downloading %s (%lu KB)...\n", e->file,
                (e->size + 1023) / 1024);
     }
-    uint8_t *data;
-    size_t size;
-    if (!source_read(e->file, DOWNLOAD_MAX, &data, &size)) {
+    char location[OPOS_HTTP_URL_MAX];
+    if (snprintf(location, sizeof(location), "%s%s", source, e->file)
+        >= (int)sizeof(location)) {
+        printf("pkg: the address is too long\n");
         return false;
     }
-    br_sha256_context context;
-    uint8_t digest[32];
-    br_sha256_init(&context);
-    br_sha256_update(&context, data, size);
-    br_sha256_out(&context, digest);
-    char hex[65];
-    for (int i = 0; i < 32; i++) {
-        snprintf(hex + i * 2, 3, "%02x", digest[i]);
-    }
-    if (size != e->size || strcmp(hex, e->sha256) != 0) {
-        printf("pkg: %s: the download differs from the index\n", e->file);
-        free(data);
-        return false;
-    }
-    long fd = opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT | OPOS_O_TRUNC);
-    size_t written = 0;
-    while (fd >= 0 && written < size) {
-        size_t want = size - written < 4096 ? size - written : 4096;
-        long put = opos_write((int)fd, data + written, want);
-        if (put <= 0) {
-            break;
-        }
-        written += (size_t)put;
-    }
-    if (fd >= 0) {
-        opos_close((int)fd);
-    }
-    free(data);
-    if (written != size) {
+    struct download_file file = {
+        opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT | OPOS_O_TRUNC),
+        {0}, 0, false,
+    };
+    if (file.fd < 0) {
         printf("pkg: %s: could not save the download\n", path);
-        (void)opos_unlink(path);
         return false;
     }
-    return true;
+    br_sha256_init(&file.hash);
+    /* Streamed to the cache file: a package can be larger than this
+       program's heap (Freedoom is over 32 MB). */
+    struct opos_http_response response;
+    opos_http_set_progress(gui ? gui_progress : show_progress, NULL);
+    long result = opos_http_download(location, DOWNLOAD_MAX, download_write,
+                                     &file, &response);
+    opos_http_set_progress(NULL, NULL);
+    opos_close((int)file.fd);
+    bool ok = false;
+    if (file.write_failed) {
+        printf("pkg: %s: could not save the download\n", path);
+    } else if (result < 0) {
+        printf("pkg: %s: %s\n", location, opos_tls_error_text(result));
+    } else if (response.status < 200 || response.status >= 300) {
+        printf("pkg: %s: the server answered %ld\n", location,
+               response.status);
+    } else {
+        uint8_t digest[32];
+        br_sha256_out(&file.hash, digest);
+        char hex[65];
+        for (int i = 0; i < 32; i++) {
+            snprintf(hex + i * 2, 3, "%02x", digest[i]);
+        }
+        ok = file.size == e->size && strcmp(hex, e->sha256) == 0;
+        if (!ok) {
+            printf("pkg: %s: the download differs from the index\n",
+                   e->file);
+        }
+    }
+    if (result == 0) {
+        opos_http_free(&response);
+    }
+    if (!ok) {
+        (void)opos_unlink(path);
+    }
+    return ok;
 }
 
 /* Installs (or updates to) entry e from the Store. */
@@ -912,6 +975,7 @@ static int store_install(const struct entry *e, bool everyone,
         | (ignore_version ? OPOS_PACKAGE_IGNORE_VERSION : 0);
     if (gui) {
         printf("@phase INSTALLING %s %s\n", e->name, e->version);
+        printf("@progress 75\n");
     }
     long result = opos_package_install_store(path, options, &info, &index);
     if (downloaded) {
@@ -922,6 +986,7 @@ static int store_install(const struct entry *e, bool everyone,
         return 1;
     }
     if (gui) {
+        printf("@progress 100\n");
         printf("@done INSTALLED %s %s.\n", info.name, info.version);
     }
     printf("Installed %s %s from the OPOS Store.%s\n", info.name,

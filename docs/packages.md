@@ -412,8 +412,8 @@ the store key.
     description: Draws pictures with a pen, shapes and colors.
 
 - Entries are sorted by id, then by version, and each appears once.
-- `category`, `license`, `featured`, `summary` and `description` come
-  from `store/catalog.txt` (see "Store pages"). Each is optional.
+- `category`, `license`, `featured`, `official`, `summary` and
+  `description` come from `store/catalog.txt` (see "Store pages"). Each is optional.
 - The kernel (`package_index_find` in `kernel/package.c`) reads only
   `format`, `entry` and `package`. Every other line must have the form
   `key: value`, and the kernel ignores it. That leaves room for
@@ -608,8 +608,10 @@ by itself in the first version.
 The Store window has three pages, below a search field:
 - **HOME**: a banner for the first featured program, up to four
   FEATURED tiles, and CATEGORIES buttons with counts: ALL PROGRAMS,
-  INSTALLED, the eight categories, and OTHER when some program has no
-  known category. A category without programs is greyed out.
+  INSTALLED, MADE BY OPOS, the eight categories, and OTHER when some
+  program has no known category. A category without programs is greyed
+  out. MADE BY OPOS lists the programs marked `official: yes` in the
+  catalog (Minesweeper, Solitaire); the SDK examples are not in it.
 - **LIST**: one category, the installed programs, or search results.
   Each row has an icon, the name, the summary and the state. A click or
   Enter opens the program's About page.
@@ -641,6 +643,7 @@ package, one block per id:
 
 - Categories: `games`, `internet`, `office`, `graphics`,
   `sound-video`, `programming`, `system`, `accessories`.
+- `official: yes` marks a program made by OPOS for MADE BY OPOS.
 - `mkindex.py --catalog` checks every line (known keys and categories,
   ASCII, length limits: license 40, summary 90, description 900) and
   copies them into the signed index.

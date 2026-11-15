@@ -38,6 +38,7 @@
  *   @phase TEXT        what is happening now
  *   @item ID\tVERSION\tNAME\tPUBLISHER\tSTATE\tINSTALLED\tNEEDS\tKB\tASKS
  *         \tCATEGORY\tLICENSE\tFEATURED\tREQUIRES\tSUMMARY\tDESCRIPTION
+ *         \tOFFICIAL
  *                      one per program (pkg available); STATE is new,
  *                      installed, update or needsopos; NEEDS is the OPOS
  *                      version a newer release needs, or empty; ASKS is
@@ -46,7 +47,8 @@
  *                      LICENSE, FEATURED (yes or empty) and SUMMARY come
  *                      from the index (store/catalog.txt) and may be
  *                      empty; REQUIRES is the OPOS version this release
- *                      needs, or empty
+ *                      needs, or empty; OFFICIAL is yes for a program
+ *                      made by OPOS, or empty
  *   @progress N        percent of the current install or update (0-100):
  *                      downloading (straight to the cache) 0-75,
  *                      installing 75-100
@@ -366,6 +368,7 @@ struct entry {
     char featured[4];
     char summary[96];
     char description[1000];
+    char official[4];
 };
 
 static struct entry *entries;
@@ -630,6 +633,7 @@ static void parse_entries(void) {
                 FIELD("category", category)
                 FIELD("license", license)
                 FIELD("featured", featured)
+                FIELD("official", official)
                 FIELD("summary", summary)
 #undef FIELD
                 if (key == 4 && strncmp(text, "file", 4) == 0) {
@@ -840,7 +844,7 @@ static int available_command(const char *given) {
                 && compare_versions(best->version, copy.version) > 0;
             updates += update;
             printf("@item %s\t%s\t%s\t%s\t%s\t%s\t%s\t%lu\t%s\t%s\t%s\t%s"
-                   "\t%s\t%s\t%s\n",
+                   "\t%s\t%s\t%s\t%s\n",
                    show_entry->id, show_entry->version, show_entry->name,
                    show_entry->publisher,
                    update ? "update" : copy.found ? "installed"
@@ -850,7 +854,8 @@ static int available_command(const char *given) {
                    (show_entry->size + 1023) / 1024, show_entry->asks,
                    show_entry->category, show_entry->license,
                    show_entry->featured, show_entry->requires,
-                   show_entry->summary, show_entry->description);
+                   show_entry->summary, show_entry->description,
+                   show_entry->official);
         } else {
             printf("  %-32s %-10s %-24s %s\n", show_entry->id,
                    show_entry->version, show_entry->name, state);

@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.minesweeper
+name: Minesweeper
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.2
+file: files/minesweeper ../build/minesweeper exec
+start: files/minesweeper Minesweeper

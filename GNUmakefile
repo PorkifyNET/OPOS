@@ -49,7 +49,8 @@ UPDATE_KEY ?= $(HOME)/.opos-signing/update-key.pem
 # The OPOS Store (store/README.md): packages built from the SDK examples.
 STORE := $(BUILD)/store
 STORE_KEY ?= $(HOME)/.opos-signing/store-key.pem
-STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
+STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg \
+	sdk/programs/minesweeper.pkg sdk/programs/solitaire.pkg
 # Linux programs built from pinned sources by store/linux/<name>/build.sh
 # (docs/linux-programs.md). Sources are downloaded once into
 # STORE_SOURCES. LINUX_CC is a static musl compiler: the musl files in

@@ -15280,6 +15280,7 @@ struct store_item {
     char requires[16];
     char summary[96];
     char description[1000];
+    char official[4]; /* "yes": made by OPOS */
 };
 
 enum store_page {
@@ -15308,11 +15309,12 @@ enum {
     STORE_LIST_OTHER = STORE_CATEGORIES, /* no category, or an unknown one */
     STORE_LIST_ALL,
     STORE_LIST_INSTALLED,
+    STORE_LIST_OFFICIAL, /* made by OPOS (official: yes in the index) */
 };
 /* HOME's category buttons. OTHER is shown only when it has programs. */
 static const size_t store_grid_lists[] = {
-    STORE_LIST_ALL, STORE_LIST_INSTALLED, 0, 1, 2, 3, 4, 5, 6, 7,
-    STORE_LIST_OTHER,
+    STORE_LIST_ALL, STORE_LIST_INSTALLED, STORE_LIST_OFFICIAL,
+    0, 1, 2, 3, 4, 5, 6, 7, STORE_LIST_OTHER,
 };
 #define STORE_GRID_MAX (sizeof(store_grid_lists) / sizeof(store_grid_lists[0]))
 #define STORE_GRID_COLUMNS 3
@@ -15401,12 +15403,17 @@ static const char *store_list_name(size_t list) {
     }
     return list == STORE_LIST_ALL ? "ALL PROGRAMS"
          : list == STORE_LIST_INSTALLED ? "INSTALLED"
+         : list == STORE_LIST_OFFICIAL ? "MADE BY OPOS"
          : "OTHER";
 }
 
 static bool store_in_list(const struct store_item *item, size_t list) {
     if (list == STORE_LIST_ALL) {
         return true;
+    }
+    if (list == STORE_LIST_OFFICIAL) {
+        return text_equals(item->official, text_length(item->official),
+                           "yes");
     }
     if (list == STORE_LIST_INSTALLED) {
         return store_item_is(item, "installed")
@@ -15597,6 +15604,9 @@ static void store_line_done(void) {
         store_field(&value, end, item->summary, sizeof(item->summary));
         store_field(&value, end, item->description,
                     sizeof(item->description));
+        /* Newer pkg versions add fields at the end; older ones leave
+           them empty. */
+        store_field(&value, end, item->official, sizeof(item->official));
         store_item_count++;
     } else if (text_equals(key, key_length, "phase")) {
         size_t count = (size_t)(end - value);

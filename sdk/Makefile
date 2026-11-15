@@ -25,6 +25,8 @@ LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 	-Wl,-z,noexecstack -Wl,-z,max-page-size=0x1000 -Wl,-T,opos.ld
 
 EXAMPLES := hello permtest sketch notepad fetch update pkg fonttest pickfile sharedread play notify
+# Programs made by OPOS and published in the Store (programs/*.pkg).
+PROGRAMS := minesweeper solitaire
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)
@@ -39,7 +41,7 @@ BEARSSL_CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -Ibearssl/src 	-DBR_USE_
 LIBRARIES := -Wl,--start-group $(LIBRARY) $(BEARSSL) -Wl,--end-group
 
 .PHONY: all clean
-all: $(LIBRARY) $(BEARSSL) $(BUILD)/browser $(addprefix $(BUILD)/,$(EXAMPLES)) $(if $(APP),$(BUILD)/$(APP))
+all: $(LIBRARY) $(BEARSSL) $(BUILD)/browser $(addprefix $(BUILD)/,$(EXAMPLES) $(PROGRAMS)) $(if $(APP),$(BUILD)/$(APP))
 
 $(BUILD)/crt0.o: src/crt0.S
 	mkdir -p $(BUILD)
@@ -66,6 +68,9 @@ BROWSER_HEADERS := $(wildcard browser/*.h)
 
 $(BUILD)/browser: $(BROWSER_SOURCES) $(BROWSER_HEADERS) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) -Ibrowser $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BROWSER_SOURCES) $(LIBRARIES)
+
+$(BUILD)/%: programs/%.c programs/fit.h $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
 
 $(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)

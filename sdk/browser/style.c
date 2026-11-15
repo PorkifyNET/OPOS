@@ -933,6 +933,545 @@ static void parse_grid_columns(struct style *style, const char *text) {
     }
 }
 
+/* ------------------------------------------------------ background images */
+
+char *(*style_copy_text)(const char *text, size_t length);
+void *(*style_alloc)(size_t size);
+
+#define BG_TOKENS 16
+
+struct bg_token {
+    const char *text;
+    size_t length;
+};
+
+/* Splits the first layer of a background value (up to a comma outside
+   parentheses) into words; "/" is a word of its own. */
+static int bg_split(const char *value, struct bg_token *tokens) {
+    int count = 0;
+    int depth = 0;
+    const char *p = value;
+    const char *start = NULL;
+    char quote = 0;
+    for (;; p++) {
+        char ch = *p;
+        bool end = ch == '\0' || (depth == 0 && quote == 0
+                                  && (ch == ',' || ch == ';' || ch == '!'));
+        bool separator = end || (depth == 0 && quote == 0
+                                 && (ch == ' ' || ch == '\t' || ch == '\n'
+                                     || ch == '/'));
+        if (separator) {
+            if (start != NULL && count < BG_TOKENS) {
+                tokens[count].text = start;
+                tokens[count].length = (size_t)(p - start);
+                count++;
+            }
+            start = NULL;
+            if (ch == '/' && count < BG_TOKENS) {
+                tokens[count].text = p;
+                tokens[count].length = 1;
+                count++;
+            }
+            if (end) {
+                return count;
+            }
+            continue;
+        }
+        if (start == NULL) {
+            start = p;
+        }
+        if (quote != 0) {
+            if (ch == quote) {
+                quote = 0;
+            }
+        } else if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch == '(') {
+            depth++;
+        } else if (ch == ')' && depth > 0) {
+            depth--;
+        }
+    }
+}
+
+static bool bg_token_is(const struct bg_token *token, const char *word) {
+    return word_is(token->text, token->length, word);
+}
+
+/* The URL of a url(...) word, copied for the page; NULL otherwise. */
+static const char *bg_url(const struct bg_token *token) {
+    if (token->length < 5 || strncmp(token->text, "url(", 4) != 0
+        || style_copy_text == NULL) {
+        return NULL;
+    }
+    const char *p = token->text + 4;
+    const char *end = token->text + token->length - 1; /* the ')' */
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t')) {
+        end--;
+    }
+    if (p < end && (*p == '"' || *p == '\'') && end[-1] == *p) {
+        p++;
+        end--;
+    }
+    if (p >= end) {
+        return NULL;
+    }
+    return style_copy_text(p, (size_t)(end - p));
+}
+
+static bool bg_length(const struct bg_token *token, int *value, bool *pct) {
+    char text[48];
+    size_t n = token->length < sizeof(text) - 1 ? token->length
+                                                : sizeof(text) - 1;
+    memcpy(text, token->text, n);
+    text[n] = '\0';
+    return parse_length(text, value, pct);
+}
+
+static bool bg_is_repeat(const struct bg_token *token) {
+    return bg_token_is(token, "repeat") || bg_token_is(token, "no-repeat")
+        || bg_token_is(token, "repeat-x") || bg_token_is(token, "repeat-y")
+        || bg_token_is(token, "space") || bg_token_is(token, "round");
+}
+
+static void bg_set_repeat(struct background *bg, const struct bg_token *t,
+                          int count) {
+    if (count == 1 && bg_token_is(&t[0], "repeat-x")) {
+        bg->no_repeat_x = false;
+        bg->no_repeat_y = true;
+    } else if (count == 1 && bg_token_is(&t[0], "repeat-y")) {
+        bg->no_repeat_x = true;
+        bg->no_repeat_y = false;
+    } else {
+        bg->no_repeat_x = bg_token_is(&t[0], "no-repeat");
+        bg->no_repeat_y = bg_token_is(&t[count > 1 ? 1 : 0], "no-repeat");
+    }
+}
+
+static bool bg_is_position(const struct bg_token *token) {
+    int value;
+    bool pct;
+    return bg_token_is(token, "left") || bg_token_is(token, "right")
+        || bg_token_is(token, "top") || bg_token_is(token, "bottom")
+        || bg_token_is(token, "center") || bg_length(token, &value, &pct);
+}
+
+/* One to four position words: keywords and lengths. "right 10px" style
+   offsets are approximated by the keyword. */
+static void bg_set_position(struct background *bg, const struct bg_token *t,
+                            int count) {
+    bool have_x = false, have_y = false;
+    int centers = 0;
+    for (int i = 0; i < count; i++) {
+        int value;
+        bool pct;
+        if (bg_token_is(&t[i], "left") || bg_token_is(&t[i], "right")) {
+            bg->position[0] = bg_token_is(&t[i], "left") ? 0 : 100;
+            bg->position_pct[0] = true;
+            have_x = true;
+        } else if (bg_token_is(&t[i], "top") || bg_token_is(&t[i], "bottom")) {
+            bg->position[1] = bg_token_is(&t[i], "top") ? 0 : 100;
+            bg->position_pct[1] = true;
+            have_y = true;
+        } else if (bg_token_is(&t[i], "center")) {
+            centers++;
+        } else if (bg_length(&t[i], &value, &pct)) {
+            bool keyword_before = i > 0 && !bg_token_is(&t[i - 1], "center")
+                               && !bg_length(&t[i - 1], &value, &pct);
+            if (keyword_before) {
+                /* "left 10px": an offset from that edge. */
+                bg_length(&t[i], &value, &pct);
+                int axis = bg_token_is(&t[i - 1], "left")
+                        || bg_token_is(&t[i - 1], "right") ? 0 : 1;
+                if (bg->position[axis] == 0) {
+                    bg->position[axis] = value;
+                    bg->position_pct[axis] = pct;
+                }
+            } else if (!have_x) {
+                bg->position[0] = value;
+                bg->position_pct[0] = pct;
+                have_x = true;
+            } else if (!have_y) {
+                bg->position[1] = value;
+                bg->position_pct[1] = pct;
+                have_y = true;
+            }
+        }
+    }
+    (void)centers;
+    if (!have_x) {
+        bg->position[0] = 50;
+        bg->position_pct[0] = true;
+    }
+    if (!have_y) {
+        bg->position[1] = 50;
+        bg->position_pct[1] = true;
+    }
+}
+
+static void bg_set_size(struct background *bg, const struct bg_token *t,
+                        int count) {
+    if (count < 1) {
+        return;
+    }
+    if (bg_token_is(&t[0], "cover")) {
+        bg->size_kind = BG_SIZE_COVER;
+        return;
+    }
+    if (bg_token_is(&t[0], "contain")) {
+        bg->size_kind = BG_SIZE_CONTAIN;
+        return;
+    }
+    bg->size_kind = BG_SIZE_EXPLICIT;
+    for (int axis = 0; axis < 2; axis++) {
+        const struct bg_token *token = &t[axis < count ? axis : 0];
+        int value;
+        bool pct;
+        if (axis >= count || bg_token_is(token, "auto")
+            || !bg_length(token, &value, &pct)) {
+            bg->size[axis] = -1;
+            bg->size_pct[axis] = false;
+        } else {
+            bg->size[axis] = value < 0 ? 0 : value;
+            bg->size_pct[axis] = pct;
+        }
+    }
+    if (bg->size[0] < 0 && bg->size[1] < 0) {
+        bg->size_kind = BG_SIZE_AUTO;
+    }
+}
+
+/* The start of layer index of a comma-separated background value, or
+   NULL when it has fewer layers. */
+static const char *bg_layer(const char *value, int index) {
+    int depth = 0;
+    char quote = 0;
+    const char *p = value;
+    while (index > 0) {
+        char ch = *p;
+        if (ch == '\0' || ch == ';' || (ch == '!' && quote == 0)) {
+            return NULL;
+        }
+        if (quote != 0) {
+            if (ch == quote) {
+                quote = 0;
+            }
+        } else if (ch == '"' || ch == '\'') {
+            quote = ch;
+        } else if (ch == '(') {
+            depth++;
+        } else if (ch == ')' && depth > 0) {
+            depth--;
+        } else if (ch == ',' && depth == 0) {
+            index--;
+        }
+        p++;
+    }
+    return p;
+}
+
+static int bg_layer_count(const char *value) {
+    int count = 1;
+    while (count < BG_LAYERS && bg_layer(value, count) != NULL) {
+        count++;
+    }
+    return count;
+}
+
+/* Layer index of the style's background (0: style->bg). The layers
+   under the top one get page memory on first use; NULL without it. */
+static struct background *bg_layer_of(struct style *style, int index) {
+    if (index == 0) {
+        return &style->bg;
+    }
+    if (style->bg_more == NULL && style_alloc != NULL) {
+        style->bg_more = style_alloc((BG_LAYERS - 1)
+                                     * sizeof(struct background));
+    }
+    return style->bg_more != NULL ? &style->bg_more[index - 1] : NULL;
+}
+
+/* A gradient function word: "linear-gradient(...)" and the like. */
+static bool bg_is_gradient(const struct bg_token *token) {
+    const char *text = token->text;
+    size_t length = token->length;
+    if (length > 8 && strncmp(text, "-webkit-", 8) == 0) {
+        text += 8;
+        length -= 8;
+    }
+    return (length > 16 && strncmp(text, "linear-gradient(", 16) == 0)
+        || (length > 16 && strncmp(text, "radial-gradient(", 16) == 0);
+}
+
+/* Sets the layer's image from a url(...) or gradient word; false when
+   the word is neither. */
+static bool bg_set_image(struct background *bg,
+                         const struct bg_token *token) {
+    const char *url = bg_url(token);
+    if (url != NULL) {
+        bg->url = url;
+        bg->gradient = false;
+        return true;
+    }
+    if (!bg_is_gradient(token)) {
+        return false;
+    }
+    bg->url = NULL;
+    if (style_alloc != NULL) {
+        char *copy = style_alloc(9 + token->length + 1);
+        if (copy != NULL) {
+            memcpy(copy, "gradient:", 9);
+            memcpy(copy + 9, token->text, token->length);
+            copy[9 + token->length] = '\0';
+            bg->url = copy;
+            bg->gradient = true;
+        }
+    }
+    return true;
+}
+
+/* The parts the background shorthand names for one layer. */
+static void bg_shorthand_layer(struct background *bg, const char *value) {
+    struct bg_token t[BG_TOKENS];
+    memset(bg, 0, sizeof(*bg));
+    int count = bg_split(value, t);
+    for (int i = 0; i < count; i++) {
+        if (bg_set_image(bg, &t[i])) {
+            continue;
+        } else if (bg_is_repeat(&t[i])) {
+            int n = i + 1 < count && bg_is_repeat(&t[i + 1]) ? 2 : 1;
+            bg_set_repeat(bg, &t[i], n);
+            i += n - 1;
+        } else if (bg_is_position(&t[i])) {
+            int n = 0;
+            while (i + n < count && n < 4 && bg_is_position(&t[i + n])) {
+                n++;
+            }
+            bg_set_position(bg, &t[i], n);
+            i += n - 1;
+            if (i + 1 < count && t[i + 1].length == 1
+                && t[i + 1].text[0] == '/') {
+                int m = 0;
+                i += 2;
+                while (i + m < count && m < 2 && !bg_is_repeat(&t[i + m])
+                       && (bg_token_is(&t[i + m], "cover")
+                           || bg_token_is(&t[i + m], "contain")
+                           || bg_token_is(&t[i + m], "auto")
+                           || bg_is_position(&t[i + m]))) {
+                    m++;
+                }
+                bg_set_size(bg, &t[i], m);
+                i += m - 1;
+            }
+        }
+    }
+}
+
+/* One background longhand (named as background-*) for one layer. */
+static void bg_longhand_layer(struct background *bg, const char *name,
+                              size_t name_length, const char *value) {
+    struct bg_token t[BG_TOKENS];
+    if (word_is(name, name_length, "background-image")) {
+        int count = bg_split(value, t);
+        bg->url = NULL;
+        bg->gradient = false;
+        if (count > 0) {
+            bg_set_image(bg, &t[0]);
+        }
+    } else if (word_is(name, name_length, "background-position")) {
+        bg_set_position(bg, t, bg_split(value, t));
+    } else if (word_is(name, name_length, "background-position-x")
+               || word_is(name, name_length, "background-position-y")) {
+        int axis = name[name_length - 1] == 'x' ? 0 : 1;
+        int count = bg_split(value, t);
+        int number;
+        bool pct;
+        if (count > 0 && bg_length(&t[0], &number, &pct)) {
+            bg->position[axis] = number;
+            bg->position_pct[axis] = pct;
+        } else if (count > 0) {
+            bg->position_pct[axis] = true;
+            bg->position[axis] = bg_token_is(&t[0], "left")
+                                 || bg_token_is(&t[0], "top") ? 0
+                               : bg_token_is(&t[0], "center") ? 50 : 100;
+        }
+    } else if (word_is(name, name_length, "background-size")) {
+        bg_set_size(bg, t, bg_split(value, t));
+    } else if (word_is(name, name_length, "background-repeat")) {
+        int count = bg_split(value, t);
+        if (count > 0) {
+            bg_set_repeat(bg, t, count);
+        }
+    }
+}
+
+/* background-image, -position, -size, -repeat and the image parts of the
+   background shorthand, for every layer (comma-separated). Returns true
+   when it was one of those, except the shorthand: its colour (in the
+   last layer) is read by the caller. */
+static bool apply_background(struct style *style, const char *name,
+                             size_t name_length, const char *value) {
+    struct background *bg = &style->bg;
+    /* mask-* and -webkit-mask-*: the same parts, for the mask image. */
+    char mapped[48];
+    bool is_mask = false;
+    const char *base = name;
+    size_t base_length = name_length;
+    if (base_length > 8 && strncmp(base, "-webkit-", 8) == 0) {
+        base += 8;
+        base_length -= 8;
+    }
+    if (base_length >= 4 && strncmp(base, "mask", 4) == 0
+        && (base_length == 4 || base[4] == '-')
+        && base_length - 4 + 10 < sizeof(mapped)) {
+        memcpy(mapped, "background", 10);
+        memcpy(mapped + 10, base + 4, base_length - 4);
+        name = mapped;
+        name_length = 10 + base_length - 4;
+        mapped[name_length] = '\0';
+        bg = &style->mask;
+        is_mask = true;
+    }
+    bool longhand = word_is(name, name_length, "background-image")
+        || word_is(name, name_length, "background-position")
+        || word_is(name, name_length, "background-position-x")
+        || word_is(name, name_length, "background-position-y")
+        || word_is(name, name_length, "background-size")
+        || word_is(name, name_length, "background-repeat");
+    bool shorthand = word_is(name, name_length, "background");
+    if (!longhand && !shorthand) {
+        return false;
+    }
+    int count = bg_layer_count(value);
+    if (is_mask) {
+        /* One mask layer: the first. */
+        if (shorthand) {
+            bg_shorthand_layer(bg, value);
+        } else {
+            bg_longhand_layer(bg, name, name_length, value);
+        }
+        return longhand || is_mask;
+    }
+    bool images = shorthand || word_is(name, name_length, "background-image");
+    if (images) {
+        style->bg_layers = (uint8_t)count;
+    }
+    /* A list shorter than the layers repeats (CSS); the image list sets
+       how many layers there are. */
+    int layers = images ? count
+               : count > 1 || style->bg_more != NULL ? BG_LAYERS : 1;
+    for (int i = 0; i < layers; i++) {
+        struct background *layer = bg_layer_of(style, i);
+        const char *part = bg_layer(value, i % count);
+        if (layer == NULL || part == NULL) {
+            break;
+        }
+        if (shorthand) {
+            bg_shorthand_layer(layer, part);
+        } else {
+            bg_longhand_layer(layer, name, name_length, part);
+        }
+    }
+    return longhand;
+}
+
+/* Boxes taken out of the flow: positioned absolute or fixed, or hidden. */
+static void flow_finish(struct style *style) {
+    if (style->position == POS_ABSOLUTE || style->position == POS_FIXED
+        || style->invisible) {
+        style->out_of_flow = true;
+    }
+}
+
+/* A box with a background image but no colour still gets a (clear)
+   background rectangle, which carries the image. */
+static void background_finish(struct style *style) {
+    if (style->mask.url != NULL && style->has_background) {
+        /* An icon: the background colour shows through the mask, which
+           also hides a fallback background image. */
+        uint32_t colour = style->background;
+        style->bg = style->mask;
+        style->bg_layers = 1;
+        style->bg.mask = true;
+        style->bg.mask_colour = colour;
+        style->bg.image_only = true;
+        return;
+    }
+    style->bg.image_only = false;
+    bool image = false;
+    for (int i = 0; i < style->bg_layers && i < BG_LAYERS; i++) {
+        const struct background *layer = i == 0 ? &style->bg
+            : style->bg_more != NULL ? &style->bg_more[i - 1] : NULL;
+        image = image || (layer != NULL && layer->url != NULL);
+    }
+    if (image && !style->has_background) {
+        style->has_background = true;
+        style->background = 0;
+        style->background_alpha = 0;
+        style->bg.image_only = true;
+    }
+}
+
+/* The translate() parts of a transform (px or percent of the box);
+   other functions (rotate, scale) are not drawn. */
+static void transform_translate(struct style *style, const char *value) {
+    style->translate[0] = style->translate[1] = 0;
+    style->translate_pct[0] = style->translate_pct[1] = false;
+    for (const char *p = value; *p != '\0' && *p != ';'; p++) {
+        if (strncmp(p, "translate", 9) != 0) {
+            continue;
+        }
+        const char *q = p + 9;
+        int first_axis = 0, axes = 2;
+        if (*q == 'X' || *q == 'x') {
+            q++;
+            axes = 1;
+        } else if (*q == 'Y' || *q == 'y') {
+            q++;
+            first_axis = 1;
+            axes = 1;
+        } else if (strncmp(q, "3d", 2) == 0) {
+            q += 2;
+        }
+        if (*q != '(') {
+            continue;
+        }
+        q++;
+        for (int axis = first_axis; axis < first_axis + axes; axis++) {
+            char word[48];
+            size_t n = 0;
+            while (*q == ' ') {
+                q++;
+            }
+            /* One argument, keeping calc(...) whole. */
+            int depth = 0;
+            while (*q != '\0' && n + 1 < sizeof(word)
+                   && (depth > 0 || (*q != ',' && *q != ')'))) {
+                depth += *q == '(' ? 1 : *q == ')' ? -1 : 0;
+                word[n++] = *q++;
+            }
+            word[n] = '\0';
+            int number;
+            bool percent;
+            if (n > 0 && parse_length(word, &number, &percent)) {
+                style->translate[axis] = number;
+                style->translate_pct[axis] = percent;
+            }
+            if (*q != ',') {
+                break;
+            }
+            q++;
+        }
+        p = q - 1;
+        if (*p == '\0') {
+            break;
+        }
+    }
+}
+
 void apply_declaration(struct style *style, const char *name,
                        size_t name_length, const char *value,
                        const struct style *parent) {
@@ -947,6 +1486,10 @@ void apply_declaration(struct style *style, const char *name,
     }
     memcpy(text, value, value_length);
     text[value_length] = '\0';
+
+    if (apply_background(style, name, name_length, value)) {
+        return;
+    }
 
     /* margin-inline, padding-block-start, ...: map to physical sides. */
     for (int box = 0; box < 2; box++) {
@@ -1046,10 +1589,41 @@ void apply_declaration(struct style *style, const char *name,
         if (parse_colour(text, &colour)) {
             style->colour = colour;
         }
-    } else if (word_is(name, name_length, "background-color")
-               || word_is(name, name_length, "background")) {
+    } else if (word_is(name, name_length, "background")) {
+        /* "background: url(x) no-repeat, #fff": the colour goes in the
+           last layer; images and gradients are not colours. */
+        int layers = bg_layer_count(value);
+        const char *last = bg_layer(value, layers - 1);
+        struct bg_token t[BG_TOKENS];
+        int count = last != NULL ? bg_split(last, t) : 0;
+        for (int i = 0; i < count; i++) {
+            char word[96];
+            uint32_t colour;
+            int alpha;
+            if (bg_is_gradient(&t[i])
+                || (t[i].length >= 4 && strncmp(t[i].text, "url(", 4) == 0)) {
+                continue;
+            }
+            if (bg_token_is(&t[i], "none") && layers == 1) {
+                style->has_background = false;
+                continue;
+            }
+            if (t[i].length >= sizeof(word)) {
+                continue;
+            }
+            memcpy(word, t[i].text, t[i].length);
+            word[t[i].length] = '\0';
+            if (parse_colour_alpha(word, &colour, &alpha)) {
+                /* "transparent" (or any fully transparent colour) removes
+                   a background set by an earlier rule. */
+                style->has_background = alpha > 0;
+                style->background = colour;
+                style->background_alpha = (uint8_t)alpha;
+                return;
+            }
+        }
+    } else if (word_is(name, name_length, "background-color")) {
         uint32_t colour;
-        /* "background: #fff url(x) no-repeat": use the first colour. */
         char *token = text;
         while (*token != '\0') {
             char *end = token;
@@ -1131,6 +1705,21 @@ void apply_declaration(struct style *style, const char *name,
                 style->max_width = style->max_width_pct = -1;
             } else {
                 style->width = style->width_pct = -1;
+            }
+        }
+    } else if (word_is(name, name_length, "box-sizing")) {
+        style->border_box = word_is(text, strlen(text), "border-box");
+    } else if (word_is(name, name_length, "height")) {
+        int number = 0;
+        bool percent = false;
+        style->height_pct = 0;
+        if (parse_length(text, &number, &percent) && number >= 0
+            && !percent) {
+            style->height = number;
+        } else {
+            style->height = -1;
+            if (percent && number > 0) {
+                style->height_pct = number;
             }
         }
     } else if (word_is(name, name_length, "content")) {
@@ -1290,8 +1879,43 @@ void apply_declaration(struct style *style, const char *name,
                        : strstr(text, "end") ? 2
                        : strstr(text, "between") ? 3 : 0;
     } else if (word_is(name, name_length, "position")) {
-        style->out_of_flow = word_is(text, strlen(text), "absolute")
-                          || word_is(text, strlen(text), "fixed");
+        style->position = word_is(text, strlen(text), "relative") ? POS_RELATIVE
+                        : word_is(text, strlen(text), "absolute") ? POS_ABSOLUTE
+                        : word_is(text, strlen(text), "fixed") ? POS_FIXED
+                        : word_is(text, strlen(text), "sticky")
+                          || word_is(text, strlen(text), "-webkit-sticky")
+                        ? POS_STICKY : POS_STATIC;
+    } else if (word_is(name, name_length, "top")
+               || word_is(name, name_length, "right")
+               || word_is(name, name_length, "bottom")
+               || word_is(name, name_length, "left")
+               || word_is(name, name_length, "inset")) {
+        int side = word_is(name, name_length, "top") ? TOP
+                 : word_is(name, name_length, "right") ? RIGHT
+                 : word_is(name, name_length, "bottom") ? BOTTOM
+                 : word_is(name, name_length, "left") ? LEFT : -1;
+        int number;
+        bool percent;
+        bool set = parse_length(text, &number, &percent);
+        for (int i = 0; i < 4; i++) {
+            if (side < 0 || side == i) {
+                style->offset_set[i] = set;
+                style->offset[i] = set ? number : 0;
+                style->offset_pct[i] = set && percent;
+            }
+        }
+    } else if (word_is(name, name_length, "clip")
+               || word_is(name, name_length, "clip-path")) {
+        style->clipped = !word_is(text, strlen(text), "auto")
+                      && !word_is(text, strlen(text), "none")
+                      && !word_is(text, strlen(text), "unset")
+                      && !word_is(text, strlen(text), "initial");
+    } else if (word_is(name, name_length, "transform")) {
+        style->clipped = strstr(text, "scale(0)") != NULL
+                      || strstr(text, "scale(0,") != NULL
+                      || strstr(text, "scaleY(0)") != NULL
+                      || strstr(text, "scaleX(0)") != NULL;
+        transform_translate(style, value);
     } else if (word_is(name, name_length, "align-items")
                || word_is(name, name_length, "align-self")) {
         uint8_t value = strstr(text, "center") != NULL ? 2
@@ -1324,8 +1948,8 @@ void apply_declaration(struct style *style, const char *name,
             style->grid_area_name = grid_name_hash(&p);
         }
     } else if (word_is(name, name_length, "visibility")) {
-        style->out_of_flow = word_is(text, strlen(text), "hidden")
-                          || word_is(text, strlen(text), "collapse");
+        style->invisible = word_is(text, strlen(text), "hidden")
+                        || word_is(text, strlen(text), "collapse");
     } else if (word_is(name, name_length, "list-style")
                || word_is(name, name_length, "list-style-type")) {
         style->no_marker = strstr(text, "none") != NULL;
@@ -1509,6 +2133,7 @@ static void style_inherit(struct style *style, const struct style *parent) {
     style->border_colour = parent->colour;
     style->width = style->max_width = -1;
     style->width_pct = style->max_width_pct = -1;
+    style->height = -1;
     style->display = DISPLAY_INLINE;
 }
 
@@ -1649,6 +2274,8 @@ bool style_compute_pseudo(const struct opos_html_node *element, int which,
                                 element_style);
     content_out = NULL;
     content_element = NULL;
+    background_finish(style);
+    flow_finish(style);
     if (!any || content_length < 0 || style->display == DISPLAY_NONE
         || style->out_of_flow) {
         return false;
@@ -1670,7 +2297,7 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_PARAM: case HTML_TAG_SOURCE: case HTML_TAG_TRACK:
     case HTML_TAG_NOFRAMES: case HTML_TAG_NOEMBED: case HTML_TAG_IFRAME:
     case HTML_TAG_OBJECT: case HTML_TAG_EMBED: case HTML_TAG_VIDEO:
-    case HTML_TAG_AUDIO: case HTML_TAG_CANVAS: case HTML_TAG_SVG:
+    case HTML_TAG_AUDIO: case HTML_TAG_CANVAS:
     case HTML_TAG_OPTION: case HTML_TAG_OPTGROUP: case HTML_TAG_COLGROUP:
     case HTML_TAG_COL: case HTML_TAG_DIALOG:
         style->display = DISPLAY_NONE;
@@ -1903,7 +2530,9 @@ void style_compute(const struct opos_html_node *element,
             style->out_of_flow = true;
         }
     }
+    flow_finish(style);
     if (style->out_of_flow) {
+        style->flow_display = style->display;
         style->display = DISPLAY_NONE;
     }
     /* A closed <details> shows only its <summary>. */
@@ -1912,7 +2541,9 @@ void style_compute(const struct opos_html_node *element,
         && element->tag != HTML_TAG_SUMMARY
         && opos_html_attribute(up, "open") == NULL) {
         style->display = DISPLAY_NONE;
+        style->flow_display = DISPLAY_NONE;
     }
+    background_finish(style);
     /* A heading or table cell inside a link keeps the link colour only
        when it has no colour of its own: nothing else to do here. */
 }

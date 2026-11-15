@@ -3,6 +3,7 @@
  *
  *   browser [URL]
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,7 @@
 #define CHROME_HEIGHT (TABBAR_HEIGHT + TOOLBAR_HEIGHT) /* above the page */
 #define STATUS_HEIGHT 20
 #define SCROLLBAR_WIDTH 12
-#define MARGIN 8
+#define MARGIN PAGE_MARGIN
 #define HISTORY_MAX 64
 #define MAX_TABS 12
 #define MAX_PAGE_BYTES (8u << 20)
@@ -462,58 +463,6 @@ static size_t count_matches(size_t *index) {
 
 /* ----------------------------------------------------------------- paint */
 
-static void blend_image(struct image_ref *ref, int x, int y, int width,
-                        int height, int clip_top, int clip_bottom) {
-    if (ref->scaled == NULL || ref->scaled_width != width
-        || ref->scaled_height != height) {
-        free(ref->scaled);
-        ref->scaled = malloc((size_t)width * height * 4);
-        ref->scaled_width = width;
-        ref->scaled_height = height;
-        if (ref->scaled == NULL) {
-            return;
-        }
-        if (width == ref->width && height == ref->height) {
-            memcpy(ref->scaled, ref->pixels, (size_t)width * height * 4);
-        } else {
-            image_resample(ref->pixels, (uint32_t)ref->width, 0, 0,
-                           (uint32_t)ref->width, (uint32_t)ref->height,
-                           ref->scaled, (uint32_t)width, (uint32_t)width,
-                           (uint32_t)height);
-        }
-    }
-    struct opos_canvas *canvas = &b.canvas;
-    for (int row = 0; row < height; row++) {
-        int dy = y + row;
-        if (dy < clip_top || dy >= clip_bottom || dy < 0
-            || dy >= canvas->height) {
-            continue;
-        }
-        const uint32_t *source = ref->scaled + (size_t)row * width;
-        uint32_t *target = canvas->pixels + (size_t)dy * canvas->stride;
-        for (int col = 0; col < width; col++) {
-            int dx = x + col;
-            if (dx < 0 || dx >= viewport_width()) {
-                continue;
-            }
-            uint32_t p = source[col];
-            uint32_t alpha = p >> 24;
-            if (alpha == 255) {
-                target[dx] = p & 0x00ffffff;
-            } else if (alpha != 0) {
-                uint32_t q = target[dx];
-                uint32_t r = (((p >> 16) & 255) * alpha
-                              + ((q >> 16) & 255) * (255 - alpha)) / 255;
-                uint32_t g = (((p >> 8) & 255) * alpha
-                              + ((q >> 8) & 255) * (255 - alpha)) / 255;
-                uint32_t bl = ((p & 255) * alpha
-                               + (q & 255) * (255 - alpha)) / 255;
-                target[dx] = r << 16 | g << 8 | bl;
-            }
-        }
-    }
-}
-
 static void fill_clipped(int x, int y, int width, int height, uint32_t colour,
                          int top, int bottom) {
     if (y < top) {
@@ -577,11 +526,12 @@ static void paint_page(void) {
         return;
     }
     int origin_y = top + MARGIN - T->scroll;
+    int fixed_y = top + MARGIN; /* fixed items do not scroll */
     int origin_x = MARGIN;
     for (size_t i = 0; i < T->page.item_count; i++) {
         const struct display_item *item = &T->page.items[i];
         int x = origin_x + item->x;
-        int y = origin_y + item->y;
+        int y = (item->fixed ? fixed_y : origin_y) + item->y;
         if (y + item->height < top || y > bottom) {
             continue;
         }
@@ -620,6 +570,11 @@ static void paint_page(void) {
             } else if (item->transparency < 255) {
                 blend_clipped(x, y, item->width, item->height, item->colour,
                               255 - item->transparency, top, bottom);
+            }
+            if (item->image != NULL) {
+                background_paint(b.canvas.pixels, (int)b.canvas.stride,
+                                 viewport_width(), b.canvas.height, item, x,
+                                 y, top, bottom);
             }
             break;
         case ITEM_OUTLINE:
@@ -677,10 +632,11 @@ static void paint_page(void) {
             break;
         }
         case ITEM_IMAGE:
-            if (item->image != NULL && item->image->state == 1
-                && item->image->pixels != NULL) {
-                blend_image(item->image, x, y, item->width, item->height, top,
-                            bottom);
+            if (item->image != NULL && item->image->state == 1) {
+                image_blend(b.canvas.pixels, (int)b.canvas.stride,
+                            viewport_width(), b.canvas.height, item->image, x,
+                            y, item->width, item->height, 0, top,
+                            viewport_width(), bottom);
             } else {
                 fill_clipped(x, y, item->width, item->height, 0x00ececec, top,
                              bottom);
@@ -1000,7 +956,8 @@ static bool dropdown_rect(int *x, int *y, int *width, int *rows) {
         *rows = count < DROP_MAX_ROWS ? count : DROP_MAX_ROWS;
         *x = MARGIN + item->x;
         *width = item->width < 120 ? 120 : item->width;
-        int top = CHROME_HEIGHT + MARGIN + item->y - T->scroll;
+        int top = CHROME_HEIGHT + MARGIN + item->y
+                - (item->fixed ? 0 : T->scroll);
         int bottom = CHROME_HEIGHT + viewport_height();
         *y = top + item->height;
         if (*y + *rows * DROP_ROW + 2 > bottom && top - *rows * DROP_ROW - 2
@@ -1209,6 +1166,79 @@ struct sheet_loads {
     char urls[MAX_SHEETS][OPOS_HTTP_URL_MAX];
 };
 
+static bool starts_with_ci(const char *text, const char *prefix);
+
+/* The sheet's text with every relative url(...) made absolute against
+   the sheet's own address (malloc'd), or NULL. */
+static char *absolute_urls(const char *base, const char *text, size_t length,
+                           size_t *out_length) {
+    size_t capacity = length + 256, used = 0;
+    char *out = malloc(capacity + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+    size_t i = 0;
+    while (i < length) {
+        bool url = i + 4 <= length && memcmp(text + i, "url(", 4) == 0
+                && (i == 0 || !(isalnum((unsigned char)text[i - 1])
+                                || text[i - 1] == '-'));
+        size_t copy_from = i, copy_to = i + 1;
+        char resolved[OPOS_HTTP_URL_MAX];
+        bool replace = false;
+        size_t after = i + 1;
+        if (url) {
+            size_t p = i + 4;
+            while (p < length && (text[p] == ' ' || text[p] == '\t')) {
+                p++;
+            }
+            char quote = p < length && (text[p] == '"' || text[p] == '\'')
+                       ? text[p] : 0;
+            size_t start = quote ? p + 1 : p;
+            size_t end = start;
+            while (end < length && end - start < OPOS_HTTP_URL_MAX - 1
+                   && (quote ? text[end] != quote
+                             : text[end] != ')' && text[end] != ' ')) {
+                end++;
+            }
+            size_t n = end - start;
+            if (end < length && n > 0 && n < OPOS_HTTP_URL_MAX - 1
+                && !starts_with_ci(text + start, "data:")
+                && text[start] != '#') {
+                char reference[OPOS_HTTP_URL_MAX];
+                memcpy(reference, text + start, n);
+                reference[n] = '\0';
+                if (opos_url_resolve(base, reference, resolved,
+                                     sizeof(resolved))) {
+                    replace = true;
+                    copy_to = start;      /* "url(" and any quote */
+                    after = end;          /* the closing quote or ")" on */
+                }
+            }
+        }
+        size_t piece = copy_to - copy_from;
+        size_t extra = replace ? strlen(resolved) : 0;
+        if (used + piece + extra > capacity) {
+            capacity = (used + piece + extra) * 2;
+            char *grown = realloc(out, capacity + 1);
+            if (grown == NULL) {
+                free(out);
+                return NULL;
+            }
+            out = grown;
+        }
+        memcpy(out + used, text + copy_from, piece);
+        used += piece;
+        if (replace) {
+            memcpy(out + used, resolved, extra);
+            used += extra;
+        }
+        i = replace ? after : copy_to;
+    }
+    out[used] = '\0';
+    *out_length = used;
+    return out;
+}
+
 static __attribute__((noinline)) void fetch_sheet(const char *base,
                                                       const char *href,
                                                       struct css_sheet **chain,
@@ -1234,8 +1264,18 @@ static __attribute__((noinline)) void fetch_sheet(const char *base,
     if (opos_http_get(url, MAX_SHEET_BYTES, &response) == 0) {
         if (response.status == 200) {
             loads->bytes += response.length;
-            *chain = css_append(*chain, css_parse((const char *)response.body,
-                                                  response.length));
+            size_t length;
+            char *text = absolute_urls(response.url,
+                                       (const char *)response.body,
+                                       response.length, &length);
+            if (text != NULL) {
+                *chain = css_append(*chain, css_parse(text, length));
+                free(text);
+            } else {
+                *chain = css_append(*chain,
+                                    css_parse((const char *)response.body,
+                                              response.length));
+            }
         }
         opos_http_free(&response);
     }
@@ -2096,15 +2136,20 @@ static enum load_result load_request(const char *url, const char *post,
              || starts_with_ci(type, "application/xhtml")
              || type[0] == '\0';
     enum image_format format = image_sniff(response.body, response.length);
+    bool svg = starts_with_ci(type, "image/svg")
+            || (!html && image_is_svg(response.body, response.length));
+    if (svg) {
+        html = false;
+    }
     bool shows_text = starts_with_ci(type, "text/")
                    || starts_with_ci(type, "application/json");
-    if (format == IMAGE_FORMAT_UNKNOWN && !html && !shows_text
+    if (format == IMAGE_FORMAT_UNKNOWN && !svg && !html && !shows_text
         && response.status < 400) {
         save_download(response.url, response.body, response.length);
         opos_http_free(&response);
         return saved();
     }
-    if (format != IMAGE_FORMAT_UNKNOWN) {
+    if (format != IMAGE_FORMAT_UNKNOWN || svg) {
         char markup[OPOS_HTTP_URL_MAX + 64];
         snprintf(markup, sizeof(markup), "<img src=\"%s\">", response.url);
         install_document(markup, strlen(markup), "utf-8", final);
@@ -2771,29 +2816,8 @@ static bool load_next_image(void) {
         paint();
         struct opos_http_response response;
         if (opos_http_get(ref->url, MAX_IMAGE_BYTES, &response) == 0) {
-            struct image_info info;
-            if (response.status == 200
-                && image_probe(response.body, response.length, &info)
-                       == IMAGE_OK) {
-                void *scratch = malloc(info.scratch_bytes + 16);
-                if (scratch != NULL) {
-                    void *aligned = (void *)(((uintptr_t)scratch + 15)
-                                             & ~(uintptr_t)15);
-                    struct image image;
-                    if (image_decode(response.body, response.length, aligned,
-                                     info.scratch_bytes, &image)
-                        == IMAGE_OK) {
-                        size_t bytes = (size_t)image.width * image.height * 4;
-                        ref->pixels = malloc(bytes);
-                        if (ref->pixels != NULL) {
-                            memcpy(ref->pixels, image.pixels, bytes);
-                            ref->width = (int)image.width;
-                            ref->height = (int)image.height;
-                            ref->state = 1;
-                        }
-                    }
-                    free(scratch);
-                }
+            if (response.status == 200) {
+                image_ref_decode(ref, response.body, response.length);
             }
             opos_http_free(&response);
         }
@@ -2851,7 +2875,8 @@ static bool link_at(int x, int y, char *out, size_t capacity) {
         return false;
     }
     const struct display_item *item = page_item_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     return link_target(item, out, capacity);
 }
 
@@ -2859,7 +2884,8 @@ static bool link_at(int x, int y, char *out, size_t capacity) {
 static void link_text(int x, int y, char *out, size_t capacity) {
     out[0] = '\0';
     const struct display_item *item = page_item_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     if (item == NULL || item->link == NULL) {
         return;
     }
@@ -3071,7 +3097,8 @@ static void on_click(int x, int y) {
         return;
     }
     const struct opos_html_node *control = page_control_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     if (control != NULL) {
         struct form_field *field = form_field(&T->page, control);
         bool select_field = is_text_field(field)
@@ -3119,7 +3146,7 @@ static void on_release(void) {
     b.dirty = true;
     const struct display_item *item = page_item_at(
         &T->page, b.press_x - MARGIN,
-        b.press_y - CHROME_HEIGHT - MARGIN + T->scroll);
+        b.press_y - CHROME_HEIGHT - MARGIN + T->scroll, T->scroll);
     char url[OPOS_HTTP_URL_MAX];
     if (link_target(item, url, sizeof(url))) {
         const char *target = opos_html_attribute(item->link, "target");
@@ -3181,7 +3208,8 @@ static void on_move(int x, int y) {
     if (T->have_page && y >= CHROME_HEIGHT && x < viewport_width()
         && y < CHROME_HEIGHT + viewport_height()) {
         const struct display_item *item = page_item_at(
-            &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+            &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
         if (link_target(item, url, sizeof(url))) {
             if (strcmp(b.status, url) != 0) {
                 set_status(url);

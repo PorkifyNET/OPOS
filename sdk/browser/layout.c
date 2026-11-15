@@ -123,10 +123,31 @@ struct ctx {
     int float_count;
     int float_extent;
     int last_baseline;      /* baseline y of the last line placed, -1 none */
+    /* Absolutely positioned boxes wait in the frame of their containing
+       block until its size is known. */
+    struct abs_frame *abs_frame;
+    int abs_bottom;         /* lowest edge of a placed absolute box */
+    /* position: fixed boxes wait here for the view (the root's frame). */
+    struct abs_frame *fixed_frame;
+    bool placing_fixed;     /* place_absolute is placing a fixed box */
+};
+
+struct abs_box {
+    const struct opos_html_node *node;
+    struct style *style;
+    int static_x, static_y; /* where it would have been in the flow */
+};
+
+struct abs_frame {
+    struct abs_box *boxes;
+    int count, capacity;
 };
 
 /* How see-through a background rectangle is (0 opaque). */
 static uint8_t fill_transparency(const struct style *style) {
+    if (style->bg.image_only) {
+        return 255;
+    }
     uint8_t alpha = style->background_alpha;
     return alpha == 0 ? 0 : (uint8_t)(255 - alpha);
 }
@@ -352,18 +373,12 @@ static void add_text(struct ctx *c, const char *text, size_t length,
 
 /* ---------------------------------------------------------------- images */
 
-static struct image_ref *image_for(struct ctx *c,
-                                   const struct opos_html_node *node) {
+static bool is_replaced(const struct opos_html_node *node) {
+    return node->tag == HTML_TAG_IMG || node->tag == HTML_TAG_SVG;
+}
+
+static struct image_ref *image_new(struct ctx *c) {
     struct page *page = c->page;
-    for (size_t i = 0; i < page->image_count; i++) {
-        if (page->images[i]->node == node) {
-            return page->images[i];
-        }
-    }
-    const char *source = opos_html_attribute(node, "src");
-    if (source == NULL || source[0] == '\0') {
-        return NULL;
-    }
     if (page->image_count == page->image_capacity) {
         size_t capacity = page->image_capacity == 0 ? 32
                         : page->image_capacity * 2;
@@ -383,12 +398,137 @@ static struct image_ref *image_for(struct ctx *c,
     }
     page->images[page->image_count++] = ref;
     memset(ref, 0, sizeof(*ref));
-    ref->node = node;
-    if (strncmp(source, "data:", 5) == 0
-        || !opos_url_resolve(page->url, source, ref->url, sizeof(ref->url))) {
+    return ref;
+}
+
+/* Points ref at source: a data: URL is decoded now, others are resolved
+   against the page for loading later. */
+static void image_source(struct ctx *c, struct image_ref *ref,
+                         const char *source) {
+    if (strncmp(source, "gradient:", 9) == 0) {
+        ref->state = 2;
+        ref->data_url = strdup(source);
+        image_ref_gradient(ref, source + 9);
+    } else if (strncmp(source, "data:", 5) == 0) {
+        ref->state = 2;
+        ref->data_url = strdup(source);
+        size_t length;
+        uint8_t *bytes = data_url_decode(source, &length);
+        if (bytes != NULL) {
+            image_ref_decode(ref, bytes, length);
+            free(bytes);
+        }
+    } else if (!opos_url_resolve(c->page->url, source, ref->url,
+                                 sizeof(ref->url))) {
         ref->state = 2;
     }
+}
+
+static struct image_ref *image_for(struct ctx *c,
+                                   const struct opos_html_node *node,
+                                   const struct style *style) {
+    struct page *page = c->page;
+    for (size_t i = 0; i < page->image_count; i++) {
+        if (page->images[i]->node == node) {
+            page->images[i]->colour = style->colour;
+            return page->images[i];
+        }
+    }
+    const char *source = NULL;
+    if (node->tag != HTML_TAG_SVG) {
+        source = opos_html_attribute(node, "src");
+        if (source == NULL || source[0] == '\0') {
+            return NULL;
+        }
+    }
+    struct image_ref *ref = image_new(c);
+    if (ref == NULL) {
+        return NULL;
+    }
+    ref->node = node;
+    ref->colour = style->colour;
+    if (node->tag == HTML_TAG_SVG) {
+        image_ref_inline_svg(ref, node);
+    } else {
+        image_source(c, ref, source);
+    }
     return ref;
+}
+
+/* The image for a CSS url(); one per URL, shared by every box. */
+static struct image_ref *background_image(struct ctx *c, const char *url) {
+    struct page *page = c->page;
+    char resolved[OPOS_HTTP_URL_MAX];
+    bool data = strncmp(url, "data:", 5) == 0
+             || strncmp(url, "gradient:", 9) == 0;
+    if (!data && !opos_url_resolve(page->url, url, resolved,
+                                   sizeof(resolved))) {
+        return NULL;
+    }
+    for (size_t i = 0; i < page->image_count; i++) {
+        struct image_ref *ref = page->images[i];
+        if (ref->node == NULL
+            && (data ? ref->data_url != NULL && strcmp(ref->data_url, url) == 0
+                     : ref->data_url == NULL
+                       && strcmp(ref->url, resolved) == 0)) {
+            return ref;
+        }
+    }
+    struct image_ref *ref = image_new(c);
+    if (ref == NULL) {
+        return NULL;
+    }
+    image_source(c, ref, url);
+    return ref;
+}
+
+/* The URL of the box's top background layer that is a picture, not a
+   gradient (sites put "linear-gradient(transparent, transparent)" over an
+   SVG for browsers without SVG); NULL without one. */
+static const char *image_layer_url(const struct style *style) {
+    int layers = style->bg_layers < 1 ? 1
+               : style->bg_layers > BG_LAYERS ? BG_LAYERS : style->bg_layers;
+    for (int i = 0; i < layers; i++) {
+        const struct background *layer = i == 0 ? &style->bg
+            : style->bg_more != NULL ? &style->bg_more[i - 1] : NULL;
+        if (layer != NULL && layer->url != NULL && !layer->gradient) {
+            return layer->url;
+        }
+    }
+    return NULL;
+}
+
+/* Gives a box's background rectangle its background layers, each with
+   its image and the layer under it; the item's image is the top one's. */
+static void attach_background(struct ctx *c, size_t index,
+                              const struct style *style) {
+    if (c->measuring || index == (size_t)-1) {
+        return;
+    }
+    int layers = style->bg_layers < 1 ? 1
+               : style->bg_layers > BG_LAYERS ? BG_LAYERS : style->bg_layers;
+    const struct background *below = NULL;
+    for (int i = layers - 1; i >= 0; i--) {
+        const struct background *layer = i == 0 ? &style->bg
+            : style->bg_more != NULL ? &style->bg_more[i - 1] : NULL;
+        if (layer == NULL || layer->url == NULL) {
+            continue;
+        }
+        struct image_ref *ref = background_image(c, layer->url);
+        struct background *copy = arena_alloc(c->page, sizeof(*copy));
+        if (ref == NULL || copy == NULL) {
+            continue;
+        }
+        *copy = *layer;
+        copy->url = NULL; /* the arena text goes with the next layout */
+        copy->image = ref;
+        copy->below = below;
+        below = copy;
+    }
+    if (below != NULL) {
+        c->page->items[index].image = below->image;
+        c->page->items[index].bg = below;
+    }
 }
 
 static int attribute_size(const struct opos_html_node *node, const char *name,
@@ -405,9 +545,29 @@ static int attribute_size(const struct opos_html_node *node, const char *name,
 
 static void add_image(struct ctx *c, const struct opos_html_node *node,
                       const struct style *style) {
-    struct image_ref *ref = image_for(c, node);
-    int width = attribute_size(node, "width", c->bwidth);
-    int height = attribute_size(node, "height", c->bwidth);
+    struct image_ref *ref = image_for(c, node, style);
+    int attr_width = attribute_size(node, "width", c->bwidth);
+    int attr_height = attribute_size(node, "height", c->bwidth);
+    int width = style->width >= 0 ? style->width
+              : style->width_pct >= 0 && !c->measuring
+              ? c->bwidth * style->width_pct / 100 : -1;
+    int height = style->height;
+    if (width < 0 && height < 0) {
+        width = attr_width;
+        height = attr_height;
+    } else if (width < 0 || height < 0) {
+        /* One CSS size: the other keeps the image's shape, from its
+           natural size or else from its width and height attributes. */
+        int rw = ref != NULL && ref->state == 1 ? ref->width : attr_width;
+        int rh = ref != NULL && ref->state == 1 ? ref->height : attr_height;
+        if (rw > 0 && rh > 0) {
+            if (width < 0) {
+                width = (int)((long)height * rw / rh);
+            } else {
+                height = (int)((long)width * rh / rw);
+            }
+        }
+    }
     const char *alt = opos_html_attribute(node, "alt");
     if (ref != NULL && ref->state == 1) {
         if (width < 0 && height < 0) {
@@ -433,6 +593,16 @@ static void add_image(struct ctx *c, const struct opos_html_node *node,
     }
     if (width <= 0 || height <= 0) {
         return;
+    }
+    int limit = style->max_width >= 0 ? style->max_width
+              : style->max_width_pct >= 0 && !c->measuring
+              ? c->bwidth * style->max_width_pct / 100 : -1;
+    if (limit >= 0 && width > limit) {
+        height = (int)((long)height * limit / width);
+        width = limit;
+        if (width <= 0 || height <= 0) {
+            return;
+        }
     }
     if (!c->measuring && width > c->bwidth && c->bwidth > 0) {
         height = height * c->bwidth / width;
@@ -963,7 +1133,9 @@ static void emit_line(struct ctx *c, size_t count, int used,
         case IT_SPACE: {
             int ascent, descent;
             line_metrics(c, style, &ascent, &descent);
-            if (style->has_background) {
+            /* An inline element's own background; a block's is its box. */
+            if (style->has_background && !style->bg.image_only
+                && style->display == DISPLAY_INLINE) {
                 struct display_item *back = add_item(
                     c, ITEM_RECT, x, baseline - ascent, p->width,
                     ascent + descent);
@@ -1019,14 +1191,14 @@ static void emit_line(struct ctx *c, size_t count, int used,
             int box_top = baseline - (item->height - (tick ? 1 : 4));
             bool field = item->box == BOX_TEXT || item->box == BOX_TEXTAREA
                       || item->box == BOX_CHECKBOX || item->box == BOX_RADIO;
+            bool own_colour = style->has_background && !style->bg.image_only;
             struct display_item *fill = add_item(c, ITEM_RECT, x, box_top,
                                                  item->width, item->height);
             if (fill != NULL) {
                 /* A button takes the page's background colour. */
-                fill->colour = !field && style->has_background
-                             ? style->background
+                fill->colour = !field && own_colour ? style->background
                              : field ? 0x00ffffff : 0x00e9e9ed;
-                fill->transparency = !field && style->has_background
+                fill->transparency = !field && own_colour
                                    ? fill_transparency(style) : 0;
                 fill->control = item->node;
                 fill->round = item->box == BOX_RADIO;
@@ -1038,7 +1210,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
                 outline->colour = item->focused ? 0x000645ad
                                 : !field && style->border > 0
                                 ? style->border_colour
-                                : !field && style->has_background
+                                : !field && own_colour
                                 ? style->background : 0x00767676;
                 outline->round = item->box == BOX_RADIO;
             }
@@ -1341,6 +1513,202 @@ static void layout_flex_children(struct ctx *c,
                                  struct style *st);
 static int measure_content(struct ctx *c, const struct opos_html_node *node,
                            struct style *style, bool minimum);
+static void layout_block(struct ctx *c, const struct opos_html_node *node,
+                         struct style *style);
+static void add_image(struct ctx *c, const struct opos_html_node *node,
+                      const struct style *style);
+
+/* -------------------------------------------------------- positioned boxes */
+
+/* Remembers an absolutely positioned box for its containing block. Boxes
+   that hide their content (screen-reader text, closed menus) are left
+   out, as before. */
+static void note_absolute(struct ctx *c, const struct opos_html_node *node,
+                          struct style *style) {
+    struct abs_frame *frame = style->position == POS_FIXED ? c->fixed_frame
+                            : c->abs_frame;
+    if (c->measuring || frame == NULL
+        || (style->position != POS_ABSOLUTE && style->position != POS_FIXED)
+        || style->flow_display == DISPLAY_NONE || style->invisible
+        || style->clipped || style->opacity_zero) {
+        return;
+    }
+    for (int i = 0; i < frame->count; i++) {
+        if (frame->boxes[i].node == node) {
+            return;
+        }
+    }
+    if (frame->count == frame->capacity) {
+        int capacity = frame->capacity == 0 ? 8 : frame->capacity * 2;
+        struct abs_box *grown = realloc(frame->boxes,
+                                        (size_t)capacity * sizeof(*grown));
+        if (grown == NULL) {
+            return;
+        }
+        frame->boxes = grown;
+        frame->capacity = capacity;
+    }
+    struct abs_box *box = &frame->boxes[frame->count++];
+    box->node = node;
+    box->style = style;
+    box->static_x = c->bx;
+    box->static_y = c->y + (c->pending_margin > 0 ? c->pending_margin : 0);
+}
+
+static void shift_items(struct ctx *c, size_t first, int dx, int dy) {
+    for (size_t i = first; i < c->page->item_count; i++) {
+        c->page->items[i].x += dx;
+        c->page->items[i].y += dy;
+    }
+}
+
+/* Lays an absolutely positioned box out in its containing block (the
+   padding box at x, y, width x height). */
+static void place_absolute(struct ctx *c, const struct abs_box *box, int cbx,
+                           int cby, int cbw, int cbh) {
+    const struct style *s = box->style;
+    if (c->depth >= MAX_DEPTH || c->inl_count > 0) {
+        return;
+    }
+    int off[4];
+    bool set[4];
+    for (int i = 0; i < 4; i++) {
+        set[i] = s->offset_set[i];
+        off[i] = !s->offset_pct[i] ? s->offset[i]
+               : (i == TOP || i == BOTTOM ? cbh : cbw) * s->offset[i] / 100;
+    }
+    int frame_h = 2 * s->border + s->padding[LEFT] + s->padding[RIGHT];
+    int frame_v = 2 * s->border + s->padding[TOP] + s->padding[BOTTOM];
+    int ml = s->margin[LEFT], mr = s->margin[RIGHT];
+    struct style copy = *s;
+    copy.out_of_flow = false;
+    copy.display = s->flow_display == DISPLAY_TABLE ? DISPLAY_TABLE
+                                                    : DISPLAY_BLOCK;
+    copy.float_side = 0;
+    copy.margin_auto_left = copy.margin_auto_right = false;
+    int width = -1;
+    if (s->width >= 0) {
+        width = s->width - (s->border_box ? frame_h : 0);
+    } else if (s->width_pct >= 0) {
+        width = cbw * s->width_pct / 100 - (s->border_box ? frame_h : 0);
+    } else if (set[LEFT] && set[RIGHT]) {
+        width = cbw - off[LEFT] - off[RIGHT] - ml - mr - frame_h;
+    }
+    /* Screen-reader text and the like: a box of a pixel or less. */
+    if ((width >= 0 && width <= 1 && (s->width >= 0 || s->width_pct >= 0))
+        || (s->height >= 0 && s->height - (s->border_box ? frame_v : 0) <= 1)) {
+        return;
+    }
+    bool replaced = is_replaced(box->node);
+    if (width < 0 && !replaced) {
+        /* Shrink to fit: as wide as the content, at most the room left. */
+        int room = cbw - (set[LEFT] ? off[LEFT] : 0) - ml - mr - frame_h;
+        int min = measure_content(c, box->node, &copy, true);
+        int max = measure_content(c, box->node, &copy, false);
+        width = min_int(max, max_int(room, min));
+    }
+    if (s->max_width >= 0 && width > s->max_width) {
+        width = s->max_width;
+    }
+    if (s->max_width_pct >= 0 && width > cbw * s->max_width_pct / 100) {
+        width = cbw * s->max_width_pct / 100;
+    }
+    if (!replaced) {
+        width = clamp_min(width, 1);
+        copy.width = width;
+        copy.width_pct = copy.max_width = copy.max_width_pct = -1;
+    }
+    int outer = (width < 0 ? 0 : width) + frame_h + ml + mr;
+    int x = set[LEFT] ? cbx + off[LEFT]
+          : set[RIGHT] ? cbx + cbw - off[RIGHT] - outer
+          : box->static_x;
+    int y = set[TOP] ? cby + off[TOP] : box->static_y;
+    /* Pushed out of view on purpose ("left: -9999px"). */
+    if (x + outer <= 0 || (set[TOP] && y < -200)) {
+        return;
+    }
+
+    int saved_x = c->bx, saved_width = c->bwidth, saved_y = c->y;
+    int saved_margin = c->pending_margin, saved_right = c->max_right;
+    int saved_baseline = c->last_baseline, saved_extent = c->float_extent;
+    enum align saved_align = c->align;
+    bool saved_marker = c->marker_pending;
+    struct float_box saved_floats[MAX_FLOATS];
+    int saved_float_count = c->float_count;
+    memcpy(saved_floats, c->floats, sizeof(saved_floats));
+
+    c->bx = x;
+    c->bwidth = replaced ? clamp_min(cbw, 1) : outer;
+    c->y = y;
+    c->pending_margin = 0;
+    c->float_count = 0;
+    c->marker_pending = false;
+    c->align = ALIGN_LEFT;
+    /* Absolute boxes inside a fixed one are placed as usual. */
+    bool fixed_box = c->placing_fixed;
+    c->placing_fixed = false;
+    size_t first = c->page->item_count;
+    if (replaced) {
+        c->y += s->margin[TOP];
+        add_image(c, box->node, &copy);
+        flush_inline(c);
+        c->y += s->margin[BOTTOM];
+    } else if (copy.display == DISPLAY_TABLE) {
+        layout_table(c, box->node, &copy);
+    } else {
+        layout_block(c, box->node, &copy);
+    }
+    flush_inline(c);
+    int bottom = c->y;
+    if (!set[TOP] && set[BOTTOM]) {
+        int target = cby + cbh - off[BOTTOM] - s->margin[BOTTOM]
+                   - (bottom - y);
+        shift_items(c, first, 0, target - y);
+        bottom += target - y;
+    }
+    c->placing_fixed = fixed_box;
+    if (fixed_box) {
+        /* A fixed box stays put in the view. One covering most of it is
+           an overlay that a script would take away (a loading screen, a
+           closed dialog's backdrop): left out. */
+        int covered = bottom - y;
+        if (set[TOP] && set[BOTTOM]) {
+            covered = max_int(covered, cbh - off[TOP] - off[BOTTOM]);
+        }
+        covered = max_int(covered, cbh * s->height_pct / 100);
+        long area = (long)outer * covered;
+        if (area * 10 > (long)cbw * cbh * 6) {
+            c->page->item_count = first;
+        }
+        for (size_t i = first; i < c->page->item_count; i++) {
+            c->page->items[i].fixed = true;
+        }
+    } else if (bottom > c->abs_bottom) {
+        c->abs_bottom = bottom;
+    }
+
+    c->bx = saved_x;
+    c->bwidth = saved_width;
+    c->y = saved_y;
+    c->pending_margin = saved_margin;
+    c->max_right = saved_right;
+    c->last_baseline = saved_baseline;
+    c->float_extent = saved_extent;
+    c->align = saved_align;
+    c->marker_pending = saved_marker;
+    c->float_count = saved_float_count;
+    memcpy(c->floats, saved_floats, sizeof(saved_floats));
+}
+
+static void place_frame(struct ctx *c, struct abs_frame *frame, int x, int y,
+                        int width, int height) {
+    for (int i = 0; i < frame->count && !c->failed; i++) {
+        place_absolute(c, &frame->boxes[i], x, y, width, height);
+    }
+    free(frame->boxes);
+    frame->boxes = NULL;
+    frame->count = frame->capacity = 0;
+}
 
 static void layout_block(struct ctx *c, const struct opos_html_node *node,
                          struct style *style) {
@@ -1387,6 +1755,16 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     c->bx += ml + style->border + style->padding[LEFT];
     c->bwidth = cw;
 
+    /* A positioned box is the containing block of the absolutely
+       positioned boxes inside it. */
+    bool contains = style->position != POS_STATIC && !c->measuring;
+    struct abs_frame inner = {NULL, 0, 0};
+    struct abs_frame *outer_frame = c->abs_frame;
+    if (contains) {
+        c->abs_frame = &inner;
+    }
+    size_t first_item = c->page->item_count;
+
     bool boxed = style->has_background || style->border > 0;
     bool collapse_top = !boxed && style->padding[TOP] == 0;
     if (collapse_top) {
@@ -1396,6 +1774,10 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
         c->pending_margin = 0;
     }
     int box_top = c->y;
+    /* Where the box really starts when its top margin is still pending
+       (collapsing with its first child's). */
+    int frame_top = box_top + (collapse_top && c->pending_margin > 0
+                               ? c->pending_margin : 0);
     size_t fill_index = (size_t)-1;
     size_t outline_index = (size_t)-1;
     if (boxed && !c->measuring) {
@@ -1405,6 +1787,7 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
                 c->page->items[fill_index].colour = style->background;
                 c->page->items[fill_index].transparency =
                     fill_transparency(style);
+                attach_background(c, fill_index, style);
             }
         }
         if (style->border > 0) {
@@ -1416,6 +1799,7 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
         }
     }
     c->y += style->border + style->padding[TOP];
+    int content_top = c->y;
     c->align = style->align;
 
     if (style->display == DISPLAY_LIST_ITEM && !style->no_marker) {
@@ -1441,6 +1825,20 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     }
     flush_inline(c);
     c->marker_pending = false;
+    if (style->height >= 0 && !c->measuring) {
+        /* CSS height. Used as a minimum: content we lay out taller than
+           the page meant is not drawn over what follows. */
+        int height = style->height;
+        if (style->border_box) {
+            height -= style->padding[TOP] + style->padding[BOTTOM]
+                    + 2 * style->border;
+        }
+        c->y += c->pending_margin;
+        c->pending_margin = 0;
+        if (c->y < content_top + height) {
+            c->y = content_top + height;
+        }
+    }
     int inner_right = c->max_right;
     if (inner_right > 0) {
         inner_right += style->padding[RIGHT] + style->border + mr;
@@ -1460,7 +1858,8 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     }
 #endif
 
-    bool collapse_bottom = !boxed && style->padding[BOTTOM] == 0;
+    bool collapse_bottom = !boxed && style->padding[BOTTOM] == 0
+                        && style->height < 0;
     if (collapse_bottom) {
         c->pending_margin = collapse(c->pending_margin, style->margin[BOTTOM]);
     } else {
@@ -1472,6 +1871,36 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
         if (outline_index != (size_t)-1) {
             c->page->items[outline_index].height = c->y - box_top;
         }
+    }
+    if (contains) {
+        c->abs_frame = outer_frame;
+        place_frame(c, &inner, box_x + style->border,
+                    frame_top + style->border, box_width - 2 * style->border,
+                    c->y - frame_top - 2 * style->border);
+    }
+    if (style->position == POS_RELATIVE && !c->measuring) {
+        int dx = style->offset_set[LEFT]
+               ? (style->offset_pct[LEFT] ? saved_width * style->offset[LEFT]
+                                            / 100 : style->offset[LEFT])
+               : style->offset_set[RIGHT] && !style->offset_pct[RIGHT]
+               ? -style->offset[RIGHT] : 0;
+        int dy = style->offset_set[TOP] && !style->offset_pct[TOP]
+               ? style->offset[TOP]
+               : style->offset_set[BOTTOM] && !style->offset_pct[BOTTOM]
+               ? -style->offset[BOTTOM] : 0;
+        if (dx != 0 || dy != 0) {
+            shift_items(c, first_item, dx, dy);
+        }
+    }
+    if ((style->translate[0] != 0 || style->translate[1] != 0)
+        && !c->measuring) {
+        /* transform: translate(); a percentage is of the box itself. */
+        int dx = style->translate_pct[0]
+               ? box_width * style->translate[0] / 100 : style->translate[0];
+        int dy = style->translate_pct[1]
+               ? (c->y - box_top) * style->translate[1] / 100
+               : style->translate[1];
+        shift_items(c, first_item, dx, dy);
     }
     c->bx = saved_x;
     c->bwidth = saved_width;
@@ -1734,6 +2163,10 @@ static void table_add_row(struct table_data *t, const struct opos_html_node *tr,
         if (width != NULL && parse_length(width, &number, &percent)
             && number > 0) {
             cell->spec = percent ? -number : number;
+        } else if (cell->style.width > 0) {
+            cell->spec = cell->style.width;      /* CSS width */
+        } else if (cell->style.width_pct > 0) {
+            cell->spec = -cell->style.width_pct;
         }
         for (int side = 0; side < 4; side++) {
             if (cell->style.padding[side] == 0) {
@@ -1838,6 +2271,7 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
     int colmin[MAX_COLUMNS] = {0};
     int colmax[MAX_COLUMNS] = {0};
     int colpct[MAX_COLUMNS] = {0};
+    bool colfixed[MAX_COLUMNS] = {false};
     for (size_t i = 0; i < t.cell_count; i++) {
         struct cell *cell = &t.cells[i];
         if (cell->colspan == 0) {
@@ -1850,6 +2284,9 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
             cell->max = max_int(cell->max, cell->spec + extra);
             cell->min = max_int(cell->min, min_int(cell->spec + extra,
                                                    cell->max));
+            if (cell->colspan == 1) {
+                colfixed[cell->column] = true;
+            }
         } else if (cell->spec < 0 && !c->measuring && cell->colspan == 1) {
             colpct[cell->column] = max_int(colpct[cell->column], -cell->spec);
         }
@@ -1935,7 +2372,24 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
     int widths[MAX_COLUMNS];
     if (inner >= sum_max) {
         int extra = target > 0 ? inner - sum_max : 0;
+        /* Extra width goes to the columns without a fixed width. */
+        int sum_auto = 0, auto_count = 0;
         for (int i = 0; i < ncols; i++) {
+            if (!colfixed[i] && colpct[i] == 0) {
+                sum_auto += colmax[i];
+                auto_count++;
+            }
+        }
+        for (int i = 0; i < ncols; i++) {
+            if (auto_count > 0) {
+                bool takes = !colfixed[i] && colpct[i] == 0;
+                widths[i] = colmax[i]
+                          + (!takes ? 0
+                             : sum_auto > 0
+                             ? (int)((long)extra * colmax[i] / sum_auto)
+                             : extra / auto_count);
+                continue;
+            }
             widths[i] = colmax[i] + (sum_max > 0
                                      ? (int)((long)extra * colmax[i] / sum_max)
                                      : extra / ncols);
@@ -1984,6 +2438,7 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
             table_fill = c->page->item_count - 1;
             c->page->items[table_fill].colour = st->background;
             c->page->items[table_fill].transparency = fill_transparency(st);
+            attach_background(c, table_fill, st);
         }
         if (border > 0 && add_item(c, ITEM_OUTLINE, x0, table_top, total, 0)
                               != NULL) {
@@ -2029,6 +2484,7 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
                     c->page->items[cell->fill_index].colour = from->background;
                     c->page->items[cell->fill_index].transparency =
                         fill_transparency(from);
+                    attach_background(c, cell->fill_index, from);
                 }
                 if (cell_border > 0
                     && add_item(c, ITEM_OUTLINE, cell_x, y, cell_width, 0)
@@ -2197,7 +2653,7 @@ static void layout_float(struct ctx *c, const struct opos_html_node *node,
     int room = clamp_min(right - left, 1);
     int top = c->y;
     int saved_floats = c->float_count;
-    if (node->tag == HTML_TAG_IMG) {
+    if (is_replaced(node)) {
         size_t before = c->inl_count;
         add_image(c, node, st);
         if (c->inl_count == before) {
@@ -2279,9 +2735,14 @@ static void add_inline_block(struct ctx *c, const struct opos_html_node *node,
     int frame = 2 * st->border + st->padding[LEFT] + st->padding[RIGHT];
     int margins = st->margin[LEFT] + st->margin[RIGHT];
     int cw;
-    /* Image replacement (a background image instead of the text): the
-       image cannot be drawn, so the box fits its text instead. */
-    bool fit_text = st->text_replaced;
+    /* Image replacement (a background image instead of the text): once
+       the image is loaded the box keeps its size and the text is left
+       out; until then (or if it fails) the box fits its text instead. */
+    const char *picture = st->text_replaced ? image_layer_url(st) : NULL;
+    struct image_ref *replacement = picture != NULL
+                                  ? background_image(c, picture) : NULL;
+    bool shows_image = replacement != NULL && replacement->state == 1;
+    bool fit_text = st->text_replaced && !shows_image;
     if (st->width >= 0 && !fit_text) {
         cw = st->width;
     } else if (st->width_pct >= 0 && !fit_text) {
@@ -2323,6 +2784,16 @@ static void add_inline_block(struct ctx *c, const struct opos_html_node *node,
         bottom = max_int(bottom, c->float_extent);
         height = bottom + st->margin[BOTTOM];
         ascent = c->last_baseline >= 0 ? c->last_baseline : height;
+        if (shows_image) {
+            /* The text sits off-screen (text-indent: -9999px). */
+            size_t kept = first;
+            for (size_t i = first; i < c->page->item_count; i++) {
+                if (c->page->items[i].kind != ITEM_TEXT) {
+                    c->page->items[kept++] = c->page->items[i];
+                }
+            }
+            c->page->item_count = kept;
+        }
         last = c->page->item_count;
         c->max_right = saved_right;
         c->float_count = saved_floats;
@@ -2381,6 +2852,7 @@ static void collect_flex_items(struct ctx *c,
         }
         style_compute(child, st, s);
         if (s->display == DISPLAY_NONE) {
+            note_absolute(c, child, s);
             continue;
         }
         if (s->display == DISPLAY_CONTENTS && depth < 8) {
@@ -2396,10 +2868,10 @@ static void collect_flex_items(struct ctx *c,
         }
         if ((s->display == DISPLAY_INLINE
              || (s->display == DISPLAY_INLINE_BLOCK && !is_control(child)))
-            && child->tag != HTML_TAG_IMG && child->tag != HTML_TAG_BR) {
+            && !is_replaced(child) && child->tag != HTML_TAG_BR) {
             s->display = DISPLAY_BLOCK;
         }
-        if (child->tag == HTML_TAG_IMG || child->tag == HTML_TAG_BR
+        if (is_replaced(child) || child->tag == HTML_TAG_BR
             || s->display == DISPLAY_INLINE
             || s->display == DISPLAY_INLINE_BLOCK
             || s->display == DISPLAY_TABLE) {
@@ -2668,11 +3140,12 @@ static void layout_grid_children(struct ctx *c,
         }
         style_compute(child, st, s);
         if (s->display == DISPLAY_NONE) {
+            note_absolute(c, child, s);
             continue;
         }
         if (count == MAX_FLEX_ITEMS
             || (s->display == DISPLAY_INLINE_BLOCK && is_control(child))
-            || child->tag == HTML_TAG_IMG || child->tag == HTML_TAG_BR) {
+            || is_replaced(child) || child->tag == HTML_TAG_BR) {
             plain = false;
             break;
         }
@@ -2839,7 +3312,7 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
          || (parent->flex && parent->flex_column))
         && (style->display == DISPLAY_INLINE
             || (style->display == DISPLAY_INLINE_BLOCK && !is_control(node)))
-        && node->tag != HTML_TAG_BR && node->tag != HTML_TAG_IMG) {
+        && node->tag != HTML_TAG_BR && !is_replaced(node)) {
         style->display = DISPLAY_BLOCK;
     }
     if (node->tag == HTML_TAG_OL || node->tag == HTML_TAG_UL
@@ -2867,6 +3340,27 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
             layout_float(c, node, style);
             return;
         }
+    }
+    if (style->display == DISPLAY_NONE) {
+        note_absolute(c, node, style);
+        return;
+    }
+    if (is_replaced(node) && style->display != DISPLAY_NONE
+        && style->display != DISPLAY_INLINE) {
+        /* An image is one box whatever its display: a block one gets a
+           line of its own. */
+        bool block = style->display != DISPLAY_INLINE_BLOCK;
+        if (block) {
+            flush_inline(c);
+            c->y += collapse(c->pending_margin, style->margin[TOP]);
+            c->pending_margin = 0;
+        }
+        add_image(c, node, style);
+        if (block) {
+            flush_inline(c);
+            c->pending_margin = style->margin[BOTTOM];
+        }
+        return;
     }
     switch (style->display) {
     case DISPLAY_NONE:
@@ -2899,7 +3393,7 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
     case DISPLAY_INLINE:
         if (node->tag == HTML_TAG_BR) {
             add_break(c, style);
-        } else if (node->tag == HTML_TAG_IMG) {
+        } else if (is_replaced(node)) {
             add_image(c, node, style);
         } else if (node->tag != HTML_TAG_WBR) {
             process_children(c, node, style);
@@ -2925,10 +3419,32 @@ void page_free_layout(struct page *page) {
     free_arena(page);
 }
 
+static struct page *copy_page;
+
+static void *zeroed_alloc(size_t size) {
+    void *memory = arena_alloc(copy_page, size);
+    if (memory != NULL) {
+        memset(memory, 0, size);
+    }
+    return memory;
+}
+
+static char *copy_text(const char *text, size_t length) {
+    char *copy = arena_alloc(copy_page, length + 1);
+    if (copy != NULL) {
+        memcpy(copy, text, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
 void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
                  int width) {
     page_free_layout(page);
     style_sheets = page->sheets;
+    copy_page = page;
+    style_copy_text = copy_text;
+    style_alloc = zeroed_alloc;
     struct ctx c;
     memset(&c, 0, sizeof(c));
     c.page = page;
@@ -2949,20 +3465,38 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
     struct style html_style, body_style;
     style_compute(page->doc->root, &root, &html_style);
     style_compute(page->doc->body, &html_style, &body_style);
-    if (html_style.has_background) {
+    if (html_style.has_background && !html_style.bg.image_only) {
         page->background = html_style.background;
     }
-    if (body_style.has_background) {
+    if (body_style.has_background && !body_style.bg.image_only) {
         page->background = body_style.background;
     }
 
+    struct abs_frame frame = {NULL, 0, 0};
+    struct abs_frame fixed = {NULL, 0, 0};
+    c.abs_frame = &frame;
+    c.fixed_frame = &fixed;
     process_node(&c, page->doc->root, &root);
     flush_inline(&c);
+    c.abs_frame = NULL;
+    int flow_bottom = c.y + c.pending_margin;
+    place_frame(&c, &frame, 0, 0, width, viewport_height_px);
+    /* Fixed boxes last, so they are drawn over the page; their frame is
+       the whole view, margins included. */
+    c.fixed_frame = NULL;
+    c.placing_fixed = true;
+    place_frame(&c, &fixed, -PAGE_MARGIN, -PAGE_MARGIN,
+                c.bwidth + 2 * PAGE_MARGIN, viewport_height_px);
+    c.placing_fixed = false;
     page->content_width = max_int(width, c.max_right);
-    page->content_height = max_int(c.y + c.pending_margin, c.float_extent);
+    page->content_height = max_int(max_int(flow_bottom, c.abs_bottom),
+                                   c.float_extent);
     free(c.inl);
     free(c.placed);
     free(c.measures);
+    style_copy_text = NULL;
+    style_alloc = NULL;
+    copy_page = NULL;
 }
 
 void page_destroy(struct page *page) {
@@ -2972,21 +3506,21 @@ void page_destroy(struct page *page) {
     free_arena(page);
     free(page->items);
     for (size_t i = 0; i < page->image_count; i++) {
-        free(page->images[i]->pixels);
-        free(page->images[i]->scaled);
-        free(page->images[i]);
+        image_ref_free(page->images[i]);
     }
     free(page->images);
     opos_html_free(page->doc);
     memset(page, 0, sizeof(*page));
 }
 
-const struct display_item *page_item_at(const struct page *page, int x, int y) {
+const struct display_item *page_item_at(const struct page *page, int x, int y,
+                                        int scroll) {
     for (size_t i = page->item_count; i > 0; i--) {
         const struct display_item *item = &page->items[i - 1];
+        int at = item->fixed ? y - scroll : y;
         if ((item->kind == ITEM_TEXT || item->kind == ITEM_IMAGE)
-            && x >= item->x && x < item->x + item->width && y >= item->y
-            && y < item->y + item->height) {
+            && x >= item->x && x < item->x + item->width && at >= item->y
+            && at < item->y + item->height) {
             return item;
         }
     }
@@ -2994,12 +3528,13 @@ const struct display_item *page_item_at(const struct page *page, int x, int y) {
 }
 
 const struct opos_html_node *page_control_at(const struct page *page, int x,
-                                             int y) {
+                                             int y, int scroll) {
     for (size_t i = page->item_count; i > 0; i--) {
         const struct display_item *item = &page->items[i - 1];
+        int at = item->fixed ? y - scroll : y;
         if (item->control != NULL && x >= item->x
-            && x < item->x + item->width && y >= item->y
-            && y < item->y + item->height) {
+            && x < item->x + item->width && at >= item->y
+            && at < item->y + item->height) {
             return item->control;
         }
     }

@@ -584,6 +584,15 @@ static inline long opos_window_resize(uint32_t width, uint32_t height) {
     return opos_syscall2(OPOS_SYS_WINDOW_RESIZE, (long)width, (long)height);
 }
 
+/* Changes the window's title, e.g. to the open document's name. Only
+   printable ASCII is shown, at most 31 characters. Older OPOS versions
+   return a negative error and keep the title from opos_window_create. */
+#define OPOS_SYS_WINDOW_TITLE 0x4f500019L
+static inline long opos_window_title(const char *title) {
+    return opos_syscall2(OPOS_SYS_WINDOW_TITLE, (long)title,
+                         (long)opos_strlen(title));
+}
+
 /* The content area's current size. */
 static inline long opos_window_size(uint32_t *width, uint32_t *height) {
     long size = opos_syscall0(OPOS_SYS_WINDOW_SIZE);

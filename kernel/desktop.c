@@ -13432,6 +13432,29 @@ int64_t desktop_app_window_resize(uint64_t owner, uint32_t width,
     return 0;
 }
 
+int64_t desktop_app_window_title(uint64_t owner, const char *title,
+                                 size_t title_length) {
+    struct app_window *window = app_window_of(owner);
+    if (window == NULL) {
+        return -9;
+    }
+    /* The desktop may draw the title meanwhile: the last byte stays 0,
+       so it always reads a terminated string. */
+    size_t used = 0;
+    for (size_t i = 0; i < title_length && used + 1 < sizeof(window->title);
+         i++) {
+        char c = title[i];
+        if (c >= ' ' && c <= '~') {
+            window->title[used++] = c;
+        }
+    }
+    for (size_t i = used; i < sizeof(window->title); i++) {
+        window->title[i] = '\0';
+    }
+    window->dirty = true; /* the frame and the taskbar show it */
+    return 0;
+}
+
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {
     struct app_window *window = app_window_of(owner);
     if (window == NULL) {

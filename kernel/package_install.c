@@ -1431,6 +1431,7 @@ static size_t start_scope(bool everyone, size_t account,
                 item->label[c] = start_text[start->label.offset + c];
             }
             item->label[label] = '\0';
+            copy_text(item->id, sizeof(item->id), start_package.id);
             size_t at = append_text(item->path, sizeof(item->path), 0,
                                     programs);
             at = at == 0 ? 0 : append(item->path, sizeof(item->path), at, "/",

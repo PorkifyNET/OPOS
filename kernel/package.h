@@ -188,6 +188,7 @@ _Static_assert(sizeof(struct package_info) == 368,
 
 /* One Start > Programs entry from an installed package. */
 struct package_start_entry {
+    char id[PACKAGE_ID_MAX + 1];
     char label[PACKAGE_NAME_MAX + 1];
     char path[256];
 };

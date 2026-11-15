@@ -278,7 +278,14 @@ one account. The Store, the index and its key come in step 4.
   administrator installed the same id for everyone.
 - Start > Programs lists every `start` entry of the account's own and
   everyone's packages. Built-in and loose program names win over package
-  labels, so a package cannot appear as a built-in.
+  labels, so a package cannot appear as a built-in. The menu groups
+  programs under category headings in the Store's category order, with
+  OTHER last. A Store package takes its category from the signed index:
+  each time the Store window lists the Store, the desktop saves every
+  listed id and category to `/disk/OPOS/STORE-CATEGORIES.TXT` (lines of
+  `ID CATEGORY`). Built-in programs have fixed categories; loose programs
+  and sideloaded packages are OTHER. Install records stay unchanged, so
+  an older kernel still reads them.
 - Packages and system updates refuse to run at the same time.
 - Tested in QEMU (KVM, installed BIOS disk): install for one account and
   everyone, update, `NOT_NEWER`, a damaged member, a Windows package, a

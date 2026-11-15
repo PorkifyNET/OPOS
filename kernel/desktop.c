@@ -1459,6 +1459,10 @@ static enum run_result app_launch(enum app_origin origin, const char *typed,
                                   size_t arguments_length,
                                   const char *document,
                                   size_t document_length);
+static int app_job_output(uint64_t process_id, const char *data,
+                          size_t length);
+static void app_job_waits_for_input(uint64_t process_id);
+static void app_job_window_created(uint64_t process_id);
 static enum run_result app_launch_builtin(enum user_program program,
                                           const char *name);
 static bool app_kill_terminal_job(void);
@@ -12789,6 +12793,7 @@ int64_t desktop_app_window_create(uint64_t owner, const char *title,
                          (uint32_t)screen_height())) {
         return -12; /* ENOMEM */
     }
+    app_job_window_created(owner);
     uint32_t *surface = window->surface;
     uint32_t surface_width = window->surface_width;
     uint32_t surface_height = window->surface_height;
@@ -13065,8 +13070,12 @@ void desktop_app_process_exited(uint64_t process_id) {
 static char app_output[APP_OUTPUT_CAPACITY];
 static size_t app_output_head;
 static size_t app_output_count;
-/* Output from a program without a window brings up the Terminal. */
+/* Output from a program without a window brings up the Terminal, if the
+   program was started there (app_job_output). */
 static bool app_output_windowless;
+/* A program started elsewhere waits for typed input: bring up the
+   Terminal with what it wrote so far (app_terminal_show). */
+static struct app_job *app_terminal_wanted;
 /* The updater run by Settings > UPDATES writes to that page instead. */
 #define UPDATES_OUTPUT_CAPACITY 2048
 static char updates_output[UPDATES_OUTPUT_CAPACITY];
@@ -13137,7 +13146,12 @@ static void app_output_sink(const char *data, size_t length, bool error) {
         store_output_sink(data, length);
         return;
     }
-    if (app_window_of(user_current_process_id()) == NULL) {
+    uint64_t process_id = user_current_process_id();
+    int held = app_job_output(process_id, data, length);
+    if (held == 0) {
+        return; /* kept for when the Terminal opens */
+    }
+    if (held < 0 && app_window_of(process_id) == NULL) {
         app_output_windowless = true;
     }
     for (size_t i = 0; i < length; i++) {
@@ -13196,6 +13210,7 @@ static int app_console_input(char *character, uint64_t deadline) {
         if (deadline == 0 || now >= deadline) {
             return 0;
         }
+        app_job_waits_for_input(user_current_process_id());
         uint64_t until = now + APP_WAIT_RECHECK_TICKS;
         if (deadline < until) {
             until = deadline;
@@ -13218,6 +13233,7 @@ static size_t app_console_pending(void) {
  */
 #define APP_JOB_CAPACITY 8
 #define APP_ARGUMENTS_CAPACITY 512
+#define APP_HELD_CAPACITY 2048
 
 struct app_job {
     bool used;
@@ -13237,6 +13253,13 @@ struct app_job {
     uint64_t process_id;
     uint64_t exit_status;
     enum user_run_result result;
+    /* It wrote to standard output or error / opened a window. */
+    bool printed;
+    bool windowed;
+    /* The last of that output, shown if the Terminal comes up for it
+       (programs not started from the Terminal; app_job_output). */
+    char held[APP_HELD_CAPACITY];
+    size_t held_length;
 };
 
 static struct app_job app_jobs[APP_JOB_CAPACITY];
@@ -13343,6 +13366,79 @@ static enum run_result app_launch_builtin(enum user_program program,
 static uint64_t app_job_process(const struct app_job *job) {
     return job->used && !job->finished ? user_task_process_id(job->task_id)
                                        : 0;
+}
+
+static struct app_job *app_job_of(uint64_t process_id) {
+    for (size_t i = 0; process_id != 0 && i < APP_JOB_CAPACITY; i++) {
+        if (app_job_process(&app_jobs[i]) == process_id) {
+            return &app_jobs[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Programs started from the Start menu, Files or Notepad often write
+ * debug text nobody needs, so their output alone does not bring up the
+ * Terminal. Each such job keeps the last APP_HELD_CAPACITY bytes it
+ * wrote. The Terminal comes up with them when the program waits for
+ * typed input without a window of its own (a command-line program such
+ * as Lua), or when it ends after writing something and either never had
+ * a window or failed (app_job_report). While the Terminal is open their
+ * output also shows there at once. A program started from the Terminal
+ * shows its output there as before.
+ *
+ * Returns -1 for a program started from the Terminal (or unknown), 0
+ * when the output was only kept, 1 when it should also show now.
+ */
+static int app_job_output(uint64_t process_id, const char *data,
+                          size_t length) {
+    struct app_job *job = app_job_of(process_id);
+    if (job == NULL || job->origin == APP_FROM_TERMINAL) {
+        return -1;
+    }
+    job->printed = true;
+    for (size_t i = 0; i < length; i++) {
+        if (job->held_length == APP_HELD_CAPACITY) {
+            /* Keep the newer half. */
+            size_t keep = APP_HELD_CAPACITY / 2;
+            for (size_t j = 0; j < keep; j++) {
+                job->held[j] = job->held[APP_HELD_CAPACITY - keep + j];
+            }
+            job->held_length = keep;
+        }
+        job->held[job->held_length++] = data[i];
+    }
+    return windows[WINDOW_TERMINAL].open ? 1 : 0;
+}
+
+/* Opens the Terminal for a job started elsewhere and shows what the job
+   kept of its output (app_job_output). An open Terminal showed it
+   already. */
+static void app_terminal_show(struct app_job *job) {
+    if (windows[WINDOW_TERMINAL].open || apps_stopping) {
+        return;
+    }
+    window_open(WINDOW_TERMINAL);
+    for (size_t i = 0; i < job->held_length; i++) {
+        terminal_output_put(job->held[i]);
+    }
+}
+
+static void app_job_waits_for_input(uint64_t process_id) {
+    struct app_job *job = app_job_of(process_id);
+    if (job != NULL && job->origin != APP_FROM_TERMINAL
+        && app_window_of(process_id) == NULL
+        && !windows[WINDOW_TERMINAL].open) {
+        app_terminal_wanted = job;
+    }
+}
+
+static void app_job_window_created(uint64_t process_id) {
+    struct app_job *job = app_job_of(process_id);
+    if (job != NULL) {
+        job->windowed = true;
+    }
 }
 
 static bool app_current_has_origin(enum app_origin origin) {
@@ -13486,6 +13582,9 @@ static void app_notify_crash(const struct app_job *job) {
 static void app_job_report(struct app_job *job) {
     enum run_result result = app_run_result(job->result);
     bool started = result == RUN_STARTED;
+    if (app_terminal_wanted == job) {
+        app_terminal_wanted = NULL; /* the slot is about to be reused */
+    }
     if (started && !apps_stopping) {
         app_notify_crash(job);
     }
@@ -13511,6 +13610,15 @@ static void app_job_report(struct app_job *job) {
             set_status(job->exit_status == 0 ? "PROGRAM EXITED WITH STATUS 0"
                        : job->exit_status == 128 + 9 ? "PROGRAM WAS ENDED"
                                                      : "PROGRAM EXITED WITH ERROR");
+            /* Show what it wrote: a command-line program's result, or
+               why it failed. */
+            bool failed = job->exit_status != 0
+                && job->exit_status != 128 + 9;
+            if (job->printed && (!job->windowed || failed)
+                && !windows[WINDOW_TERMINAL].open) {
+                app_terminal_show(job);
+                terminal_output_flush();
+            }
         }
         break;
     case APP_FROM_UPDATES:
@@ -15620,6 +15728,14 @@ static bool apps_poll(void) {
     if (store_output_count != 0) {
         store_output_drain();
         redraw = true;
+    }
+    if (app_terminal_wanted != NULL) {
+        struct app_job *job = app_terminal_wanted;
+        app_terminal_wanted = NULL;
+        if (job->used) {
+            app_terminal_show(job);
+            redraw = true;
+        }
     }
     if (app_output_count != 0) {
         if (app_output_windowless && !windows[WINDOW_TERMINAL].open

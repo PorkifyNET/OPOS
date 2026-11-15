@@ -488,6 +488,27 @@ void scheduler_restore_current_fpu(
     scheduler_restore_fpu(saved);
 }
 
+/*
+ * A running task in kernel code is not switched away by the yield
+ * interrupt (scheduler_switch), so mark it runnable first: it then goes
+ * to the back of the round robin and runs again on its next turn.
+ */
+void scheduler_yield_current(void) {
+    if (!scheduler_ready) {
+        return;
+    }
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    struct scheduler_task *task = &tasks[current_task];
+    if (task->state == SCHEDULER_TASK_RUNNING) {
+        task->state = SCHEDULER_TASK_RUNNABLE;
+        __asm__ volatile ("int $0x81" : : : "memory");
+    }
+    if ((flags & (1u << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
+}
+
 bool scheduler_sleep_until(uint64_t wake_tick) {
     if (!scheduler_ready) {
         return false;

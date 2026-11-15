@@ -37,6 +37,8 @@ void scheduler_save_current_fpu(uint8_t state[SCHEDULER_FPU_STATE_SIZE]);
 void scheduler_restore_current_fpu(
     const uint8_t state[SCHEDULER_FPU_STATE_SIZE]);
 bool scheduler_sleep_until(uint64_t wake_tick);
+/* Lets other runnable tasks run first, then returns (sched_yield). */
+void scheduler_yield_current(void);
 bool scheduler_block_current_locked(const void *event);
 /* Like scheduler_block_current_locked, but also wakes at wake_tick. */
 bool scheduler_block_current_until_locked(const void *event,

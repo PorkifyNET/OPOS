@@ -300,9 +300,35 @@ bool bookmark_toggle(const char *url, const char *title);
 void history_add(const char *url, const char *title);
 void download_record(const char *name, const char *path,
                      unsigned long long size, bool failed);
+/* A download running in the background: download_start returns its id
+   for the other calls. */
+int download_start(const char *name, const char *path);
+void download_update(int id, unsigned long long received,
+                     unsigned long long total);
+void download_end(int id, unsigned long long size, bool failed,
+                  bool cancelled);
+/* main.c: stops a running download (about:downloads?cancel=ID). */
+void download_cancel(int id);
 /* The HTML of about:home, about:bookmarks (?remove=N), about:history
-   (?clear), about:downloads or about:blank; malloc'd. */
+   (?clear), about:downloads (?cancel=ID), about:cookies (?remove=N,
+   ?clear) or about:blank; malloc'd. */
 char *about_page(const char *url, size_t *length);
+
+/* cookies.c: the cookie jar, kept in data_dir/cookies.txt ("": in memory
+   only). cookies_attach makes the HTTP library send cookies (and, with
+   store, keep the ones responses set) until cookies_detach, which also
+   saves them. */
+void cookies_open(const char *data_dir);
+void cookies_attach(bool store);
+void cookies_detach(void);
+void cookies_save(void);
+/* Calls each for every site with cookies, sorted by name; returns the
+   number of sites. */
+int cookies_sites(void (*each)(void *context, int index, const char *site,
+                               int count),
+                  void *context);
+/* Deletes the cookies of the site with that index (-1: all sites). */
+void cookies_forget(int site);
 
 /* form.c */
 enum field_kind form_kind(const struct opos_html_node *node);

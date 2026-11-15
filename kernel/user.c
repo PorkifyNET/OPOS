@@ -1597,6 +1597,12 @@ static int64_t user_pipe_read(struct user_file_descriptor *file,
             }
             return 0;
         }
+        if (file->nonblocking) {
+            if ((flags & (1u << 9)) != 0) {
+                __asm__ volatile ("sti" : : : "memory");
+            }
+            return -11; /* EAGAIN */
+        }
         if (!scheduler_block_current_locked(pipe)) {
             if ((flags & (1u << 9)) != 0) {
                 __asm__ volatile ("sti" : : : "memory");
@@ -1650,6 +1656,13 @@ static int64_t user_pipe_write(struct user_file_descriptor *file,
                 __asm__ volatile ("sti" : : : "memory");
             }
             return (int64_t)length;
+        }
+        if (file->nonblocking) {
+            /* All or nothing, like Linux for writes up to PIPE_BUF. */
+            if ((flags & (1u << 9)) != 0) {
+                __asm__ volatile ("sti" : : : "memory");
+            }
+            return -11; /* EAGAIN */
         }
         if (!scheduler_block_current_locked(pipe)) {
             if ((flags & (1u << 9)) != 0) {
@@ -2293,7 +2306,8 @@ static int64_t user_linux_open_file(struct user_process *process,
 static int64_t user_linux_pipe(struct user_process *process,
                                uintptr_t descriptor_address,
                                uint64_t flags) {
-    if (process == NULL || (flags & ~((uint64_t)LINUX_O_CLOEXEC)) != 0) {
+    if (process == NULL
+        || (flags & ~((uint64_t)(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK))) != 0) {
         return -22;
     }
     if (!paging_user_range_valid(descriptor_address,
@@ -2343,6 +2357,7 @@ static int64_t user_linux_pipe(struct user_process *process,
         .kind = USER_OPEN_FILE_PIPE_READ,
         .readable = true,
         .pipe_slot = (uint8_t)pipe_slot,
+        .nonblocking = (flags & LINUX_O_NONBLOCK) != 0,
     };
     open_files[file_slots[1]] = (struct user_file_descriptor) {
         .used = true,
@@ -2350,6 +2365,7 @@ static int64_t user_linux_pipe(struct user_process *process,
         .kind = USER_OPEN_FILE_PIPE_WRITE,
         .writable = true,
         .pipe_slot = (uint8_t)pipe_slot,
+        .nonblocking = (flags & LINUX_O_NONBLOCK) != 0,
     };
     bool close_on_exec = (flags & LINUX_O_CLOEXEC) != 0;
     process->descriptors[descriptor_slots[0]] = (struct user_descriptor) {

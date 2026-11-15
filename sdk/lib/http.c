@@ -18,6 +18,8 @@
 
 #define HEADER_MAX 16384
 #define READ_BUFFER 16384
+/* Request line and headers: the path, the cookies and the rest. */
+#define REQUEST_MAX (OPOS_HTTP_URL_MAX + OPOS_HTTP_COOKIE_MAX + 512)
 #define USER_AGENT "Mozilla/5.0 (compatible; OPOS)"
 
 static opos_http_progress progress_callback;
@@ -26,6 +28,17 @@ static void *progress_context;
 void opos_http_set_progress(opos_http_progress callback, void *context) {
     progress_callback = callback;
     progress_context = context;
+}
+
+static opos_http_cookie_get cookie_get;
+static opos_http_cookie_set cookie_set;
+static void *cookie_context;
+
+void opos_http_set_cookies(opos_http_cookie_get get, opos_http_cookie_set set,
+                           void *context) {
+    cookie_get = get;
+    cookie_set = set;
+    cookie_context = context;
 }
 
 /* ---------------------------------------------------------------- URLs */
@@ -471,11 +484,13 @@ static long http_request(const char *address, const char *post_type,
     strcpy(location, address);
     struct connection *c = malloc(sizeof(*c));
     char *line = malloc(HEADER_MAX);
-    char *request = malloc(OPOS_HTTP_URL_MAX + 512);
+    char *request = malloc(REQUEST_MAX);
+    char *cookies = malloc(OPOS_HTTP_COOKIE_MAX + 16);
     struct url *url = malloc(sizeof(*url));
     long result = -OPOS_ENOMEM;
     struct body body = {NULL, 0, 0, max_body, 0, NULL, NULL};
-    if (c == NULL || line == NULL || request == NULL || url == NULL) {
+    if (c == NULL || line == NULL || request == NULL || url == NULL
+        || cookies == NULL) {
         goto done;
     }
     for (int redirects = 0;; redirects++) {
@@ -507,18 +522,30 @@ static long http_request(const char *address, const char *post_type,
                      "Content-Type: %s\r\nContent-Length: %lu\r\n",
                      post_type, (unsigned long)post_length);
         }
-        int length = snprintf(request, OPOS_HTTP_URL_MAX + 512,
+        cookies[0] = '\0';
+        if (cookie_get != NULL) {
+            char *value = line; /* free until the response arrives */
+            value[0] = '\0';
+            cookie_get(cookie_context, location, value,
+                       OPOS_HTTP_COOKIE_MAX);
+            value[OPOS_HTTP_COOKIE_MAX - 1] = '\0';
+            if (value[0] != '\0' && value[strcspn(value, "\r\n")] == '\0') {
+                snprintf(cookies, OPOS_HTTP_COOKIE_MAX + 16,
+                         "Cookie: %s\r\n", value);
+            }
+        }
+        int length = snprintf(request, REQUEST_MAX,
                               "%s %s HTTP/1.1\r\nHost: %s\r\n"
                               "User-Agent: " USER_AGENT "\r\n"
                               "Accept: text/html,*/*;q=0.8\r\n"
                               "Accept-Encoding: %s\r\n"
-                              "%s"
+                              "%s%s"
                               "Connection: close\r\n\r\n",
                               post_type != NULL ? "POST" : "GET", url->path,
                               host_header,
                               sink != NULL ? "identity" : "gzip",
-                              post_headers);
-        if (length <= 0 || length >= OPOS_HTTP_URL_MAX + 512
+                              post_headers, cookies);
+        if (length <= 0 || length >= REQUEST_MAX
             || raw_write(c, request, (size_t)length) != length
             || (post_type != NULL && post_length > 0
                 && raw_write(c, post_body, post_length)
@@ -571,6 +598,9 @@ static long http_request(const char *address, const char *post_type,
             } else if (header_is(line, "location", &value)) {
                 have_location = opos_url_resolve(location, value, next,
                                                  sizeof(next));
+            } else if (header_is(line, "set-cookie", &value)
+                       && cookie_set != NULL) {
+                cookie_set(cookie_context, location, value);
             }
         }
         if ((status == 301 || status == 302 || status == 303 || status == 307
@@ -640,6 +670,7 @@ done:
     free(c);
     free(line);
     free(request);
+    free(cookies);
     free(url);
     return result;
 }

@@ -20,6 +20,9 @@ compatibility layer cannot talk its way around it.
   shared class (`/disk`, `/disk2`, and so on outside the protected
   folders). It can read one file in the account home after the user picks
   it in Files (`opos_pick_file()`, one grant, checked by device and inode).
+  It can write one file the user names in Files' save mode
+  (`opos_save_file()`, one grant by path: create, write and read, never
+  remove).
 - It has full network access and full shared clipboard access. Nothing
   asks the user for either.
 - Built-in programs from the initramfs are not confined. They read the
@@ -53,7 +56,7 @@ A capability is a named right that the kernel checks. The first set:
 | Capability | Meaning | Default for a new disk program |
 | --- | --- | --- |
 | `storage` | Read and write its own app storage | granted |
-| `files.pick` | Use `opos_pick_file()` and `opos_save_file()` (new) | granted |
+| `files.pick` | Use `opos_pick_file()` and `opos_save_file()` | granted |
 | `files.shared` | Read the shared class outside its own directory | denied |
 | `net` | Open sockets (one capability, no local/internet split) | denied, asked on first use |
 | `clipboard.read` | Read the shared clipboard | denied, asked on first use |

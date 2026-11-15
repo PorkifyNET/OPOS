@@ -12453,6 +12453,14 @@ static void files_key(char character) {
             files_key_navigate(character == KEY_LEFT ? '\b'
                                : character == KEY_RIGHT ? KEY_RIGHT
                                : character);
+            /* Choosing a file with the arrows takes its name, as a
+               click does, so Enter replaces it (after asking). */
+            size_t chosen;
+            if ((character == KEY_UP || character == KEY_DOWN)
+                && files_row_entry(files_selection, &chosen)
+                && !files_entries[chosen].directory) {
+                files_save_name_set(files_entries[chosen].name);
+            }
         }
         return;
     }

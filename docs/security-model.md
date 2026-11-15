@@ -118,7 +118,14 @@ choose a file or cancel. The selected file gets one read grant, checked
 against its device and inode so replacing the file at that path does not
 extend the grant. A new selection replaces the path grant for future opens;
 file handles already opened remain valid. Grants follow `fork` and
-`execve` but never allow writing outside app storage.
+`execve`.
+To write outside app storage, a program calls `opos_save_file()`. Files
+opens in save mode with the program's suggested name; the user chooses a
+folder and a name, and confirms again before an existing file is
+replaced. The chosen path gets one write grant: create, write and read
+that path, never remove it. It needs a path the program's unconfined
+identity could write (the user's own home or shared folders) and is not
+a folder. A new save grant replaces the previous one.
 The picker cannot grant access to another account's home or to the
 password file.
 

@@ -143,6 +143,40 @@ int main(void) {
     assert(!allows(&app, "/disk/Users/Bob/note.txt", PERMISSION_READ));
     assert(!allows(&app, "/disk/OPOS/ACCOUNTS.DAT", PERMISSION_READ));
 
+    /* opos_save_file: one chosen name, which need not exist yet. */
+    {
+        struct permission_identity saver = app;
+        const char *picture = "/disk/Users/Alice/picture.png";
+        assert(!allows(&saver, picture, PERMISSION_WRITE));
+        assert(permission_grant_write_file(&saver, picture,
+                                           strlen(picture)));
+        assert(allows(&saver, picture, PERMISSION_WRITE));
+        assert(allows(&saver, picture, PERMISSION_READ));
+        assert(allows(&saver, "/disk/Users/Alice/PICTURE.PNG",
+                      PERMISSION_WRITE));
+        assert(!allows(&saver, picture, PERMISSION_REMOVE));
+        assert(!allows(&saver, "/disk/Users/Alice/other.png",
+                       PERMISSION_WRITE));
+        /* Not another account's home, the system, or a folder. */
+        assert(!permission_grant_write_file(
+            &saver, "/disk/Users/Bob/x.png", strlen("/disk/Users/Bob/x.png")));
+        assert(!permission_grant_write_file(
+            &saver, "/disk/OPOS/ACCOUNTS.DAT",
+            strlen("/disk/OPOS/ACCOUNTS.DAT")));
+        assert(!permission_grant_write_file(&saver, "/disk/Users/Alice",
+                                            strlen("/disk/Users/Alice")));
+        assert(allows(&saver, picture, PERMISSION_WRITE));
+        /* A new choice replaces the old one. */
+        const char *other = "/disk/Users/Alice/other.png";
+        assert(permission_grant_write_file(&saver, other, strlen(other)));
+        assert(!allows(&saver, picture, PERMISSION_WRITE));
+        assert(allows(&saver, other, PERMISSION_WRITE));
+        /* Built-in programs are not confined and need no grant. */
+        struct permission_identity open = built_in;
+        assert(!permission_grant_write_file(&open, picture,
+                                            strlen(picture)));
+    }
+
     struct permission_identity child = app;
     assert(allows(&child, "/disk/Users/Alice/other.txt", PERMISSION_READ));
     permission_confine_disk_program(&child, "/bin/hello", 10);

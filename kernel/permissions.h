@@ -87,6 +87,10 @@ struct permission_identity {
     char read_grant[256];
     uint64_t read_grant_device;
     uint64_t read_grant_inode;
+    /* One file the person chose to save to (opos_save_file): the program
+       may create, write, truncate and read it, but not remove or rename
+       it. Bound to the path, because the file may not exist yet. */
+    char write_grant[256];
 };
 
 enum permission_access {
@@ -152,6 +156,12 @@ bool permission_program_may_run(const struct permission_identity *identity,
 /* Called only after the desktop picker chooses a file. */
 bool permission_grant_read_file(struct permission_identity *identity,
                                 const char *path, size_t length);
+
+/* Called only after the desktop save picker chooses a file name. The
+   account itself must be able to write there; an existing directory is
+   refused. Replaces any earlier write grant. */
+bool permission_grant_write_file(struct permission_identity *identity,
+                                 const char *path, size_t length);
 
 /* Programs. path is absolute and canonical (no ".", "..", or "//"). */
 bool permission_program_allows(const struct permission_identity *identity,

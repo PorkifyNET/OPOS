@@ -26,7 +26,7 @@ LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 
 EXAMPLES := hello permtest sketch notepad fetch update pkg fonttest pickfile sharedread play notify
 # Programs made by OPOS and published in the Store (programs/*.pkg).
-PROGRAMS := minesweeper solitaire
+PROGRAMS := minesweeper solitaire picasso
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)
@@ -69,7 +69,7 @@ BROWSER_HEADERS := $(wildcard browser/*.h)
 $(BUILD)/browser: $(BROWSER_SOURCES) $(BROWSER_HEADERS) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) -Ibrowser $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BROWSER_SOURCES) $(LIBRARIES)
 
-$(BUILD)/%: programs/%.c programs/fit.h $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
+$(BUILD)/%: programs/%.c $(wildcard programs/*.h) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)
 
 $(BUILD)/%: examples/%.c $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld

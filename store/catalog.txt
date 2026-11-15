@@ -82,3 +82,10 @@ license: GPL-3.0
 official: yes
 summary: The classic Klondike patience: build four suits from Ace to King.
 description: Move every card to the four foundations, by suit from Ace to King. On the seven columns cards go down in alternating colors, and only a King may fill an empty column. Drag cards with the mouse, click the stock to deal, and double-click or right-click a card to send it home. Choose between drawing one card or three (D), undo moves (U) and deal a new game (N). Arrows, Space and A (all cards home) play it from the keyboard.
+
+[net.porkify.opos.picasso]
+category: graphics
+license: GPL-3.0
+official: yes
+summary: Draw and edit pictures, then save them as PNG.
+description: Picasso is the OPOS image editor. Draw with the pen, eraser and spray can in six brush sizes; draw lines, rectangles and ellipses, outlined or filled (hold Shift for straight lines, squares and circles); fill areas with the bucket and pick colors from the picture. The left mouse button paints with the first color and the right button with the second. Open PNG, JPEG and BMP pictures up to 4096 x 4096 and save them as PNG in any folder you choose. Zoom from 25% to 800%, undo and redo, and use keyboard shortcuts such as Ctrl+S, Ctrl+Z and P, E, L, R, O, F for the tools.

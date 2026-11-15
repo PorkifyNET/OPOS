@@ -49,7 +49,9 @@ static void *arena_alloc(struct page *page, size_t size) {
 
 /* --------------------------------------------------------------- context */
 
-enum inline_kind { IT_WORD, IT_SPACE, IT_BREAK, IT_IMAGE, IT_BOX };
+/* IT_ATOMIC: an inline-block box, already laid out at (0,0) into the
+   display items [first_item, last_item); placing the line moves them. */
+enum inline_kind { IT_WORD, IT_SPACE, IT_BREAK, IT_IMAGE, IT_BOX, IT_ATOMIC };
 
 enum box_kind {
     BOX_TEXT, BOX_BUTTON, BOX_CHECKBOX, BOX_RADIO, BOX_TEXTAREA, BOX_SELECT
@@ -69,6 +71,8 @@ struct inline_item {
     bool focused;
     size_t field_offset;
     const struct opos_html_node *node;
+    size_t first_item, last_item; /* IT_ATOMIC */
+    int ascent;                   /* IT_ATOMIC: top to its baseline */
 };
 
 struct placed {
@@ -118,6 +122,7 @@ struct ctx {
     struct float_box floats[MAX_FLOATS];
     int float_count;
     int float_extent;
+    int last_baseline;      /* baseline y of the last line placed, -1 none */
 };
 
 /* How see-through a background rectangle is (0 opaque). */
@@ -453,6 +458,12 @@ static void append_text(const struct opos_html_node *node, char *out,
         }
     }
     out[*used] = '\0';
+}
+
+/* Form controls are drawn by add_control, not from their content. */
+static bool is_control(const struct opos_html_node *node) {
+    return node->tag == HTML_TAG_INPUT || node->tag == HTML_TAG_BUTTON
+        || node->tag == HTML_TAG_SELECT || node->tag == HTML_TAG_TEXTAREA;
 }
 
 static void add_control(struct ctx *c, const struct opos_html_node *node,
@@ -887,6 +898,9 @@ static void emit_line(struct ctx *c, size_t count, int used,
         if (item->kind == IT_IMAGE) {
             ascent = item->height;
             descent = 0;
+        } else if (item->kind == IT_ATOMIC) {
+            ascent = item->ascent;
+            descent = item->height - item->ascent;
         } else if (item->kind == IT_BOX) {
             /* Keep in step with the box_top rule where boxes are drawn. */
             descent = item->box == BOX_CHECKBOX || item->box == BOX_RADIO
@@ -903,6 +917,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
     }
     int top = c->y;
     int baseline = top + line_ascent;
+    c->last_baseline = baseline;
     int offset = 0;
     if (!c->measuring) {
         if (c->align == ALIGN_CENTER) {
@@ -977,6 +992,14 @@ static void emit_line(struct ctx *c, size_t count, int used,
             }
             break;
         }
+        case IT_ATOMIC: {
+            int dx = x, dy = baseline - item->ascent;
+            for (size_t k = item->first_item; k < item->last_item; k++) {
+                c->page->items[k].x += dx;
+                c->page->items[k].y += dy;
+            }
+            break;
+        }
         case IT_BOX: {
             bool tick = item->box == BOX_CHECKBOX || item->box == BOX_RADIO;
             /* Text boxes hang 4px below the baseline; a check box sits
@@ -987,7 +1010,12 @@ static void emit_line(struct ctx *c, size_t count, int used,
             struct display_item *fill = add_item(c, ITEM_RECT, x, box_top,
                                                  item->width, item->height);
             if (fill != NULL) {
-                fill->colour = field ? 0x00ffffff : 0x00e9e9ed;
+                /* A button takes the page's background colour. */
+                fill->colour = !field && style->has_background
+                             ? style->background
+                             : field ? 0x00ffffff : 0x00e9e9ed;
+                fill->transparency = !field && style->has_background
+                                   ? fill_transparency(style) : 0;
                 fill->control = item->node;
                 fill->round = item->box == BOX_RADIO;
             }
@@ -995,7 +1023,11 @@ static void emit_line(struct ctx *c, size_t count, int used,
                                                     box_top, item->width,
                                                     item->height);
             if (outline != NULL) {
-                outline->colour = item->focused ? 0x000645ad : 0x00767676;
+                outline->colour = item->focused ? 0x000645ad
+                                : !field && style->border > 0
+                                ? style->border_colour
+                                : !field && style->has_background
+                                ? style->background : 0x00767676;
                 outline->round = item->box == BOX_RADIO;
             }
             if (item->focused) {
@@ -2158,6 +2190,90 @@ static void layout_float(struct ctx *c, const struct opos_html_node *node,
     float_note(c, st->float_side, x, total, top, bottom);
 }
 
+/* An inline-block (or inline-flex, inline-grid) element: a shrink-to-fit
+   block laid out on its own at (0,0), then placed on the line as one
+   unbreakable item whose display items move with it. Its baseline is the
+   baseline of its last line, or its bottom margin edge without one. */
+static void add_inline_block(struct ctx *c, const struct opos_html_node *node,
+                             struct style *st) {
+    /* The box's own content must not flush the line it sits in. */
+    struct inline_item *outer = c->inl;
+    size_t outer_count = c->inl_count, outer_capacity = c->inl_capacity;
+    c->inl = NULL;
+    c->inl_count = c->inl_capacity = 0;
+
+    int frame = 2 * st->border + st->padding[LEFT] + st->padding[RIGHT];
+    int margins = st->margin[LEFT] + st->margin[RIGHT];
+    int cw;
+    /* Image replacement (a background image instead of the text): the
+       image cannot be drawn, so the box fits its text instead. */
+    bool fit_text = st->text_replaced;
+    if (st->width >= 0 && !fit_text) {
+        cw = st->width;
+    } else if (st->width_pct >= 0 && !fit_text) {
+        cw = c->measuring ? 0
+           : c->bwidth * st->width_pct / 100 - frame - margins;
+    } else {
+        int min, max;
+        if (!measure_lookup(c, node, &min, &max)) {
+            min = measure_content(c, node, st, true);
+            max = measure_content(c, node, st, false);
+            measure_store(c, node, min, max);
+        }
+        if (c->measuring) {
+            cw = c->measure_min ? min : max;
+        } else {
+            cw = min_int(max, c->bwidth - frame - margins);
+            cw = max_int(cw, min);
+        }
+    }
+    if (st->max_width >= 0 && cw > st->max_width && !fit_text) {
+        cw = st->max_width;
+    }
+    cw = clamp_min(cw, 1);
+
+    int height = 0, ascent = 0;
+    size_t first = c->page->item_count, last = first;
+    if (!c->measuring) {
+        int saved_right = c->max_right, saved_floats = c->float_count;
+        int saved_extent = c->float_extent;
+        bool saved_marker = c->marker_pending;
+        c->float_count = 0;
+        c->float_extent = 0;
+        c->marker_pending = false;
+        c->last_baseline = -1;
+        /* Vertical margins stay outside: they do not collapse here. */
+        struct style copy = *st;
+        copy.margin[TOP] = copy.margin[BOTTOM] = 0;
+        int bottom = layout_boxed(c, node, &copy, 0, cw, st->margin[TOP]);
+        bottom = max_int(bottom, c->float_extent);
+        height = bottom + st->margin[BOTTOM];
+        ascent = c->last_baseline >= 0 ? c->last_baseline : height;
+        last = c->page->item_count;
+        c->max_right = saved_right;
+        c->float_count = saved_floats;
+        c->float_extent = saved_extent;
+        c->marker_pending = saved_marker;
+    }
+
+    free(c->inl);
+    c->inl = outer;
+    c->inl_count = outer_count;
+    c->inl_capacity = outer_capacity;
+    struct inline_item *item = inline_push(c);
+    if (item == NULL) {
+        return;
+    }
+    item->kind = IT_ATOMIC;
+    item->style = st;
+    item->node = node;
+    item->width = cw + frame + margins;
+    item->height = height;
+    item->ascent = ascent;
+    item->first_item = first;
+    item->last_item = last;
+}
+
 #define MAX_FLEX_ITEMS 40
 
 struct flex_item {
@@ -2204,8 +2320,9 @@ static void collect_flex_items(struct ctx *c,
             plain = false;
             break;
         }
-        if (s->display == DISPLAY_INLINE && child->tag != HTML_TAG_IMG
-            && child->tag != HTML_TAG_BR) {
+        if ((s->display == DISPLAY_INLINE
+             || (s->display == DISPLAY_INLINE_BLOCK && !is_control(child)))
+            && child->tag != HTML_TAG_IMG && child->tag != HTML_TAG_BR) {
             s->display = DISPLAY_BLOCK;
         }
         if (child->tag == HTML_TAG_IMG || child->tag == HTML_TAG_BR
@@ -2476,12 +2593,14 @@ static void layout_grid_children(struct ctx *c,
         if (s->display == DISPLAY_NONE) {
             continue;
         }
-        if (count == MAX_FLEX_ITEMS || s->display == DISPLAY_INLINE_BLOCK
+        if (count == MAX_FLEX_ITEMS
+            || (s->display == DISPLAY_INLINE_BLOCK && is_control(child))
             || child->tag == HTML_TAG_IMG || child->tag == HTML_TAG_BR) {
             plain = false;
             break;
         }
-        if (s->display == DISPLAY_INLINE) {
+        if (s->display == DISPLAY_INLINE
+            || s->display == DISPLAY_INLINE_BLOCK) {
             s->display = DISPLAY_BLOCK;
         }
         items[count].node = child;
@@ -2630,6 +2749,15 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
         return;
     }
     style_compute(node, parent, style);
+    /* Children of a one-column grid or a column flexbox are blocks
+       (laid out here in normal flow, they stack like grid rows). */
+    if (((parent->grid && parent->grid_count == 0)
+         || (parent->flex && parent->flex_column))
+        && (style->display == DISPLAY_INLINE
+            || (style->display == DISPLAY_INLINE_BLOCK && !is_control(node)))
+        && node->tag != HTML_TAG_BR && node->tag != HTML_TAG_IMG) {
+        style->display = DISPLAY_BLOCK;
+    }
     if (node->tag == HTML_TAG_OL || node->tag == HTML_TAG_UL
         || node->tag == HTML_TAG_MENU || node->tag == HTML_TAG_DIR) {
         style->ordered = node->tag == HTML_TAG_OL;
@@ -2675,7 +2803,11 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
         layout_table(c, node, style);
         return;
     case DISPLAY_INLINE_BLOCK:
-        add_control(c, node, style);
+        if (is_control(node)) {
+            add_control(c, node, style);
+        } else {
+            add_inline_block(c, node, style);
+        }
         return;
     case DISPLAY_CONTENTS:
         process_children(c, node, style);

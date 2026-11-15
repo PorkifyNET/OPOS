@@ -1009,21 +1009,21 @@ void apply_declaration(struct style *style, const char *name,
         }
         if (word_is(text, strlen(text), "none")) {
             style->display = DISPLAY_NONE;
-        } else if (word_is(text, strlen(text), "flex")
-                   || word_is(text, strlen(text), "inline-flex")) {
+        } else if (word_is(text, strlen(text), "flex")) {
             style->display = DISPLAY_BLOCK;
             style->flex = true;
+        } else if (word_is(text, strlen(text), "inline-flex")) {
+            style->display = DISPLAY_INLINE_BLOCK;
+            style->flex = true;
         } else if (word_is(text, strlen(text), "block")
-                   || word_is(text, strlen(text), "flex")
                    || word_is(text, strlen(text), "grid")
-                   || word_is(text, strlen(text), "inline-grid")
                    || word_is(text, strlen(text), "flow-root")) {
             style->display = DISPLAY_BLOCK;
         } else if (word_is(text, strlen(text), "inline")) {
             style->display = DISPLAY_INLINE;
-        } else if (word_is(text, strlen(text), "inline-block")) {
-            style->display = style->display == DISPLAY_INLINE_BLOCK
-                           ? DISPLAY_INLINE_BLOCK : DISPLAY_INLINE;
+        } else if (word_is(text, strlen(text), "inline-block")
+                   || word_is(text, strlen(text), "inline-grid")) {
+            style->display = DISPLAY_INLINE_BLOCK;
         } else if (word_is(text, strlen(text), "list-item")) {
             style->display = DISPLAY_LIST_ITEM;
         } else if (word_is(text, strlen(text), "contents")) {
@@ -1120,6 +1120,12 @@ void apply_declaration(struct style *style, const char *name,
             } else {
                 style->width = style->width_pct = -1;
             }
+        }
+    } else if (word_is(name, name_length, "text-indent")) {
+        int number;
+        bool percent;
+        if (parse_length(text, &number, &percent)) {
+            style->text_replaced = !percent && number <= -999;
         }
     } else if (word_is(name, name_length, "float")) {
         style->float_side = word_is(text, strlen(text), "left") ? 1
@@ -1448,6 +1454,20 @@ static int legacy_font_size(const char *value, int parent_size) {
     return sizes[number - 1];
 }
 
+/* Whether a list sits inside another list: such lists get no top or
+   bottom margin (as in other browsers' default style sheets). */
+static bool inside_list(const struct opos_html_node *element) {
+    for (const struct opos_html_node *up = element->parent; up != NULL;
+         up = up->parent) {
+        if (up->type == HTML_NODE_ELEMENT
+            && (up->tag == HTML_TAG_UL || up->tag == HTML_TAG_OL
+                || up->tag == HTML_TAG_MENU || up->tag == HTML_TAG_DIR)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const struct css_sheet *style_sheets;
 
 void style_compute(const struct opos_html_node *element,
@@ -1529,7 +1549,7 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_UL: case HTML_TAG_OL: case HTML_TAG_MENU:
     case HTML_TAG_DIR:
         style->display = DISPLAY_BLOCK;
-        if (parent->display != DISPLAY_LIST_ITEM) {
+        if (!inside_list(element)) {
             block_margins(style, 100, 100);
         }
         style->padding[LEFT] = 40;
@@ -1629,6 +1649,13 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_TEXTAREA:
         style->display = DISPLAY_INLINE_BLOCK;
         break;
+    case HTML_TAG_BR: {
+        /* <br clear="all"> (also left, right, both) moves below floats. */
+        const char *clear = opos_html_attribute(element, "clear");
+        style->clear_both = clear != NULL && clear[0] != '\0'
+                         && strcmp(clear, "none") != 0;
+        break;
+    }
     case HTML_TAG_FONT: {
         const char *size = opos_html_attribute(element, "size");
         if (size != NULL) {
@@ -1678,6 +1705,15 @@ void style_compute(const struct opos_html_node *element,
     css_apply(style_sheets, element, style, parent);
     if ((value = opos_html_attribute(element, "style")) != NULL) {
         css_apply_block(style, value, parent);
+    }
+    /* An inline-flex or inline-grid form control (often a styled
+       <button>) lays out its content as a block, as before inline boxes
+       existed; flex containers handle such items only as blocks. */
+    if (style->display == DISPLAY_INLINE_BLOCK && (style->flex || style->grid)
+        && (element->tag == HTML_TAG_INPUT || element->tag == HTML_TAG_BUTTON
+            || element->tag == HTML_TAG_SELECT
+            || element->tag == HTML_TAG_TEXTAREA)) {
+        style->display = DISPLAY_BLOCK;
     }
     /* An invisible item placed into a shared grid cell (the "stack"
        trick: a hidden copy that only reserves size) would otherwise

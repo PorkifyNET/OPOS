@@ -30,7 +30,7 @@ enum display {
     DISPLAY_TABLE,
     DISPLAY_TABLE_PART, /* row, row group, caption, column: handled by table */
     DISPLAY_TABLE_CELL,
-    DISPLAY_INLINE_BLOCK, /* form controls */
+    DISPLAY_INLINE_BLOCK, /* form controls, inline-block/-flex/-grid boxes */
     DISPLAY_CONTENTS      /* no box: children belong to the parent */
 };
 
@@ -63,6 +63,9 @@ struct style {
     bool no_marker;          /* list-style: none */
     bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
     bool opacity_zero;       /* opacity: 0 */
+    /* text-indent of -999px or less: text pushed out of view so that a
+       background image (which OPOS cannot draw yet) stands in for it. */
+    bool text_replaced;
     /* align-items (container) and align-self (item): 0 normal/auto,
        1 start, 2 center, 3 end. */
     uint8_t align_items, align_self;

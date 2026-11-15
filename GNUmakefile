@@ -33,7 +33,7 @@ SDK_PLAY := sdk/build/play
 SDK_NOTIFY := sdk/build/notify
 SDK_FONTTEST := sdk/build/fonttest
 SDK_BROWSER := sdk/build/browser
-FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt)
+FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt data/fonts/fallback.txt)
 SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/examples/play.c sdk/examples/notify.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
@@ -56,6 +56,8 @@ STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg
 # build/musl-local with build/musl-local.specs when present, else the
 # distribution's musl-gcc (Ubuntu/Debian: apt install musl-tools).
 STORE_LINUX ?= lua sqlite
+# Font packages from pinned downloads, store/fonts/<name>/build.sh.
+STORE_FONTS ?= cjk
 STORE_SOURCES ?= $(BUILD)/store_sources
 # Already-built .opk files, or folders of them, that `make store` lists in
 # the index as they are, without rebuilding them: for example the
@@ -360,6 +362,11 @@ store:
 	mkdir -p $(BUILD)/store_opk
 	for package in $(STORE_PACKAGES); do \
 		python3 sdk/tools/mkopk.py build $$package -o $(BUILD)/store_opk || exit 1; \
+	done
+	for font in $(STORE_FONTS); do \
+		MKOPK="$(abspath sdk/tools/mkopk.py)" \
+		sh store/fonts/$$font/build.sh $(abspath $(BUILD)/store_opk) \
+			$(abspath $(STORE_SOURCES)) || exit 1; \
 	done
 	@test -n "$(MUSL_LICENSE)" || { echo "store: musl's copyright file not found; set MUSL_LICENSE"; exit 1; }
 	for program in $(STORE_LINUX); do \

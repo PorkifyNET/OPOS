@@ -39,7 +39,11 @@ int opos_font_line_height(const struct opos_font *font, int size);
    at most length) and stores the code point, or U+FFFD for bad bytes. */
 size_t opos_utf8_decode(const char *text, size_t length, uint32_t *code);
 
-/* True when the font has a glyph for the code point. */
+/* Characters a font lacks come from the fallback fonts listed in
+   /share/fonts/fallback.txt (other scripts, symbols; see sdk/lib/ttf.c),
+   read the first time one is needed. What no font has is drawn as U+FFFD.
+
+   True when the font or a fallback font has a glyph for the code point. */
 bool opos_font_has_glyph(const struct opos_font *font, uint32_t code);
 
 /* Advance of one character in 1/64 pixel. */

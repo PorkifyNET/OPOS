@@ -209,6 +209,9 @@ Mozilla root certificate bundle (MPL 2.0), shipped as
 `sdk/stb/stb_truetype.h` is [stb_truetype](https://github.com/nothings/stb)
 1.26 (public domain or MIT license, at the user's choice; see the end of the
 file), used to draw TrueType fonts in the browser. `data/fonts/` holds the
-[Noto Sans](https://fonts.google.com/noto) and Noto Sans Mono fonts (SIL Open
-Font License 1.1, see `data/fonts/OFL.txt`). They are shipped with the license
-text as `/share/fonts/`.
+[Noto Sans](https://fonts.google.com/noto) and Noto Sans Mono fonts and the
+fallback fonts Noto Sans Symbols, Symbols 2, Armenian, Georgian, Thai and
+Ethiopic (SIL Open Font License 1.1, see `data/fonts/OFL.txt`). They are
+shipped with the license text as `/share/fonts/`. The Store package
+"Chinese, Japanese, Korean fonts" (`store/fonts/cjk/`) holds Droid Sans
+Fallback (Apache License 2.0), downloaded when `make store` runs.

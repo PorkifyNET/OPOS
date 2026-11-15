@@ -36,6 +36,27 @@ enum display {
 
 enum align { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
 
+enum position { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
+
+enum { BG_SIZE_AUTO, BG_SIZE_COVER, BG_SIZE_CONTAIN, BG_SIZE_EXPLICIT };
+
+/* A CSS background image (the first layer). All zero: none. */
+struct background {
+    const char *url;           /* as written; copied for the page */
+    uint8_t size_kind;         /* BG_SIZE_* */
+    bool image_only;           /* no background colour */
+    bool mask;                 /* a mask image: drawn in mask_colour */
+    uint32_t mask_colour;
+    bool no_repeat_x, no_repeat_y;
+    int size[2];               /* explicit size: px or percent, -1 auto */
+    bool size_pct[2];
+    int position[2];           /* px or percent */
+    bool position_pct[2];
+};
+
+/* Copies text for the page being laid out (background URLs). */
+extern char *(*style_copy_text)(const char *text, size_t length);
+
 struct var_scope;
 
 struct style {
@@ -59,12 +80,23 @@ struct style {
     bool ordered;            /* the list this item belongs to is an <ol> */
     int width, max_width;    /* px, -1 = auto */
     int width_pct, max_width_pct; /* percent of the container, -1 = none */
+    int height;              /* px, -1 = auto */
+    struct background mask;  /* mask-image (icons drawn in a colour) */
+    bool border_box;         /* box-sizing: border-box */
+    struct background bg;
     bool margin_auto_left, margin_auto_right;
     bool no_marker;          /* list-style: none */
-    bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
+    bool out_of_flow;        /* position absolute/fixed or hidden: not in
+                                the flow (absolute boxes are placed later) */
+    uint8_t position;        /* enum position */
+    enum display flow_display; /* out-of-flow boxes: display before NONE */
+    bool invisible;          /* visibility: hidden or collapse */
+    bool clipped;            /* clip, clip-path or scale(0): hidden content */
+    int offset[4];           /* top, right, bottom, left: px or percent */
+    bool offset_set[4], offset_pct[4];
     bool opacity_zero;       /* opacity: 0 */
     /* text-indent of -999px or less: text pushed out of view so that a
-       background image (which OPOS cannot draw yet) stands in for it. */
+       background image stands in for it. */
     bool text_replaced;
     /* align-items (container) and align-self (item): 0 normal/auto,
        1 start, 2 center, 3 end. */
@@ -147,8 +179,9 @@ struct display_item {
     int baseline;              /* offset from y to the baseline */
     bool underline, strike;
     struct opos_html_node *link;
-    /* image */
+    /* image; on a rectangle: its background image, placed by bg */
     struct image_ref *image;
+    const struct background *bg;
     /* the form control a control's background rectangle belongs to */
     const struct opos_html_node *control;
     /* Byte offset in the control value represented by this text item. */
@@ -230,16 +263,53 @@ static inline size_t browser_utf8_offset(const char *text, size_t length,
     return at;
 }
 
-/* An <img> of the page, loaded after the page is laid out. */
+/* An <img>, inline <svg> or CSS background image of the page. Images
+   with a URL are loaded after the page is laid out. */
 struct image_ref {
-    const struct opos_html_node *node;
+    const struct opos_html_node *node; /* <img>/<svg>; NULL: background */
     char url[OPOS_HTTP_URL_MAX];
+    char *data_url;            /* a data: URL (malloc'd), instead of url */
     int state;                 /* 0 not asked, 1 loaded, 2 failed */
     int width, height;         /* natural size once loaded */
-    uint32_t *pixels;          /* decoded 0xAARRGGBB */
-    uint32_t *scaled;          /* cached resample for scaled_width/height */
+    uint32_t *pixels;          /* decoded 0xAARRGGBB (not for SVG) */
+    const struct opos_html_node *svg;  /* SVG: its <svg> element */
+    struct opos_html_doc *svg_doc;     /* SVG file: the document it is in */
+    uint32_t colour;           /* SVG currentColor (the text colour) */
+    uint32_t *scaled;          /* cached copy at scaled_width/height */
     int scaled_width, scaled_height;
+    uint32_t scaled_colour;
 };
+
+/* image.c */
+bool image_is_svg(const uint8_t *data, size_t length);
+/* Decodes fetched bytes (PNG, JPEG, BMP or SVG); sets state 1 on success. */
+bool image_ref_decode(struct image_ref *ref, const uint8_t *data,
+                      size_t length);
+/* Makes ref show an <svg> element of the page. */
+void image_ref_inline_svg(struct image_ref *ref,
+                          const struct opos_html_node *svg);
+/* The bytes of a data: URL (malloc'd, NUL-terminated), or NULL. */
+uint8_t *data_url_decode(const char *url, size_t *length);
+/* The image at width x height (cached in ref->scaled), or NULL. */
+const uint32_t *image_ref_scaled(struct image_ref *ref, int width,
+                                 int height);
+void image_ref_free(struct image_ref *ref);
+/* Draws the image scaled to width x height at x, y onto 0x00RRGGBB
+   pixels, inside the clip rectangle. */
+void image_blend(uint32_t *target, int stride, int target_width,
+                 int target_height, struct image_ref *ref, int x, int y,
+                 int width, int height, int clip_left, int clip_top,
+                 int clip_right, int clip_bottom);
+/* The first tile of a background image in a box. */
+void background_tiles(const struct background *bg, struct image_ref *ref,
+                      int box_x, int box_y, int box_width, int box_height,
+                      int *tile_x, int *tile_y, int *tile_width,
+                      int *tile_height);
+/* Paints a rectangle item's background image (item->image, item->bg) at
+   x, y onto 0x00RRGGBB pixels, inside the clip rectangle. */
+void background_paint(uint32_t *target, int stride, int target_width,
+                      int target_height, const struct display_item *item,
+                      int x, int y, int clip_top, int clip_bottom);
 
 struct css_sheet;
 
@@ -329,6 +399,21 @@ int cookies_sites(void (*each)(void *context, int index, const char *site,
                   void *context);
 /* Deletes the cookies of the site with that index (-1: all sites). */
 void cookies_forget(int site);
+
+/* svg.c: SVG images from a tree that opos_html_parse built. */
+/* The first <svg> element at or under node, or NULL. */
+const struct opos_html_node *svg_root(const struct opos_html_node *node);
+/* The element with that id under root, else anywhere in document. */
+const struct opos_html_node *svg_find_id(const struct opos_html_node *root,
+                                         const struct opos_html_node *document,
+                                         const char *id);
+/* The natural size: width/height attributes, else the viewBox size, else
+   300 x 150. */
+bool svg_size(const struct opos_html_node *svg, int *width, int *height);
+/* Draws the image at width x height; colour is currentColor. Returns
+   malloc'd 0xAARRGGBB pixels, or NULL. */
+uint32_t *svg_render(const struct opos_html_node *svg, int width, int height,
+                     uint32_t colour);
 
 /* form.c */
 enum field_kind form_kind(const struct opos_html_node *node);

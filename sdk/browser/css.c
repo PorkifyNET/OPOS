@@ -258,6 +258,26 @@ static bool parse_compound(char **cursor, struct part *part) {
                 part->link = true;
             } else if (n == 4 && strncmp(start, "root", 4) == 0) {
                 part->root = true;
+            } else if (n == 3 && strncmp(start, "not", 3) == 0 && *p == '(') {
+                /* :not(:focus), :not(:hover) and the like always match:
+                   nothing on the page has focus or the pointer at layout
+                   time. Hidden-until-focused links rely on them. */
+                static const char *const states[] = {
+                    ":focus)", ":focus-within)", ":focus-visible)",
+                    ":hover)", ":active)", ":target)", NULL
+                };
+                bool matched = false;
+                for (int i = 0; states[i] != NULL; i++) {
+                    size_t length = strlen(states[i]);
+                    if (strncmp(p + 1, states[i], length) == 0) {
+                        p += 1 + length;
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    return false;
+                }
             } else {
                 return false;
             }

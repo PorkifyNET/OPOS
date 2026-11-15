@@ -2113,3 +2113,459 @@ uint32_t *svg_render(const struct opos_html_node *svg, int width, int height,
     free(r);
     return out;
 }
+
+/* ------------------------------------------------------- CSS gradients */
+
+/*
+ * linear-gradient() and radial-gradient() for CSS backgrounds, drawn once
+ * into a GRADIENT_SIZE square that is stretched over the box (so angles
+ * other than multiples of 90 degrees are approximate on boxes that are
+ * not square). Stop positions in px are spread out like unplaced stops.
+ */
+
+#define GRADIENT_SIZE 256
+#define GRADIENT_ARGS 18
+
+/* A number at the start of text; unit points past it (to text when
+   there is none). */
+static double strtod_simple(char *text, char **unit) {
+    const char *p = text;
+    double value;
+    if (!read_number(&p, &value)) {
+        *unit = text;
+        return 0;
+    }
+    *unit = (char *)p;
+    return value;
+}
+
+/* Whether text (length bytes) holds word. */
+static bool strstr_n(const char *text, size_t length, const char *word) {
+    size_t n = strlen(word);
+    for (size_t i = 0; i + n <= length; i++) {
+        if (strncmp(text + i, word, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct gradient_stop {
+    double at;          /* 0..1, or -1 unplaced */
+    double r, g, b, a;  /* premultiplied, 0..1 */
+};
+
+/* The next comma-separated argument of text (up to the closing ')'). */
+static const char *gradient_arg(const char *p, const char *end,
+                                const char **arg_end) {
+    int depth = 0;
+    const char *q = p;
+    while (q < end && (depth > 0 || *q != ',')) {
+        depth += *q == '(' ? 1 : *q == ')' ? -1 : 0;
+        q++;
+    }
+    *arg_end = q;
+    return p;
+}
+
+static bool gradient_word(const char *text, size_t length, const char *word) {
+    return strlen(word) == length && strncmp(text, word, length) == 0;
+}
+
+/* An angle word ("45deg", "0.25turn", "1rad", "100grad", "0") in degrees. */
+static bool gradient_angle(const char *text, size_t length, double *degrees) {
+    char word[32];
+    if (length == 0 || length >= sizeof(word)) {
+        return false;
+    }
+    memcpy(word, text, length);
+    word[length] = '\0';
+    char *unit;
+    double value = strtod_simple(word, &unit);
+    if (unit == word) {
+        return false;
+    }
+    if (strcmp(unit, "deg") == 0) {
+        *degrees = value;
+    } else if (strcmp(unit, "turn") == 0) {
+        *degrees = value * 360;
+    } else if (strcmp(unit, "rad") == 0) {
+        *degrees = value * 180 / SVG_PI;
+    } else if (strcmp(unit, "grad") == 0) {
+        *degrees = value * 0.9;
+    } else if (*unit == '\0' && value == 0) {
+        *degrees = 0;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/* A side or corner ("top", "bottom right") as the angle pointing at it. */
+static bool gradient_side(const char *text, size_t length, double *degrees) {
+    bool top = false, bottom = false, left = false, right = false;
+    size_t i = 0;
+    while (i < length) {
+        while (i < length && text[i] == ' ') {
+            i++;
+        }
+        size_t start = i;
+        while (i < length && text[i] != ' ') {
+            i++;
+        }
+        const char *word = text + start;
+        size_t n = i - start;
+        if (n == 0) {
+            break;
+        }
+        if (gradient_word(word, n, "top")) {
+            top = true;
+        } else if (gradient_word(word, n, "bottom")) {
+            bottom = true;
+        } else if (gradient_word(word, n, "left")) {
+            left = true;
+        } else if (gradient_word(word, n, "right")) {
+            right = true;
+        } else {
+            return false;
+        }
+    }
+    if (!(top || bottom || left || right)) {
+        return false;
+    }
+    double x = right ? 1 : left ? -1 : 0;
+    double y = top ? 1 : bottom ? -1 : 0;
+    *degrees = svg_atan2(x, y) * 180 / SVG_PI;
+    return true;
+}
+
+/* A stop: "colour [position [position]]". Adds one or two stops. */
+static int gradient_parse_stop(const char *text, size_t length,
+                               struct gradient_stop *stops, int count,
+                               int capacity) {
+    /* Split off trailing positions: words that start with a digit, '.',
+       '-' or '+' (colours never do, except bare hex which needs '#'). */
+    size_t colour_end = length;
+    double positions[2];
+    int position_count = 0;
+    for (;;) {
+        size_t end = colour_end;
+        while (end > 0 && text[end - 1] == ' ') {
+            end--;
+        }
+        size_t start = end;
+        int depth = 0;
+        while (start > 0 && (depth > 0 || text[start - 1] != ' ')) {
+            depth += text[start - 1] == ')' ? 1 : text[start - 1] == '(' ? -1
+                                                                          : 0;
+            start--;
+        }
+        if (start == end || start == 0) {
+            break;
+        }
+        char c = text[start];
+        if (!((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+'
+              || strncmp(text + start, "calc(", 5) == 0)) {
+            break;
+        }
+        if (position_count < 2) {
+            char word[32];
+            size_t n = end - start < sizeof(word) - 1 ? end - start
+                                                      : sizeof(word) - 1;
+            memcpy(word, text + start, n);
+            word[n] = '\0';
+            char *unit;
+            double value = strtod_simple(word, &unit);
+            /* Only percentages are known without the box's size. */
+            positions[position_count++] = strcmp(unit, "%") == 0
+                ? value / 100 : -1;
+        }
+        colour_end = start;
+    }
+    while (colour_end > 0 && text[colour_end - 1] == ' ') {
+        colour_end--;
+    }
+    if (colour_end == 0 || colour_end >= 160) {
+        return count; /* a colour hint alone, or too long */
+    }
+    char colour_text[160];
+    memcpy(colour_text, text, colour_end);
+    colour_text[colour_end] = '\0';
+    uint32_t colour;
+    int alpha;
+    if (!parse_colour_alpha(colour_text, &colour, &alpha)) {
+        return count;
+    }
+    double a = alpha / 255.0;
+    struct gradient_stop stop = {
+        -1, ((colour >> 16) & 255) / 255.0 * a, ((colour >> 8) & 255) / 255.0 * a,
+        (colour & 255) / 255.0 * a, a};
+    /* Positions were read last to first. */
+    if (position_count == 2) {
+        double first = positions[1];
+        positions[1] = positions[0];
+        positions[0] = first;
+    }
+    for (int i = 0; i < (position_count > 0 ? position_count : 1); i++) {
+        if (count >= capacity) {
+            break;
+        }
+        stop.at = position_count > 0 ? positions[i] : -1;
+        stops[count++] = stop;
+    }
+    return count;
+}
+
+/* Places unplaced stops: first at 0, last at 1, the others evenly
+   between their placed neighbours; positions never go back. */
+static void gradient_place(struct gradient_stop *stops, int count) {
+    if (stops[0].at < 0) {
+        stops[0].at = 0;
+    }
+    if (stops[count - 1].at < 0) {
+        stops[count - 1].at = 1;
+    }
+    double highest = stops[0].at;
+    for (int i = 1; i < count; i++) {
+        if (stops[i].at >= 0 && stops[i].at < highest) {
+            stops[i].at = highest;
+        }
+        if (stops[i].at >= 0) {
+            highest = stops[i].at;
+        }
+    }
+    int i = 1;
+    while (i < count) {
+        if (stops[i].at >= 0) {
+            i++;
+            continue;
+        }
+        int next = i;
+        while (stops[next].at < 0) {
+            next++;
+        }
+        double from = stops[i - 1].at, to = stops[next].at;
+        for (int k = i; k < next; k++) {
+            stops[k].at = from + (to - from) * (k - i + 1) / (next - i + 1);
+        }
+        i = next;
+    }
+}
+
+static uint32_t gradient_colour(const struct gradient_stop *stops, int count,
+                                double t) {
+    const struct gradient_stop *a = &stops[0], *b = &stops[0];
+    double mix = 0;
+    if (t <= stops[0].at) {
+        a = b = &stops[0];
+    } else if (t >= stops[count - 1].at) {
+        a = b = &stops[count - 1];
+    } else {
+        for (int i = 1; i < count; i++) {
+            if (t <= stops[i].at) {
+                a = &stops[i - 1];
+                b = &stops[i];
+                double span = b->at - a->at;
+                mix = span > 0 ? (t - a->at) / span : 1;
+                break;
+            }
+        }
+    }
+    double alpha = a->a + (b->a - a->a) * mix;
+    if (alpha <= 0) {
+        return 0;
+    }
+    double r = (a->r + (b->r - a->r) * mix) / alpha;
+    double g = (a->g + (b->g - a->g) * mix) / alpha;
+    double bl = (a->b + (b->b - a->b) * mix) / alpha;
+    uint32_t ai = (uint32_t)(alpha * 255 + 0.5);
+    uint32_t ri = (uint32_t)(r * 255 + 0.5), gi = (uint32_t)(g * 255 + 0.5);
+    uint32_t bi = (uint32_t)(bl * 255 + 0.5);
+    ri = ri > 255 ? 255 : ri;
+    gi = gi > 255 ? 255 : gi;
+    bi = bi > 255 ? 255 : bi;
+    return ai << 24 | ri << 16 | gi << 8 | bi;
+}
+
+bool image_ref_gradient(struct image_ref *ref, const char *css) {
+    bool webkit = strncmp(css, "-webkit-", 8) == 0;
+    if (webkit) {
+        css += 8;
+    }
+    bool radial = strncmp(css, "radial-gradient(", 16) == 0;
+    if (!radial && strncmp(css, "linear-gradient(", 16) != 0) {
+        return false;
+    }
+    const char *p = css + 16;
+    const char *end = p + strlen(p);
+    while (end > p && end[-1] != ')') {
+        end--;
+    }
+    if (end == p) {
+        return false;
+    }
+    end--; /* the closing ')' */
+
+    struct gradient_stop stops[GRADIENT_ARGS];
+    int count = 0;
+    double degrees = 180;          /* linear: to bottom */
+    double cx = 0.5, cy = 0.5;     /* radial: centre and radii */
+    double rx = -1, ry = -1;
+    bool first = true;
+    while (p < end) {
+        const char *arg_end;
+        const char *arg = gradient_arg(p, end, &arg_end);
+        while (arg < arg_end && *arg == ' ') {
+            arg++;
+        }
+        size_t length = (size_t)(arg_end - arg);
+        while (length > 0 && arg[length - 1] == ' ') {
+            length--;
+        }
+        bool config = false;
+        if (first && !radial) {
+            double value;
+            if (length > 3 && strncmp(arg, "to ", 3) == 0
+                && gradient_side(arg + 3, length - 3, &value)) {
+                degrees = value;
+                config = true;
+            } else if (webkit && gradient_side(arg, length, &value)) {
+                degrees = value + 180; /* old syntax: the start side */
+                config = true;
+            } else if (gradient_angle(arg, length, &value)) {
+                degrees = webkit ? 90 - value : value;
+                config = true;
+            }
+        } else if (first) {
+            /* Shape, size and "at" position, unless it is a stop. */
+            struct gradient_stop probe[2];
+            if (gradient_parse_stop(arg, length, probe, 0, 2) == 0) {
+                config = true;
+                const char *at = NULL;
+                for (size_t i = 0; i + 2 < length; i++) {
+                    if (strncmp(arg + i, "at ", 3) == 0
+                        && (i == 0 || arg[i - 1] == ' ')) {
+                        at = arg + i + 3;
+                        break;
+                    }
+                }
+                size_t shape_length = at != NULL ? (size_t)(at - 3 - arg)
+                                                 : length;
+                const char *shape = arg;
+                if (at != NULL) {
+                    /* Up to two position words: keywords or percentages. */
+                    const char *q = at;
+                    for (int axis = 0; axis < 2 && q < arg + length; axis++) {
+                        while (q < arg + length && *q == ' ') {
+                            q++;
+                        }
+                        const char *w = q;
+                        while (q < arg + length && *q != ' ') {
+                            q++;
+                        }
+                        size_t wn = (size_t)(q - w);
+                        double v = -1;
+                        if (gradient_word(w, wn, "left")
+                            || gradient_word(w, wn, "top")) {
+                            v = 0;
+                        } else if (gradient_word(w, wn, "right")
+                                   || gradient_word(w, wn, "bottom")) {
+                            v = 1;
+                        } else if (gradient_word(w, wn, "center")) {
+                            v = 0.5;
+                        } else if (wn > 0 && w[wn - 1] == '%') {
+                            char word[32];
+                            size_t k = wn < sizeof(word) - 1 ? wn
+                                                             : sizeof(word) - 1;
+                            memcpy(word, w, k);
+                            word[k] = '\0';
+                            char *unit;
+                            v = strtod_simple(word, &unit) / 100;
+                        }
+                        bool vertical = gradient_word(w, wn, "top")
+                                     || gradient_word(w, wn, "bottom");
+                        if (v >= 0) {
+                            if (vertical || axis == 1) {
+                                cy = v;
+                            } else {
+                                cx = v;
+                            }
+                        }
+                    }
+                }
+                double near_x = cx < 1 - cx ? cx : 1 - cx;
+                double far_x = cx > 1 - cx ? cx : 1 - cx;
+                double near_y = cy < 1 - cy ? cy : 1 - cy;
+                double far_y = cy > 1 - cy ? cy : 1 - cy;
+                const char *size = shape;
+                size_t size_length = shape_length;
+                if (strstr_n(size, size_length, "closest-side")) {
+                    rx = near_x;
+                    ry = near_y;
+                } else if (strstr_n(size, size_length, "farthest-side")) {
+                    rx = far_x;
+                    ry = far_y;
+                } else if (strstr_n(size, size_length, "closest-corner")) {
+                    rx = near_x * 1.41421356;
+                    ry = near_y * 1.41421356;
+                }
+                if (rx < 0) { /* farthest-corner */
+                    rx = far_x * 1.41421356;
+                    ry = far_y * 1.41421356;
+                }
+            }
+        }
+        if (!config) {
+            count = gradient_parse_stop(arg, length, stops, count,
+                                        GRADIENT_ARGS);
+        }
+        first = false;
+        p = arg_end < end ? arg_end + 1 : end;
+    }
+    if (count < 1) {
+        return false;
+    }
+    if (count == 1) {
+        stops[1] = stops[0];
+        count = 2;
+    }
+    gradient_place(stops, count);
+    if (radial && rx < 0) {
+        rx = ry = 0.70710678;
+    }
+    if (rx <= 0.0001) {
+        rx = 0.0001;
+    }
+    if (ry <= 0.0001) {
+        ry = 0.0001;
+    }
+
+    uint32_t *pixels = malloc((size_t)GRADIENT_SIZE * GRADIENT_SIZE * 4);
+    if (pixels == NULL) {
+        return false;
+    }
+    double angle = degrees * SVG_PI / 180;
+    double sx = svg_sin(angle), cy_ = svg_cos(angle);
+    double line = svg_fabs(sx) + svg_fabs(cy_);
+    for (int y = 0; y < GRADIENT_SIZE; y++) {
+        double v = (y + 0.5) / GRADIENT_SIZE;
+        for (int x = 0; x < GRADIENT_SIZE; x++) {
+            double u = (x + 0.5) / GRADIENT_SIZE;
+            double t;
+            if (radial) {
+                double dx = (u - cx) / rx, dy = (v - cy) / ry;
+                t = svg_sqrt(dx * dx + dy * dy);
+            } else {
+                /* CSS angles: 0 points up, clockwise. */
+                t = ((u - 0.5) * sx - (v - 0.5) * cy_) / line + 0.5;
+            }
+            pixels[(size_t)y * GRADIENT_SIZE + x] =
+                gradient_colour(stops, count, t);
+        }
+    }
+    ref->pixels = pixels;
+    ref->width = GRADIENT_SIZE;
+    ref->height = GRADIENT_SIZE;
+    ref->state = 1;
+    return true;
+}

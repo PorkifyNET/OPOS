@@ -18,7 +18,7 @@
 #define CHROME_HEIGHT (TABBAR_HEIGHT + TOOLBAR_HEIGHT) /* above the page */
 #define STATUS_HEIGHT 20
 #define SCROLLBAR_WIDTH 12
-#define MARGIN 8
+#define MARGIN PAGE_MARGIN
 #define HISTORY_MAX 64
 #define MAX_TABS 12
 #define MAX_PAGE_BYTES (8u << 20)
@@ -526,11 +526,12 @@ static void paint_page(void) {
         return;
     }
     int origin_y = top + MARGIN - T->scroll;
+    int fixed_y = top + MARGIN; /* fixed items do not scroll */
     int origin_x = MARGIN;
     for (size_t i = 0; i < T->page.item_count; i++) {
         const struct display_item *item = &T->page.items[i];
         int x = origin_x + item->x;
-        int y = origin_y + item->y;
+        int y = (item->fixed ? fixed_y : origin_y) + item->y;
         if (y + item->height < top || y > bottom) {
             continue;
         }
@@ -955,7 +956,8 @@ static bool dropdown_rect(int *x, int *y, int *width, int *rows) {
         *rows = count < DROP_MAX_ROWS ? count : DROP_MAX_ROWS;
         *x = MARGIN + item->x;
         *width = item->width < 120 ? 120 : item->width;
-        int top = CHROME_HEIGHT + MARGIN + item->y - T->scroll;
+        int top = CHROME_HEIGHT + MARGIN + item->y
+                - (item->fixed ? 0 : T->scroll);
         int bottom = CHROME_HEIGHT + viewport_height();
         *y = top + item->height;
         if (*y + *rows * DROP_ROW + 2 > bottom && top - *rows * DROP_ROW - 2
@@ -2873,7 +2875,8 @@ static bool link_at(int x, int y, char *out, size_t capacity) {
         return false;
     }
     const struct display_item *item = page_item_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     return link_target(item, out, capacity);
 }
 
@@ -2881,7 +2884,8 @@ static bool link_at(int x, int y, char *out, size_t capacity) {
 static void link_text(int x, int y, char *out, size_t capacity) {
     out[0] = '\0';
     const struct display_item *item = page_item_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     if (item == NULL || item->link == NULL) {
         return;
     }
@@ -3093,7 +3097,8 @@ static void on_click(int x, int y) {
         return;
     }
     const struct opos_html_node *control = page_control_at(
-        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+        &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
     if (control != NULL) {
         struct form_field *field = form_field(&T->page, control);
         bool select_field = is_text_field(field)
@@ -3141,7 +3146,7 @@ static void on_release(void) {
     b.dirty = true;
     const struct display_item *item = page_item_at(
         &T->page, b.press_x - MARGIN,
-        b.press_y - CHROME_HEIGHT - MARGIN + T->scroll);
+        b.press_y - CHROME_HEIGHT - MARGIN + T->scroll, T->scroll);
     char url[OPOS_HTTP_URL_MAX];
     if (link_target(item, url, sizeof(url))) {
         const char *target = opos_html_attribute(item->link, "target");
@@ -3203,7 +3208,8 @@ static void on_move(int x, int y) {
     if (T->have_page && y >= CHROME_HEIGHT && x < viewport_width()
         && y < CHROME_HEIGHT + viewport_height()) {
         const struct display_item *item = page_item_at(
-            &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll);
+            &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
+        T->scroll);
         if (link_target(item, url, sizeof(url))) {
             if (strcmp(b.status, url) != 0) {
                 set_status(url);

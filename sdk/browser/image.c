@@ -283,6 +283,11 @@ void background_tiles(const struct background *bg, struct image_ref *ref,
     int iw = ref->width > 0 ? ref->width : 1;
     int ih = ref->height > 0 ? ref->height : 1;
     int w = iw, h = ih;
+    if (bg->gradient) {
+        /* A gradient has no size of its own: the box's, by default. */
+        iw = w = box_width > 0 ? box_width : 1;
+        ih = h = box_height > 0 ? box_height : 1;
+    }
     if (bg->size_kind == BG_SIZE_COVER || bg->size_kind == BG_SIZE_CONTAIN) {
         /* Scale (in 1/1024ths) to cover or fit the box. */
         long sx = (long)box_width * 1024 / iw, sy = (long)box_height * 1024 / ih;
@@ -319,17 +324,17 @@ void background_tiles(const struct background *bg, struct image_ref *ref,
     *tile_height = h;
 }
 
-void background_paint(uint32_t *target, int stride, int target_width,
-                      int target_height, const struct display_item *item,
-                      int x, int y, int clip_top, int clip_bottom) {
-    struct image_ref *ref = item->image;
-    if (ref == NULL || ref->state != 1 || item->bg == NULL
-        || item->width <= 0 || item->height <= 0) {
+/* One background layer over the box at x, y. */
+static void paint_layer(uint32_t *target, int stride, int target_width,
+                        int target_height, const struct display_item *item,
+                        const struct background *bg, struct image_ref *ref,
+                        int x, int y, int clip_top, int clip_bottom) {
+    if (ref == NULL || ref->state != 1) {
         return;
     }
     int tx, ty, tw, th;
-    background_tiles(item->bg, ref, x, y, item->width, item->height, &tx,
-                     &ty, &tw, &th);
+    background_tiles(bg, ref, x, y, item->width, item->height, &tx, &ty, &tw,
+                     &th);
     int left = x, right = x + item->width;
     int top = y > clip_top ? y : clip_top;
     int bottom = y + item->height < clip_bottom ? y + item->height
@@ -339,13 +344,13 @@ void background_paint(uint32_t *target, int stride, int target_width,
     }
     /* The first and last tile columns and rows that touch the box. */
     int x0 = tx, x1 = tx + tw;
-    if (!item->bg->no_repeat_x) {
+    if (!bg->no_repeat_x) {
         while (x0 > left) x0 -= tw;
         while (x0 + tw <= left) x0 += tw;
         x1 = right;
     }
     int y0 = ty, y1 = ty + th;
-    if (!item->bg->no_repeat_y) {
+    if (!bg->no_repeat_y) {
         while (y0 > top) y0 -= th;
         while (y0 + th <= top) y0 += th;
         y1 = bottom;
@@ -354,11 +359,32 @@ void background_paint(uint32_t *target, int stride, int target_width,
     for (int yy = y0; yy < y1 && yy < bottom; yy += th) {
         for (int xx = x0; xx < x1 && xx < right; xx += tw) {
             blend(target, stride, target_width, target_height, ref, xx, yy,
-                  tw, th, left, top, right, bottom, item->bg->mask,
-                  item->bg->mask_colour);
+                  tw, th, left, top, right, bottom, bg->mask,
+                  bg->mask_colour);
             if (++tiles > 4096) {
                 return; /* tiny tiles over a huge box */
             }
         }
+    }
+}
+
+void background_paint(uint32_t *target, int stride, int target_width,
+                      int target_height, const struct display_item *item,
+                      int x, int y, int clip_top, int clip_bottom) {
+    if (item->bg == NULL || item->width <= 0 || item->height <= 0) {
+        return;
+    }
+    /* The bottom layer first. */
+    const struct background *layers[BG_LAYERS];
+    int count = 0;
+    for (const struct background *bg = item->bg; bg != NULL
+         && count < BG_LAYERS; bg = bg->below) {
+        layers[count++] = bg;
+    }
+    for (int i = count - 1; i >= 0; i--) {
+        struct image_ref *ref = layers[i]->image != NULL ? layers[i]->image
+                              : i == 0 ? item->image : NULL;
+        paint_layer(target, stride, target_width, target_height, item,
+                    layers[i], ref, x, y, clip_top, clip_bottom);
     }
 }

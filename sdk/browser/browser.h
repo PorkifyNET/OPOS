@@ -40,9 +40,19 @@ enum position { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
 
 enum { BG_SIZE_AUTO, BG_SIZE_COVER, BG_SIZE_CONTAIN, BG_SIZE_EXPLICIT };
 
-/* A CSS background image (the first layer). All zero: none. */
+/* Background layers kept per box (CSS allows any number). */
+#define BG_LAYERS 4
+
+/* What the page area keeps clear around the content (px). */
+#define PAGE_MARGIN 8
+
+struct image_ref;
+
+/* A CSS background image layer. All zero: none. */
 struct background {
-    const char *url;           /* as written; copied for the page */
+    const char *url;           /* as written; copied for the page; a
+                                  gradient is "gradient:" + its CSS */
+    bool gradient;             /* no size of its own: fills the box */
     uint8_t size_kind;         /* BG_SIZE_* */
     bool image_only;           /* no background colour */
     bool mask;                 /* a mask image: drawn in mask_colour */
@@ -52,10 +62,15 @@ struct background {
     bool size_pct[2];
     int position[2];           /* px or percent */
     bool position_pct[2];
+    /* In a laid-out page: the layer's image and the layer under it. */
+    struct image_ref *image;
+    const struct background *below;
 };
 
 /* Copies text for the page being laid out (background URLs). */
 extern char *(*style_copy_text)(const char *text, size_t length);
+/* Zeroed memory that lives as long as the page being laid out. */
+extern void *(*style_alloc)(size_t size);
 
 struct var_scope;
 
@@ -81,9 +96,13 @@ struct style {
     int width, max_width;    /* px, -1 = auto */
     int width_pct, max_width_pct; /* percent of the container, -1 = none */
     int height;              /* px, -1 = auto */
+    int height_pct;          /* percent height (not laid out), 0 = none */
     struct background mask;  /* mask-image (icons drawn in a colour) */
     bool border_box;         /* box-sizing: border-box */
-    struct background bg;
+    struct background bg;    /* the top background layer */
+    /* Layers under it (BG_LAYERS - 1 of them, page memory), or NULL. */
+    struct background *bg_more;
+    uint8_t bg_layers;       /* layers in use, counting bg */
     bool margin_auto_left, margin_auto_right;
     bool no_marker;          /* list-style: none */
     bool out_of_flow;        /* position absolute/fixed or hidden: not in
@@ -94,6 +113,8 @@ struct style {
     bool clipped;            /* clip, clip-path or scale(0): hidden content */
     int offset[4];           /* top, right, bottom, left: px or percent */
     bool offset_set[4], offset_pct[4];
+    int translate[2];        /* transform: translate(); px or percent */
+    bool translate_pct[2];
     bool opacity_zero;       /* opacity: 0 */
     /* text-indent of -999px or less: text pushed out of view so that a
        background image stands in for it. */
@@ -187,6 +208,7 @@ struct display_item {
     /* Byte offset in the control value represented by this text item. */
     size_t field_offset;
     bool round;                /* rect/outline: a circle in the square box */
+    bool fixed;                /* position: fixed; y is from the view's top */
 };
 
 /* For a round item of the given diameter: how many pixels row `row`
@@ -290,6 +312,9 @@ void image_ref_inline_svg(struct image_ref *ref,
                           const struct opos_html_node *svg);
 /* The bytes of a data: URL (malloc'd, NUL-terminated), or NULL. */
 uint8_t *data_url_decode(const char *url, size_t *length);
+/* Makes ref a CSS gradient ("linear-gradient(...)" or
+   "radial-gradient(...)"); false when it cannot be drawn. */
+bool image_ref_gradient(struct image_ref *ref, const char *css);
 /* The image at width x height (cached in ref->scaled), or NULL. */
 const uint32_t *image_ref_scaled(struct image_ref *ref, int width,
                                  int height);
@@ -441,11 +466,13 @@ void page_free_layout(struct page *page);
 /* Frees everything the page owns: layout, document, images. */
 void page_destroy(struct page *page);
 
-/* The item (link or not) under a point in page coordinates, or NULL. */
-const struct display_item *page_item_at(const struct page *page, int x, int y);
+/* The item (link or not) under a point in page coordinates, or NULL.
+   scroll: how far the page is scrolled (fixed items do not move). */
+const struct display_item *page_item_at(const struct page *page, int x, int y,
+                                        int scroll);
 
 /* The form control under a point in page coordinates, or NULL. */
 const struct opos_html_node *page_control_at(const struct page *page, int x,
-                                             int y);
+                                             int y, int scroll);
 
 #endif

@@ -9502,6 +9502,29 @@ static void draw_taskbar_menu(void) {
     }
 }
 
+/* The categories of store/catalog.txt (tools/mkindex.py), used by the
+   OPOS Store window and Start > PROGRAMS. */
+#define STORE_CATEGORIES 8
+static const char *const store_category_ids[STORE_CATEGORIES] = {
+    "games", "internet", "office", "graphics", "sound-video",
+    "programming", "system", "accessories",
+};
+static const char *const store_category_names[STORE_CATEGORIES] = {
+    "GAMES", "INTERNET", "OFFICE", "GRAPHICS", "SOUND AND VIDEO",
+    "PROGRAMMING", "SYSTEM TOOLS", "ACCESSORIES",
+};
+
+/* The index of a category id, or STORE_CATEGORIES for none or an unknown
+   one ("other"). */
+static size_t store_category_index(const char *id, size_t length) {
+    for (size_t i = 0; i < STORE_CATEGORIES; i++) {
+        if (text_equals(id, length, store_category_ids[i])) {
+            return i;
+        }
+    }
+    return STORE_CATEGORIES;
+}
+
 /*
  * Start > PROGRAMS: built-in /bin and installed /disk/Programs files in a
  * submenu beside Start, then the start entries of installed packages
@@ -9510,16 +9533,33 @@ static void draw_taskbar_menu(void) {
  * for a built-in. Terminal-only tools stay in /bin but are omitted from the
  * menu, including disk files with those names. The list is read each time
  * it opens.
+ *
+ * The list is grouped under category headings, in the Store's category
+ * order with OTHER last, and sorted by name within each. Built-in programs
+ * have fixed categories. Packages take theirs from PROGRAMS_CATEGORY_FILE,
+ * which the OPOS Store window writes from the signed index each time it
+ * lists the Store (store_save_categories), so it holds only Store
+ * packages; loose disk files and sideloaded packages are OTHER.
  */
 #define PROGRAMS_MAX 32
 #define PROGRAMS_NAME_CAPACITY 32
 #define PROGRAMS_DIRECTORY "/bin"
 #define PROGRAMS_DISK_DIRECTORY "/disk/Programs"
+#define PROGRAMS_CATEGORY_FILE "/disk/OPOS/STORE-CATEGORIES.TXT"
+#define PROGRAMS_CATEGORY_FILE_MAX 8192
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
+#define PROGRAMS_HEADING_HEIGHT (CHAR_HEIGHT + 12)
 
 static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
 static char programs_paths[PROGRAMS_MAX][256];
+static uint8_t programs_categories[PROGRAMS_MAX]; /* store_category_index */
+/* Each program's top, below the submenu's top edge and padding, and the
+   height of all rows and headings (programs_layout). */
+static int64_t programs_tops[PROGRAMS_MAX];
+static int64_t programs_rows_height;
 static struct package_start_entry programs_packages[PROGRAMS_MAX];
+static char programs_category_text[PROGRAMS_CATEGORY_FILE_MAX];
+static size_t programs_category_length;
 static size_t programs_count;
 static bool programs_focus;  /* the keyboard is in the submenu */
 static size_t programs_selection;
@@ -9552,10 +9592,57 @@ static bool programs_terminal_only(const char *name) {
         || programs_name_equal(name, "pkg");
 }
 
-/* Adds name (length bytes) with its path, sorted, unless a program of
-   that name is listed already. */
+/* The categories of the built-in programs in /bin. */
+static const struct {
+    const char *name;
+    const char *category;
+} programs_builtin_categories[] = {
+    {"browser", "internet"},
+    {"notepad", "accessories"},
+    {"notify", "system"},
+    {"play", "sound-video"},
+};
+
+static size_t programs_builtin_category(const char *name) {
+    for (size_t i = 0; i < sizeof(programs_builtin_categories)
+                               / sizeof(programs_builtin_categories[0]);
+         i++) {
+        if (programs_name_equal(name, programs_builtin_categories[i].name)) {
+            const char *id = programs_builtin_categories[i].category;
+            return store_category_index(id, text_length(id));
+        }
+    }
+    return STORE_CATEGORIES;
+}
+
+/* The category of package id in PROGRAMS_CATEGORY_FILE, read by
+   programs_load: lines of "ID CATEGORY". */
+static size_t programs_package_category(const char *id) {
+    size_t line = 0;
+    while (line < programs_category_length) {
+        size_t end = line;
+        while (end < programs_category_length
+               && programs_category_text[end] != '\n') {
+            end++;
+        }
+        size_t space = line;
+        while (space < end && programs_category_text[space] != ' ') {
+            space++;
+        }
+        if (space < end
+            && text_equals(programs_category_text + line, space - line, id)) {
+            return store_category_index(programs_category_text + space + 1,
+                                        end - space - 1);
+        }
+        line = end + 1;
+    }
+    return STORE_CATEGORIES;
+}
+
+/* Adds name (length bytes) with its path and category, sorted by category
+   and then name, unless a program of that name is listed already. */
 static void programs_add(const char *name, size_t name_length,
-                         const char *path) {
+                         const char *path, size_t category) {
     if (programs_count == PROGRAMS_MAX
         || name_length >= PROGRAMS_NAME_CAPACITY) {
         return;
@@ -9570,26 +9657,54 @@ static void programs_add(const char *name, size_t name_length,
             return;
         }
     }
-    /* Sorted by name, case ignored. */
+    /* Sorted by category, then by name with case ignored. */
     size_t at = programs_count++;
     while (at > 0) {
         const char *other = programs_names[at - 1];
-        size_t j = 0;
-        while (j < name_length && other[j] != '\0'
-               && ascii_upper(name[j]) == ascii_upper(other[j])) {
-            j++;
-        }
-        char mine = j < name_length ? ascii_upper(name[j]) : 0;
-        if (mine >= ascii_upper(other[j])) {
-            break;
+        size_t other_category = programs_categories[at - 1];
+        if (category != other_category) {
+            if (category > other_category) {
+                break;
+            }
+        } else {
+            size_t j = 0;
+            while (j < name_length && other[j] != '\0'
+                   && ascii_upper(name[j]) == ascii_upper(other[j])) {
+                j++;
+            }
+            char mine = j < name_length ? ascii_upper(name[j]) : 0;
+            if (mine >= ascii_upper(other[j])) {
+                break;
+            }
         }
         text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, other);
         text_copy(programs_paths[at], sizeof(programs_paths[at]),
                   programs_paths[at - 1]);
+        programs_categories[at] = (uint8_t)other_category;
         at--;
     }
     text_copy(programs_names[at], PROGRAMS_NAME_CAPACITY, copy);
     text_copy(programs_paths[at], sizeof(programs_paths[at]), path);
+    programs_categories[at] = (uint8_t)category;
+}
+
+/* A heading goes above the first program of each category. */
+static bool programs_heading_above(size_t index) {
+    return index < programs_count
+        && (index == 0
+            || programs_categories[index] != programs_categories[index - 1]);
+}
+
+static void programs_layout(void) {
+    int64_t top = 0;
+    for (size_t i = 0; i < programs_count; i++) {
+        if (programs_heading_above(i)) {
+            top += PROGRAMS_HEADING_HEIGHT;
+        }
+        programs_tops[i] = top;
+        top += MENU_ITEM_HEIGHT;
+    }
+    programs_rows_height = programs_count == 0 ? MENU_ITEM_HEIGHT : top;
 }
 
 static void programs_load_directory(const char *directory, bool disk) {
@@ -9624,14 +9739,25 @@ static void programs_load_directory(const char *directory, bool disk) {
                 continue;
             }
         }
-        programs_add(entry.name, entry.name_length, path);
+        programs_add(entry.name, entry.name_length, path,
+                     disk ? STORE_CATEGORIES
+                          : programs_builtin_category(entry.name));
     }
 }
 
 static void programs_load(void) {
     static const char disk_directory[] = PROGRAMS_DISK_DIRECTORY;
+    static const char category_file[] = PROGRAMS_CATEGORY_FILE;
     struct vfs_metadata metadata;
     programs_count = 0;
+    programs_category_length = 0;
+    if (!vfs_read_file(category_file, sizeof(category_file) - 1,
+                       (uint8_t *)programs_category_text,
+                       sizeof(programs_category_text),
+                       &programs_category_length)
+        || programs_category_length > sizeof(programs_category_text)) {
+        programs_category_length = 0;
+    }
     programs_load_directory(PROGRAMS_DIRECTORY, false);
     if (!vfs_stat(disk_directory, sizeof(disk_directory) - 1, &metadata)) {
         (void)vfs_create_directory(disk_directory,
@@ -9645,8 +9771,10 @@ static void programs_load(void) {
     for (size_t i = 0; i < count; i++) {
         programs_add(programs_packages[i].label,
                      text_length(programs_packages[i].label),
-                     programs_packages[i].path);
+                     programs_packages[i].path,
+                     programs_package_category(programs_packages[i].id));
     }
+    programs_layout();
 }
 
 static void programs_show(bool focus) {
@@ -9684,8 +9812,7 @@ static size_t menu_index_of(enum menu_action action) {
 static struct rect programs_rect(void) {
     struct rect menu = menu_rect();
     struct rect item = menu_item_rect(menu_index_of(MENU_PROGRAMS));
-    size_t rows = programs_count == 0 ? 1 : programs_count;
-    int64_t height = (int64_t)rows * MENU_ITEM_HEIGHT + 12;
+    int64_t height = programs_rows_height + 12;
     int64_t x = menu.x + menu.width - 2;
     if (x + PROGRAMS_WIDTH > screen_width()) {
         x = menu.x - PROGRAMS_WIDTH + 2; /* no room on the right */
@@ -9699,9 +9826,9 @@ static struct rect programs_rect(void) {
 
 static struct rect programs_item_rect(size_t index) {
     struct rect box = programs_rect();
-    return (struct rect){box.x + 6, box.y + 6
-                             + (int64_t)index * MENU_ITEM_HEIGHT,
-                         box.width - 12, MENU_ITEM_HEIGHT};
+    int64_t top = index < programs_count ? programs_tops[index] : 0;
+    return (struct rect){box.x + 6, box.y + 6 + top, box.width - 12,
+                         MENU_ITEM_HEIGHT};
 }
 
 static void programs_launch(size_t index) {
@@ -9730,6 +9857,19 @@ static void draw_programs_menu(void) {
     }
     for (size_t i = 0; i < programs_count; i++) {
         struct rect item = programs_item_rect(i);
+        if (programs_heading_above(i)) {
+            size_t category = programs_categories[i];
+            int64_t top = item.y - PROGRAMS_HEADING_HEIGHT;
+            if (i != 0) {
+                fill((struct rect){item.x, top + 3, item.width, 1},
+                     58, 66, 88);
+            }
+            draw_text_clipped(item.x + 10, top + 9, item.width - 20,
+                              category < STORE_CATEGORIES
+                                  ? store_category_names[category]
+                                  : "OTHER",
+                              130, 160, 220);
+        }
         if (i == programs_selection) {
             fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
                  70, 100, 160);
@@ -14190,16 +14330,6 @@ enum store_focus {
     STORE_FOCUS_COUNT,
 };
 
-/* The categories of store/catalog.txt (tools/mkindex.py). */
-#define STORE_CATEGORIES 8
-static const char *const store_category_ids[STORE_CATEGORIES] = {
-    "games", "internet", "office", "graphics", "sound-video",
-    "programming", "system", "accessories",
-};
-static const char *const store_category_names[STORE_CATEGORIES] = {
-    "GAMES", "INTERNET", "OFFICE", "GRAPHICS", "SOUND AND VIDEO",
-    "PROGRAMMING", "SYSTEM TOOLS", "ACCESSORIES",
-};
 /* Icon colors: one per category, then "other". */
 static const uint8_t store_category_colors[STORE_CATEGORIES + 1][3] = {
     {190, 74, 74},  {62, 120, 206}, {66, 150, 98},  {176, 92, 190},
@@ -14296,13 +14426,7 @@ static bool store_item_is(const struct store_item *item, const char *state) {
 }
 
 static size_t store_item_category(const struct store_item *item) {
-    for (size_t i = 0; i < STORE_CATEGORIES; i++) {
-        if (text_equals(item->category, text_length(item->category),
-                        store_category_ids[i])) {
-            return i;
-        }
-    }
-    return STORE_LIST_OTHER;
+    return store_category_index(item->category, text_length(item->category));
 }
 
 static const char *store_list_name(size_t list) {
@@ -14608,6 +14732,49 @@ static void store_open(void) {
     }
 }
 
+/* After a full listing: saves each program's category from the signed
+   index for Start > PROGRAMS (PROGRAMS_CATEGORY_FILE), when it changed. */
+static void store_save_categories(void) {
+    static char text[PROGRAMS_CATEGORY_FILE_MAX];
+    static char old[PROGRAMS_CATEGORY_FILE_MAX];
+    static const char path[] = PROGRAMS_CATEGORY_FILE;
+    if (!fat16_system_mounted()) {
+        return;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < store_item_count; i++) {
+        const struct store_item *item = &store_items[i];
+        size_t category = store_item_category(item);
+        if (category == STORE_CATEGORIES) {
+            continue;
+        }
+        size_t need = text_length(item->id) + 1
+                    + text_length(store_category_ids[category]) + 1;
+        if (used + need > sizeof(text)) {
+            break;
+        }
+        used = append_text(text, sizeof(text), used, item->id);
+        used = append_text(text, sizeof(text), used, " ");
+        used = append_text(text, sizeof(text), used,
+                           store_category_ids[category]);
+        used = append_text(text, sizeof(text), used, "\n");
+    }
+    size_t old_length = 0;
+    if (vfs_read_file(path, sizeof(path) - 1, (uint8_t *)old, sizeof(old),
+                      &old_length)
+        && old_length == used) {
+        bool same = true;
+        for (size_t i = 0; i < used && same; i++) {
+            same = old[i] == text[i];
+        }
+        if (same) {
+            return;
+        }
+    }
+    (void)vfs_write_file(path, sizeof(path) - 1, (const uint8_t *)text,
+                         used);
+}
+
 /* pkg ended (from app_job_report). */
 static void store_finished(bool started, uint64_t exit_status) {
     if (store_line_length != 0) {
@@ -14625,6 +14792,10 @@ static void store_finished(bool started, uint64_t exit_status) {
         text_copy(store_message, sizeof(store_message),
                   exit_status == 128 + 9 ? "PKG WAS ENDED" : "PKG FAILED");
         store_message_error = true;
+    }
+    if (started && exit_status == 0 && store_listing
+        && store_item_count != 0) {
+        store_save_categories();
     }
     store_filter();
     if (store_refresh_after) {

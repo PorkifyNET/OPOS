@@ -41,6 +41,8 @@ hardware support remain future work.
 - Start > Programs lists graphical built-in programs from `/bin` and ELF
   programs placed in writable `/disk/Programs`. Built-in names take
   precedence. The `fetch` and `update` tools run from Terminal, not the menu.
+  Programs are grouped by category (Games, Internet, Office and so on), with
+  Store programs in the category the OPOS Store gives them.
 - Notepad: the text editor is an ordinary SDK program (`/bin/notepad`), with
   selection, Ctrl shortcuts, Save As, and CRLF-preserving save. The built-in
   editor remains for administrators editing system files and as a fallback;

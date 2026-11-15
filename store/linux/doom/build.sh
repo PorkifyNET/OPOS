@@ -14,8 +14,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 VERSION=3.1.1
 FREEDOOM=0.13.0
 # The package version: Freedoom's, plus a fourth number for OPOS rebuilds
-# (0.13.0.1: SDL with full-screen windows).
-PACKAGE_VERSION=0.13.0.1
+# (0.13.0.1: SDL with full-screen windows; 0.13.0.2: window resize
+# requests).
+PACKAGE_VERSION=0.13.0.2
 SOURCE=$(fetch "https://github.com/chocolate-doom/chocolate-doom/archive/refs/tags/chocolate-doom-$VERSION.tar.gz" \
     1edcc41254bdc194beb0d33e267fae306556c4d24110a1d3d3f865717f25da23 \
     "$CACHE")

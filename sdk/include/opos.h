@@ -224,7 +224,9 @@ static inline long opos_pick_file(char *path, size_t capacity) {
 }
 
 /* Shows Files for the user to choose a folder and type a file name to
-   save to, starting with suggested (e.g. "Picture.png", may be ""). An
+   save to, starting with suggested (e.g. "Picture.png", may be ""; a
+   full path such as "/disk/Users/bob/Pictures/a.png" starts in that
+   folder, which needs OPOS 0.6.3 or newer like the call itself). An
    existing file is replaced only after the user confirms. Returns the
    path length, -OPOS_ECANCELED on Esc/close, or another negative error.
    The app may then create, write and read that one file (not remove or

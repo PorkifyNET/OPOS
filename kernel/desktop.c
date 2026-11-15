@@ -3196,6 +3196,8 @@ static struct {
     /* Files was opened for this request: close it afterwards and bring
        the program's window back to the front. */
     bool opened_files;
+    /* Save mode: the folder to start in (from a suggested path). */
+    char start_folder[FILES_PATH_CAPACITY];
     volatile bool finished;
     uint64_t finished_owner;
 } files_picker;
@@ -14262,7 +14264,27 @@ static int64_t desktop_app_file_request(
     files_picker.result = 0;
     files_picker.open_pending = true;
     files_picker.save = suggested != NULL;
-    files_save_name_set(suggested != NULL ? suggested : "");
+    files_picker.start_folder[0] = '\0';
+    if (suggested != NULL) {
+        /* "/folder/name" starts in that folder with that name. */
+        size_t slash = (size_t)-1;
+        for (size_t i = 0; suggested[i] != '\0'; i++) {
+            if (suggested[i] == '/') {
+                slash = i;
+            }
+        }
+        if (slash != (size_t)-1 && slash != 0 && suggested[0] == '/'
+            && slash < sizeof(files_picker.start_folder)) {
+            for (size_t i = 0; i < slash; i++) {
+                files_picker.start_folder[i] = suggested[i];
+            }
+            files_picker.start_folder[slash] = '\0';
+        }
+        files_save_name_set(slash != (size_t)-1 ? suggested + slash + 1
+                                                : suggested);
+    } else {
+        files_save_name_set("");
+    }
     files_picker.path[0] = '\0';
     files_picker.identity = *identity;
     text_copy(files_picker.name, sizeof(files_picker.name), name);
@@ -17025,7 +17047,13 @@ static bool apps_poll(void) {
         window_open(WINDOW_FILES);
         char home[FILES_PATH_CAPACITY];
         size_t length = accounts_home_path(NULL, home, sizeof(home));
-        if (length != 0) {
+        size_t start = 0;
+        while (files_picker.start_folder[start] != '\0') {
+            start++;
+        }
+        if (start != 0 && files_visit(files_picker.start_folder, start)) {
+            /* The folder of the file being saved again. */
+        } else if (length != 0) {
             (void)files_visit(home, length);
         }
         files_menu_open = false;

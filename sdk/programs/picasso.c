@@ -705,12 +705,15 @@ static bool write_png(const char *file) {
 }
 
 static bool do_save_as(void) {
-    char suggested[64];
-    size_t length = strlen(file_name);
-    memcpy(suggested, file_name, length + 1);
+    /* The picture's own path, so Files starts in its folder. */
+    char suggested[PATH_MAX_LENGTH + 8];
+    const char *from = path[0] == '/' ? path : file_name;
+    size_t length = strlen(from);
+    memcpy(suggested, from, length + 1);
     /* Saving always writes PNG: suggest a .png name. */
     char *dot = strrchr(suggested, '.');
-    if (dot != NULL && dot != suggested) {
+    char *slash = strrchr(suggested, '/');
+    if (dot != NULL && dot != suggested && (slash == NULL || dot > slash + 1)) {
         *dot = '\0';
         length = (size_t)(dot - suggested);
     }

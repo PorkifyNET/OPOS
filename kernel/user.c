@@ -4125,7 +4125,8 @@ static int64_t user_opos_save_file(struct user_process *process,
     if (!process->identity.confined) {
         return -22;
     }
-    char suggested[64];
+    /* A name, or a full path to start in that folder. */
+    char suggested[USER_FILE_PATH_CAPACITY];
     size_t name_length = (size_t)frame->rsi;
     if (name_length == 0) {
         suggested[0] = '\0';

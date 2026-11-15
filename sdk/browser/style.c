@@ -966,7 +966,15 @@ void apply_declaration(struct style *style, const char *name,
         if (elen == 0) {
             /* One or two values: start [end]. */
             char a[96], b[96];
-            const char *space = strchr(text, ' ');
+            /* The first space outside parentheses: calc(-1 * 20px). */
+            const char *space = NULL;
+            int depth = 0;
+            for (const char *s = text; *s != '\0' && space == NULL; s++) {
+                depth += *s == '(' ? 1 : *s == ')' ? -1 : 0;
+                if (*s == ' ' && depth == 0) {
+                    space = s;
+                }
+            }
             if (space == NULL) {
                 snprintf(a, sizeof(a), "%s", text);
                 snprintf(b, sizeof(b), "%s", text);
@@ -1136,6 +1144,11 @@ void apply_declaration(struct style *style, const char *name,
         style->flex_column = strncmp(text, "column", 6) == 0;
     } else if (word_is(name, name_length, "flex-wrap")) {
         style->flex_wrap = strncmp(text, "wrap", 4) == 0;
+    } else if (word_is(name, name_length, "flex-flow")) {
+        /* <direction> || <wrap>: a missing part resets to row/nowrap. */
+        style->flex_column = strstr(text, "column") != NULL;
+        style->flex_wrap = strstr(text, "wrap") != NULL
+                        && strstr(text, "nowrap") == NULL;
     } else if (word_is(name, name_length, "flex-grow")) {
         style->flex_grow = flex_weight(text);
     } else if (word_is(name, name_length, "flex-shrink")) {
@@ -1647,7 +1660,8 @@ void style_compute(const struct opos_html_node *element,
         break;
     case HTML_TAG_INPUT: case HTML_TAG_BUTTON: case HTML_TAG_SELECT:
     case HTML_TAG_TEXTAREA:
-        style->display = DISPLAY_INLINE_BLOCK;
+        style->display = form_kind(element) == FIELD_HIDDEN
+                       ? DISPLAY_NONE : DISPLAY_INLINE_BLOCK;
         break;
     case HTML_TAG_BR: {
         /* <br clear="all"> (also left, right, both) moves below floats. */

@@ -138,6 +138,18 @@ static int clamp_min(int value, int minimum) {
 static int max_int(int a, int b) { return a > b ? a : b; }
 static int min_int(int a, int b) { return a < b ? a : b; }
 
+/* Two adjoining vertical margins collapse into one: the larger of two
+   positive ones, the more negative of two negative ones, else the sum. */
+static int collapse(int a, int b) {
+    if (a >= 0 && b >= 0) {
+        return max_int(a, b);
+    }
+    if (a < 0 && b < 0) {
+        return min_int(a, b);
+    }
+    return a + b;
+}
+
 /* ------------------------------------------------------------- display list */
 
 static struct display_item *add_item(struct ctx *c, enum item_kind kind,
@@ -1137,6 +1149,9 @@ static void flush_inline(struct ctx *c) {
         if (i >= n) {
             break;
         }
+        /* The first line ends the margins collapsing above it. */
+        c->y += c->pending_margin;
+        c->pending_margin = 0;
         size_t line_start = i;
         bool restart = false;
         {
@@ -1243,7 +1258,7 @@ static void process_children(struct ctx *c, const struct opos_html_node *node,
 
 static void layout_hr(struct ctx *c, const struct style *style) {
     flush_inline(c);
-    c->y += max_int(c->pending_margin, style->margin[TOP]);
+    c->y += collapse(c->pending_margin, style->margin[TOP]);
     c->pending_margin = 0;
     if (!c->measuring) {
         struct display_item *dark = add_item(c, ITEM_RECT, c->bx, c->y,
@@ -1320,9 +1335,9 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
     bool boxed = style->has_background || style->border > 0;
     bool collapse_top = !boxed && style->padding[TOP] == 0;
     if (collapse_top) {
-        c->pending_margin = max_int(c->pending_margin, style->margin[TOP]);
+        c->pending_margin = collapse(c->pending_margin, style->margin[TOP]);
     } else {
-        c->y += max_int(c->pending_margin, style->margin[TOP]);
+        c->y += collapse(c->pending_margin, style->margin[TOP]);
         c->pending_margin = 0;
     }
     int box_top = c->y;
@@ -1392,7 +1407,7 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
 
     bool collapse_bottom = !boxed && style->padding[BOTTOM] == 0;
     if (collapse_bottom) {
-        c->pending_margin = max_int(c->pending_margin, style->margin[BOTTOM]);
+        c->pending_margin = collapse(c->pending_margin, style->margin[BOTTOM]);
     } else {
         c->y += c->pending_margin + style->padding[BOTTOM] + style->border;
         c->pending_margin = style->margin[BOTTOM];
@@ -1904,7 +1919,7 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
     }
     note_right(c, x0 + total);
 
-    c->y += max_int(c->pending_margin, st->margin[TOP]);
+    c->y += collapse(c->pending_margin, st->margin[TOP]);
     c->pending_margin = 0;
     int table_top = c->y;
     size_t table_fill = (size_t)-1, table_outline = (size_t)-1;
@@ -2355,6 +2370,9 @@ static void layout_flex_children(struct ctx *c,
         process_children(c, node, st);
         return;
     }
+    /* Flex items do not collapse margins with the container. */
+    c->y += c->pending_margin;
+    c->pending_margin = 0;
     int saved_floats = c->float_count;
     int avail = c->bwidth;
     int gap = st->gap;
@@ -2612,6 +2630,9 @@ static void layout_grid_children(struct ctx *c,
         process_children(c, node, st);
         return;
     }
+    /* Grid items do not collapse margins with the container. */
+    c->y += c->pending_margin;
+    c->pending_margin = 0;
     /* Column widths. */
     int widths[12];
     int fixed = gap * (columns - 1);

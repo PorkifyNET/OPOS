@@ -9779,6 +9779,13 @@ static bool programs_terminal_only(const char *name) {
         || programs_name_equal(name, "pkg");
 }
 
+/* Built-in test programs that Start > Programs leaves out; the Terminal
+   still runs them. */
+static bool programs_test_only(const char *name) {
+    return programs_name_equal(name, "play")
+        || programs_name_equal(name, "notify");
+}
+
 /* The categories of the built-in programs in /bin. */
 static const struct {
     const char *name;
@@ -9786,8 +9793,6 @@ static const struct {
 } programs_builtin_categories[] = {
     {"browser", "internet"},
     {"notepad", "accessories"},
-    {"notify", "system"},
-    {"play", "sound-video"},
 };
 
 static size_t programs_builtin_category(const char *name) {
@@ -9909,7 +9914,8 @@ static void programs_load_directory(const char *directory, bool disk) {
         }
         if (entry.type != VFS_NODE_FILE
             || entry.name_length >= PROGRAMS_NAME_CAPACITY
-            || programs_terminal_only(entry.name)) {
+            || programs_terminal_only(entry.name)
+            || (!disk && programs_test_only(entry.name))) {
             continue;
         }
         char path[64];

@@ -8508,8 +8508,31 @@ static struct rect net_icon_rect(void) {
                          NET_ICON_WIDTH, NET_ICON_HEIGHT};
 }
 
-/* Notification Center bell, left of the network icon (or the clock),
-   with the unread count beside it. Not on the login screen. */
+/* Speaker icon, left of the network icon (or the clock); only with a
+   sound output. A click opens the volume panel (volume_panel_*). */
+#define SPEAKER_ICON_WIDTH 26
+#define SPEAKER_ICON_HEIGHT 22
+
+static bool speaker_icon_visible(void) {
+    return sound_output_ready();
+}
+
+static struct rect speaker_icon_rect(void) {
+    struct rect bar = taskbar_rect();
+    struct rect next = net_icon_visible() ? net_icon_rect() : clock_rect();
+    if (taskbar_vertical()) {
+        return (struct rect){bar.x + (bar.width - SPEAKER_ICON_WIDTH) / 2,
+                             next.y - SPEAKER_ICON_HEIGHT - 8,
+                             SPEAKER_ICON_WIDTH, SPEAKER_ICON_HEIGHT};
+    }
+    return (struct rect){next.x - SPEAKER_ICON_WIDTH - 12,
+                         bar.y + (bar.height - SPEAKER_ICON_HEIGHT) / 2,
+                         SPEAKER_ICON_WIDTH, SPEAKER_ICON_HEIGHT};
+}
+
+/* Notification Center bell, left of the speaker icon (or the network
+   icon, or the clock), with the unread count beside it. Not on the login
+   screen. */
 #define BELL_ICON_WIDTH 26
 #define BELL_ICON_HEIGHT 22
 
@@ -8527,7 +8550,8 @@ static void bell_count_text(char *text, size_t capacity) {
 
 static struct rect bell_icon_rect(void) {
     struct rect bar = taskbar_rect();
-    struct rect next = net_icon_visible() ? net_icon_rect() : clock_rect();
+    struct rect next = speaker_icon_visible() ? speaker_icon_rect()
+                     : net_icon_visible() ? net_icon_rect() : clock_rect();
     char count[4];
     bell_count_text(count, sizeof(count));
     int64_t width = BELL_ICON_WIDTH;
@@ -8693,6 +8717,8 @@ static int64_t taskbar_menu_y;
 static bool taskbar_pointer_reveal;
 /* The network popup (click on the network icon). */
 static bool net_popup_open;
+/* The volume panel (click on the speaker icon). */
+static bool volume_panel_open;
 
 static bool front_window_fullscreen(void) {
     return z_count != 0 && windows[z_order[z_count - 1]].fullscreen;
@@ -8704,11 +8730,11 @@ static bool front_window_fullscreen(void) {
 static bool taskbar_shown(void) {
     if (front_window_fullscreen()) {
         return start_menu_open || taskbar_menu_open || net_popup_open
-            || keyboard_super_held();
+            || volume_panel_open || keyboard_super_held();
     }
     return !appearance_taskbar_autohide() || start_menu_open
-        || taskbar_menu_open || net_popup_open || taskbar_pointer_reveal
-        || keyboard_super_held();
+        || taskbar_menu_open || net_popup_open || volume_panel_open
+        || taskbar_pointer_reveal || keyboard_super_held();
 }
 
 /* Returns true when the pointer revealed or hid the taskbar. */
@@ -8782,6 +8808,7 @@ static void draw_button(struct rect area, const char *label, bool active) {
 }
 
 static void draw_net_icon(void);
+static void draw_speaker_icon(void);
 
 static void draw_taskbar(void) {
     struct rect bar = taskbar_rect();
@@ -8830,6 +8857,7 @@ static void draw_taskbar(void) {
         append_two_digits(time, sizeof(time), length, seconds % 60);
     }
     draw_net_icon();
+    draw_speaker_icon();
     draw_bell_icon();
     struct rect clock = clock_rect();
     if (taskbar_vertical()) {
@@ -8960,8 +8988,25 @@ static bool volume_key(uint8_t key) {
     } else {
         return false;
     }
-    volume_popup_until = timer_ticks() + VOLUME_POPUP_TICKS;
+    /* An open volume panel shows the change itself. */
+    if (!volume_panel_open) {
+        volume_popup_until = timer_ticks() + VOLUME_POPUP_TICKS;
+    }
     return true;
+}
+
+/* "VOLUME 45%", "MUTED" or "NO SOUND OUTPUT". */
+static void volume_text(char *line, size_t capacity) {
+    line[0] = '\0';
+    if (!sound_output_ready()) {
+        append_text(line, capacity, 0, "NO SOUND OUTPUT");
+    } else if (sound_muted()) {
+        append_text(line, capacity, 0, "MUTED");
+    } else {
+        size_t length = append_text(line, capacity, 0, "VOLUME ");
+        length = append_decimal(line, capacity, length, sound_volume());
+        append_text(line, capacity, length, "%");
+    }
 }
 
 static struct rect volume_popup_rect(void) {
@@ -8980,27 +9025,9 @@ static void draw_volume_popup(void) {
     fill(popup, 110, 160, 255);
     fill((struct rect){popup.x + 2, popup.y + 2, popup.width - 4,
                        popup.height - 4}, 26, 34, 54);
-    char line[24] = "";
-    size_t length;
+    char line[24];
+    volume_text(line, sizeof(line));
     uint32_t volume = sound_volume();
-    if (!sound_output_ready()) {
-        append_text(line, sizeof(line), 0, "NO SOUND OUTPUT");
-    } else if (sound_muted()) {
-        append_text(line, sizeof(line), 0, "MUTED");
-    } else {
-        length = append_text(line, sizeof(line), 0, "VOLUME ");
-        if (volume >= 100) {
-            length = append_text(line, sizeof(line), length, "100");
-        } else {
-            if (volume >= 10) {
-                char tens[2] = {(char)('0' + volume / 10), '\0'};
-                length = append_text(line, sizeof(line), length, tens);
-            }
-            char ones[2] = {(char)('0' + volume % 10), '\0'};
-            length = append_text(line, sizeof(line), length, ones);
-        }
-        append_text(line, sizeof(line), length, "%");
-    }
     draw_text_clipped(popup.x + 12, popup.y + 8, popup.width - 24, line,
                       230, 238, 255);
     struct rect bar = {popup.x + 12, popup.y + 14 + CHAR_HEIGHT,
@@ -9010,6 +9037,149 @@ static void draw_volume_popup(void) {
         fill((struct rect){bar.x, bar.y, bar.width * (int64_t)volume / 100,
                            bar.height}, 110, 160, 255);
     }
+}
+
+/*
+ * The speaker icon: a cone with one to three waves by volume, or a red
+ * cross when muted or at 0.
+ */
+static void draw_speaker_icon(void) {
+    if (!speaker_icon_visible()) {
+        return;
+    }
+    struct rect icon = speaker_icon_rect();
+    if (volume_panel_open) {
+        fill(icon, 70, 100, 160);
+    }
+    int64_t middle = icon.y + icon.height / 2;
+    fill((struct rect){icon.x + 3, middle - 3, 4, 6}, 230, 238, 255);
+    for (int64_t c = 0; c < 6; c++) {
+        fill((struct rect){icon.x + 7 + c, middle - 3 - c, 1, 6 + 2 * c},
+             230, 238, 255);
+    }
+    uint32_t volume = sound_volume();
+    if (sound_muted() || volume == 0) {
+        for (int i = 0; i < 7; i++) {
+            fill((struct rect){icon.x + 16 + i, middle - 4 + i, 2, 2},
+                 240, 90, 90);
+            fill((struct rect){icon.x + 22 - i, middle - 4 + i, 2, 2},
+                 240, 90, 90);
+        }
+        return;
+    }
+    int waves = volume < 34 ? 1 : volume < 67 ? 2 : 3;
+    for (int w = 0; w < waves; w++) {
+        int64_t x = icon.x + 15 + 4 * w;
+        int64_t half = 3 + 2 * w;
+        fill((struct rect){x, middle - half + 1, 2, 2 * half - 2},
+             230, 238, 255);
+        fill((struct rect){x - 1, middle - half, 1, 1}, 230, 238, 255);
+        fill((struct rect){x - 1, middle + half - 1, 1, 1}, 230, 238, 255);
+    }
+}
+
+/*
+ * The volume panel above (or beside) the speaker icon: the volume, a
+ * slider that a click or drag sets, and MUTE / UNMUTE. Volume keys and
+ * the wheel over the icon or panel change it too.
+ */
+#define VOLUME_SLIDER_HEIGHT 18
+
+static struct rect volume_panel_rect(void) {
+    struct rect icon = speaker_icon_rect();
+    int64_t width = 18 * CHAR_WIDTH + 26;
+    int64_t height = 2 * CHAR_HEIGHT + VOLUME_SLIDER_HEIGHT + 46;
+    return taskbar_popup_rect(icon.x + icon.width - width, icon.y, width,
+                              height);
+}
+
+static struct rect volume_slider_rect(void) {
+    struct rect panel = volume_panel_rect();
+    return (struct rect){panel.x + 14, panel.y + 16 + CHAR_HEIGHT,
+                         panel.width - 28, VOLUME_SLIDER_HEIGHT};
+}
+
+static struct rect volume_mute_rect(void) {
+    struct rect panel = volume_panel_rect();
+    struct rect slider = volume_slider_rect();
+    return (struct rect){panel.x + 12, slider.y + slider.height + 8,
+                         panel.width - 24, CHAR_HEIGHT + 10};
+}
+
+/* Sets the volume from a pointer x over the slider; true if it changed.
+   Not saved yet: letting go of the slider saves it (DRAG_VOLUME). */
+static bool volume_slider_set(int32_t x) {
+    struct rect slider = volume_slider_rect();
+    int64_t offset = x - slider.x;
+    offset = offset < 0 ? 0 : offset > slider.width ? slider.width : offset;
+    uint32_t volume = (uint32_t)((offset * 100 + slider.width / 2)
+                                 / slider.width);
+    if (volume == sound_volume() && !sound_muted()) {
+        return false;
+    }
+    sound_set_muted(false);
+    sound_set_volume_unsaved(volume);
+    return true;
+}
+
+static void draw_volume_panel(void) {
+    if (!volume_panel_open) {
+        return;
+    }
+    struct rect panel = volume_panel_rect();
+    fill(panel, 110, 160, 255);
+    fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
+                       panel.height - 4}, 26, 34, 54);
+    char line[24];
+    volume_text(line, sizeof(line));
+    draw_text_clipped(panel.x + 12, panel.y + 10, panel.width - 24, line,
+                      230, 238, 255);
+    struct rect slider = volume_slider_rect();
+    struct rect track = {slider.x, slider.y + slider.height / 2 - 3,
+                         slider.width, 6};
+    fill(track, 60, 70, 95);
+    int64_t filled = slider.width * (int64_t)sound_volume() / 100;
+    bool muted = sound_muted();
+    fill((struct rect){track.x, track.y, filled, track.height},
+         muted ? 100 : 110, muted ? 110 : 160, muted ? 130 : 255);
+    fill((struct rect){slider.x + filled - 4, slider.y, 8, slider.height},
+         muted ? 150 : 230, muted ? 160 : 238, muted ? 180 : 255);
+    draw_button(volume_mute_rect(), muted ? "UNMUTE" : "MUTE", muted);
+}
+
+/* A press inside the open panel. */
+static void volume_panel_press(int32_t x, int32_t y, bool *drag_slider) {
+    *drag_slider = false;
+    struct rect slider = volume_slider_rect();
+    if (rect_contains((struct rect){slider.x - 8, slider.y,
+                                    slider.width + 16, slider.height},
+                      x, y)) {
+        (void)volume_slider_set(x);
+        *drag_slider = true;
+    } else if (rect_contains(volume_mute_rect(), x, y)) {
+        sound_set_muted(!sound_muted());
+        if (!sound_muted()) {
+            system_sound_play(SYSTEM_SOUND_VOLUME);
+        }
+    }
+}
+
+/* The wheel over the speaker icon or the open panel: one step a notch. */
+static bool volume_wheel(int32_t x, int32_t y, int32_t notches) {
+    if (!taskbar_shown() || !speaker_icon_visible()
+        || !(rect_contains(speaker_icon_rect(), x, y)
+             || (volume_panel_open
+                 && rect_contains(volume_panel_rect(), x, y)))) {
+        return false;
+    }
+    int32_t steps = notches < 0 ? -notches : notches;
+    for (int32_t i = 0; i < steps && i < 20; i++) {
+        volume_step(notches > 0 ? 1 : -1);
+    }
+    if (!volume_panel_open) {
+        volume_popup_until = timer_ticks() + VOLUME_POPUP_TICKS;
+    }
+    return true;
 }
 
 /* ---------------------------------------------------------------- toasts */
@@ -9317,6 +9487,7 @@ static void center_show(bool open) {
         start_menu_open = false;
         taskbar_menu_open = false;
         net_popup_open = false;
+        volume_panel_open = false;
         toasts_reset();
         center_selected = 0;
         center_scroll = 0;
@@ -10060,6 +10231,7 @@ static void draw_scene(void) {
     }
     draw_taskbar_menu();
     draw_net_popup();
+    draw_volume_panel();
     draw_volume_popup();
     draw_center();
     draw_toasts();
@@ -11446,7 +11618,8 @@ enum drag_mode {
     DRAG_SPLIT,
     DRAG_FILES, /* the Files selection (files_drag_*) */
     DRAG_TASKBAR, /* a taskbar button (taskbar_drag_motion) */
-    DRAG_TERMINAL /* a text selection in the Terminal */
+    DRAG_TERMINAL, /* a text selection in the Terminal */
+    DRAG_VOLUME /* the volume panel's slider */
 };
 
 /* A second title bar click this soon (in ticks) toggles maximize. */
@@ -11749,6 +11922,19 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         net_popup_open = true;
         return DESKTOP_CONTINUE;
     }
+    bool volume_panel_was_open = volume_panel_open;
+    volume_panel_open = false;
+    if (volume_panel_was_open && speaker_icon_visible()
+        && rect_contains(volume_panel_rect(), x, y)) {
+        volume_panel_open = true;
+        bool drag_slider;
+        volume_panel_press(x, y, &drag_slider);
+        if (drag_slider) {
+            drag->active = true;
+            drag->mode = DRAG_VOLUME;
+        }
+        return DESKTOP_CONTINUE;
+    }
     if (taskbar_menu_open) {
         taskbar_menu_open = false;
         for (size_t i = 0; i < TASKBAR_MENU_COUNT; i++) {
@@ -11798,6 +11984,13 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     if (taskbar_shown() && rect_contains(taskbar_rect(), x, y)) {
         if (net_icon_visible() && rect_contains(net_icon_rect(), x, y)) {
             net_popup_open = !net_popup_was_open;
+            start_menu_open = false;
+            return DESKTOP_CONTINUE;
+        }
+        if (speaker_icon_visible()
+            && rect_contains(speaker_icon_rect(), x, y)) {
+            volume_panel_open = !volume_panel_was_open;
+            volume_popup_until = 0;
             start_menu_open = false;
             return DESKTOP_CONTINUE;
         }
@@ -16047,7 +16240,7 @@ static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
     if (notches == 0 || protected_active || login_active || start_menu_open) {
         return false;
     }
-    if (center_wheel(x, y, notches)) {
+    if (center_wheel(x, y, notches) || volume_wheel(x, y, notches)) {
         return true;
     }
     enum window_kind kind = window_at(x, y);
@@ -16205,6 +16398,8 @@ static bool desktop_step(void) {
                 redraw |= terminal_drag_motion(
                     content_rect(window_rect(WINDOW_TERMINAL)),
                     mouse.x, mouse.y);
+            } else if (loop_drag.mode == DRAG_VOLUME) {
+                redraw |= volume_panel_open && volume_slider_set(mouse.x);
             } else {
                 redraw |= handle_drag(&loop_drag, mouse.x, mouse.y);
             }
@@ -16213,6 +16408,12 @@ static bool desktop_step(void) {
                 && loop_drag.mode == DRAG_FILES) {
                 files_drag_end(mouse.x, mouse.y);
                 redraw = true;
+            }
+            /* Saves the level the slider was let go at, with one click. */
+            if (was_pressed && loop_drag.active
+                && loop_drag.mode == DRAG_VOLUME) {
+                sound_set_volume(sound_volume());
+                system_sound_play(SYSTEM_SOUND_VOLUME);
             }
             loop_drag.active = false;
         }

@@ -67,6 +67,9 @@ void sound_process_exited(uint64_t owner);
 /* Master volume, 0-100, kept in the settings. Muting keeps the volume. */
 uint32_t sound_volume(void);
 void sound_set_volume(uint32_t volume);
+/* Changes the volume without saving it (while a slider is dragged); a
+   later sound_set_volume saves it. */
+void sound_set_volume_unsaved(uint32_t volume);
 bool sound_muted(void);
 void sound_set_muted(bool muted);
 

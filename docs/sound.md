@@ -130,6 +130,13 @@ driver's source, so the timer interrupt mixes every 10 ms:
   The shell has `volume [0-100|mute|unmute]`, and `sound` also prints the
   volume and how many streams are open. A volume slider in Settings is
   left for later.
+- **Taskbar.** With a sound output, a speaker icon sits between the bell
+  and the network icon: a cone with one to three waves by volume, or a
+  red cross when muted or at 0. A click opens a panel with the volume, a
+  slider (click or drag; saved when let go, so a drag writes the settings
+  once) and MUTE / UNMUTE. The wheel over the icon or the panel changes
+  the volume in steps of 5. While the panel is open, the volume keys do
+  not show their popup.
 - **Demo.** `/bin/play` (`sdk/examples/play.c`) plays a 16-bit PCM WAV
   file, mono or stereo, at any rate (converted to 48 kHz by linear
   interpolation). With no file it plays 440 Hz and then 880 Hz.

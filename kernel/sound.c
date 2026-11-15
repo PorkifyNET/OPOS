@@ -317,12 +317,13 @@ uint32_t sound_volume(void) {
     return volume;
 }
 
+void sound_set_volume_unsaved(uint32_t new_volume) {
+    volume = new_volume > 100 ? 100 : new_volume;
+}
+
 void sound_set_volume(uint32_t new_volume) {
-    if (new_volume > 100) {
-        new_volume = 100;
-    }
-    volume = new_volume;
-    settings_set_sound_volume((uint8_t)new_volume);
+    sound_set_volume_unsaved(new_volume);
+    settings_set_sound_volume((uint8_t)volume);
 }
 
 bool sound_muted(void) {

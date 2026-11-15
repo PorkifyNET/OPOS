@@ -20,7 +20,9 @@ hardware support remain future work.
   by dragging the gap between them (tiled), or with Super+Shift+arrows.
 - Taskbar with Start menu, window buttons and clock, on the bottom, top,
   left or right edge of the screen (per user). Right-click it for the window
-  layout, its position, Task Manager and taskbar settings.
+  layout, its position, Task Manager and taskbar settings. Status icons
+  beside the clock: notifications, volume (click for a slider and mute,
+  or use the wheel) and network.
 - Desktop apps: Terminal, Files, Text Editor, Image Viewer, Settings, Browser,
   and a Welcome window shown on each user's first login. Text Editor and
   Browser are native SDK programs; the others currently live in the desktop.

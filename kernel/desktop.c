@@ -9709,17 +9709,18 @@ static size_t store_category_index(const char *id, size_t length) {
  * category order with OTHER last. Each category opens a further submenu
  * (the "group" menu) with its programs sorted by name; when that list is
  * taller than the screen it scrolls. Built-in programs have fixed
- * categories. Packages take theirs from PROGRAMS_CATEGORY_FILE, which the
- * OPOS Store window writes from the signed index each time it lists the
- * Store (store_save_categories), so it holds only Store packages; loose
- * disk files and sideloaded packages are OTHER.
+ * categories. Packages take theirs from PROGRAMS_CATEGORY_FILE, which is
+ * written from the signed index when the OPOS Store window lists the Store
+ * (store_save_categories) and after each install from the Store
+ * (package_install), so it holds only Store packages; loose disk files and
+ * sideloaded packages are OTHER.
  */
 #define PROGRAMS_MAX 128
 #define PROGRAMS_NAME_CAPACITY 32
 #define PROGRAMS_DIRECTORY "/bin"
 #define PROGRAMS_DISK_DIRECTORY "/disk/Programs"
-#define PROGRAMS_CATEGORY_FILE "/disk/OPOS/STORE-CATEGORIES.TXT"
-#define PROGRAMS_CATEGORY_FILE_MAX 8192
+#define PROGRAMS_CATEGORY_FILE PACKAGE_CATEGORY_FILE
+#define PROGRAMS_CATEGORY_FILE_MAX PACKAGE_CATEGORY_FILE_MAX
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
 #define PROGRAMS_GROUPS (STORE_CATEGORIES + 1) /* the categories and OTHER */
 #define PROGRAMS_WHEEL_ROWS 3

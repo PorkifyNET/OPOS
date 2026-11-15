@@ -282,8 +282,9 @@ one account. The Store, the index and its key come in step 4.
   categories that have programs, in the Store's category order with
   OTHER last; each opens a submenu of its programs, which scrolls when it
   is taller than the screen. A Store package takes its category from the signed index:
-  each time the Store window lists the Store, the desktop saves every
-  listed id and category to `/disk/OPOS/STORE-CATEGORIES.TXT` (lines of
+  each time the Store window lists the Store, and after each install from
+  the Store (also `pkg install` in the Terminal), every listed id and
+  category is saved to `/disk/OPOS/STORE-CATEGORIES.TXT` (lines of
   `ID CATEGORY`). Built-in programs have fixed categories; loose programs
   and sideloaded packages are OTHER. Install records stay unchanged, so
   an older kernel still reads them.

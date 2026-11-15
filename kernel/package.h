@@ -122,6 +122,22 @@ enum package_result package_index_find(const char *text, size_t length,
                                        const char *id, const char *version,
                                        uint8_t hash[32], char *reason);
 
+/*
+ * Start > PROGRAMS takes each Store package's category from this file:
+ * lines of "ID CATEGORY". It is written from the signed index by the
+ * OPOS Store window each time it lists the Store, and by package_install
+ * after each install from the Store, so it does not wait for the window.
+ * Install records stay unchanged, so an older kernel still reads them.
+ */
+#define PACKAGE_CATEGORY_FILE "/disk/OPOS/STORE-CATEGORIES.TXT"
+#define PACKAGE_CATEGORY_FILE_MAX 8192
+
+/* The "ID CATEGORY" lines of an index that package_index_find accepted,
+   one per id with a category made of a-z and '-'; whole lines only, up to
+   capacity bytes. Returns the bytes written. */
+size_t package_index_categories(const char *text, size_t length, char *out,
+                                size_t capacity);
+
 /* "1.2.3" against "1.2.10": -1, 0 or 1. Both must be valid versions. */
 int package_compare_versions(const char *a, const char *b);
 bool package_version_valid(const char *text, size_t length);

@@ -774,6 +774,59 @@ static bool same_span(const char *a, size_t a_length, const char *b,
     return true;
 }
 
+size_t package_index_categories(const char *text, size_t length, char *out,
+                                size_t capacity) {
+    size_t used = 0;
+    const char *id = NULL;     /* the current entry's id */
+    size_t id_length = 0;
+    const char *last = NULL;   /* the id of the last line written */
+    size_t last_length = 0;
+    for (size_t line = 0; line < length;) {
+        size_t end = line;
+        while (end < length && text[end] != '\n') {
+            end++;
+        }
+        const char *at = text + line;
+        size_t line_length = end - line;
+        line = end + 1;
+        size_t value_length;
+        const char *value = index_value(at, line_length, "entry",
+                                        &value_length);
+        if (value != NULL) {
+            id = value;
+            id_length = 0;
+            while (id_length < value_length && value[id_length] != ' ') {
+                id_length++;
+            }
+            continue;
+        }
+        value = index_value(at, line_length, "category", &value_length);
+        if (value == NULL || id == NULL || value_length == 0
+            || value_length > 32
+            || (last != NULL && same_span(last, last_length, id, id_length))) {
+            continue;
+        }
+        bool plain = true;
+        for (size_t i = 0; i < value_length && plain; i++) {
+            plain = (value[i] >= 'a' && value[i] <= 'z') || value[i] == '-';
+        }
+        if (!plain || used + id_length + value_length + 2 > capacity) {
+            continue;
+        }
+        for (size_t i = 0; i < id_length; i++) {
+            out[used++] = id[i];
+        }
+        out[used++] = ' ';
+        for (size_t i = 0; i < value_length; i++) {
+            out[used++] = value[i];
+        }
+        out[used++] = '\n';
+        last = id;
+        last_length = id_length;
+    }
+    return used;
+}
+
 enum package_result package_index_find(const char *text, size_t length,
                                        const char *id, const char *version,
                                        uint8_t hash[32], char *reason) {

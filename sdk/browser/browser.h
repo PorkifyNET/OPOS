@@ -285,7 +285,24 @@ struct page {
     size_t field_count;
     size_t field_capacity;
     const struct opos_html_node *focus; /* the text field being typed in */
+    /* The #fragment target; layout_page sets anchor_y to its top (-1 when
+       it was not laid out). */
+    const struct opos_html_node *anchor;
+    int anchor_y;
 };
+
+/* library.c: bookmarks, history and downloads. data_dir "" keeps them
+   only in memory. */
+void library_open(const char *data_dir);
+bool bookmark_has(const char *url);
+/* Adds or removes the bookmark; true when it is now bookmarked. */
+bool bookmark_toggle(const char *url, const char *title);
+void history_add(const char *url, const char *title);
+void download_record(const char *name, const char *path,
+                     unsigned long long size, bool failed);
+/* The HTML of about:home, about:bookmarks (?remove=N), about:history
+   (?clear), about:downloads or about:blank; malloc'd. */
+char *about_page(const char *url, size_t *length);
 
 /* form.c */
 enum field_kind form_kind(const struct opos_html_node *node);

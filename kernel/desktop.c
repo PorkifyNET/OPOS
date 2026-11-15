@@ -4895,6 +4895,12 @@ static bool store_running;
 static bool store_loaded;
 static size_t store_update_count;
 static bool settings_in_sidebar = true;
+/* The home page (see "settings home"): tiles for the pages and a search. */
+static bool settings_home;
+static void draw_settings_home(struct rect area, bool focused);
+static void settings_home_key(struct rect area, char character);
+static void settings_home_click(struct rect area, int32_t x, int32_t y);
+static void settings_home_wheel(struct rect area, int32_t notches);
 /* First row shown; rows scroll so the selected one stays visible. */
 static size_t settings_scroll;
 
@@ -4938,12 +4944,17 @@ static struct rect settings_sidebar_rect(struct rect area) {
     return (struct rect){area.x, area.y, width, area.height};
 }
 
-static struct rect settings_category_rect(struct rect area, size_t index) {
+/* Sidebar slot 0 is "< HOME", the pages follow. */
+static struct rect settings_sidebar_slot(struct rect area, size_t slot) {
     struct rect sidebar = settings_sidebar_rect(area);
     return (struct rect){sidebar.x + 6,
                          sidebar.y + 10
-                             + (int64_t)index * SETTINGS_CATEGORY_HEIGHT,
+                             + (int64_t)slot * SETTINGS_CATEGORY_HEIGHT,
                          sidebar.width - 12, SETTINGS_CATEGORY_HEIGHT - 4};
+}
+
+static struct rect settings_category_rect(struct rect area, size_t index) {
+    return settings_sidebar_slot(area, index + 1);
 }
 
 /* The page: the window without the sidebar. */
@@ -5164,9 +5175,16 @@ static void setting_value_text(const struct setting_row *row,
 }
 
 static void draw_settings(struct rect area, bool focused) {
+    if (settings_home) {
+        draw_settings_home(area, focused);
+        return;
+    }
     fill(area, 24, 30, 46);
     struct rect sidebar = settings_sidebar_rect(area);
     fill(sidebar, 30, 38, 58);
+    struct rect home = settings_sidebar_slot(area, 0);
+    draw_text_clipped(home.x + 10, home.y + (home.height - CHAR_HEIGHT) / 2,
+                      home.width - 20, "< HOME", 151, 190, 255);
     for (size_t i = 0; i < CATEGORY_COUNT; i++) {
         struct rect item = settings_category_rect(area, i);
         if (item.y + item.height > sidebar.y + sidebar.height) {
@@ -5185,7 +5203,7 @@ static void draw_settings(struct rect area, bool focused) {
     struct rect page = settings_page_rect(area);
     size_t count = settings_row_count();
     const char *hint = settings_in_sidebar || !settings_page_has_focus()
-        ? "UP/DOWN: PAGE  TAB: OPEN"
+        ? "UP/DOWN: PAGE  TAB: OPEN  ESC: HOME"
         : settings_category == CATEGORY_ACCOUNTS
         ? "N R P A I DEL: ACTIONS  TAB: PAGES"
         : settings_category == CATEGORY_UPDATES
@@ -5478,7 +5496,11 @@ static void settings_change(size_t index, int delta) {
  * anywhere. On the ACCOUNTS page the other keys go to the accounts
  * manager, and all keys do while it asks for a name or password.
  */
-static void settings_key(char character) {
+static void settings_key(struct rect area, char character) {
+    if (settings_home) {
+        settings_home_key(area, character);
+        return;
+    }
     size_t count = settings_row_count();
     bool accounts_page = settings_category == CATEGORY_ACCOUNTS
                        && !settings_in_sidebar;
@@ -5502,6 +5524,8 @@ static void settings_key(char character) {
         } else if ((character == '\t' || character == '\n'
                     || character == KEY_RIGHT) && settings_page_has_focus()) {
             settings_in_sidebar = false;
+        } else if (character == KEY_ESCAPE) {
+            settings_home = true;
         }
         return;
     }
@@ -5524,6 +5548,14 @@ static void settings_key(char character) {
 }
 
 static void settings_click(struct rect area, int32_t x, int32_t y) {
+    if (settings_home) {
+        settings_home_click(area, x, y);
+        return;
+    }
+    if (rect_contains(settings_sidebar_slot(area, 0), x, y)) {
+        settings_home = true;
+        return;
+    }
     for (size_t i = 0; i < CATEGORY_COUNT; i++) {
         if (rect_contains(settings_category_rect(area, i), x, y)) {
             if (i != settings_category) {
@@ -5644,6 +5676,513 @@ static void draw_text_button(struct rect area, const char *label,
     fill(area, 43, 48, 60);
     draw_text_clipped(area.x + 10, area.y + (area.height - CHAR_HEIGHT) / 2,
                       area.width - 20, label, 110, 118, 135);
+}
+
+/* ------------------------------------------------------- settings home */
+
+/*
+ * The page Settings opens on: a search field and a tile per settings page
+ * (icon, name, what it holds). Typing searches the settings' names and
+ * the pages' names, summaries and keywords; the results replace the
+ * tiles. Arrows pick a tile or result, Enter or a click opens it, Esc
+ * clears the search and Tab goes to the pages.
+ */
+
+#define SETTINGS_SEARCH_MAX 24
+#define SETTINGS_TILE_MIN_WIDTH 210
+#define SETTINGS_TILE_HEIGHT 102
+#define SETTINGS_TILE_GAP 12
+#define SETTINGS_RESULT_HEIGHT 36
+#define SETTINGS_RESULTS_MAX (SETTING_ROW_TOTAL + CATEGORY_COUNT)
+#define SETTINGS_ICON_SIZE 16
+
+static const char *const category_summaries[CATEGORY_COUNT] = {
+    "BOOT, TERMINAL", "USERS, PASSWORDS", "RESOLUTION", "VOLUME, ALERTS",
+    "THEME, BACKGROUND", "WINDOWS, TASKBAR", "CLOCK, DATE",
+    "TAP, SCROLLING", "OPOS, PROGRAMS", "VERSION, MEMORY",
+};
+
+/* Words that find a page without showing on its tile. */
+static const char *const category_keywords[CATEGORY_COUNT] = {
+    "BOOT STARTUP START-UP TERMINAL COLORS CONFIG",
+    "USER USERS ACCOUNT PASSWORD ADMIN ADMINISTRATOR PICTURE AVATAR "
+    "SIGN IN LOGIN NAME",
+    "SCREEN MONITOR RESOLUTION SIZE AUTOFIT",
+    "AUDIO VOLUME SPEAKER MUTE NOTIFICATIONS ALERTS DISTURB",
+    "THEME COLOR COLOUR DARK LIGHT WALLPAPER BACKGROUND PICTURE",
+    "WINDOWS TILING FLOATING LAYOUT TASKBAR AUTO-HIDE",
+    "CLOCK TIME DATE CALENDAR 12-HOUR 24-HOUR FORMAT",
+    "MOUSE POINTER CURSOR TAP SCROLL SPEED TRACKPAD",
+    "UPDATE UPGRADE VERSION STORE PROGRAMS INSTALL",
+    "VERSION SYSTEM INFORMATION MEMORY RAM UPTIME DISKS HARDWARE",
+};
+
+/* 16x16 icons: '#' in the accent colour, r/g/b/y in those colours. */
+static const char *const category_icons[CATEGORY_COUNT][SETTINGS_ICON_SIZE] = {
+    { /* SYSTEM: a chip */
+        "................", "...#..#..#..#...", "..############..",
+        "..#..........#..", "###.########.###", "..#.#......#.#..",
+        "..#.#......#.#..", "###.#......#.###", "..#.#......#.#..",
+        "..#.#......#.#..", "###.########.###", "..#..........#..",
+        "..############..", "...#..#..#..#...", "................",
+        "................",
+    },
+    { /* ACCOUNTS: a person */
+        "................", "......####......", ".....######.....",
+        ".....######.....", ".....######.....", ".....######.....",
+        "......####......", "................", "....########....",
+        "...##########...", "..############..", "..############..",
+        "..############..", "..############..", "................",
+        "................",
+    },
+    { /* DISPLAY: a monitor */
+        "................", ".##############.", ".#............#.",
+        ".#............#.", ".#............#.", ".#............#.",
+        ".#............#.", ".#............#.", ".#............#.",
+        ".##############.", "......####......", "......####......",
+        "....########....", "................", "................",
+        "................",
+    },
+    { /* SOUND: a speaker */
+        "................", "......#.........", ".....##.....#...",
+        "....###...#..#..", "#######....#..#.", "#######..#..#.#.",
+        "#######...#.#.#.", "#######...#.#.#.", "#######..#..#.#.",
+        "#######....#..#.", "....###...#..#..", ".....##.....#...",
+        "......#.........", "................", "................",
+        "................",
+    },
+    { /* APPEARANCE: colour swatches */
+        "................", ".rrrrrr..gggggg.", ".rrrrrr..gggggg.",
+        ".rrrrrr..gggggg.", ".rrrrrr..gggggg.", ".rrrrrr..gggggg.",
+        ".rrrrrr..gggggg.", "................", "................",
+        ".bbbbbb..yyyyyy.", ".bbbbbb..yyyyyy.", ".bbbbbb..yyyyyy.",
+        ".bbbbbb..yyyyyy.", ".bbbbbb..yyyyyy.", ".bbbbbb..yyyyyy.",
+        "................",
+    },
+    { /* DESKTOP: two tiled windows over a taskbar */
+        "................", "#######.########", "#######.########",
+        "#.....#.#......#", "#.....#.#......#", "#.....#.#......#",
+        "#.....#.#......#", "#.....#.#......#", "#.....#.#......#",
+        "#######.########", "................", "################",
+        "################", "................", "................",
+        "................",
+    },
+    { /* DATE & TIME: a calendar */
+        "................", "...#........#...", "################",
+        "################", "#..............#", "#.##.##..##.##.#",
+        "#.##.##..##.##.#", "#..............#", "#.##.##..##.##.#",
+        "#.##.##..##.##.#", "#..............#", "#.##.##..##....#",
+        "#.##.##..##....#", "#..............#", "################",
+        "................",
+    },
+    { /* TOUCHPAD */
+        "................", ".##############.", ".#............#.",
+        ".#............#.", ".#............#.", ".#............#.",
+        ".#............#.", ".#............#.", ".#............#.",
+        ".##############.", ".#.....##.....#.", ".#.....##.....#.",
+        ".##############.", "................", "................",
+        "................",
+    },
+    { /* UPDATES: an arrow into a tray */
+        "................", "......####......", "......####......",
+        "......####......", "......####......", "......####......",
+        "......####......", "..############..", "...##########...",
+        "....########....", ".....######.....", "#.....####.....#",
+        "#......##......#", "#..............#", "################",
+        "................",
+    },
+    { /* ABOUT: an i */
+        "................", ".##############.", ".#............#.",
+        ".#.....##.....#.", ".#.....##.....#.", ".#............#.",
+        ".#....###.....#.", ".#.....##.....#.", ".#.....##.....#.",
+        ".#.....##.....#.", ".#.....##.....#.", ".#....####....#.",
+        ".#............#.", ".##############.", "................",
+        "................",
+    },
+};
+
+static bool settings_home = true;
+static struct text_field settings_search;
+static size_t settings_home_focus;
+static size_t settings_home_scroll; /* first tile row or result shown */
+static bool settings_home_reveal;   /* scroll so the focus shows */
+
+/* A search result: a page, or one of its settings (row in setting_rows). */
+struct settings_result {
+    enum settings_category category;
+    size_t row; /* SETTING_ROW_TOTAL for the page itself */
+};
+
+static void settings_search_ready(void) {
+    if (settings_search.limit == 0) {
+        field_reset(&settings_search, SETTINGS_SEARCH_MAX, false);
+    }
+}
+
+static char settings_upper(char character) {
+    return character >= 'a' && character <= 'z' ? (char)(character - 32)
+                                                : character;
+}
+
+/* Whether text holds word (length bytes), ignoring case. */
+static bool settings_text_has(const char *text, const char *word,
+                              size_t length) {
+    for (size_t start = 0; text[start] != '\0'; start++) {
+        size_t i = 0;
+        while (i < length && text[start + i] != '\0'
+               && settings_upper(text[start + i]) == settings_upper(word[i])) {
+            i++;
+        }
+        if (i == length) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether every word of the search is in one of the texts. */
+static bool settings_search_matches(const char *const *texts, size_t count) {
+    const char *query = settings_search.text;
+    size_t start = 0;
+    bool any = false;
+    while (query[start] != '\0') {
+        while (query[start] == ' ') {
+            start++;
+        }
+        size_t end = start;
+        while (query[end] != '\0' && query[end] != ' ') {
+            end++;
+        }
+        if (end == start) {
+            break;
+        }
+        bool found = false;
+        for (size_t i = 0; i < count && !found; i++) {
+            found = settings_text_has(texts[i], query + start, end - start);
+        }
+        if (!found) {
+            return false;
+        }
+        any = true;
+        start = end;
+    }
+    return any;
+}
+
+/* The results for the search: matching pages first, then settings. */
+static size_t settings_search_results(struct settings_result *results) {
+    size_t count = 0;
+    for (size_t i = 0; i < CATEGORY_COUNT; i++) {
+        const char *texts[] = {category_names[i], category_summaries[i],
+                               category_keywords[i]};
+        if (settings_search_matches(texts, 3)) {
+            results[count++] = (struct settings_result){
+                (enum settings_category)i, SETTING_ROW_TOTAL};
+        }
+    }
+    for (size_t i = 0; i < SETTING_ROW_TOTAL; i++) {
+        const char *texts[] = {setting_rows[i].label,
+                               category_names[setting_rows[i].category]};
+        if (settings_search_matches(texts, 2)) {
+            results[count++] = (struct settings_result){
+                setting_rows[i].category, i};
+        }
+    }
+    return count;
+}
+
+/* Where things go on the home page; tiles and results in view only. */
+struct settings_home_view {
+    struct rect field;
+    int64_t content_top;
+    size_t columns;
+    size_t visible;       /* tile rows or results that fit */
+    size_t count;         /* tiles or results in all */
+    bool searching;
+    struct settings_result results[SETTINGS_RESULTS_MAX];
+};
+
+static void settings_home_layout(struct rect area,
+                                 struct settings_home_view *view) {
+    int64_t field_width = area.width - 32 < 480 ? area.width - 32 : 480;
+    view->field = (struct rect){area.x + (area.width - field_width) / 2,
+                                area.y + 72, field_width, 32};
+    view->content_top = view->field.y + view->field.height + 20;
+    int64_t room = area.y + area.height - 8 - view->content_top;
+    int64_t width = area.width - 32 + SETTINGS_TILE_GAP;
+    int64_t columns = width / (SETTINGS_TILE_MIN_WIDTH + SETTINGS_TILE_GAP);
+    view->columns = columns < 1 ? 1 : columns > 5 ? 5 : (size_t)columns;
+    view->searching = settings_search.length != 0;
+    if (view->searching) {
+        view->count = settings_search_results(view->results);
+        int64_t fit = room / SETTINGS_RESULT_HEIGHT;
+        view->visible = fit < 1 ? 1 : (size_t)fit;
+    } else {
+        view->count = CATEGORY_COUNT;
+        int64_t fit = (room + SETTINGS_TILE_GAP)
+                    / (SETTINGS_TILE_HEIGHT + SETTINGS_TILE_GAP);
+        view->visible = fit < 1 ? 1 : (size_t)fit;
+    }
+    /* Keep the focus in range and (after a key) in view. */
+    if (settings_home_focus >= view->count) {
+        settings_home_focus = view->count == 0 ? 0 : view->count - 1;
+    }
+    size_t lines = view->searching
+        ? view->count : (view->count + view->columns - 1) / view->columns;
+    size_t focus_line = view->searching
+        ? settings_home_focus : settings_home_focus / view->columns;
+    if (settings_home_reveal) {
+        if (focus_line < settings_home_scroll) {
+            settings_home_scroll = focus_line;
+        } else if (focus_line >= settings_home_scroll + view->visible) {
+            settings_home_scroll = focus_line + 1 - view->visible;
+        }
+        settings_home_reveal = false;
+    }
+    if (settings_home_scroll + view->visible > lines) {
+        settings_home_scroll = lines > view->visible ? lines - view->visible
+                                                     : 0;
+    }
+}
+
+/* Where tile index (a page) is; width 0 when it is scrolled out of view. */
+static struct rect settings_tile_rect(struct rect area,
+                                      const struct settings_home_view *view,
+                                      size_t index) {
+    size_t line = index / view->columns;
+    if (line < settings_home_scroll
+        || line >= settings_home_scroll + view->visible) {
+        return (struct rect){0, 0, 0, 0};
+    }
+    int64_t width = (area.width - 32
+                     - (int64_t)(view->columns - 1) * SETTINGS_TILE_GAP)
+                  / (int64_t)view->columns;
+    size_t column = index % view->columns;
+    return (struct rect){
+        area.x + 16 + (int64_t)column * (width + SETTINGS_TILE_GAP),
+        view->content_top + (int64_t)(line - settings_home_scroll)
+                                * (SETTINGS_TILE_HEIGHT + SETTINGS_TILE_GAP),
+        width, SETTINGS_TILE_HEIGHT};
+}
+
+static struct rect settings_result_rect(struct rect area,
+                                        const struct settings_home_view *view,
+                                        size_t index) {
+    if (index < settings_home_scroll
+        || index >= settings_home_scroll + view->visible) {
+        return (struct rect){0, 0, 0, 0};
+    }
+    return (struct rect){
+        area.x + 16,
+        view->content_top + (int64_t)(index - settings_home_scroll)
+                                * SETTINGS_RESULT_HEIGHT,
+        area.width - 32, SETTINGS_RESULT_HEIGHT - 4};
+}
+
+/* Draws icon at (x, y), each of its pixels scale x scale. */
+static void draw_settings_icon(int64_t x, int64_t y, int64_t scale,
+                               enum settings_category category) {
+    for (size_t row = 0; row < SETTINGS_ICON_SIZE; row++) {
+        const char *line = category_icons[category][row];
+        size_t column = 0;
+        while (column < SETTINGS_ICON_SIZE) {
+            char kind = line[column];
+            size_t run = 1;
+            while (column + run < SETTINGS_ICON_SIZE
+                   && line[column + run] == kind) {
+                run++;
+            }
+            uint8_t red = 151, green = 190, blue = 255;
+            if (kind == 'r') {
+                red = 235, green = 90, blue = 90;
+            } else if (kind == 'g') {
+                red = 90, green = 200, blue = 120;
+            } else if (kind == 'b') {
+                red = 80, green = 140, blue = 240;
+            } else if (kind == 'y') {
+                red = 240, green = 200, blue = 80;
+            }
+            if (kind != '.') {
+                fill((struct rect){x + (int64_t)column * scale,
+                                   y + (int64_t)row * scale,
+                                   (int64_t)run * scale, scale},
+                     red, green, blue);
+            }
+            column += run;
+        }
+    }
+}
+
+/* Draws text centred in [x, x + width). */
+static void draw_text_centered(int64_t x, int64_t y, int64_t width,
+                               const char *text, uint8_t red, uint8_t green,
+                               uint8_t blue) {
+    int64_t text_width = (int64_t)text_length(text) * CHAR_WIDTH;
+    if (text_width > width) {
+        text_width = width;
+    }
+    draw_text_clipped(x + (width - text_width) / 2, y, width, text, red,
+                      green, blue);
+}
+
+static void draw_settings_home(struct rect area, bool focused) {
+    settings_search_ready();
+    fill(area, 24, 30, 46);
+    struct settings_home_view view;
+    settings_home_layout(area, &view);
+    draw_text_clipped(area.x + 16, area.y + 14, area.width - 32,
+                      "TYPE TO SEARCH  ARROWS: PICK  ENTER: OPEN"
+                      "  TAB: PAGES", 151, 190, 235);
+    draw_text_centered(area.x, area.y + 44, area.width, "OPOS SETTINGS",
+                       240, 245, 255);
+    draw_field(view.field, &settings_search, focused);
+    if (settings_search.length == 0) {
+        draw_text_clipped(view.field.x + 8 + (focused ? CHAR_WIDTH : 0),
+                          view.field.y + (view.field.height - CHAR_HEIGHT) / 2,
+                          view.field.width - 16 - CHAR_WIDTH,
+                          "FIND A SETTING", 110, 120, 150);
+    }
+    if (view.searching) {
+        if (view.count == 0) {
+            draw_text_centered(area.x, view.content_top + 8, area.width,
+                               "NO SETTINGS MATCH", 151, 160, 190);
+        }
+        for (size_t i = 0; i < view.count; i++) {
+            struct rect row = settings_result_rect(area, &view, i);
+            if (row.width == 0) {
+                continue;
+            }
+            const struct settings_result *result = &view.results[i];
+            bool chosen = focused && i == settings_home_focus;
+            fill(row, chosen ? 52 : 34, chosen ? 82 : 42, chosen ? 140 : 64);
+            draw_settings_icon(row.x + 8, row.y + (row.height - 16) / 2, 1,
+                               result->category);
+            const char *page = category_names[result->category];
+            int64_t page_width = (int64_t)text_length(page) * CHAR_WIDTH;
+            int64_t text_y = row.y + (row.height - CHAR_HEIGHT) / 2;
+            const char *label = result->row < SETTING_ROW_TOTAL
+                ? setting_rows[result->row].label : page;
+            draw_text_clipped(row.x + 34, text_y,
+                              row.width - 34 - page_width - 24, label, 230,
+                              238, 255);
+            if (result->row < SETTING_ROW_TOTAL) {
+                draw_text_clipped(row.x + row.width - 10 - page_width,
+                                  text_y, page_width, page, 130, 150, 190);
+            }
+        }
+        return;
+    }
+    for (size_t i = 0; i < CATEGORY_COUNT; i++) {
+        struct rect tile = settings_tile_rect(area, &view, i);
+        if (tile.width == 0) {
+            continue;
+        }
+        bool chosen = focused && i == settings_home_focus;
+        fill(tile, chosen ? 52 : 34, chosen ? 82 : 42, chosen ? 140 : 64);
+        draw_settings_icon(tile.x + (tile.width - 32) / 2, tile.y + 12, 2,
+                           (enum settings_category)i);
+        draw_text_centered(tile.x + 6, tile.y + 52, tile.width - 12,
+                           category_names[i], 240, 245, 255);
+        draw_text_centered(tile.x + 6, tile.y + 52 + CHAR_HEIGHT + 4,
+                           tile.width - 12, category_summaries[i], 151, 160,
+                           190);
+    }
+}
+
+/* Opens a page from the home page: a tile, or a search result. */
+static void settings_home_open(const struct settings_home_view *view,
+                               size_t index) {
+    if (index >= view->count) {
+        return;
+    }
+    enum settings_category category = (enum settings_category)index;
+    size_t row = SETTING_ROW_TOTAL;
+    if (view->searching) {
+        category = view->results[index].category;
+        row = view->results[index].row;
+    }
+    settings_home = false;
+    settings_show_category(category);
+    settings_in_sidebar = !settings_page_has_focus();
+    if (row < SETTING_ROW_TOTAL) {
+        /* Select that setting: its place among the page's rows. */
+        size_t place = 0;
+        for (size_t i = 0; i < row; i++) {
+            place += setting_rows[i].category == category ? 1 : 0;
+        }
+        settings_selection = place;
+    }
+}
+
+static void settings_home_key(struct rect area, char character) {
+    settings_search_ready();
+    struct settings_home_view view;
+    settings_home_layout(area, &view);
+    size_t step = view.searching ? 1 : view.columns;
+    if (character == '\n') {
+        settings_home_open(&view, settings_home_focus);
+    } else if (character == '\t') {
+        settings_home = false;
+        settings_in_sidebar = true;
+    } else if (character == KEY_ESCAPE) {
+        field_set(&settings_search, "");
+        settings_home_focus = 0;
+        settings_home_scroll = 0;
+    } else if (character == KEY_UP || character == KEY_DOWN
+               || character == KEY_LEFT || character == KEY_RIGHT
+               || character == KEY_HOME || character == KEY_END) {
+        size_t focus = settings_home_focus;
+        if (view.count == 0) {
+            return;
+        }
+        if (character == KEY_LEFT && !view.searching && focus > 0) {
+            focus--;
+        } else if (character == KEY_RIGHT && !view.searching
+                   && focus + 1 < view.count) {
+            focus++;
+        } else if (character == KEY_UP && focus >= step) {
+            focus -= step;
+        } else if (character == KEY_DOWN && focus + step < view.count) {
+            focus += step;
+        } else if (character == KEY_HOME) {
+            focus = 0;
+        } else if (character == KEY_END) {
+            focus = view.count - 1;
+        }
+        settings_home_focus = focus;
+        settings_home_reveal = true;
+    } else if (field_key(&settings_search, character)) {
+        settings_home_focus = 0;
+        settings_home_scroll = 0;
+    }
+}
+
+static void settings_home_click(struct rect area, int32_t x, int32_t y) {
+    settings_search_ready();
+    struct settings_home_view view;
+    settings_home_layout(area, &view);
+    for (size_t i = 0; i < view.count; i++) {
+        struct rect box = view.searching
+            ? settings_result_rect(area, &view, i)
+            : settings_tile_rect(area, &view, i);
+        if (box.width != 0 && rect_contains(box, x, y)) {
+            settings_home_focus = i;
+            settings_home_open(&view, i);
+            return;
+        }
+    }
+}
+
+static void settings_home_wheel(struct rect area, int32_t notches) {
+    struct settings_home_view view;
+    settings_home_layout(area, &view);
+    size_t lines = view.searching
+        ? view.count : (view.count + view.columns - 1) / view.columns;
+    int64_t next = (int64_t)settings_home_scroll - notches;
+    int64_t last = lines > view.visible ? (int64_t)(lines - view.visible)
+                                        : 0;
+    settings_home_scroll = next < 0 ? 0 : next > last ? (size_t)last
+                                                      : (size_t)next;
 }
 
 /* --------------------------------------- protected system-file confirmation */
@@ -10456,8 +10995,21 @@ static void taskbar_set_autohide(bool hide) {
 
 static void settings_open_category(enum settings_category category) {
     window_open(WINDOW_SETTINGS);
+    settings_home = false;
     settings_show_category(category);
     settings_in_sidebar = false;
+}
+
+/* Start > Settings and Super+I: a newly opened Settings starts at home. */
+static void settings_open(void) {
+    if (!windows[WINDOW_SETTINGS].open) {
+        settings_home = true;
+        settings_home_focus = 0;
+        settings_home_scroll = 0;
+        settings_search_ready();
+        field_set(&settings_search, "");
+    }
+    window_open(WINDOW_SETTINGS);
 }
 
 static void taskbar_menu_activate(size_t item) {
@@ -10538,7 +11090,7 @@ static enum desktop_result menu_activate(enum menu_action action) {
         store_open();
         break;
     case MENU_SETTINGS:
-        window_open(WINDOW_SETTINGS);
+        settings_open();
         break;
     case MENU_INSTALL:
         installer_open();
@@ -12579,7 +13131,7 @@ static enum desktop_result handle_super_key(char character) {
     switch (character) {
     case 'i':
     case 'I':
-        window_open(WINDOW_SETTINGS);
+        settings_open();
         break;
     case 'n':
     case 'N':
@@ -12716,7 +13268,7 @@ static enum desktop_result handle_key(char character, bool super) {
     } else if (z_count != 0 && window_is_app(z_order[z_count - 1])) {
         app_key(z_order[z_count - 1] - WINDOW_APP, character);
     } else if (z_count != 0 && z_order[z_count - 1] == WINDOW_SETTINGS) {
-        settings_key(character);
+        settings_key(content_rect(window_rect(WINDOW_SETTINGS)), character);
     }
     return DESKTOP_CONTINUE;
 }
@@ -16508,6 +17060,10 @@ static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
         return true;
     }
     if (kind == WINDOW_SETTINGS) {
+        if (settings_home) {
+            settings_home_wheel(area, notches);
+            return true;
+        }
         struct rect page = settings_page_rect(area);
         if (x < page.x) {
             /* Over the sidebar: the wheel flips through the pages. */

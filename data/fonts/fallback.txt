@@ -1,0 +1,26 @@
+# Fallback fonts: characters a font lacks are drawn with the first font
+# below that lists them and has them (sdk/lib/ttf.c). One font per line:
+#   PATH RANGE...   (hex code points; FROM-TO; "~/" is the home folder)
+# A font is read only when one of its characters is first needed.
+
+# Noto Sans with all its characters (the shipped NotoSans-* files are cut
+# down to Latin, Greek and Cyrillic): Vietnamese, the rest of Latin,
+# phonetic letters, punctuation, currency and letter-like symbols.
+/share/fonts/NotoSans-Regular-Full.ttf 0080-052F 1AB0-1AFF 1C80-1C8F 1D00-1FFF 2000-218F 2C60-2C7F 2DE0-2DFF A640-A69F A700-A7FF AB30-AB6F FB00-FB06 FE20-FE2F
+
+# Symbols: arrows, technical symbols, box drawing, shapes, dingbats,
+# braille, playing cards, chess.
+/share/fonts/NotoSansSymbols2-Regular.ttf 2190-2BFF 1F000-1FBFF
+/share/fonts/NotoSansSymbols-Regular.ttf 20D0-2BFF 1F000-1FBFF
+
+# Scripts drawn without text shaping.
+/share/fonts/NotoSansArmenian-Regular.ttf 0530-058F FB13-FB17
+/share/fonts/NotoSansGeorgian-Regular.ttf 10A0-10FF 1C90-1CBF 2D00-2D2F
+/share/fonts/NotoSansThai-Regular.ttf 0E00-0E7F
+/share/fonts/NotoSansEthiopic-Regular.ttf 1200-139F 2D80-2DDF AB00-AB2F 1E7E0-1E7FF
+
+# Chinese, Japanese and Korean: the Store package "Chinese, Japanese,
+# Korean fonts" (store/fonts/cjk), installed for everyone or for
+# one account.
+/disk/Programs/net.porkify.opos.fonts-cjk/DroidSansFallbackFull.ttf 1100-11FF 2E80-2FDF 3000-33FF 3400-4DBF 4E00-9FFF A960-A97F AC00-D7FF F900-FAFF FE30-FE4F FF00-FFEF 20000-2FA1F
+~/Programs/net.porkify.opos.fonts-cjk/DroidSansFallbackFull.ttf 1100-11FF 2E80-2FDF 3000-33FF 3400-4DBF 4E00-9FFF A960-A97F AC00-D7FF F900-FAFF FE30-FE4F FF00-FFEF 20000-2FA1F

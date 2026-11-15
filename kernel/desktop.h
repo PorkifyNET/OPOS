@@ -68,6 +68,10 @@ int64_t desktop_app_window_options(uint64_t owner, uint32_t options);
    Returns 0, -9 without a window, or -22 for a zero or too large size. */
 int64_t desktop_app_window_resize(uint64_t owner, uint32_t width,
                                   uint32_t height);
+/* Changes the window's title (printable ASCII; other bytes are dropped,
+   at most 31 kept). Returns 0, or -9 without a window. */
+int64_t desktop_app_window_title(uint64_t owner, const char *title,
+                                 size_t title_length);
 /* The screen size as width << 32 | height (what a full-screen window
    gets), or 0 without a screen. */
 uint64_t desktop_screen_size(void);

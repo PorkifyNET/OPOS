@@ -86,6 +86,164 @@ struct opos_font {
     uint32_t fallback; /* code point drawn for missing characters */
 };
 
+/* ------------------------------------------------------ fallback fonts */
+
+/*
+ * Characters a font lacks are drawn with the first fallback font that has
+ * them. /share/fonts/fallback.txt lists those fonts, one per line:
+ *
+ *   PATH RANGE...          e.g. /share/fonts/NotoSansThai-Regular.ttf 0E00-0E7F
+ *
+ * RANGE is a hex code point or FROM-TO. A path may start with "~/" for
+ * the account's home folder (fonts installed for one account). Missing
+ * files are skipped. A font is read only when a character in its ranges
+ * is first needed, so large ones cost nothing on pages that do not use
+ * them.
+ */
+#define FALLBACK_LIST "/share/fonts/fallback.txt"
+#define FALLBACK_MAX 32
+#define FALLBACK_RANGES 24
+
+struct fallback_font {
+    char path[192];
+    uint32_t from[FALLBACK_RANGES], to[FALLBACK_RANGES];
+    int range_count;
+    bool tried;           /* loading was attempted */
+    struct opos_font *font;
+};
+
+static struct fallback_font fallbacks[FALLBACK_MAX];
+static int fallback_count = -1; /* -1: the list was not read yet */
+
+static uint32_t parse_hex(const char **p) {
+    uint32_t value = 0;
+    for (;;) {
+        char c = **p;
+        int digit = c >= '0' && c <= '9' ? c - '0'
+                  : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                  : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (digit < 0 || value > 0x10ffff) {
+            return value;
+        }
+        value = value * 16 + (uint32_t)digit;
+        (*p)++;
+    }
+}
+
+static void fallback_read_list(void) {
+    fallback_count = 0;
+    long fd = opos_open(FALLBACK_LIST, OPOS_O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    char text[8192];
+    size_t length = 0;
+    for (;;) {
+        long got = opos_read((int)fd, text + length,
+                             sizeof(text) - 1 - length < 4096
+                                 ? sizeof(text) - 1 - length : 4096);
+        if (got <= 0) {
+            break;
+        }
+        length += (size_t)got;
+        if (length == sizeof(text) - 1) {
+            break;
+        }
+    }
+    opos_close((int)fd);
+    text[length] = '\0';
+
+    char home[128] = "";
+    struct opos_user_info user;
+    if (opos_user_info(&user) == 0 && user.home[0] != '\0') {
+        memcpy(home, user.home, sizeof(home));
+        home[sizeof(home) - 1] = '\0';
+    }
+    for (const char *p = text; *p != '\0' && fallback_count < FALLBACK_MAX;) {
+        const char *end = strchr(p, '\n');
+        if (end == NULL) {
+            end = p + strlen(p);
+        }
+        while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+        if (p < end && *p != '#') {
+            struct fallback_font *f = &fallbacks[fallback_count];
+            memset(f, 0, sizeof(*f));
+            const char *name = p;
+            while (p < end && *p != ' ' && *p != '\t') {
+                p++;
+            }
+            size_t name_length = (size_t)(p - name);
+            bool in_home = name_length > 2 && name[0] == '~' && name[1] == '/';
+            size_t prefix = in_home ? strlen(home) : 0;
+            if ((!in_home || prefix > 0)
+                && prefix + name_length < sizeof(f->path)) {
+                memcpy(f->path, home, prefix);
+                memcpy(f->path + prefix, name + (in_home ? 1 : 0),
+                       name_length - (in_home ? 1 : 0));
+                f->path[prefix + name_length - (in_home ? 1 : 0)] = '\0';
+                while (p < end && f->range_count < FALLBACK_RANGES) {
+                    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) {
+                        p++;
+                    }
+                    if (p >= end) {
+                        break;
+                    }
+                    const char *start = p;
+                    uint32_t from = parse_hex(&p);
+                    uint32_t to = from;
+                    if (*p == '-') {
+                        p++;
+                        to = parse_hex(&p);
+                    }
+                    if (p == start) {
+                        break; /* not a range: ignore the rest */
+                    }
+                    if (to >= from) {
+                        f->from[f->range_count] = from;
+                        f->to[f->range_count] = to;
+                        f->range_count++;
+                    }
+                }
+                if (f->range_count > 0) {
+                    fallback_count++;
+                }
+            }
+        }
+        p = *end == '\n' ? end + 1 : end;
+    }
+}
+
+/* The fallback font that draws code, or NULL. */
+static struct opos_font *fallback_for(uint32_t code) {
+    if (code < 0x80) {
+        return NULL; /* every font has ASCII; spare the list read */
+    }
+    if (fallback_count < 0) {
+        fallback_read_list();
+    }
+    for (int i = 0; i < fallback_count; i++) {
+        struct fallback_font *f = &fallbacks[i];
+        bool covered = false;
+        for (int r = 0; r < f->range_count && !covered; r++) {
+            covered = code >= f->from[r] && code <= f->to[r];
+        }
+        if (!covered) {
+            continue;
+        }
+        if (!f->tried) {
+            f->tried = true;
+            f->font = opos_font_load(f->path);
+        }
+        if (f->font != NULL
+            && stbtt_FindGlyphIndex(&f->font->info, (int)code) != 0) {
+            return f->font;
+        }
+    }
+    return NULL;
+}
+
 struct opos_font *opos_font_load(const char *path) {
     long fd = opos_open(path, OPOS_O_RDONLY);
     if (fd < 0) {
@@ -219,7 +377,8 @@ size_t opos_utf8_decode(const char *text, size_t length, uint32_t *code) {
 }
 
 bool opos_font_has_glyph(const struct opos_font *font, uint32_t code) {
-    return stbtt_FindGlyphIndex(&font->info, (int)code) != 0;
+    return stbtt_FindGlyphIndex(&font->info, (int)code) != 0
+        || fallback_for(code) != NULL;
 }
 
 /* Finds or renders the glyph for (code, size). */
@@ -246,16 +405,25 @@ static struct glyph *glyph_get(struct opos_font *font, int size,
         }
         slot = (slot + 1) & (CACHE_SLOTS - 1);
     }
+    /* A missing character comes from a fallback font at the same pixel
+       size, else shows as the replacement glyph. */
     uint32_t render = code;
+    const struct opos_font *source = font;
     if (stbtt_FindGlyphIndex(&font->info, (int)code) == 0) {
-        render = font->fallback;
+        struct opos_font *other = fallback_for(code);
+        if (other != NULL) {
+            source = other;
+        } else {
+            render = font->fallback;
+        }
     }
-    float scale = scale_for(font, size);
+    float scale = scale_for(source, size);
     struct glyph *g = &font->cache[slot];
     int advance, bearing;
-    stbtt_GetCodepointHMetrics(&font->info, (int)render, &advance, &bearing);
+    stbtt_GetCodepointHMetrics(&source->info, (int)render, &advance,
+                               &bearing);
     int width = 0, height = 0, x_offset = 0, y_offset = 0;
-    uint8_t *bitmap = stbtt_GetCodepointBitmap(&font->info, scale, scale,
+    uint8_t *bitmap = stbtt_GetCodepointBitmap(&source->info, scale, scale,
                                                (int)render, &width, &height,
                                                &x_offset, &y_offset);
     g->code = code;

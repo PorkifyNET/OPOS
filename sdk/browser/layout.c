@@ -2829,6 +2829,10 @@ static void process_node(struct ctx *c, const struct opos_html_node *node,
         return;
     }
     style_compute(node, parent, style);
+    if (node == c->page->anchor && !c->measuring) {
+        c->page->anchor_y = c->y + (c->pending_margin > 0 ? c->pending_margin
+                                                            : 0);
+    }
     /* Children of a one-column grid or a column flexbox are blocks
        (laid out here in normal flow, they stack like grid rows). */
     if (((parent->grid && parent->grid_count == 0)
@@ -2932,6 +2936,7 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
     c.bx = 0;
     c.bwidth = clamp_min(width, 40);
     c.align = ALIGN_LEFT;
+    page->anchor_y = -1;
 
     struct style root;
     memset(&root, 0, sizeof(root));

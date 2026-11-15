@@ -60,3 +60,9 @@ category: system
 license: GPL-2.0
 summary: A Unix shell with vi, less and over 300 tools in one program.
 description: BusyBox: a shell (ash) with vi, less and over 300 Unix tools in one program. Run "busybox sh" from the Terminal. BusyBox is GPL-2.0 and its source release and build configuration are included in the package.
+
+[net.porkify.opos.fonts-cjk]
+category: system
+license: Apache-2.0
+summary: Shows Chinese, Japanese and Korean text in the browser instead of boxes.
+description: Droid Sans Fallback, a font with Chinese characters, Japanese kana and Korean Hangul. Without it, text in these scripts shows as boxes. Once installed, the browser and every other program that draws text with the OPOS TrueType fonts use it for the characters their own fonts lack. It adds no Start menu entry. 4 MB.

@@ -18,6 +18,12 @@ checked against its SHA-256) and built with a static musl compiler:
 (`apt install musl-tools`). Override with `LINUX_CC=...` and
 `MUSL_LICENSE=...`.
 
+Font packages are listed in `STORE_FONTS` (default `cjk`): each
+`fonts/<name>/build.sh` downloads its pinned font files and packages
+them. `fonts/cjk` is "Chinese, Japanese, Korean fonts", Droid Sans
+Fallback (Apache-2.0, 4 MB). It installs no program: OPOS finds the
+font through `/share/fonts/fallback.txt` (`data/fonts/fallback.txt`).
+
 `linux/busybox/build.sh` is not in the default `STORE_LINUX`. BusyBox
 is GPL-2.0, and its package carries its source release and build
 configuration. Add it with `STORE_LINUX="lua sqlite busybox"`. It needs

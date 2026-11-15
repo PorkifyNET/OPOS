@@ -1453,9 +1453,12 @@ static void tcp_receive(const uint8_t *ip, const uint8_t *tcp,
     bool in_order = seq == c->rcv_nxt;
     if (data_length != 0) {
         send_ack = true;
-        if (in_order && !c->remote_closed && c->detached && !c->queued) {
-            /* Nobody reads any more: accept and drop. */
-            c->rcv_nxt += (uint32_t)data_length;
+        if (!c->remote_closed && c->detached && !c->queued) {
+            /* Nobody reads any more: reset, as Linux does (RFC 2525
+               2.17), so the peer stops sending a body nobody wants. */
+            tcp_segment(c, c->snd_nxt, TCP_RST | TCP_ACK, NULL, 0);
+            tcp_free(c);
+            return;
         } else if (in_order && !c->remote_closed) {
             size_t room = TCP_RECEIVE_CAPACITY - c->receive_length;
             size_t take = data_length < room ? data_length : room;
@@ -1635,7 +1638,16 @@ void net_tcp_close(int handle) {
         return;
     }
     c->detached = true;
+    bool unread = c->receive_length != 0;
     c->receive_length = 0;
+    if (unread && !c->failed && c->state != TCP_CLOSED
+        && c->state != TCP_SYN_SENT) {
+        /* Closed with data left unread: reset instead of a FIN, so the
+           peer stops sending (RFC 2525 2.17; what Linux does). */
+        tcp_segment(c, c->snd_nxt, TCP_RST | TCP_ACK, NULL, 0);
+        tcp_free(c);
+        return;
+    }
     if (c->state == TCP_SYN_SENT || c->state == TCP_CLOSED || c->failed) {
         if (c->state == TCP_SYN_SENT) {
             tcp_segment(c, c->snd_nxt, TCP_RST, NULL, 0);

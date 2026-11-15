@@ -12,6 +12,9 @@
 #define KERNEL_CODE_SELECTOR 0x28
 #define INITIAL_FLAGS 0x202
 #define SELF_TEST_TICKS 6
+/* A runnable task that has waited this long goes before tasks that just
+   woke up, so tasks waking every tick cannot starve it (100 ms). */
+#define SCHEDULER_STARVE_TICKS 10
 #define IA32_FS_BASE_MSR 0xc0000100u
 #define CR0_MONITOR_COPROCESSOR (1ULL << 1)
 #define CR0_EMULATION (1ULL << 2)
@@ -73,6 +76,9 @@ struct scheduler_task {
     /* Set when a sleep or wait ends: the task runs before the others
        that are only waiting for their turn (see scheduler_switch). */
     bool woken;
+    /* The tick it last had to give up the processor while still able to
+       run (or was created): see SCHEDULER_STARVE_TICKS. */
+    uint64_t ready_since;
     uint64_t run_ticks;
     bool kernel_gs_active;
     uint64_t user_fs_base;
@@ -234,6 +240,20 @@ void *scheduler_yield(void *interrupt_frame) {
  * thread from waiting behind every busy task (docs/sound.md).
  */
 static size_t scheduler_pick(void) {
+    /* First, the task that has waited longest, once that is too long. */
+    uint64_t now = timer_ticks();
+    size_t starving = SCHEDULER_TASK_CAPACITY;
+    for (size_t i = 0; i < SCHEDULER_TASK_CAPACITY; i++) {
+        if (tasks[i].state == SCHEDULER_TASK_RUNNABLE && !tasks[i].woken
+            && now - tasks[i].ready_since >= SCHEDULER_STARVE_TICKS
+            && (starving == SCHEDULER_TASK_CAPACITY
+                || tasks[i].ready_since < tasks[starving].ready_since)) {
+            starving = i;
+        }
+    }
+    if (starving != SCHEDULER_TASK_CAPACITY) {
+        return starving;
+    }
     for (size_t offset = 1; offset <= SCHEDULER_TASK_CAPACITY; offset++) {
         size_t candidate = (current_task + offset) % SCHEDULER_TASK_CAPACITY;
         if (tasks[candidate].state == SCHEDULER_TASK_RUNNABLE
@@ -260,6 +280,7 @@ static void *scheduler_switch(void *interrupt_frame) {
     }
     if (current->state == SCHEDULER_TASK_RUNNING) {
         current->state = SCHEDULER_TASK_RUNNABLE;
+        current->ready_since = timer_ticks();
     }
 
     size_t candidate = scheduler_pick();
@@ -354,6 +375,11 @@ bool scheduler_spawn(scheduler_task_entry entry, void *argument,
     scheduler_save_fpu(tasks[current_task].fpu_state);
     scheduler_copy_fpu(task->fpu_state, tasks[current_task].fpu_state);
     task->state = SCHEDULER_TASK_RUNNABLE;
+    /* A new task gets its first turn like one that just woke up; else
+       tasks that wake every tick (a download, the desktop) could keep it
+       from ever starting. */
+    task->woken = true;
+    task->ready_since = timer_ticks();
     *task_id = task->id;
     return true;
 }
@@ -502,6 +528,7 @@ void scheduler_yield_current(void) {
     struct scheduler_task *task = &tasks[current_task];
     if (task->state == SCHEDULER_TASK_RUNNING) {
         task->state = SCHEDULER_TASK_RUNNABLE;
+        task->ready_since = timer_ticks();
         __asm__ volatile ("int $0x81" : : : "memory");
     }
     if ((flags & (1u << 9)) != 0) {

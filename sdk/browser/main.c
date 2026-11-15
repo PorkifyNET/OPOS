@@ -23,6 +23,7 @@
 #define MAX_PAGE_BYTES (8u << 20)
 #define MAX_IMAGE_BYTES (6u << 20)
 #define MAX_DOWNLOAD_BYTES (1ull << 32)
+#define MAX_RUNNING_DOWNLOADS 6
 #define HOME_URL "https://example.com/"
 #define NEW_TAB_URL "about:home"
 
@@ -75,7 +76,7 @@ enum menu_action {
     MENU_OPEN_NEW_TAB, MENU_COPY_LINK, MENU_BOOKMARK_LINK, MENU_DOWNLOAD_LINK,
     MENU_BACK, MENU_FORWARD, MENU_RELOAD, MENU_BOOKMARK_PAGE, MENU_COPY,
     MENU_NEW_TAB, MENU_CLOSE_TAB, MENU_BOOKMARKS, MENU_HISTORY,
-    MENU_DOWNLOADS, MENU_COUNT
+    MENU_DOWNLOADS, MENU_COOKIES, MENU_COUNT
 };
 
 struct browser {
@@ -864,6 +865,7 @@ static const char *menu_label(enum menu_action action) {
     case MENU_BOOKMARKS: return "Bookmarks";
     case MENU_HISTORY: return "History";
     case MENU_DOWNLOADS: return "Downloads";
+    case MENU_COOKIES: return "Cookies";
     default: return "";
     }
 }
@@ -1691,20 +1693,17 @@ static void download_progress(void *context, size_t received, size_t total) {
     paint();
 }
 
-/* Downloads url straight to a file, however large. */
-static void download_url(const char *url) {
-    char name[96], path[256];
-    download_name(url, name, sizeof(name));
-    long fd = download_create(name, path, sizeof(path));
-    if (fd < 0) {
-        download_finished(name, b.downloads_dir, 0, false);
-        return;
-    }
+/* Downloads url straight to the file fd, however large, while the window
+   waits (when no background download can be started). */
+static void download_here(const char *url, long fd, const char *name,
+                          const char *path) {
     struct download_sink sink = {(int)fd, name};
     struct opos_http_response response;
     opos_http_set_progress(download_progress, &sink);
+    cookies_attach(false);
     long error = opos_http_download(url, (size_t)MAX_DOWNLOAD_BYTES,
                                     download_write, &sink, &response);
+    cookies_detach();
     opos_http_set_progress(NULL, NULL);
     opos_close((int)fd);
     bool ok = error == 0 && response.status >= 200 && response.status < 300;
@@ -1716,6 +1715,244 @@ static void download_url(const char *url) {
         opos_unlink(path);
     }
     download_finished(name, path, size, ok);
+}
+
+/*
+ * Background downloads. Each runs in a forked copy of the browser, which
+ * fetches into the file and reports through a pipe, one line per report:
+ *   "P received total" while it runs, "D 1 size" or "D 0 0" at the end.
+ * The window stays usable meanwhile. The copy also posts the "Download
+ * complete" notification, so it arrives even if the browser was closed.
+ */
+struct running {
+    bool used;
+    int id;              /* the library's download id */
+    long pid;
+    int pipe;            /* read end, nonblocking */
+    bool reported;       /* the "D" line arrived */
+    bool ok;
+    bool cancelled;
+    unsigned long long size;
+    char line[64];
+    size_t line_length;
+    char name[96];
+    char path[256];
+};
+
+static struct running running[MAX_RUNNING_DOWNLOADS];
+static bool downloads_page_stale; /* about:downloads needs a refresh */
+
+#define LINUX_O_NONBLOCK 0x800
+#define LINUX_O_CLOEXEC 0x80000
+#define LINUX_EAGAIN 11
+#define LINUX_SIGKILL 9
+
+static int child_pipe = -1;      /* in a download child: the write end */
+static long long child_reported; /* uptime in ms of the last "P" line */
+
+static long long uptime_ms(void) {
+    struct opos_timespec time = {0, 0};
+    opos_uptime(&time);
+    return (long long)time.seconds * 1000 + time.nanoseconds / 1000000;
+}
+
+static void child_send(const char *line, bool must) {
+    size_t length = strlen(line);
+    for (int tries = 0; tries < 3000; tries++) {
+        long written = opos_write(child_pipe, line, length);
+        if (written == (long)length) {
+            return;
+        }
+        if (written != -LINUX_EAGAIN || !must) {
+            return; /* a lost progress line does not matter */
+        }
+        opos_sleep_ms(10);
+    }
+}
+
+static void child_progress(void *context, size_t received, size_t total) {
+    (void)context;
+    long long t = uptime_ms();
+    if (t - child_reported < 300) {
+        return;
+    }
+    child_reported = t;
+    char line[64];
+    snprintf(line, sizeof(line), "P %llu %llu\n",
+             (unsigned long long)received, (unsigned long long)total);
+    child_send(line, false);
+}
+
+static long child_write(void *context, const uint8_t *data, size_t length) {
+    return write_all(*(int *)context, data, length) ? 0 : -OPOS_EIO;
+}
+
+__attribute__((noreturn)) static void child_download(const char *url, int fd,
+                                                     const char *name) {
+    struct opos_http_response response;
+    opos_http_set_progress(child_progress, NULL);
+    cookies_attach(false); /* send the site's cookies, keep no new ones */
+    long error = opos_http_download(url, (size_t)MAX_DOWNLOAD_BYTES,
+                                    child_write, &fd, &response);
+    opos_close(fd);
+    bool ok = error == 0 && response.status >= 200 && response.status < 300;
+    char line[64];
+    snprintf(line, sizeof(line), "D %d %llu\n", ok ? 1 : 0,
+             ok ? (unsigned long long)response.length : 0ull);
+    if (ok) {
+        opos_notify("Download complete", name);
+    }
+    child_send(line, true);
+    opos_close(child_pipe);
+    for (;;) {
+        opos_syscall1(231 /* exit_group */, ok ? 0 : 1);
+    }
+}
+
+/* Downloads url to a new file in Downloads, in the background when it
+   can. */
+static void download_url(const char *url) {
+    char name[96], path[256];
+    download_name(url, name, sizeof(name));
+    long fd = download_create(name, path, sizeof(path));
+    if (fd < 0) {
+        download_finished(name, b.downloads_dir, 0, false);
+        return;
+    }
+    struct running *r = NULL;
+    for (int i = 0; i < MAX_RUNNING_DOWNLOADS && r == NULL; i++) {
+        if (!running[i].used) {
+            r = &running[i];
+        }
+    }
+    int ends[2];
+    if (r == NULL
+        || opos_syscall2(293 /* pipe2 */, (long)ends,
+                         LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0) {
+        download_here(url, fd, name, path);
+        return;
+    }
+    long pid = opos_syscall0(57 /* fork */);
+    if (pid == 0) {
+        opos_close(ends[0]);
+        for (int i = 0; i < MAX_RUNNING_DOWNLOADS; i++) {
+            if (running[i].used) {
+                opos_close(running[i].pipe);
+            }
+        }
+        child_pipe = ends[1];
+        child_download(url, (int)fd, name);
+    }
+    opos_close(ends[1]);
+    if (pid < 0) {
+        opos_close(ends[0]);
+        download_here(url, fd, name, path);
+        return;
+    }
+    opos_close((int)fd);
+    memset(r, 0, sizeof(*r));
+    r->used = true;
+    r->pid = pid;
+    r->pipe = ends[0];
+    r->id = download_start(name, path);
+    snprintf(r->name, sizeof(r->name), "%s", name);
+    snprintf(r->path, sizeof(r->path), "%s", path);
+    char text[160];
+    snprintf(text, sizeof(text), "Downloading %s (Ctrl+J shows downloads)",
+             name);
+    set_status(text);
+    downloads_page_stale = true;
+}
+
+static bool downloads_running(void) {
+    for (int i = 0; i < MAX_RUNNING_DOWNLOADS; i++) {
+        if (running[i].used) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void download_cancel(int id) {
+    for (int i = 0; i < MAX_RUNNING_DOWNLOADS; i++) {
+        if (running[i].used && running[i].id == id && !running[i].reported) {
+            running[i].cancelled = true;
+            opos_syscall2(62 /* kill */, running[i].pid, LINUX_SIGKILL);
+        }
+    }
+}
+
+static void running_line(struct running *r) {
+    char *end;
+    unsigned long long one = strtoul(r->line + 2, &end, 10), two = 0;
+    if (*end == ' ') {
+        two = strtoul(end + 1, NULL, 10);
+    }
+    if (r->line[0] == 'P') {
+        download_update(r->id, one, two);
+    } else if (r->line[0] == 'D') {
+        r->reported = true;
+        r->ok = one == 1;
+        r->size = two;
+    }
+}
+
+/* Reads what the download children reported and collects the ones that
+   ended. */
+static void downloads_poll(void) {
+    for (int i = 0; i < MAX_RUNNING_DOWNLOADS; i++) {
+        struct running *r = &running[i];
+        if (!r->used) {
+            continue;
+        }
+        bool ended = false;
+        for (;;) {
+            char data[256];
+            long got = opos_read(r->pipe, data, sizeof(data));
+            if (got == -LINUX_EAGAIN) {
+                break;
+            }
+            if (got <= 0) {
+                ended = true; /* the child closed its end or died */
+                break;
+            }
+            for (long k = 0; k < got; k++) {
+                if (data[k] == '\n') {
+                    r->line[r->line_length] = '\0';
+                    running_line(r);
+                    r->line_length = 0;
+                } else if (r->line_length + 1 < sizeof(r->line)) {
+                    r->line[r->line_length++] = data[k];
+                }
+            }
+            downloads_page_stale = true;
+        }
+        if (!ended) {
+            continue;
+        }
+        int status = 0;
+        if (opos_syscall4(61 /* wait4 */, r->pid, (long)&status, 1, 0) == 0) {
+            continue; /* not gone yet: look again on the next pass */
+        }
+        opos_close(r->pipe);
+        bool ok = r->reported && r->ok && !r->cancelled;
+        if (!ok) {
+            opos_unlink(r->path);
+        }
+        download_end(r->id, ok ? r->size : 0, !ok, r->cancelled);
+        char text[160];
+        if (ok) {
+            snprintf(text, sizeof(text), "Saved %s to Downloads (Ctrl+J)",
+                     r->name);
+        } else if (r->cancelled) {
+            snprintf(text, sizeof(text), "Download of %s cancelled", r->name);
+        } else {
+            snprintf(text, sizeof(text), "Download of %s failed", r->name);
+        }
+        set_status(text);
+        r->used = false;
+        downloads_page_stale = true;
+    }
 }
 
 /* --------------------------------------------------------------- loading */
@@ -1743,6 +1980,31 @@ static void show_about(const char *url) {
     snprintf(T->url, sizeof(T->url), "%s", base);
     set_address(strcmp(base, NEW_TAB_URL) == 0 ? "" : base);
     set_status("");
+}
+
+/* Shows new download progress when about:downloads is on screen, at most
+   once a second. */
+static void refresh_downloads_page(void) {
+    static long long last;
+    if (!downloads_page_stale || strcmp(T->url, "about:downloads") != 0
+        || T->editing) {
+        downloads_page_stale = false;
+        return;
+    }
+    long long t = uptime_ms();
+    if (t - last < 1000 && downloads_running()) {
+        return;
+    }
+    last = t;
+    downloads_page_stale = false;
+    int scroll = T->scroll;
+    char status[sizeof(b.status)];
+    snprintf(status, sizeof(status), "%s", b.status);
+    show_about("about:downloads");
+    set_status(status);
+    T->scroll = scroll;
+    clamp_scroll();
+    b.dirty = true;
 }
 
 /* After a download: keep the page, or show the downloads in an empty
@@ -1785,10 +2047,12 @@ static enum load_result load_request(const char *url, const char *post,
 
     struct opos_http_response response;
     opos_http_set_progress(progress, NULL);
+    cookies_attach(true);
     long error = post != NULL
         ? opos_http_post(fetch, "application/x-www-form-urlencoded", post,
                          post_length, MAX_PAGE_BYTES, &response)
         : opos_http_get(fetch, MAX_PAGE_BYTES, &response);
+    cookies_detach();
     opos_http_set_progress(NULL, NULL);
     if (error == -OPOS_EFBIG && post == NULL) {
         /* Too big for a page: almost surely a file to keep. */
@@ -2655,6 +2919,7 @@ static void open_main_menu(void) {
     menu_add(MENU_BOOKMARKS);
     menu_add(MENU_HISTORY);
     menu_add(MENU_DOWNLOADS);
+    menu_add(MENU_COOKIES);
     menu_place(menu_button_x() + 28 - MENU_WIDTH, BUTTON_Y + 30);
 }
 
@@ -2685,6 +2950,7 @@ static void menu_run(enum menu_action action) {
     case MENU_BOOKMARKS: navigate("about:bookmarks", true); break;
     case MENU_HISTORY: navigate("about:history", true); break;
     case MENU_DOWNLOADS: navigate("about:downloads", true); break;
+    case MENU_COOKIES: navigate("about:cookies", true); break;
     default: break;
     }
 }
@@ -3179,6 +3445,7 @@ int main(int argc, char **argv) {
                  user.home);
     }
     library_open(b.data_dir);
+    cookies_open(b.data_dir);
 
     tab_open(argc > 1 ? argv[1] : NULL, true);
     if (T == NULL) {
@@ -3192,10 +3459,18 @@ int main(int argc, char **argv) {
         }
         long got = opos_window_event(&event, 0);
         if (got == 0) {
+            if (downloads_running() || downloads_page_stale) {
+                downloads_poll();
+                refresh_downloads_page();
+                if (b.dirty) {
+                    continue; /* paint before waiting */
+                }
+            }
             if (load_next_image()) {
                 continue;
             }
-            got = opos_window_event(&event, -1);
+            /* While downloads run, wake up to show their progress. */
+            got = opos_window_event(&event, downloads_running() ? 250 : -1);
         }
         if (got <= 0) {
             if (got < 0) {
@@ -3205,6 +3480,8 @@ int main(int argc, char **argv) {
         }
         switch (event.type) {
         case OPOS_EVENT_CLOSE:
+            /* Running downloads finish on their own and notify. */
+            cookies_save();
             return 0;
         case OPOS_EVENT_RESIZE:
             resize((int)event.width, (int)event.height);

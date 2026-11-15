@@ -1,6 +1,6 @@
 /*
  * OPOS browser: bookmarks, history and downloads, and the about: pages
- * that show them.
+ * that show them (and about:cookies).
  *
  * Bookmarks and history are kept as text files in the data folder (one
  * "URL<TAB>title" per line), so they last between runs. Without a data
@@ -33,13 +33,18 @@ static int history_count;
 static int history_lines; /* lines in the history file */
 
 struct download {
+    int id;
     char name[96];
     char path[256];
-    unsigned long long size;
+    unsigned long long size;     /* bytes so far while running */
+    unsigned long long total;    /* announced size while running, or 0 */
+    bool running;
     bool failed;
+    bool cancelled;
 };
 static struct download downloads[DOWNLOADS_MAX];
 static int download_count;
+static int download_next_id = 1;
 
 /* -------------------------------------------------------------- files */
 
@@ -348,18 +353,61 @@ static void history_clear(void) {
 
 /* ---------------------------------------------------------- downloads */
 
-void download_record(const char *name, const char *path,
-                     unsigned long long size, bool failed) {
+int download_start(const char *name, const char *path) {
     if (download_count == DOWNLOADS_MAX) {
-        memmove(downloads, downloads + 1,
-                (DOWNLOADS_MAX - 1) * sizeof(downloads[0]));
+        /* Forget the oldest finished one; running ones stay listed. */
+        int oldest = 0;
+        while (oldest < download_count && downloads[oldest].running) {
+            oldest++;
+        }
+        if (oldest == download_count) {
+            oldest = 0;
+        }
+        memmove(downloads + oldest, downloads + oldest + 1,
+                (size_t)(DOWNLOADS_MAX - oldest - 1) * sizeof(downloads[0]));
         download_count--;
     }
     struct download *d = &downloads[download_count++];
+    memset(d, 0, sizeof(*d));
+    d->id = download_next_id++;
     snprintf(d->name, sizeof(d->name), "%s", name);
     snprintf(d->path, sizeof(d->path), "%s", path);
-    d->size = size;
-    d->failed = failed;
+    d->running = true;
+    return d->id;
+}
+
+static struct download *download_find(int id) {
+    for (int i = 0; i < download_count; i++) {
+        if (downloads[i].id == id) {
+            return &downloads[i];
+        }
+    }
+    return NULL;
+}
+
+void download_update(int id, unsigned long long received,
+                     unsigned long long total) {
+    struct download *d = download_find(id);
+    if (d != NULL) {
+        d->size = received;
+        d->total = total;
+    }
+}
+
+void download_end(int id, unsigned long long size, bool failed,
+                  bool cancelled) {
+    struct download *d = download_find(id);
+    if (d != NULL) {
+        d->size = size;
+        d->running = false;
+        d->failed = failed;
+        d->cancelled = cancelled;
+    }
+}
+
+void download_record(const char *name, const char *path,
+                     unsigned long long size, bool failed) {
+    download_end(download_start(name, path), size, failed, false);
 }
 
 /* --------------------------------------------------------- about pages */
@@ -450,7 +498,8 @@ static void page_start(struct html *h, const char *title) {
     puts_raw(h, "</head><body><p class=nav><a href=\"about:home\">New tab"
                 "</a><a href=\"about:bookmarks\">Bookmarks</a>"
                 "<a href=\"about:history\">History</a>"
-                "<a href=\"about:downloads\">Downloads</a></p><h1>");
+                "<a href=\"about:downloads\">Downloads</a>"
+                "<a href=\"about:cookies\">Cookies</a></p><h1>");
     puts_escaped(h, title);
     puts_raw(h, "</h1>");
 }
@@ -506,6 +555,19 @@ static long number_after(const char *text, const char *key) {
     return n;
 }
 
+static void put_site(void *context, int index, const char *site,
+                     int count) {
+    struct html *h = context;
+    puts_raw(h, "<li><b>");
+    puts_escaped(h, site);
+    puts_raw(h, "</b> <span class=u>");
+    put_number(h, (unsigned long long)count);
+    puts_raw(h, count == 1 ? " cookie" : " cookies");
+    puts_raw(h, "</span> <a class=x href=\"about:cookies?remove=");
+    put_number(h, (unsigned long long)index);
+    puts_raw(h, "\">Delete</a></li>");
+}
+
 char *about_page(const char *url, size_t *length) {
     struct html h = {NULL, 0, 0};
     const char *name = url + 6; /* after "about:" */
@@ -526,7 +588,35 @@ char *about_page(const char *url, size_t *length) {
                          " history</a></p>");
         }
         put_history(&h, HISTORY_KEEP);
+    } else if (strncmp(name, "cookies", 7) == 0) {
+        long remove = number_after(name, "?remove=");
+        if (remove >= 0) {
+            cookies_forget((int)remove);
+        } else if (strstr(name, "?clear") != NULL) {
+            cookies_forget(-1);
+        }
+        page_start(&h, "Cookies");
+        puts_raw(&h, "<p class=n>Sites keep sign-ins and settings in "
+                     "cookies. Only the site you visit can set them; images"
+                     " and styles from other sites get none.</p>");
+        struct html list = {NULL, 0, 0};
+        int sites = cookies_sites(put_site, &list);
+        if (sites == 0) {
+            puts_raw(&h, "<p class=n>No site has cookies.</p>");
+        } else {
+            puts_raw(&h, "<p><a class=x href=\"about:cookies?clear\">Delete "
+                         "all cookies</a></p><ul>");
+            if (list.text != NULL) {
+                puts_raw(&h, list.text);
+            }
+            puts_raw(&h, "</ul>");
+        }
+        free(list.text);
     } else if (strncmp(name, "downloads", 9) == 0) {
+        long cancel = number_after(name, "?cancel=");
+        if (cancel > 0) {
+            download_cancel((int)cancel);
+        }
         page_start(&h, "Downloads");
         if (download_count == 0) {
             puts_raw(&h, "<p class=n>Nothing downloaded since the browser "
@@ -539,7 +629,18 @@ char *about_page(const char *url, size_t *length) {
             puts_raw(&h, "<li><b>");
             puts_escaped(&h, d->name);
             puts_raw(&h, "</b> ");
-            if (d->failed) {
+            if (d->running) {
+                put_size(&h, d->size);
+                if (d->total > 0) {
+                    puts_raw(&h, " of ");
+                    put_size(&h, d->total);
+                }
+                puts_raw(&h, " <a class=x href=\"about:downloads?cancel=");
+                put_number(&h, (unsigned long long)d->id);
+                puts_raw(&h, "\">Cancel</a>");
+            } else if (d->cancelled) {
+                puts_raw(&h, "<span class=n>cancelled</span>");
+            } else if (d->failed) {
                 puts_raw(&h, "<span class=bad>failed</span>");
             } else {
                 put_size(&h, d->size);

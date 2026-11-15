@@ -70,6 +70,19 @@ typedef void (*opos_http_progress)(void *context, size_t received,
                                    size_t total);
 void opos_http_set_progress(opos_http_progress callback, void *context);
 
+/* Optional cookie handling, used by every request until turned off (pass
+   NULL for both). Before each request, also after a redirect, get fills
+   out (capacity OPOS_HTTP_COOKIE_MAX) with the Cookie header value for url,
+   or "" for none. set is called with the URL of each response and the
+   value of each of its Set-Cookie headers. Either callback may be NULL. */
+#define OPOS_HTTP_COOKIE_MAX 8192
+typedef void (*opos_http_cookie_get)(void *context, const char *url,
+                                     char *out, size_t capacity);
+typedef void (*opos_http_cookie_set)(void *context, const char *url,
+                                     const char *header);
+void opos_http_set_cookies(opos_http_cookie_get get, opos_http_cookie_set set,
+                           void *context);
+
 /* Resolves reference (an absolute URL, "//host/path", "/path", "path",
    "?query", "#fragment") against the absolute URL base, removing "." and
    ".." segments. Returns false when it does not fit or base is not an

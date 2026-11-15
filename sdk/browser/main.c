@@ -1072,7 +1072,9 @@ static void dropdown_click(int click_x, int click_y) {
 
 static void paint(void) {
     struct opos_canvas *canvas = &b.canvas;
-    opos_fill_rect(canvas, 0, TABBAR_HEIGHT, b.width, b.height - TABBAR_HEIGHT,
+    /* The page first: the chrome then covers text that runs above it. */
+    paint_page();
+    opos_fill_rect(canvas, 0, TABBAR_HEIGHT, b.width, TOOLBAR_HEIGHT,
                    COL_TOOLBAR);
     paint_tabs();
     int field_x = ADDRESS_X;
@@ -1113,7 +1115,6 @@ static void paint(void) {
         int cursor = field_x + 8 + text_width - shift;
         opos_fill_rect(canvas, cursor + 1, field_y + 5, 1, 18, COL_TEXT);
     }
-    paint_page();
     paint_dropdown();
     int status_y = b.height - STATUS_HEIGHT;
     opos_fill_rect(canvas, 0, status_y, b.width, STATUS_HEIGHT, COL_STATUS);
@@ -1292,29 +1293,64 @@ static const struct opos_html_node *find_autofocus(
     return NULL;
 }
 
+/* A plain ASCII stand-in for a character the window frame cannot show:
+   the base letter of an accented Latin letter, a dash or quote, else
+   '?'. */
+static char ascii_fold(uint32_t code) {
+    /* U+00C0 to U+017F, two characters per letter pair where they
+       alternate; '?' where nothing fits. */
+    static const char latin1[] =
+        "AAAAAAACEEEEIIII" "DNOOOOOxOUUUUYTs" "aaaaaaaceeeeiiii"
+        "dnooooo/ouuuuyty";
+    static const char extended_a[] =
+        "AaAaAaCcCcCcCcDd" "DdEeEeEeEeEeGgGg" "GgGgHhHhIiIiIiIi"
+        "IiJjJjKkkLlLlLlL" "lLlNnNnNnnNnOoOo" "OoOoRrRrRrSsSsSs"
+        "SsTtTtTtUuUuUuUu" "UuUuWwYyYZzZzZzs";
+    /* U+1EA0 to U+1EF9: Vietnamese letters with tone marks. */
+    static const char vietnamese[] =
+        "AaAaAaAaAaAaAaAaAaAaAaAaEeEeEeEeEeEeEeEeIiIiOoOoOoOoOoOoOoOo"
+        "OoOoOoOoUuUuUuUuUuUuUuYyYyYyYy";
+    if (code >= 0xc0 && code < 0x100) {
+        return latin1[code - 0xc0];
+    }
+    if (code >= 0x100 && code < 0x180) {
+        return extended_a[code - 0x100];
+    }
+    if (code >= 0x1ea0 && code <= 0x1ef9) {
+        return vietnamese[code - 0x1ea0];
+    }
+    if (code >= 0x2010 && code <= 0x2015) {
+        return '-';
+    }
+    if (code >= 0x2018 && code <= 0x201b) {
+        return '\'';
+    }
+    if (code >= 0x201c && code <= 0x201f) {
+        return '"';
+    }
+    if (code == 0x2022 || code == 0xb7) {
+        return '-';
+    }
+    if (code == 0xa0) {
+        return ' ';
+    }
+    return '?';
+}
+
 /* Sends the window a title: the page title folded to ASCII (the window
    frame shows only that), else "Browser". */
 static void update_caption(void) {
     char caption[sizeof(b.caption)];
     size_t used = 0;
     const char *title = T->title[0] != '\0' ? T->title : "Browser";
+    size_t length = strlen(title);
     bool space = false;
-    for (const char *p = title; *p != '\0' && used + 1 < sizeof(caption);
-         p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c >= 0x80) {
-            if ((c & 0xc0) == 0x80) {
-                continue; /* the rest of a UTF-8 character */
-            }
-            c = '?';
-            /* Dashes and quotes have plain stand-ins. */
-            if ((unsigned char)p[0] == 0xe2 && (unsigned char)p[1] == 0x80) {
-                unsigned char third = (unsigned char)p[2];
-                c = third >= 0x90 && third <= 0x95 ? '-'
-                  : third >= 0x98 && third <= 0x9b ? '\''
-                  : third >= 0x9c && third <= 0x9f ? '"'
-                  : third == 0xa2 ? '-' : '?';
-            }
+    for (size_t i = 0; i < length && used + 1 < sizeof(caption);) {
+        uint32_t code;
+        i += opos_utf8_decode(title + i, length - i, &code);
+        char c = code < 0x80 ? (char)code : ascii_fold(code);
+        if (c < ' ' || c > '~') {
+            continue;
         }
         if (c == ' ' && (space || used == 0)) {
             continue;

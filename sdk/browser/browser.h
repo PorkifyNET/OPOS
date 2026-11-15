@@ -30,7 +30,7 @@ enum display {
     DISPLAY_TABLE,
     DISPLAY_TABLE_PART, /* row, row group, caption, column: handled by table */
     DISPLAY_TABLE_CELL,
-    DISPLAY_INLINE_BLOCK, /* form controls */
+    DISPLAY_INLINE_BLOCK, /* form controls, inline-block/-flex/-grid boxes */
     DISPLAY_CONTENTS      /* no box: children belong to the parent */
 };
 
@@ -63,6 +63,9 @@ struct style {
     bool no_marker;          /* list-style: none */
     bool out_of_flow;        /* position absolute/fixed or hidden: not shown */
     bool opacity_zero;       /* opacity: 0 */
+    /* text-indent of -999px or less: text pushed out of view so that a
+       background image (which OPOS cannot draw yet) stands in for it. */
+    bool text_replaced;
     /* align-items (container) and align-self (item): 0 normal/auto,
        1 start, 2 center, 3 end. */
     uint8_t align_items, align_self;
@@ -110,6 +113,15 @@ extern int viewport_width_px, viewport_height_px;
    attributes such as bgcolor, align and width) given its parent's style. */
 void style_compute(const struct opos_html_node *element,
                    const struct style *parent, struct style *style);
+
+#define PSEUDO_BEFORE 1
+#define PSEUDO_AFTER 2
+/* The style of element's ::before or ::after box (which: PSEUDO_*), with
+   element_style as its parent. Returns its generated text (UTF-8, in
+   text, NUL-terminated) and true, or false when it shows no text. */
+bool style_compute_pseudo(const struct opos_html_node *element, int which,
+                          const struct style *element_style,
+                          struct style *style, char *text, size_t capacity);
 
 /* ------------------------------------------------------------- display list */
 
@@ -242,6 +254,11 @@ bool css_media_matches(const char *query);
 void css_apply(const struct css_sheet *chain,
                const struct opos_html_node *element, struct style *style,
                const struct style *parent);
+/* Applies the rules for element's ::before or ::after (which: PSEUDO_*);
+   false when no rule styles it. */
+bool css_apply_pseudo(const struct css_sheet *chain,
+                      const struct opos_html_node *element, int which,
+                      struct style *style, const struct style *parent);
 void css_apply_block(struct style *style, const char *text,
                      const struct style *parent);
 void apply_declaration(struct style *style, const char *name,

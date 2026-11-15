@@ -11,6 +11,10 @@
 
 #include "browser.h"
 
+/* ::before/::after text (see style_compute_pseudo). */
+static char *content_out;
+static void parse_content(const char *p);
+
 /* ---------------------------------------------------------------- colours */
 
 struct named_colour {
@@ -966,7 +970,15 @@ void apply_declaration(struct style *style, const char *name,
         if (elen == 0) {
             /* One or two values: start [end]. */
             char a[96], b[96];
-            const char *space = strchr(text, ' ');
+            /* The first space outside parentheses: calc(-1 * 20px). */
+            const char *space = NULL;
+            int depth = 0;
+            for (const char *s = text; *s != '\0' && space == NULL; s++) {
+                depth += *s == '(' ? 1 : *s == ')' ? -1 : 0;
+                if (*s == ' ' && depth == 0) {
+                    space = s;
+                }
+            }
             if (space == NULL) {
                 snprintf(a, sizeof(a), "%s", text);
                 snprintf(b, sizeof(b), "%s", text);
@@ -1009,21 +1021,21 @@ void apply_declaration(struct style *style, const char *name,
         }
         if (word_is(text, strlen(text), "none")) {
             style->display = DISPLAY_NONE;
-        } else if (word_is(text, strlen(text), "flex")
-                   || word_is(text, strlen(text), "inline-flex")) {
+        } else if (word_is(text, strlen(text), "flex")) {
             style->display = DISPLAY_BLOCK;
             style->flex = true;
+        } else if (word_is(text, strlen(text), "inline-flex")) {
+            style->display = DISPLAY_INLINE_BLOCK;
+            style->flex = true;
         } else if (word_is(text, strlen(text), "block")
-                   || word_is(text, strlen(text), "flex")
                    || word_is(text, strlen(text), "grid")
-                   || word_is(text, strlen(text), "inline-grid")
                    || word_is(text, strlen(text), "flow-root")) {
             style->display = DISPLAY_BLOCK;
         } else if (word_is(text, strlen(text), "inline")) {
             style->display = DISPLAY_INLINE;
-        } else if (word_is(text, strlen(text), "inline-block")) {
-            style->display = style->display == DISPLAY_INLINE_BLOCK
-                           ? DISPLAY_INLINE_BLOCK : DISPLAY_INLINE;
+        } else if (word_is(text, strlen(text), "inline-block")
+                   || word_is(text, strlen(text), "inline-grid")) {
+            style->display = DISPLAY_INLINE_BLOCK;
         } else if (word_is(text, strlen(text), "list-item")) {
             style->display = DISPLAY_LIST_ITEM;
         } else if (word_is(text, strlen(text), "contents")) {
@@ -1121,6 +1133,16 @@ void apply_declaration(struct style *style, const char *name,
                 style->width = style->width_pct = -1;
             }
         }
+    } else if (word_is(name, name_length, "content")) {
+        if (content_out != NULL) {
+            parse_content(text);
+        }
+    } else if (word_is(name, name_length, "text-indent")) {
+        int number;
+        bool percent;
+        if (parse_length(text, &number, &percent)) {
+            style->text_replaced = !percent && number <= -999;
+        }
     } else if (word_is(name, name_length, "float")) {
         style->float_side = word_is(text, strlen(text), "left") ? 1
                           : word_is(text, strlen(text), "right") ? 2 : 0;
@@ -1130,6 +1152,11 @@ void apply_declaration(struct style *style, const char *name,
         style->flex_column = strncmp(text, "column", 6) == 0;
     } else if (word_is(name, name_length, "flex-wrap")) {
         style->flex_wrap = strncmp(text, "wrap", 4) == 0;
+    } else if (word_is(name, name_length, "flex-flow")) {
+        /* <direction> || <wrap>: a missing part resets to row/nowrap. */
+        style->flex_column = strstr(text, "column") != NULL;
+        style->flex_wrap = strstr(text, "wrap") != NULL
+                        && strstr(text, "nowrap") == NULL;
     } else if (word_is(name, name_length, "flex-grow")) {
         style->flex_grow = flex_weight(text);
     } else if (word_is(name, name_length, "flex-shrink")) {
@@ -1448,10 +1475,24 @@ static int legacy_font_size(const char *value, int parent_size) {
     return sizes[number - 1];
 }
 
+/* Whether a list sits inside another list: such lists get no top or
+   bottom margin (as in other browsers' default style sheets). */
+static bool inside_list(const struct opos_html_node *element) {
+    for (const struct opos_html_node *up = element->parent; up != NULL;
+         up = up->parent) {
+        if (up->type == HTML_NODE_ELEMENT
+            && (up->tag == HTML_TAG_UL || up->tag == HTML_TAG_OL
+                || up->tag == HTML_TAG_MENU || up->tag == HTML_TAG_DIR)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 const struct css_sheet *style_sheets;
 
-void style_compute(const struct opos_html_node *element,
-                   const struct style *parent, struct style *style) {
+/* A fresh style with the inherited properties of parent. */
+static void style_inherit(struct style *style, const struct style *parent) {
     memset(style, 0, sizeof(*style));
     style->vars = parent->vars;
     style->font_size = parent->font_size;
@@ -1469,6 +1510,157 @@ void style_compute(const struct opos_html_node *element,
     style->width = style->max_width = -1;
     style->width_pct = style->max_width_pct = -1;
     style->display = DISPLAY_INLINE;
+}
+
+/* Set while a ::before/::after style is computed: where the "content"
+   declaration puts its text, and its length (-1: no content). */
+static size_t content_capacity;
+static int content_length = -1;
+static const struct opos_html_node *content_element;
+
+static void content_put(uint32_t code, size_t *used, bool *icon) {
+    /* Private-use code points are icon-font glyphs we cannot draw. */
+    if ((code >= 0xe000 && code <= 0xf8ff) || code >= 0xf0000) {
+        *icon = true;
+    }
+    char utf8[4];
+    size_t n = code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    if (n == 1) {
+        utf8[0] = (char)code;
+    } else if (n == 2) {
+        utf8[0] = (char)(0xc0 | code >> 6);
+        utf8[1] = (char)(0x80 | (code & 0x3f));
+    } else if (n == 3) {
+        utf8[0] = (char)(0xe0 | code >> 12);
+        utf8[1] = (char)(0x80 | ((code >> 6) & 0x3f));
+        utf8[2] = (char)(0x80 | (code & 0x3f));
+    } else {
+        utf8[0] = (char)(0xf0 | code >> 18);
+        utf8[1] = (char)(0x80 | ((code >> 12) & 0x3f));
+        utf8[2] = (char)(0x80 | ((code >> 6) & 0x3f));
+        utf8[3] = (char)(0x80 | (code & 0x3f));
+    }
+    if (*used + n < content_capacity) {
+        memcpy(content_out + *used, utf8, n);
+        *used += n;
+    }
+}
+
+/* content: strings (with \hex escapes), attr(name), open-quote and
+   close-quote. none/normal, counters, images and icon-font glyphs give
+   no text. */
+static void parse_content(const char *p) {
+    content_length = -1;
+    size_t used = 0;
+    bool icon = false;
+    for (;;) {
+        p = skip_space(p);
+        if (*p == '\0' || *p == '/' || *p == '!') {
+            break; /* "/ alt text" is for screen readers */
+        }
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            while (*p != '\0' && *p != quote) {
+                if (*p == '\\' && p[1] != '\0') {
+                    p++;
+                    if (isxdigit((unsigned char)*p)) {
+                        uint32_t code = 0;
+                        for (int i = 0; i < 6 && isxdigit((unsigned char)*p);
+                             i++, p++) {
+                            code = code * 16 + (uint32_t)(isdigit((unsigned char)*p)
+                                   ? *p - '0' : (tolower((unsigned char)*p) - 'a' + 10));
+                        }
+                        if (*p == ' ') {
+                            p++;
+                        }
+                        if (code != 0 && code <= 0x10ffff) {
+                            content_put(code, &used, &icon);
+                        }
+                        continue;
+                    }
+                    if (*p == '\n') {
+                        p++;
+                        continue;
+                    }
+                }
+                uint32_t code;
+                size_t step = opos_utf8_decode(p, strlen(p), &code);
+                content_put(step > 0 ? code : 0xfffd, &used, &icon);
+                p += step > 0 ? step : 1;
+            }
+            if (*p == quote) {
+                p++;
+            }
+        } else if (strncmp(p, "open-quote", 10) == 0) {
+            content_put(0x201c, &used, &icon);
+            p += 10;
+        } else if (strncmp(p, "close-quote", 11) == 0) {
+            content_put(0x201d, &used, &icon);
+            p += 11;
+        } else if (strncmp(p, "attr(", 5) == 0) {
+            p += 5;
+            const char *start = skip_space(p);
+            const char *end = start;
+            while (isalnum((unsigned char)*end) || *end == '-' || *end == '_') {
+                end++;
+            }
+            char name[48];
+            size_t n = (size_t)(end - start) < sizeof(name) - 1
+                     ? (size_t)(end - start) : sizeof(name) - 1;
+            memcpy(name, start, n);
+            name[n] = '\0';
+            const char *value = content_element != NULL
+                              ? opos_html_attribute(content_element, name)
+                              : NULL;
+            while (value != NULL && *value != '\0') {
+                uint32_t code;
+                size_t step = opos_utf8_decode(value, strlen(value), &code);
+                content_put(step > 0 ? code : 0xfffd, &used, &icon);
+                value += step > 0 ? step : 1;
+            }
+            p = strchr(p, ')');
+            p = p != NULL ? p + 1 : "";
+        } else if (strncmp(p, "none", 4) == 0 || strncmp(p, "normal", 6) == 0) {
+            return;
+        } else {
+            /* counter(), url(), no-open-quote ...: skip the token. */
+            int depth = 0;
+            while (*p != '\0' && (depth > 0 || (*p != ' ' && *p != '\t'))) {
+                depth += *p == '(' ? 1 : *p == ')' ? -1 : 0;
+                p++;
+            }
+        }
+    }
+    if (!icon) {
+        content_length = (int)used;
+    }
+}
+
+bool style_compute_pseudo(const struct opos_html_node *element, int which,
+                          const struct style *element_style,
+                          struct style *style, char *text, size_t capacity) {
+    style_inherit(style, element_style);
+    style->display = DISPLAY_INLINE;
+    content_out = text;
+    content_capacity = capacity;
+    content_length = -1;
+    content_element = element;
+    bool any = css_apply_pseudo(style_sheets, element, which, style,
+                                element_style);
+    content_out = NULL;
+    content_element = NULL;
+    if (!any || content_length < 0 || style->display == DISPLAY_NONE
+        || style->out_of_flow) {
+        return false;
+    }
+    text[content_length] = '\0';
+    /* An empty one matters only when it clears floats (a "clearfix"). */
+    return content_length > 0 || style->clear_both;
+}
+
+void style_compute(const struct opos_html_node *element,
+                   const struct style *parent, struct style *style) {
+    style_inherit(style, parent);
 
     switch (element->tag) {
     case HTML_TAG_HEAD: case HTML_TAG_SCRIPT: case HTML_TAG_STYLE:
@@ -1529,7 +1721,7 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_UL: case HTML_TAG_OL: case HTML_TAG_MENU:
     case HTML_TAG_DIR:
         style->display = DISPLAY_BLOCK;
-        if (parent->display != DISPLAY_LIST_ITEM) {
+        if (!inside_list(element)) {
             block_margins(style, 100, 100);
         }
         style->padding[LEFT] = 40;
@@ -1627,8 +1819,16 @@ void style_compute(const struct opos_html_node *element,
         break;
     case HTML_TAG_INPUT: case HTML_TAG_BUTTON: case HTML_TAG_SELECT:
     case HTML_TAG_TEXTAREA:
-        style->display = DISPLAY_INLINE_BLOCK;
+        style->display = form_kind(element) == FIELD_HIDDEN
+                       ? DISPLAY_NONE : DISPLAY_INLINE_BLOCK;
         break;
+    case HTML_TAG_BR: {
+        /* <br clear="all"> (also left, right, both) moves below floats. */
+        const char *clear = opos_html_attribute(element, "clear");
+        style->clear_both = clear != NULL && clear[0] != '\0'
+                         && strcmp(clear, "none") != 0;
+        break;
+    }
     case HTML_TAG_FONT: {
         const char *size = opos_html_attribute(element, "size");
         if (size != NULL) {
@@ -1678,6 +1878,15 @@ void style_compute(const struct opos_html_node *element,
     css_apply(style_sheets, element, style, parent);
     if ((value = opos_html_attribute(element, "style")) != NULL) {
         css_apply_block(style, value, parent);
+    }
+    /* An inline-flex or inline-grid form control (often a styled
+       <button>) lays out its content as a block, as before inline boxes
+       existed; flex containers handle such items only as blocks. */
+    if (style->display == DISPLAY_INLINE_BLOCK && (style->flex || style->grid)
+        && (element->tag == HTML_TAG_INPUT || element->tag == HTML_TAG_BUTTON
+            || element->tag == HTML_TAG_SELECT
+            || element->tag == HTML_TAG_TEXTAREA)) {
+        style->display = DISPLAY_BLOCK;
     }
     /* An invisible item placed into a shared grid cell (the "stack"
        trick: a hidden copy that only reserves size) would otherwise

@@ -984,6 +984,29 @@ static enum package_result store_listed(const char *index,
     return PACKAGE_OK;
 }
 
+/* After an install from the Store: Start > PROGRAMS categories from the
+   signed index (PACKAGE_CATEGORY_FILE), when they changed. Best effort:
+   the install has succeeded either way. */
+static void save_categories(const char *index, size_t index_size) {
+    static char lines[PACKAGE_CATEGORY_FILE_MAX];
+    static char old[PACKAGE_CATEGORY_FILE_MAX];
+    static const char path[] = PACKAGE_CATEGORY_FILE;
+    size_t used = package_index_categories(index, index_size, lines,
+                                           sizeof(lines));
+    size_t old_length = 0;
+    if (read_whole(path, old, sizeof(old), &old_length)
+        && old_length == used) {
+        bool same = true;
+        for (size_t i = 0; i < used && same; i++) {
+            same = old[i] == lines[i];
+        }
+        if (same) {
+            return;
+        }
+    }
+    (void)write_whole(path, lines, used);
+}
+
 enum package_result package_install(const char *path, size_t length,
                                     size_t account, bool admin,
                                     uint32_t options, const char *index,
@@ -1090,6 +1113,9 @@ enum package_result package_install(const char *path, size_t length,
     }
     ok = apply(true);
     package_registry_load();
+    if (ok && from_store) {
+        save_categories(index, index_size);
+    }
     return ok ? PACKAGE_OK : PACKAGE_DISK_ERROR;
 }
 

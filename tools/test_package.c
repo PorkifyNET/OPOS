@@ -228,6 +228,36 @@ static void test_index(void) {
           == PACKAGE_OK);
 }
 
+static void test_index_categories(void) {
+    static const char index[] =
+        "format: 1\n"
+        "\n"
+        "entry: org.example.chess 1.0\n"
+        "category: games\n"
+        "\n"
+        "entry: org.example.chess 2.0\n"
+        "category: games\n"
+        "\n"
+        "entry: org.example.odd 1.0\n"
+        "category: Bad Value\n"
+        "\n"
+        "entry: org.example.plain 1.0\n"
+        "name: Plain\n"
+        "\n"
+        "entry: org.example.write 1.0\n"
+        "category: sound-video\n";
+    char out[256];
+    size_t used = package_index_categories(index, sizeof(index) - 1, out,
+                                           sizeof(out));
+    static const char want[] =
+        "org.example.chess games\norg.example.write sound-video\n";
+    CHECK(used == sizeof(want) - 1 && memcmp(out, want, used) == 0);
+    /* Only whole lines fit. */
+    used = package_index_categories(index, sizeof(index) - 1, out, 30);
+    CHECK(used == 24 && memcmp(out, want, used) == 0);
+    CHECK(package_index_categories("format: 1\n", 10, out, sizeof(out)) == 0);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--index") == 0) {
         return index_file(argv[2], argc >= 5 ? argv[3] : NULL,
@@ -237,6 +267,7 @@ int main(int argc, char **argv) {
         return parse_file(argv[1]);
     }
     test_index();
+    test_index_categories();
     test_good();
     test_records();
     test_versions();

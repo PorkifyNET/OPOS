@@ -278,9 +278,10 @@ one account. The Store, the index and its key come in step 4.
   administrator installed the same id for everyone.
 - Start > Programs lists every `start` entry of the account's own and
   everyone's packages. Built-in and loose program names win over package
-  labels, so a package cannot appear as a built-in. The menu groups
-  programs under category headings in the Store's category order, with
-  OTHER last. A Store package takes its category from the signed index:
+  labels, so a package cannot appear as a built-in. The menu lists the
+  categories that have programs, in the Store's category order with
+  OTHER last; each opens a submenu of its programs, which scrolls when it
+  is taller than the screen. A Store package takes its category from the signed index:
   each time the Store window lists the Store, the desktop saves every
   listed id and category to `/disk/OPOS/STORE-CATEGORIES.TXT` (lines of
   `ID CATEGORY`). Built-in programs have fixed categories; loose programs

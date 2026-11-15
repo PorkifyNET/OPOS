@@ -9705,41 +9705,56 @@ static size_t store_category_index(const char *id, size_t length) {
  * menu, including disk files with those names. The list is read each time
  * it opens.
  *
- * The list is grouped under category headings, in the Store's category
- * order with OTHER last, and sorted by name within each. Built-in programs
- * have fixed categories. Packages take theirs from PROGRAMS_CATEGORY_FILE,
- * which the OPOS Store window writes from the signed index each time it
- * lists the Store (store_save_categories), so it holds only Store
- * packages; loose disk files and sideloaded packages are OTHER.
+ * The submenu lists the categories that have programs, in the Store's
+ * category order with OTHER last. Each category opens a further submenu
+ * (the "group" menu) with its programs sorted by name; when that list is
+ * taller than the screen it scrolls. Built-in programs have fixed
+ * categories. Packages take theirs from PROGRAMS_CATEGORY_FILE, which the
+ * OPOS Store window writes from the signed index each time it lists the
+ * Store (store_save_categories), so it holds only Store packages; loose
+ * disk files and sideloaded packages are OTHER.
  */
-#define PROGRAMS_MAX 32
+#define PROGRAMS_MAX 128
 #define PROGRAMS_NAME_CAPACITY 32
 #define PROGRAMS_DIRECTORY "/bin"
 #define PROGRAMS_DISK_DIRECTORY "/disk/Programs"
 #define PROGRAMS_CATEGORY_FILE "/disk/OPOS/STORE-CATEGORIES.TXT"
 #define PROGRAMS_CATEGORY_FILE_MAX 8192
 #define PROGRAMS_WIDTH (20 * CHAR_WIDTH + 24)
-#define PROGRAMS_HEADING_HEIGHT (CHAR_HEIGHT + 12)
+#define PROGRAMS_GROUPS (STORE_CATEGORIES + 1) /* the categories and OTHER */
+#define PROGRAMS_WHEEL_ROWS 3
 
 static char programs_names[PROGRAMS_MAX][PROGRAMS_NAME_CAPACITY];
 static char programs_paths[PROGRAMS_MAX][256];
 static uint8_t programs_categories[PROGRAMS_MAX]; /* store_category_index */
-/* Each program's top, below the submenu's top edge and padding, and the
-   height of all rows and headings (programs_layout). */
-static int64_t programs_tops[PROGRAMS_MAX];
-static int64_t programs_rows_height;
 static struct package_start_entry programs_packages[PROGRAMS_MAX];
 static char programs_category_text[PROGRAMS_CATEGORY_FILE_MAX];
 static size_t programs_category_length;
 static size_t programs_count;
-static bool programs_focus;  /* the keyboard is in the submenu */
-static size_t programs_selection;
+/* The categories that have programs, in menu order: each one's category
+   index, first program and number of programs (programs_group). */
+static uint8_t programs_group_category[PROGRAMS_GROUPS];
+static size_t programs_group_first[PROGRAMS_GROUPS];
+static size_t programs_group_size[PROGRAMS_GROUPS];
+static size_t programs_group_count;
+static bool programs_focus;  /* the keyboard is in the submenus */
+static size_t programs_selection; /* a category row */
+/* The open category submenu; it is shown only while programs_open. */
+static bool group_open;
+static bool group_focus;     /* the keyboard is in the category submenu */
+static size_t group_shown;   /* the category row it lists */
+static size_t group_selection; /* a program, counted within the category */
+static size_t group_scroll;  /* the first program row shown */
 static int32_t menu_hover_x = -1;
 static int32_t menu_hover_y = -1;
 /* Leaving PROGRAMS closes the submenu only after a short delay, so the
    pointer can cross other items on its way there; 0: no close pending. */
 #define PROGRAMS_CLOSE_TICKS 40
 static uint64_t programs_close_at;
+/* Resting on another category row switches the category submenu after
+   the same delay, so the pointer can cross rows on its way into the open
+   one; 0: no switch pending. */
+static uint64_t group_switch_at;
 
 static char ascii_upper(char character) {
     return character >= 'a' && character <= 'z' ? (char)(character - 32)
@@ -9859,23 +9874,24 @@ static void programs_add(const char *name, size_t name_length,
     programs_categories[at] = (uint8_t)category;
 }
 
-/* A heading goes above the first program of each category. */
-static bool programs_heading_above(size_t index) {
-    return index < programs_count
-        && (index == 0
-            || programs_categories[index] != programs_categories[index - 1]);
+/* Splits the sorted programs into one group per category. */
+static void programs_group(void) {
+    programs_group_count = 0;
+    for (size_t i = 0; i < programs_count; i++) {
+        if (i == 0 || programs_categories[i] != programs_categories[i - 1]) {
+            size_t group = programs_group_count++;
+            programs_group_category[group] = programs_categories[i];
+            programs_group_first[group] = i;
+            programs_group_size[group] = 0;
+        }
+        programs_group_size[programs_group_count - 1]++;
+    }
 }
 
-static void programs_layout(void) {
-    int64_t top = 0;
-    for (size_t i = 0; i < programs_count; i++) {
-        if (programs_heading_above(i)) {
-            top += PROGRAMS_HEADING_HEIGHT;
-        }
-        programs_tops[i] = top;
-        top += MENU_ITEM_HEIGHT;
-    }
-    programs_rows_height = programs_count == 0 ? MENU_ITEM_HEIGHT : top;
+static const char *programs_group_name(size_t group) {
+    size_t category = programs_group_category[group];
+    return category < STORE_CATEGORIES ? store_category_names[category]
+                                       : "OTHER";
 }
 
 static void programs_load_directory(const char *directory, bool disk) {
@@ -9945,27 +9961,54 @@ static void programs_load(void) {
                      programs_packages[i].path,
                      programs_package_category(programs_packages[i].id));
     }
-    programs_layout();
+    programs_group();
 }
 
 static void programs_show(bool focus) {
     if (!programs_open) {
         programs_load();
         programs_selection = 0;
+        group_open = false;
+        group_focus = false;
+        group_switch_at = 0;
     }
     programs_open = true;
     programs_focus = focus;
     programs_close_at = 0;
 }
 
-/* Runs the delayed close; true when the submenu just closed. */
+/* Opens the submenu of category row group; focus gives it the keyboard. */
+static void group_show(size_t group, bool focus) {
+    if (group >= programs_group_count) {
+        return;
+    }
+    if (!group_open || group_shown != group) {
+        group_shown = group;
+        group_selection = 0;
+        group_scroll = 0;
+    }
+    group_open = true;
+    group_focus = focus;
+    group_switch_at = 0;
+    programs_selection = group;
+}
+
+/* Runs the delayed close and category switch; true when either ran. */
 static bool programs_close_check(void) {
+    bool changed = false;
+    if (group_switch_at != 0 && timer_ticks() >= group_switch_at) {
+        group_switch_at = 0;
+        if (programs_open) {
+            group_show(programs_selection, false);
+            changed = true;
+        }
+    }
     if (programs_close_at == 0 || timer_ticks() < programs_close_at) {
-        return false;
+        return changed;
     }
     programs_close_at = 0;
     if (!programs_open || programs_focus) {
-        return false;
+        return changed;
     }
     programs_open = false;
     return true;
@@ -9983,7 +10026,8 @@ static size_t menu_index_of(enum menu_action action) {
 static struct rect programs_rect(void) {
     struct rect menu = menu_rect();
     struct rect item = menu_item_rect(menu_index_of(MENU_PROGRAMS));
-    int64_t height = programs_rows_height + 12;
+    size_t rows = programs_group_count == 0 ? 1 : programs_group_count;
+    int64_t height = (int64_t)rows * MENU_ITEM_HEIGHT + 12;
     int64_t x = menu.x + menu.width - 2;
     if (x + PROGRAMS_WIDTH > screen_width()) {
         x = menu.x - PROGRAMS_WIDTH + 2; /* no room on the right */
@@ -9997,9 +10041,78 @@ static struct rect programs_rect(void) {
 
 static struct rect programs_item_rect(size_t index) {
     struct rect box = programs_rect();
-    int64_t top = index < programs_count ? programs_tops[index] : 0;
-    return (struct rect){box.x + 6, box.y + 6 + top, box.width - 12,
-                         MENU_ITEM_HEIGHT};
+    return (struct rect){box.x + 6,
+                         box.y + 6 + (int64_t)index * MENU_ITEM_HEIGHT,
+                         box.width - 12, MENU_ITEM_HEIGHT};
+}
+
+/* Program rows of the category submenu: all of them, or as many as fit
+   on the screen, when it scrolls. */
+static size_t group_rows(void) {
+    int64_t fit = (screen_height() - 12) / MENU_ITEM_HEIGHT;
+    size_t visible = fit < 1 ? 1 : (size_t)fit;
+    size_t size = programs_group_size[group_shown];
+    return size < visible ? size : visible;
+}
+
+static bool group_scrolls(void) {
+    return programs_group_size[group_shown] > group_rows();
+}
+
+/* Beside the PROGRAMS submenu, on the side away from the Start menu,
+   level with its category row. */
+static struct rect group_rect(void) {
+    struct rect parent = programs_rect();
+    struct rect row = programs_item_rect(group_shown);
+    int64_t height = (int64_t)group_rows() * MENU_ITEM_HEIGHT + 12;
+    int64_t x = parent.x + parent.width - 2;
+    if (parent.x < menu_rect().x || x + PROGRAMS_WIDTH > screen_width()) {
+        x = parent.x - PROGRAMS_WIDTH + 2;
+    }
+    int64_t y = row.y - 6;
+    if (y + height > screen_height()) {
+        y = screen_height() - height;
+    }
+    return (struct rect){x, y < 0 ? 0 : y, PROGRAMS_WIDTH, height};
+}
+
+/* The row-th visible program row of the category submenu. */
+static struct rect group_item_rect(size_t row) {
+    struct rect box = group_rect();
+    int64_t bar = group_scrolls() ? 8 : 0;
+    return (struct rect){box.x + 6,
+                         box.y + 6 + (int64_t)row * MENU_ITEM_HEIGHT,
+                         box.width - 12 - bar, MENU_ITEM_HEIGHT};
+}
+
+/* Scrolls so the selected program is visible. */
+static void group_follow_selection(void) {
+    size_t rows = group_rows();
+    if (group_selection < group_scroll) {
+        group_scroll = group_selection;
+    } else if (group_selection >= group_scroll + rows) {
+        group_scroll = group_selection - rows + 1;
+    }
+}
+
+/* The wheel over the category submenu scrolls it (positive notches
+   scroll up); the selection stays on a visible row. */
+static bool group_wheel(int32_t x, int32_t y, int32_t notches) {
+    if (!programs_open || !group_open || !rect_contains(group_rect(), x, y)
+        || !group_scrolls()) {
+        return false;
+    }
+    size_t rows = group_rows();
+    int64_t last = (int64_t)(programs_group_size[group_shown] - rows);
+    int64_t next = (int64_t)group_scroll
+                 - (int64_t)notches * PROGRAMS_WHEEL_ROWS;
+    group_scroll = next < 0 ? 0 : next > last ? (size_t)last : (size_t)next;
+    if (group_selection < group_scroll) {
+        group_selection = group_scroll;
+    } else if (group_selection >= group_scroll + rows) {
+        group_selection = group_scroll + rows - 1;
+    }
+    return true;
 }
 
 static void programs_launch(size_t index) {
@@ -10020,33 +10133,60 @@ static void draw_programs_menu(void) {
     fill(box, 110, 160, 255);
     fill((struct rect){box.x + 2, box.y + 2, box.width - 4, box.height - 4},
          26, 34, 54);
-    if (programs_count == 0) {
+    if (programs_group_count == 0) {
         struct rect item = programs_item_rect(0);
         draw_text_clipped(item.x + 10, item.y + 7, item.width - 20,
                           "(NO PROGRAMS)", 120, 130, 150);
         return;
     }
-    for (size_t i = 0; i < programs_count; i++) {
+    for (size_t i = 0; i < programs_group_count; i++) {
         struct rect item = programs_item_rect(i);
-        if (programs_heading_above(i)) {
-            size_t category = programs_categories[i];
-            int64_t top = item.y - PROGRAMS_HEADING_HEIGHT;
-            if (i != 0) {
-                fill((struct rect){item.x, top + 3, item.width, 1},
-                     58, 66, 88);
-            }
-            draw_text_clipped(item.x + 10, top + 9, item.width - 20,
-                              category < STORE_CATEGORIES
-                                  ? store_category_names[category]
-                                  : "OTHER",
-                              130, 160, 220);
-        }
         if (i == programs_selection) {
+            fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
+                 70, 100, 160);
+        } else if (group_open && i == group_shown) {
+            fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
+                 48, 64, 100);
+        }
+        draw_text_clipped(item.x + 10, item.y + 7,
+                          item.width - 30 - CHAR_WIDTH,
+                          programs_group_name(i), 230, 238, 255);
+        draw_text_clipped(item.x + item.width - 10 - CHAR_WIDTH, item.y + 7,
+                          CHAR_WIDTH, ">", 230, 238, 255);
+    }
+    if (!group_open) {
+        return;
+    }
+    box = group_rect();
+    fill(box, 110, 160, 255);
+    fill((struct rect){box.x + 2, box.y + 2, box.width - 4, box.height - 4},
+         26, 34, 54);
+    size_t first = programs_group_first[group_shown];
+    size_t size = programs_group_size[group_shown];
+    size_t rows = group_rows();
+    for (size_t row = 0; row < rows && group_scroll + row < size; row++) {
+        struct rect item = group_item_rect(row);
+        size_t index = group_scroll + row;
+        if (index == group_selection) {
             fill((struct rect){item.x, item.y + 2, item.width, item.height - 3},
                  70, 100, 160);
         }
         draw_text_clipped(item.x + 10, item.y + 7, item.width - 20,
-                          programs_names[i], 230, 238, 255);
+                          programs_names[first + index], 230, 238, 255);
+    }
+    if (size > rows) {
+        /* Scroll bar: the thumb's share and place match the rows shown. */
+        int64_t track_y = box.y + 6;
+        int64_t track_height = (int64_t)rows * MENU_ITEM_HEIGHT;
+        int64_t thumb = track_height * (int64_t)rows / (int64_t)size;
+        if (thumb < 16) {
+            thumb = 16;
+        }
+        int64_t thumb_y = track_y + (track_height - thumb)
+                        * (int64_t)group_scroll / (int64_t)(size - rows);
+        int64_t bar_x = box.x + box.width - 11;
+        fill((struct rect){bar_x, track_y, 4, track_height}, 40, 50, 74);
+        fill((struct rect){bar_x, thumb_y, 4, thumb}, 110, 160, 255);
     }
 }
 
@@ -10058,11 +10198,30 @@ static bool start_menu_hover(int32_t x, int32_t y) {
     }
     menu_hover_x = x;
     menu_hover_y = y;
+    if (programs_open && group_open && rect_contains(group_rect(), x, y)) {
+        programs_close_at = 0;
+        group_switch_at = 0;
+        programs_selection = group_shown;
+        for (size_t row = 0; row < group_rows(); row++) {
+            if (rect_contains(group_item_rect(row), x, y)) {
+                group_selection = group_scroll + row;
+            }
+        }
+        return true;
+    }
     if (programs_open && rect_contains(programs_rect(), x, y)) {
         programs_close_at = 0;
-        for (size_t i = 0; i < programs_count; i++) {
-            if (rect_contains(programs_item_rect(i), x, y)) {
-                programs_selection = i;
+        for (size_t i = 0; i < programs_group_count; i++) {
+            if (!rect_contains(programs_item_rect(i), x, y)) {
+                continue;
+            }
+            programs_selection = i;
+            if (!group_open) {
+                group_show(i, false);
+            } else if (i == group_shown) {
+                group_switch_at = 0;
+            } else if (group_switch_at == 0) {
+                group_switch_at = timer_ticks() + PROGRAMS_CLOSE_TICKS;
             }
         }
         return true;
@@ -10086,13 +10245,34 @@ static bool programs_key(char character) {
     if (!programs_open || !programs_focus) {
         return false;
     }
-    size_t count = programs_count == 0 ? 1 : programs_count;
+    if (group_open && group_focus) {
+        size_t size = programs_group_size[group_shown];
+        if (character == KEY_UP) {
+            group_selection = (group_selection + size - 1) % size;
+            group_follow_selection();
+        } else if (character == KEY_DOWN) {
+            group_selection = (group_selection + 1) % size;
+            group_follow_selection();
+        } else if (character == '\n' || character == KEY_RIGHT) {
+            programs_launch(programs_group_first[group_shown]
+                            + group_selection);
+        } else if (character == KEY_LEFT || character == KEY_ESCAPE) {
+            group_open = false;
+            group_focus = false;
+        }
+        return true;
+    }
+    size_t count = programs_group_count == 0 ? 1 : programs_group_count;
     if (character == KEY_UP) {
         programs_selection = (programs_selection + count - 1) % count;
+        group_open = false;
+        group_switch_at = 0;
     } else if (character == KEY_DOWN) {
         programs_selection = (programs_selection + 1) % count;
+        group_open = false;
+        group_switch_at = 0;
     } else if (character == '\n' || character == KEY_RIGHT) {
-        programs_launch(programs_selection);
+        group_show(programs_selection, true);
     } else if (character == KEY_LEFT || character == KEY_ESCAPE) {
         programs_open = false;
         programs_focus = false;
@@ -11948,10 +12128,21 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
         }
     }
     if (start_menu_open) {
+        if (programs_open && group_open
+            && rect_contains(group_rect(), x, y)) {
+            for (size_t row = 0; row < group_rows(); row++) {
+                if (rect_contains(group_item_rect(row), x, y)) {
+                    programs_launch(programs_group_first[group_shown]
+                                    + group_scroll + row);
+                    break;
+                }
+            }
+            return DESKTOP_CONTINUE;
+        }
         if (programs_open && rect_contains(programs_rect(), x, y)) {
-            for (size_t i = 0; i < programs_count; i++) {
+            for (size_t i = 0; i < programs_group_count; i++) {
                 if (rect_contains(programs_item_rect(i), x, y)) {
-                    programs_launch(i);
+                    group_show(i, false);
                 }
             }
             return DESKTOP_CONTINUE;
@@ -16237,8 +16428,11 @@ static size_t wheel_scrolled(size_t first, int32_t notches, size_t rows,
 /* Mouse wheel or two-finger scroll (positive notches scroll up). It goes
    to the window under the pointer, focused or not. */
 static bool handle_wheel(int32_t x, int32_t y, int32_t notches) {
-    if (notches == 0 || protected_active || login_active || start_menu_open) {
+    if (notches == 0 || protected_active || login_active) {
         return false;
+    }
+    if (start_menu_open) {
+        return group_wheel(x, y, notches);
     }
     if (center_wheel(x, y, notches) || volume_wheel(x, y, notches)) {
         return true;

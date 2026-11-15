@@ -637,6 +637,13 @@ static bool picked(const struct permission_identity *identity,
         && metadata.inode == identity->read_grant_inode;
 }
 
+/* path is the file the person chose to save to. */
+static bool written(const struct permission_identity *identity,
+                    const char *path, size_t length) {
+    return identity->write_grant[0] != '\0'
+        && equal_ignore_case(path, length, identity->write_grant);
+}
+
 /* A read of a shared-class path that needs files.shared. */
 static bool shared_read_needs_capability(
     const struct permission_identity *identity, const char *path,
@@ -656,6 +663,7 @@ bool permission_program_allows(const struct permission_identity *identity,
     }
     struct path_info info = classify_visible(path, length);
     if (identity->confined && access != PERMISSION_READ
+        && !(access == PERMISSION_WRITE && written(identity, path, length))
         && (identity->private_path[0] == '\0'
             || !begins_component(path, length, identity->private_path)
             || (access == PERMISSION_REMOVE
@@ -666,7 +674,8 @@ bool permission_program_allows(const struct permission_identity *identity,
     case CLASS_SHARED:
         if (access == PERMISSION_READ
             && shared_read_needs_capability(identity, path, length)) {
-            return picked(identity, path, length);
+            return picked(identity, path, length)
+                || written(identity, path, length);
         }
         return access != PERMISSION_REMOVE || !info.anchor;
     case CLASS_SYSTEM:
@@ -712,7 +721,8 @@ bool permission_program_allows(const struct permission_identity *identity,
                 && begins_component(path, length, identity->program_folder)) {
                 return true;
             }
-            return picked(identity, path, length);
+            return picked(identity, path, length)
+                || written(identity, path, length);
         }
         return access != PERMISSION_REMOVE || !info.anchor;
     }
@@ -766,6 +776,30 @@ bool permission_grant_read_file(struct permission_identity *identity,
     identity->read_grant[length] = '\0';
     identity->read_grant_device = metadata.device;
     identity->read_grant_inode = metadata.inode;
+    return true;
+}
+
+bool permission_grant_write_file(struct permission_identity *identity,
+                                 const char *path, size_t length) {
+    if (identity == NULL || !identity->confined || path == NULL
+        || length == 0 || length >= sizeof(identity->write_grant)) {
+        return false;
+    }
+    struct permission_identity baseline = *identity;
+    baseline.confined = false;
+    if (!permission_program_allows(&baseline, path, length,
+                                   PERMISSION_WRITE)) {
+        return false;
+    }
+    struct vfs_metadata metadata;
+    if (vfs_stat(path, length, &metadata)
+        && metadata.type != VFS_NODE_FILE) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        identity->write_grant[i] = path[i];
+    }
+    identity->write_grant[length] = '\0';
     return true;
 }
 

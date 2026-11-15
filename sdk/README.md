@@ -282,7 +282,12 @@ home folder in `/disk/Users`. Programs launched from disk can write only
 inside their private directory; `opos_app_storage(path, capacity)` returns
 its path. To read a file elsewhere in their account home, call
 `opos_pick_file(path, capacity)` and open the returned path. The user chooses
-the file in Files; Esc or closing Files cancels the request. Built-in
+the file in Files; Esc or closing Files cancels the request.
+To save a file there, call `opos_save_file(suggested, path, capacity)`:
+Files opens in save mode with the suggested name, the user picks a folder
+and name (and confirms replacing an existing file), and the program may
+then create and write the returned path. It returns the path length,
+`-OPOS_ECANCELED`, or `-OPOS_ENOSYS` on OPOS before 0.6.3. Built-in
 programs from the ISO retain the broader shared-disk
 access described in the security model.
 

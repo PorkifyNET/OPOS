@@ -14,8 +14,8 @@ The repository release then holds index, index.sig and the .opk files
 (docs/packages.md, "Repository").
 
 --catalog names the Store catalog (store/catalog.txt): for each package
-id, a "[id]" line and then category, license, featured, summary and
-description lines for the Store window.
+id, a "[id]" line and then category, license, featured, official,
+summary and description lines for the Store window.
 
 The index format, which kernel/package.c checks the same way
 (parse_index below is its twin; tools/test_package_parity.py compares
@@ -32,6 +32,7 @@ them):
     category: games
     license: GPL-2.0
     featured: yes
+    official: yes
     summary: ...
     description: ...
 
@@ -154,7 +155,7 @@ def one_line(text):
 
 CATALOG_CATEGORIES = {"games", "internet", "office", "graphics",
                       "sound-video", "programming", "system", "accessories"}
-CATALOG_LIMITS = {"category": 16, "license": 40, "featured": 3,
+CATALOG_LIMITS = {"category": 16, "license": 40, "featured": 3, "official": 3,
                   "summary": 90, "description": 900}
 
 
@@ -194,8 +195,8 @@ def read_catalog(path):
             if key == "category" and text not in CATALOG_CATEGORIES:
                 raise SystemExit(f"{where}: category must be one of "
                                  + ", ".join(sorted(CATALOG_CATEGORIES)))
-            if key == "featured" and text != "yes":
-                raise SystemExit(f"{where}: featured can only be 'yes'")
+            if key in ("featured", "official") and text != "yes":
+                raise SystemExit(f"{where}: {key} can only be 'yes'")
             current[key] = text
     return catalog
 
@@ -267,8 +268,8 @@ def build(paths, output, catalog):
         if package.get("requires-opos"):
             lines.append(f"requires-opos: {package['requires-opos']}")
         about = catalog.get(ident, {})
-        for key in ("category", "license", "featured", "summary",
-                    "description"):
+        for key in ("category", "license", "featured", "official",
+                    "summary", "description"):
             if about.get(key):
                 lines.append(f"{key}: {about[key]}")
     data = ("\n".join(lines) + "\n").encode("utf-8")

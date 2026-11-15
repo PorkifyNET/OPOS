@@ -3884,6 +3884,7 @@ static int64_t user_linux_execve(struct user_process *process,
 #define OPOS_SYSCALL_USER_INFO (OPOS_SYSCALL_BASE + 1)
 #define OPOS_SYSCALL_APP_STORAGE (OPOS_SYSCALL_BASE + 2)
 #define OPOS_SYSCALL_PICK_FILE (OPOS_SYSCALL_BASE + 3)
+#define OPOS_SYSCALL_SAVE_FILE (OPOS_SYSCALL_BASE + 4)
 #define OPOS_ABI_VERSION 1
 #define OPOS_USER_ADMIN 1u
 #define OPOS_USER_ACCOUNT 2u
@@ -4114,6 +4115,56 @@ static bool user_copy_string(uintptr_t address, size_t length, char *out,
     }
     out[length] = '\0';
     return true;
+}
+
+/* opos_save_file(name, name_length, path, capacity): Files asks where to
+   save, suggesting name. The program may then create, write and read
+   that one file (permission_grant_write_file). */
+static int64_t user_opos_save_file(struct user_process *process,
+                                   const struct linux_syscall_frame *frame) {
+    if (!process->identity.confined) {
+        return -22;
+    }
+    /* A name, or a full path to start in that folder. */
+    char suggested[USER_FILE_PATH_CAPACITY];
+    size_t name_length = (size_t)frame->rsi;
+    if (name_length == 0) {
+        suggested[0] = '\0';
+    } else if (!user_copy_string((uintptr_t)frame->rdi, name_length,
+                                 suggested, sizeof(suggested))) {
+        return -22;
+    }
+    uintptr_t address = (uintptr_t)frame->rdx;
+    size_t capacity = (size_t)frame->r10;
+    if (capacity == 0) {
+        return -36;
+    }
+    size_t checked = capacity < USER_FILE_PATH_CAPACITY
+        ? capacity : USER_FILE_PATH_CAPACITY;
+    if (!paging_user_range_valid(address, checked, true, false)) {
+        return -14;
+    }
+    char path[USER_FILE_PATH_CAPACITY];
+    int64_t length = desktop_app_save_file(process->id, process->name,
+                                           &process->identity, suggested,
+                                           path, sizeof(path));
+    if (length < 0) {
+        return length;
+    }
+    if ((size_t)length + 1 > capacity) {
+        return -36;
+    }
+    if (!paging_user_range_valid(address, (size_t)length + 1, true, false)) {
+        return -14;
+    }
+    if (!permission_grant_write_file(&process->identity, path,
+                                     (size_t)length)) {
+        return -13; /* no longer allowed while the picker ran */
+    }
+    for (size_t i = 0; i <= (size_t)length; i++) {
+        ((char *)address)[i] = path[i];
+    }
+    return length;
 }
 
 static int64_t user_opos_package(const struct user_process *process,
@@ -6121,6 +6172,10 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
     if (number == OPOS_SYSCALL_PICK_FILE) {
         frame->rax = (uint64_t)user_opos_pick_file(
             process, (uintptr_t)frame->rdi, (size_t)frame->rsi);
+        return false;
+    }
+    if (number == OPOS_SYSCALL_SAVE_FILE) {
+        frame->rax = (uint64_t)user_opos_save_file(process, frame);
         return false;
     }
     if (number >= OPOS_SYSCALL_WINDOW_CREATE

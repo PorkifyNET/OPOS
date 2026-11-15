@@ -42,6 +42,13 @@ int64_t desktop_app_window_event(uint64_t owner,
 int64_t desktop_app_pick_file(uint64_t owner, const char *name,
                               const struct permission_identity *identity,
                               char *path, size_t capacity);
+/* Asks the person to choose a folder and file name to save to, starting
+   from suggested (may be ""). Returns the path length, -125 on
+   cancellation, or another negative errno. The caller grants the write. */
+int64_t desktop_app_save_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              const char *suggested, char *path,
+                              size_t capacity);
 /* Asks the person at the desktop whether the program may have one
    PERMISSION_CAP_* capability. Returns 1 for allow, 0 for deny, -38 with
    no desktop or at the login screen, -16 while another prompt is open,

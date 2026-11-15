@@ -6,6 +6,8 @@
 #             programming | system | accessories
 #   license: SPDX name or a short text (40 characters at most)
 #   featured: yes          (optional: shown on the Store's start page)
+#   official: yes          (optional: made by OPOS, listed under MADE BY
+#                          OPOS; not for the SDK examples)
 #   summary: one short line (90 characters at most)
 #   description: the About page text, one line (900 characters at most)
 #
@@ -66,3 +68,24 @@ category: system
 license: Apache-2.0
 summary: Shows Chinese, Japanese and Korean text in the browser instead of boxes.
 description: Droid Sans Fallback, a font with Chinese characters, Japanese kana and Korean Hangul. Without it, text in these scripts shows as boxes. Once installed, the browser and every other program that draws text with the OPOS TrueType fonts use it for the characters their own fonts lack. It adds no Start menu entry. 4 MB.
+
+[net.porkify.opos.minesweeper]
+category: games
+license: GPL-3.0
+official: yes
+summary: Clear the field without stepping on a mine.
+description: Open every cell that holds no mine. A number tells how many of the eight cells around it hide one. Left click opens a cell, right click plants a flag, and a click on a number whose flags are all placed opens the cells around it. Three levels: beginner (9 x 9, 10 mines), intermediate (16 x 16, 40 mines) and expert (30 x 16, 99 mines); press 1, 2 or 3 to switch. The keyboard works too: arrows move, Space opens, F flags and N starts a new game.
+
+[net.porkify.opos.solitaire]
+category: games
+license: GPL-3.0
+official: yes
+summary: The classic Klondike patience: build four suits from Ace to King.
+description: Move every card to the four foundations, by suit from Ace to King. On the seven columns cards go down in alternating colors, and only a King may fill an empty column. Drag cards with the mouse, click the stock to deal, and double-click or right-click a card to send it home. Choose between drawing one card or three (D), undo moves (U) and deal a new game (N). Arrows, Space and A (all cards home) play it from the keyboard.
+
+[net.porkify.opos.picasso]
+category: graphics
+license: GPL-3.0
+official: yes
+summary: Draw and edit pictures, then save them as PNG.
+description: Picasso is the OPOS image editor. Draw with the pen, eraser and spray can in six brush sizes; draw lines, rectangles and ellipses, outlined or filled (hold Shift for straight lines, squares and circles); fill areas with the bucket and pick colors from the picture. The left mouse button paints with the first color and the right button with the second. Open PNG, JPEG and BMP pictures up to 4096 x 4096 and save them as PNG in any folder you choose. Zoom from 25% to 800%, undo and redo, and use keyboard shortcuts such as Ctrl+S, Ctrl+Z and P, E, L, R, O, F for the tools.

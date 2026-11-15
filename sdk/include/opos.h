@@ -223,6 +223,23 @@ static inline long opos_pick_file(char *path, size_t capacity) {
     return opos_syscall2(OPOS_SYS_PICK_FILE, (long)path, (long)capacity);
 }
 
+/* Shows Files for the user to choose a folder and type a file name to
+   save to, starting with suggested (e.g. "Picture.png", may be ""; a
+   full path such as "/disk/Users/bob/Pictures/a.png" starts in that
+   folder, which needs OPOS 0.6.3 or newer like the call itself). An
+   existing file is replaced only after the user confirms. Returns the
+   path length, -OPOS_ECANCELED on Esc/close, or another negative error.
+   The app may then create, write and read that one file (not remove or
+   rename it) until it saves elsewhere. Disk apps only; older OPOS
+   versions return -OPOS_ENOSYS. */
+#define OPOS_SYS_SAVE_FILE 0x4f500004L
+static inline long opos_save_file(const char *suggested, char *path,
+                                  size_t capacity) {
+    return opos_syscall4(OPOS_SYS_SAVE_FILE, (long)suggested,
+                         (long)opos_strlen(suggested), (long)path,
+                         (long)capacity);
+}
+
 /* ------------------------------------------------------- system update */
 
 /*

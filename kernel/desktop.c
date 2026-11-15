@@ -3177,15 +3177,49 @@ static size_t files_last_click_row = (size_t)-1;
 static uint64_t files_last_click_tick;
 
 /* One outstanding file request. Only Files can complete it; the process
-   waiting in the syscall receives the selected path afterward. */
+   waiting in the syscall receives the selected path afterward. A save
+   request (opos_save_file) has a file name the person types; the folder
+   is the one Files shows. */
+#define FILES_SAVE_NAME_MAX 63
 static struct {
     uint64_t owner;
     volatile int result; /* 0: waiting, 1: selected, 2: cancelled */
     bool open_pending;
+    bool save;
+    /* The name exists: the next Enter replaces it. */
+    bool replace_asked;
     char name[32];
     char path[FILES_PATH_CAPACITY];
+    char save_name[FILES_SAVE_NAME_MAX + 1];
+    size_t save_length;
     struct permission_identity identity;
+    /* Files was opened for this request: close it afterwards and bring
+       the program's window back to the front. */
+    bool opened_files;
+    /* Save mode: the folder to start in (from a suggested path). */
+    char start_folder[FILES_PATH_CAPACITY];
+    volatile bool finished;
+    uint64_t finished_owner;
 } files_picker;
+
+static bool files_picking(void) {
+    return files_picker.owner != 0 && files_picker.result == 0;
+}
+
+static bool files_saving(void) {
+    return files_picking() && files_picker.save;
+}
+
+static void files_save_name_set(const char *name) {
+    size_t length = 0;
+    while (name[length] != '\0' && length < FILES_SAVE_NAME_MAX) {
+        files_picker.save_name[length] = name[length];
+        length++;
+    }
+    files_picker.save_name[length] = '\0';
+    files_picker.save_length = length;
+    files_picker.replace_asked = false;
+}
 
 static void files_picker_cancel(void) {
     if (files_picker.owner != 0 && files_picker.result == 0) {
@@ -4021,6 +4055,67 @@ static void files_open_drive(size_t row) {
 
 static void viewer_open(const char *path, size_t length);
 
+/* Saving: Enter with a name. A folder's name opens it; an existing file
+   is replaced after a second Enter; otherwise the request completes when
+   the account may write there. */
+static void files_save_confirm(void) {
+    const char *name = files_picker.save_name;
+    size_t name_length = files_picker.save_length;
+    bool dots = (name_length == 1 && name[0] == '.')
+        || (name_length == 2 && name[0] == '.' && name[1] == '.');
+    if (name_length == 0 || dots) {
+        set_status("TYPE A FILE NAME");
+        return;
+    }
+    for (size_t i = 0; i < name_length; i++) {
+        if (name[i] == '/' || name[i] == '\\' || name[i] == ':') {
+            set_status("A FILE NAME CANNOT HAVE / \\ OR :");
+            return;
+        }
+    }
+    if (files_in_drives() || files_at_root()) {
+        set_status("CHOOSE A FOLDER FIRST");
+        return;
+    }
+    char path[FILES_PATH_CAPACITY];
+    size_t length = 0;
+    for (size_t i = 0; i < files_path_length; i++) {
+        path[length++] = files_path[i];
+    }
+    if (length + 1 + name_length >= sizeof(path)) {
+        set_status("THE NAME IS TOO LONG");
+        return;
+    }
+    path[length++] = '/';
+    for (size_t i = 0; i < name_length; i++) {
+        path[length++] = name[i];
+    }
+    path[length] = '\0';
+    struct vfs_metadata metadata;
+    bool exists = vfs_stat(path, length, &metadata);
+    if (exists && metadata.type != VFS_NODE_FILE) {
+        files_save_name_set("");
+        (void)files_visit(path, length);
+        return;
+    }
+    struct permission_identity baseline = files_picker.identity;
+    baseline.confined = false;
+    if (!permission_program_allows(&baseline, path, length,
+                                   PERMISSION_WRITE)) {
+        set_status("YOU CANNOT SAVE IN THIS FOLDER");
+        return;
+    }
+    if (exists && !files_picker.replace_asked) {
+        files_picker.replace_asked = true;
+        return;
+    }
+    for (size_t i = 0; i <= length; i++) {
+        files_picker.path[i] = path[i];
+    }
+    files_picker.result = 1;
+    scheduler_wake_event(&files_picker);
+}
+
 /* Opens a row: ".." goes up, folders are entered, pictures are shown,
    programs run. */
 static void files_open_row(size_t row) {
@@ -4042,6 +4137,9 @@ static void files_open_row(size_t row) {
     size_t length = files_entry_path(row, path, sizeof(path));
     if (files_entries[row].directory) {
         (void)files_visit(path, length);
+    } else if (files_saving()) {
+        files_save_name_set(files_entries[row].name);
+        files_save_confirm();
     } else if (files_picker.owner != 0 && files_picker.result == 0) {
         struct permission_identity baseline = files_picker.identity;
         baseline.confined = false;
@@ -4638,11 +4736,29 @@ static void draw_files(struct rect area, bool focused) {
                             list.y + list.height - LINE_HEIGHT - 1,
                             list.width - 12, LINE_HEIGHT};
         fill(line, 54, 73, 108);
-        char message[128];
+        char message[192];
         size_t used = append_text(message, sizeof(message), 0,
                                   files_picker.name);
-        append_text(message, sizeof(message), used,
-                    ": CHOOSE FILE TO READ (ENTER); ESC CANCELS");
+        if (files_picker.save && files_picker.replace_asked) {
+            used = append_text(message, sizeof(message), used, ": ");
+            used = append_text(message, sizeof(message), used,
+                               files_picker.save_name);
+            append_text(message, sizeof(message), used,
+                        " EXISTS. ENTER REPLACES IT; ESC CANCELS");
+        } else if (files_picker.save) {
+            used = append_text(message, sizeof(message), used,
+                               ": SAVE AS ");
+            used = append_text(message, sizeof(message), used,
+                               files_picker.save_name);
+            if ((timer_ticks() / 50) % 2 == 0) {
+                used = append_text(message, sizeof(message), used, "_");
+            }
+            append_text(message, sizeof(message), used,
+                        "  (ENTER SAVES; ESC CANCELS)");
+        } else {
+            append_text(message, sizeof(message), used,
+                        ": CHOOSE FILE TO READ (ENTER); ESC CANCELS");
+        }
         draw_text_clipped(line.x + 6, line.y + 3, line.width - 12,
                           message, 240, 245, 255);
         return;
@@ -11189,6 +11305,11 @@ static bool files_click(struct rect area, int32_t x, int32_t y) {
         files_anchor = row;
         files_last_click_row = double_click ? (size_t)-1 : row;
         files_last_click_tick = now;
+        size_t clicked;
+        if (files_saving() && files_row_entry(row, &clicked)
+            && !files_entries[clicked].directory) {
+            files_save_name_set(files_entries[clicked].name);
+        }
         if (double_click) {
             files_marks_clear();
             files_open_row(row);
@@ -12301,6 +12422,50 @@ static void draw_files_menu(void) {
 }
 
 static void files_key(char character) {
+    if (files_saving() && !files_address_editing) {
+        /* Typing edits the name; arrows choose folders and files. */
+        if (character == KEY_ESCAPE && files_picker.replace_asked) {
+            files_picker.replace_asked = false;
+        } else if (character == KEY_ESCAPE) {
+            files_picker_cancel();
+        } else if (keyboard_last_ctrl()
+                   && (character == 'l' || character == 'L')) {
+            files_address_start();
+        } else if (character == '\n' && files_picker.save_length == 0) {
+            /* No name yet: Enter opens the chosen folder (or file). */
+            files_key_navigate('\n');
+        } else if (character == '\n') {
+            files_save_confirm();
+        } else if (character == '\b') {
+            if (files_picker.save_length != 0) {
+                files_picker.save_name[--files_picker.save_length] = '\0';
+            }
+            files_picker.replace_asked = false;
+        } else if (character >= ' ' && character <= '~'
+                   && !keyboard_last_ctrl()) {
+            if (files_picker.save_length < FILES_SAVE_NAME_MAX) {
+                files_picker.save_name[files_picker.save_length++] =
+                    character;
+                files_picker.save_name[files_picker.save_length] = '\0';
+            }
+            files_picker.replace_asked = false;
+        } else if (character == KEY_UP || character == KEY_DOWN
+                   || character == KEY_LEFT || character == KEY_RIGHT) {
+            files_picker.replace_asked = false;
+            files_key_navigate(character == KEY_LEFT ? '\b'
+                               : character == KEY_RIGHT ? KEY_RIGHT
+                               : character);
+            /* Choosing a file with the arrows takes its name, as a
+               click does, so Enter replaces it (after asking). */
+            size_t chosen;
+            if ((character == KEY_UP || character == KEY_DOWN)
+                && files_row_entry(files_selection, &chosen)
+                && !files_entries[chosen].directory) {
+                files_save_name_set(files_entries[chosen].name);
+            }
+        }
+        return;
+    }
     if (files_picker.owner != 0 && files_picker.result == 0) {
         if (character == KEY_ESCAPE) {
             files_picker_cancel();
@@ -14082,9 +14247,10 @@ int64_t desktop_app_window_event(uint64_t owner,
     return result;
 }
 
-int64_t desktop_app_pick_file(uint64_t owner, const char *name,
-                              const struct permission_identity *identity,
-                              char *path, size_t capacity) {
+static int64_t desktop_app_file_request(
+    uint64_t owner, const char *name,
+    const struct permission_identity *identity, const char *suggested,
+    char *path, size_t capacity) {
     if (owner == 0 || name == NULL || identity == NULL || path == NULL) {
         return -22;
     }
@@ -14097,6 +14263,28 @@ int64_t desktop_app_pick_file(uint64_t owner, const char *name,
     files_picker.owner = owner;
     files_picker.result = 0;
     files_picker.open_pending = true;
+    files_picker.save = suggested != NULL;
+    files_picker.start_folder[0] = '\0';
+    if (suggested != NULL) {
+        /* "/folder/name" starts in that folder with that name. */
+        size_t slash = (size_t)-1;
+        for (size_t i = 0; suggested[i] != '\0'; i++) {
+            if (suggested[i] == '/') {
+                slash = i;
+            }
+        }
+        if (slash != (size_t)-1 && slash != 0 && suggested[0] == '/'
+            && slash < sizeof(files_picker.start_folder)) {
+            for (size_t i = 0; i < slash; i++) {
+                files_picker.start_folder[i] = suggested[i];
+            }
+            files_picker.start_folder[slash] = '\0';
+        }
+        files_save_name_set(slash != (size_t)-1 ? suggested + slash + 1
+                                                : suggested);
+    } else {
+        files_save_name_set("");
+    }
     files_picker.path[0] = '\0';
     files_picker.identity = *identity;
     text_copy(files_picker.name, sizeof(files_picker.name), name);
@@ -14120,10 +14308,31 @@ int64_t desktop_app_pick_file(uint64_t owner, const char *name,
             result = (int64_t)length;
         }
     }
+    files_picker.finished_owner = files_picker.owner;
     files_picker.owner = 0;
     files_picker.result = 0;
     files_picker.open_pending = false;
+    files_picker.save = false;
+    files_picker.finished = true;
     return result;
+}
+
+int64_t desktop_app_pick_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              char *path, size_t capacity) {
+    return desktop_app_file_request(owner, name, identity, NULL, path,
+                                    capacity);
+}
+
+int64_t desktop_app_save_file(uint64_t owner, const char *name,
+                              const struct permission_identity *identity,
+                              const char *suggested, char *path,
+                              size_t capacity) {
+    if (suggested == NULL) {
+        return -22;
+    }
+    return desktop_app_file_request(owner, name, identity, suggested, path,
+                                    capacity);
 }
 
 int64_t desktop_app_ask_permission(uint64_t owner, const char *name,
@@ -15280,6 +15489,7 @@ struct store_item {
     char requires[16];
     char summary[96];
     char description[1000];
+    char official[4]; /* "yes": made by OPOS */
 };
 
 enum store_page {
@@ -15308,11 +15518,12 @@ enum {
     STORE_LIST_OTHER = STORE_CATEGORIES, /* no category, or an unknown one */
     STORE_LIST_ALL,
     STORE_LIST_INSTALLED,
+    STORE_LIST_OFFICIAL, /* made by OPOS (official: yes in the index) */
 };
 /* HOME's category buttons. OTHER is shown only when it has programs. */
 static const size_t store_grid_lists[] = {
-    STORE_LIST_ALL, STORE_LIST_INSTALLED, 0, 1, 2, 3, 4, 5, 6, 7,
-    STORE_LIST_OTHER,
+    STORE_LIST_ALL, STORE_LIST_INSTALLED, STORE_LIST_OFFICIAL,
+    0, 1, 2, 3, 4, 5, 6, 7, STORE_LIST_OTHER,
 };
 #define STORE_GRID_MAX (sizeof(store_grid_lists) / sizeof(store_grid_lists[0]))
 #define STORE_GRID_COLUMNS 3
@@ -15401,12 +15612,17 @@ static const char *store_list_name(size_t list) {
     }
     return list == STORE_LIST_ALL ? "ALL PROGRAMS"
          : list == STORE_LIST_INSTALLED ? "INSTALLED"
+         : list == STORE_LIST_OFFICIAL ? "MADE BY OPOS"
          : "OTHER";
 }
 
 static bool store_in_list(const struct store_item *item, size_t list) {
     if (list == STORE_LIST_ALL) {
         return true;
+    }
+    if (list == STORE_LIST_OFFICIAL) {
+        return text_equals(item->official, text_length(item->official),
+                           "yes");
     }
     if (list == STORE_LIST_INSTALLED) {
         return store_item_is(item, "installed")
@@ -15597,6 +15813,9 @@ static void store_line_done(void) {
         store_field(&value, end, item->summary, sizeof(item->summary));
         store_field(&value, end, item->description,
                     sizeof(item->description));
+        /* Newer pkg versions add fields at the end; older ones leave
+           them empty. */
+        store_field(&value, end, item->official, sizeof(item->official));
         store_item_count++;
     } else if (text_equals(key, key_length, "phase")) {
         size_t count = (size_t)(end - value);
@@ -16824,15 +17043,36 @@ static bool apps_poll(void) {
     if (files_picker.owner != 0 && files_picker.result == 0
         && files_picker.open_pending) {
         files_picker.open_pending = false;
+        files_picker.opened_files = !windows[WINDOW_FILES].open;
         window_open(WINDOW_FILES);
         char home[FILES_PATH_CAPACITY];
         size_t length = accounts_home_path(NULL, home, sizeof(home));
-        if (length != 0) {
+        size_t start = 0;
+        while (files_picker.start_folder[start] != '\0') {
+            start++;
+        }
+        if (start != 0 && files_visit(files_picker.start_folder, start)) {
+            /* The folder of the file being saved again. */
+        } else if (length != 0) {
             (void)files_visit(home, length);
         }
         files_menu_open = false;
         files_prompt_kind = FILES_PROMPT_NONE;
         files_marks_clear();
+        redraw = true;
+    }
+    if (files_picker.finished && files_picker.owner == 0) {
+        files_picker.finished = false;
+        if (files_picker.opened_files && windows[WINDOW_FILES].open) {
+            window_close(WINDOW_FILES);
+        }
+        files_picker.opened_files = false;
+        for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {
+            if (app_windows[slot].owner == files_picker.finished_owner
+                && windows[WINDOW_APP + slot].open) {
+                window_raise(WINDOW_APP + slot);
+            }
+        }
         redraw = true;
     }
     for (size_t slot = 0; slot < APP_WINDOW_COUNT; slot++) {

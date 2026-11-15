@@ -114,6 +114,15 @@ extern int viewport_width_px, viewport_height_px;
 void style_compute(const struct opos_html_node *element,
                    const struct style *parent, struct style *style);
 
+#define PSEUDO_BEFORE 1
+#define PSEUDO_AFTER 2
+/* The style of element's ::before or ::after box (which: PSEUDO_*), with
+   element_style as its parent. Returns its generated text (UTF-8, in
+   text, NUL-terminated) and true, or false when it shows no text. */
+bool style_compute_pseudo(const struct opos_html_node *element, int which,
+                          const struct style *element_style,
+                          struct style *style, char *text, size_t capacity);
+
 /* ------------------------------------------------------------- display list */
 
 enum item_kind {
@@ -245,6 +254,11 @@ bool css_media_matches(const char *query);
 void css_apply(const struct css_sheet *chain,
                const struct opos_html_node *element, struct style *style,
                const struct style *parent);
+/* Applies the rules for element's ::before or ::after (which: PSEUDO_*);
+   false when no rule styles it. */
+bool css_apply_pseudo(const struct css_sheet *chain,
+                      const struct opos_html_node *element, int which,
+                      struct style *style, const struct style *parent);
 void css_apply_block(struct style *style, const char *text,
                      const struct style *parent);
 void apply_declaration(struct style *style, const char *name,

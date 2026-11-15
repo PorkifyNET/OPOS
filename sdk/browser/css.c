@@ -43,11 +43,13 @@ struct part {
     struct attr_test attrs[MAX_ATTRS];
     int attr_count;
     bool first_child, last_child, link, root;
+    uint8_t pseudo;                /* PSEUDO_BEFORE/AFTER: ::before/::after */
 };
 
 struct rule {
     struct part *parts;
     int part_count;
+    uint8_t pseudo;                /* 0, or the pseudo-element it styles */
     uint32_t specificity;
     uint32_t order;
     const char *normal;            /* declarations, NUL-terminated */
@@ -228,14 +230,25 @@ static bool parse_compound(char **cursor, struct part *part) {
             p++;
             any = true;
         } else if (c == ':') {
-            if (p[1] == ':') {
-                return false; /* pseudo-element */
-            }
-            char *start = ++p;
+            bool element = p[1] == ':';
+            char *start = p += element ? 2 : 1;
             while (is_ident(*p)) {
                 p++;
             }
             size_t n = (size_t)(p - start);
+            /* ::before and ::after (also the old one-colon form) end the
+               compound; other pseudo-elements are not supported. */
+            if (n == 6 && strncmp(start, "before", 6) == 0) {
+                part->pseudo = PSEUDO_BEFORE;
+            } else if (n == 5 && strncmp(start, "after", 5) == 0) {
+                part->pseudo = PSEUDO_AFTER;
+            } else if (element) {
+                return false;
+            }
+            if (part->pseudo != 0) {
+                any = true;
+                break;
+            }
             if (n == 11 && strncmp(start, "first-child", 11) == 0) {
                 part->first_child = true;
             } else if (n == 10 && strncmp(start, "last-child", 10) == 0) {
@@ -276,12 +289,16 @@ static bool parse_selector(char *start, char *end, struct part *parts,
             ok = false;
             break;
         }
+        if (n > 0 && parts[n - 1].pseudo != 0) {
+            ok = false; /* a pseudo-element must be last */
+            break;
+        }
         parts[n].combinator = combinator;
         a += parts[n].id != NULL;
         b += (uint32_t)parts[n].class_count + (uint32_t)parts[n].attr_count
            + parts[n].first_child + parts[n].last_child + parts[n].link
            + parts[n].root;
-        c += parts[n].tag != NULL;
+        c += (parts[n].tag != NULL) + (parts[n].pseudo != 0);
         n++;
         char *after = skip_blank(p);
         combinator = 0;
@@ -827,6 +844,7 @@ static void parse_rules(struct css_sheet *sheet, char *p, char *limit) {
                 if (rule.parts != NULL) {
                     memcpy(rule.parts, parts, (size_t)count * sizeof(struct part));
                     rule.part_count = count;
+                    rule.pseudo = parts[count - 1].pseudo;
                     rule.specificity = specificity;
                     rule.order = sheet->next_order++;
                     rule.normal = normal;
@@ -1812,11 +1830,15 @@ static const struct var_scope *element_scope(
     }
     struct var_scope *scope = NULL;
     for (size_t i = 0; i < matched->count; i++) {
-        collect_vars(index, &scope, parent, matched->rules[i]->normal);
+        if (matched->rules[i]->pseudo == 0) {
+            collect_vars(index, &scope, parent, matched->rules[i]->normal);
+        }
     }
     collect_vars(index, &scope, parent, opos_html_attribute(element, "style"));
     for (size_t i = 0; i < matched->count; i++) {
-        collect_vars(index, &scope, parent, matched->rules[i]->important);
+        if (matched->rules[i]->pseudo == 0) {
+            collect_vars(index, &scope, parent, matched->rules[i]->important);
+        }
     }
     matched->scope = scope != NULL ? scope : parent;
     matched->scope_ready = true;
@@ -1860,16 +1882,60 @@ void css_apply(const struct css_sheet *chain,
     }
 #endif
     for (size_t i = 0; i < matched->count; i++) {
-        if (matched->rules[i]->normal != NULL) {
+        if (matched->rules[i]->normal != NULL
+            && matched->rules[i]->pseudo == 0) {
             css_apply_block(style, matched->rules[i]->normal, parent);
         }
     }
     for (size_t i = 0; i < matched->count; i++) {
         const char *important = matched->rules[i]->important;
-        if (important != NULL && important[0] != '\0') {
+        if (important != NULL && important[0] != '\0'
+            && matched->rules[i]->pseudo == 0) {
             css_apply_block(style, important, parent);
         }
     }
+}
+
+bool css_apply_pseudo(const struct css_sheet *chain,
+                      const struct opos_html_node *element, int which,
+                      struct style *style, const struct style *parent) {
+    if (chain == NULL) {
+        return false;
+    }
+    struct css_index *index = chain_index((struct css_sheet *)chain);
+    if (index == NULL) {
+        return false;
+    }
+    struct cached *matched = matched_rules(index, element);
+    if (matched == NULL) {
+        return false;
+    }
+    bool any = false;
+    for (size_t i = 0; i < matched->count; i++) {
+        if (matched->rules[i]->pseudo == which) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) {
+        return false;
+    }
+    /* The pseudo-element sees its element's custom properties. */
+    style->vars = parent->vars;
+    for (size_t i = 0; i < matched->count; i++) {
+        if (matched->rules[i]->normal != NULL
+            && matched->rules[i]->pseudo == which) {
+            css_apply_block(style, matched->rules[i]->normal, parent);
+        }
+    }
+    for (size_t i = 0; i < matched->count; i++) {
+        const char *important = matched->rules[i]->important;
+        if (important != NULL && important[0] != '\0'
+            && matched->rules[i]->pseudo == which) {
+            css_apply_block(style, important, parent);
+        }
+    }
+    return true;
 }
 
 void css_reset_variables(void) {

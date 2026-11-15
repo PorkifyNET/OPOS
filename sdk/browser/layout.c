@@ -1243,16 +1243,71 @@ static void flush_inline(struct ctx *c) {
 static void process_node(struct ctx *c, const struct opos_html_node *node,
                          struct style *parent);
 
+/* The ::before or ::after text of node, if a style sheet gives it one. */
+static void add_pseudo(struct ctx *c, const struct opos_html_node *node,
+                       struct style *style, int which) {
+    if (node->type != HTML_NODE_ELEMENT || style_sheets == NULL) {
+        return;
+    }
+    struct style pseudo;
+    char text[256];
+    if (!style_compute_pseudo(node, which, style, &pseudo, text,
+                              sizeof(text))) {
+        return;
+    }
+    size_t length = strlen(text);
+    if (length == 0) {
+        /* content:"" with clear: the "clearfix" that keeps floats in. */
+        if (!c->measuring) {
+            flush_inline(c);
+            while (float_clear(c)) {
+            }
+        }
+        return;
+    }
+    /* Generated text is mostly decoration (arrows, separators): leave it
+       out rather than draw a replacement box for a missing glyph. */
+    struct opos_font *font = font_for(c, &pseudo);
+    for (size_t i = 0; i < length;) {
+        uint32_t code;
+        size_t step = opos_utf8_decode(text + i, length - i, &code);
+        if (step == 0 || (code > ' ' && !opos_font_has_glyph(font, code))) {
+            return;
+        }
+        i += step;
+    }
+    struct style *kept = arena_alloc(c->page, sizeof(*kept));
+    char *copy = arena_alloc(c->page, length + 1);
+    if (kept == NULL || copy == NULL) {
+        c->failed = true;
+        return;
+    }
+    *kept = pseudo;
+    memcpy(copy, text, length + 1);
+    /* A block-level one gets lines of its own. */
+    bool block = kept->display != DISPLAY_INLINE
+              && kept->display != DISPLAY_INLINE_BLOCK;
+    if (block) {
+        flush_inline(c);
+    }
+    add_text(c, copy, length, kept);
+    if (block) {
+        flush_inline(c);
+    }
+}
+
 static void process_children(struct ctx *c, const struct opos_html_node *node,
                              struct style *style) {
     if (c->depth >= MAX_DEPTH) {
         return;
     }
     c->depth++;
+    add_pseudo(c, node, style, PSEUDO_BEFORE);
     for (const struct opos_html_node *child = node->first_child;
          child != NULL && !c->failed; child = child->next_sibling) {
         process_node(c, child, style);
     }
+    add_pseudo(c, node, style, PSEUDO_AFTER);
     c->depth--;
 }
 
@@ -2133,6 +2188,10 @@ static void float_note(struct ctx *c, int side, int x, int width, int top,
 static void layout_float(struct ctx *c, const struct opos_html_node *node,
                          struct style *st) {
     flush_inline(c);
+    /* The float starts below the margin collapsing above it, as the
+       text next to it does. */
+    c->y += c->pending_margin;
+    c->pending_margin = 0;
     int left, right;
     line_bounds(c, c->y, &left, &right);
     int room = clamp_min(right - left, 1);

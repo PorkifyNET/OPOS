@@ -26,7 +26,7 @@ LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none \
 
 EXAMPLES := hello permtest sketch notepad fetch update pkg fonttest pickfile sharedread play notify
 # Programs made by OPOS and published in the Store (programs/*.pkg).
-PROGRAMS := minesweeper solitaire picasso
+PROGRAMS := minesweeper solitaire picasso mediaplayer
 LIB_SOURCES := $(wildcard lib/*.c)
 LIB_OBJECTS := $(patsubst lib/%.c,$(BUILD)/lib/%.o,$(LIB_SOURCES))
 HEADERS := $(wildcard include/*.h)

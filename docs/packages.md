@@ -525,8 +525,9 @@ capabilities named in the manifest notes of the package's executables
 (`net`, `clipboard.read`, `files.shared`, `notifications`), or `none`. Other platforms
 use the `capabilities:` line of PACKAGE. The line is covered by the
 index signature. The kernel ignores it; the window shows it as "MAY ASK
-FOR: NETWORK". It only informs the person: each permission is still
-asked for when the program first needs it.
+FOR: NETWORK". INSTALL and UPDATE first show a permissions sheet built
+from it, where each permission can be allowed, denied or left to be asked
+for when the program first needs it (`docs/store-permissions.md`).
 
 **Settings > UPDATES.** A PROGRAMS line under the OPOS status says how
 many Store programs have an update, from the last list the Store window

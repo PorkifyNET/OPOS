@@ -17210,6 +17210,8 @@ static bool store_reveal; /* scroll HOME so store_home_focus shows */
 static size_t store_focus;
 /* After an install, update or removal the list is read again. */
 static bool store_refresh_after;
+/* The permissions sheet is open (below). */
+static bool store_sheet_open;
 static bool store_listing;
 static char store_phase[STORE_TEXT];
 static char store_message[STORE_TEXT];
@@ -17567,6 +17569,7 @@ static void store_open(void) {
         field_reset(&store_search, STORE_SEARCH_MAX, false);
     }
     window_open(WINDOW_STORE);
+    store_sheet_open = false;
     if (!store_running) {
         store_message[0] = '\0';
         store_run("available", NULL);
@@ -17616,6 +17619,177 @@ static void store_save_categories(void) {
                          used);
 }
 
+/* ---- The permissions sheet (docs/store-permissions.md)
+ *
+ * INSTALL and UPDATE on ABOUT first list what the program may ask for
+ * (its signed asks: line) and this account has not decided yet. Each
+ * row is ALLOW, DENY or ASK WHEN NEEDED (the default: the program asks
+ * the first time it needs it, as without the sheet). The choices are
+ * saved as the program's grants (store:<id>) once pkg installed it, so a
+ * failed install leaves none behind. Without undecided rows the sheet
+ * does not open. UPDATE ALL and `pkg` in the Terminal never show it.
+ */
+#define STORE_SHEET_ROWS 5
+
+enum store_choice {
+    STORE_CHOICE_ALLOW,
+    STORE_CHOICE_DENY,
+    STORE_CHOICE_ASK,
+    STORE_CHOICES,
+};
+
+static const struct {
+    const char *word;
+    uint32_t capability;
+    const char *label;
+    const char *detail;
+} store_permissions[] = {
+    {"net", PERMISSION_CAP_NET, "NETWORK",
+     "CONNECT TO THE INTERNET AND YOUR LOCAL NETWORK."},
+    {"clipboard.read", PERMISSION_CAP_CLIPBOARD_READ,
+     "READING THE CLIPBOARD", "SEE TEXT YOU COPIED IN OTHER PROGRAMS."},
+    {"files.shared", PERMISSION_CAP_FILES_SHARED, "SHARED FILES",
+     "READ FILES ON YOUR DISKS AND CDS OUTSIDE ITS OWN FOLDER."},
+    {"notifications", PERMISSION_CAP_NOTIFY, "NOTIFICATIONS",
+     "SHOW MESSAGES IN THE CORNER OF THE SCREEN."},
+};
+
+static bool store_sheet_update;
+static char store_sheet_id[64];
+static char store_sheet_name[32];
+static size_t store_sheet_count;
+/* A row's capability, or 0 for "something this OPOS does not know". */
+static uint32_t store_sheet_caps[STORE_SHEET_ROWS];
+static uint8_t store_sheet_choice[STORE_SHEET_ROWS];
+/* A row, then store_sheet_count for INSTALL and one more for CANCEL. */
+static size_t store_sheet_focus;
+
+/* Choices waiting for pkg to finish. */
+static bool store_decide_pending;
+static char store_decide_id[64];
+static char store_decide_name[32];
+static uint32_t store_decide_allow;
+static uint32_t store_decide_deny;
+
+/* Fills the rows: what item asks for that this account has not decided. */
+static void store_sheet_fill(const struct store_item *item, bool update) {
+    static struct permission_grants grants;
+    uint32_t decided = 0;
+    size_t account = accounts_current();
+    if (account != ACCOUNT_NONE && permission_grants_load(account, &grants)) {
+        uint8_t key[SHA256_DIGEST_SIZE];
+        permission_store_key(item->id, key);
+        const struct permission_grant *grant =
+            permission_grants_find(&grants, key);
+        if (grant != NULL) {
+            decided = grant->granted | grant->denied;
+        }
+    }
+    store_sheet_count = 0;
+    bool unknown = false;
+    const char *word = item->asks;
+    while (*word != '\0') {
+        const char *stop = word;
+        while (*stop != '\0' && *stop != ' ') {
+            stop++;
+        }
+        size_t length = (size_t)(stop - word);
+        bool known = length == 0 || text_equals(word, length, "none");
+        for (size_t i = 0; i < sizeof(store_permissions)
+                                   / sizeof(store_permissions[0]);
+             i++) {
+            if (!text_equals(word, length, store_permissions[i].word)) {
+                continue;
+            }
+            known = true;
+            uint32_t capability = store_permissions[i].capability;
+            bool listed = (decided & capability) != 0;
+            for (size_t row = 0; row < store_sheet_count; row++) {
+                listed = listed || store_sheet_caps[row] == capability;
+            }
+            if (!listed && store_sheet_count < STORE_SHEET_ROWS - 1) {
+                store_sheet_caps[store_sheet_count] = capability;
+                store_sheet_choice[store_sheet_count] = STORE_CHOICE_ASK;
+                store_sheet_count++;
+            }
+        }
+        unknown = unknown || !known;
+        word = *stop == ' ' ? stop + 1 : stop;
+    }
+    /* An update says so only next to something new to decide. */
+    if (unknown && (!update || store_sheet_count != 0)) {
+        store_sheet_caps[store_sheet_count] = 0;
+        store_sheet_choice[store_sheet_count] = STORE_CHOICE_DENY;
+        store_sheet_count++;
+    }
+}
+
+/* INSTALL or UPDATE on ABOUT: the sheet, or straight to pkg. */
+static void store_sheet_begin(const struct store_item *item, bool update) {
+    store_sheet_fill(item, update);
+    text_copy(store_sheet_id, sizeof(store_sheet_id), item->id);
+    text_copy(store_sheet_name, sizeof(store_sheet_name), item->name);
+    store_sheet_update = update;
+    if (store_sheet_count == 0) {
+        store_refresh_after = true;
+        store_run(update ? "update" : "install", store_sheet_id);
+        return;
+    }
+    store_sheet_focus = store_sheet_count; /* INSTALL */
+    store_sheet_open = true;
+}
+
+static void store_sheet_confirm(void) {
+    store_sheet_open = false;
+    store_decide_allow = 0;
+    store_decide_deny = 0;
+    for (size_t row = 0; row < store_sheet_count; row++) {
+        if (store_sheet_choice[row] == STORE_CHOICE_ALLOW) {
+            store_decide_allow |= store_sheet_caps[row];
+        } else if (store_sheet_choice[row] == STORE_CHOICE_DENY) {
+            store_decide_deny |= store_sheet_caps[row];
+        }
+    }
+    text_copy(store_decide_id, sizeof(store_decide_id), store_sheet_id);
+    text_copy(store_decide_name, sizeof(store_decide_name),
+              store_sheet_name);
+    store_refresh_after = true;
+    store_run(store_sheet_update ? "update" : "install", store_sheet_id);
+    store_decide_pending = store_running
+        && (store_decide_allow | store_decide_deny) != 0;
+}
+
+/* pkg installed the program: saves the sheet's choices. */
+static void store_sheet_apply(void) {
+    size_t account = accounts_current();
+    if (account == ACCOUNT_NONE) {
+        return;
+    }
+    uint8_t key[SHA256_DIGEST_SIZE];
+    permission_store_key(store_decide_id, key);
+    bool saved = true;
+    for (uint32_t bit = 1; bit <= PERMISSION_CAPS_ALL && bit != 0;
+         bit <<= 1) {
+        bool allow = (store_decide_allow & bit) != 0;
+        if (!allow && (store_decide_deny & bit) == 0) {
+            continue;
+        }
+        if (!permission_grants_decide(account, key, store_decide_name, bit,
+                                      allow, user_clock_stamp())) {
+            saved = false;
+        } else if (!allow) {
+            /* An updated program may be running already. */
+            (void)user_revoke_capabilities(account, key, bit);
+        }
+    }
+    if (!saved) {
+        text_copy(store_message, sizeof(store_message),
+                  "INSTALLED, BUT YOUR PERMISSION CHOICES COULD NOT BE "
+                  "SAVED. SET THEM IN THE SECURITY CENTER.");
+        store_message_error = true;
+    }
+}
+
 /* pkg ended (from app_job_report). */
 static void store_finished(bool started, uint64_t exit_status) {
     if (store_line_length != 0) {
@@ -17625,6 +17799,12 @@ static void store_finished(bool started, uint64_t exit_status) {
     store_phase[0] = '\0';
     store_progress = -1;
     store_busy_id[0] = '\0';
+    if (store_decide_pending) {
+        store_decide_pending = false;
+        if (started && exit_status == 0) {
+            store_sheet_apply();
+        }
+    }
     if (!started) {
         text_copy(store_message, sizeof(store_message),
                   "/BIN/PKG COULD NOT START");
@@ -17738,11 +17918,14 @@ static void store_about_press(size_t button) {
         settings_open_category(CATEGORY_UPDATES);
         return;
     }
+    if (button == 0) {
+        store_sheet_begin(item, store_item_is(item, "update"));
+        return;
+    }
     char id[64];
     text_copy(id, sizeof(id), item->id);
     store_refresh_after = true;
-    store_run(button == 1 ? "remove"
-              : store_item_is(item, "update") ? "update" : "install", id);
+    store_run("remove", id);
 }
 
 static bool store_bar_enabled(size_t focus) {
@@ -18342,6 +18525,8 @@ static void store_draw_about(struct rect page, bool focused) {
     store_about_height = y + 8 - top;
 }
 
+static void store_draw_sheet(struct rect area, bool focused);
+
 static void draw_store(struct rect area, bool focused) {
     fill(area, 24, 30, 46);
     struct rect page = store_page_rect(area);
@@ -18431,6 +18616,220 @@ static void draw_store(struct rect area, bool focused) {
             draw_button(button, label, focused && store_focus == focus);
         }
     }
+    if (store_sheet_open) {
+        store_draw_sheet(area, focused);
+    }
+}
+
+/* ---- Drawing and using the permissions sheet */
+
+#define STORE_SHEET_BUTTON 30
+
+struct store_sheet_layout {
+    struct rect box;
+    int64_t header_y;
+    struct rect rows[STORE_SHEET_ROWS];
+    struct rect choices[STORE_SHEET_ROWS][STORE_CHOICES];
+    int64_t note_y;
+    struct rect install;
+    struct rect cancel;
+};
+
+static const char *const store_choice_labels[STORE_CHOICES] = {
+    "ALLOW", "DENY", "ASK WHEN NEEDED",
+};
+
+static void store_sheet_layout(struct rect area,
+                               struct store_sheet_layout *layout) {
+    int64_t width = area.width - 32 < 820 ? area.width - 32 : 820;
+    int64_t choice_widths[STORE_CHOICES];
+    int64_t choices_width = 0;
+    for (size_t i = 0; i < STORE_CHOICES; i++) {
+        choice_widths[i] =
+            (int64_t)text_length(store_choice_labels[i]) * CHAR_WIDTH + 20;
+        choices_width += choice_widths[i] + (i != 0 ? 6 : 0);
+    }
+    /* The choices go right of the text when its longest line fits, else
+       below it. */
+    size_t longest = 0;
+    for (size_t i = 0; i < sizeof(store_permissions)
+                               / sizeof(store_permissions[0]);
+         i++) {
+        size_t length = text_length(store_permissions[i].detail);
+        longest = length > longest ? length : longest;
+    }
+    bool beside = width - 60 >= choices_width + (int64_t)longest * CHAR_WIDTH;
+    int64_t row_height = beside ? 2 * STORE_LINE + 14
+                                : 2 * STORE_LINE + STORE_SHEET_BUTTON + 18;
+    int64_t height = 20 + 56 + 16 + (int64_t)store_sheet_count * row_height
+                   + 12 + 2 * STORE_LINE + 12 + 32 + 20;
+    layout->box = (struct rect){area.x + (area.width - width) / 2,
+                                area.y + (area.height - height) / 2, width,
+                                height};
+    if (layout->box.y < area.y + 8) {
+        layout->box.y = area.y + 8;
+    }
+    struct rect box = layout->box;
+    layout->header_y = box.y + 20;
+    int64_t y = layout->header_y + 56 + 16;
+    for (size_t row = 0; row < store_sheet_count; row++) {
+        layout->rows[row] = (struct rect){box.x + 12, y, box.width - 24,
+                                          row_height - 4};
+        int64_t x = beside ? box.x + box.width - 20 - choices_width
+                           : box.x + 20;
+        int64_t top = beside
+            ? y + (row_height - 4 - STORE_SHEET_BUTTON) / 2
+            : y + 2 * STORE_LINE + 8;
+        for (size_t i = 0; i < STORE_CHOICES; i++) {
+            layout->choices[row][i] = (struct rect){x, top, choice_widths[i],
+                                                    STORE_SHEET_BUTTON};
+            x += choice_widths[i] + 6;
+        }
+        y += row_height;
+    }
+    layout->note_y = y + 12;
+    int64_t install_width = 7 * CHAR_WIDTH + 20;
+    int64_t cancel_width = 6 * CHAR_WIDTH + 20;
+    int64_t button_y = box.y + box.height - 20 - 32;
+    layout->cancel = (struct rect){box.x + box.width - 20 - cancel_width,
+                                   button_y, cancel_width, 32};
+    layout->install = (struct rect){layout->cancel.x - 8 - install_width,
+                                    button_y, install_width, 32};
+}
+
+static void store_draw_sheet(struct rect area, bool focused) {
+    struct store_sheet_layout layout;
+    store_sheet_layout(area, &layout);
+    struct rect box = layout.box;
+    fill(box, 90, 120, 190);
+    fill((struct rect){box.x + 2, box.y + 2, box.width - 4, box.height - 4},
+         30, 38, 60);
+    const struct store_item *item = store_about_item();
+    struct rect icon = {box.x + 20, layout.header_y, 56, 56};
+    if (item != NULL) {
+        store_icon(area, icon, item);
+    }
+    int64_t text_x = icon.x + icon.width + 16;
+    int64_t text_width = box.x + box.width - 20 - text_x;
+    draw_text_clipped(text_x, layout.header_y + 6, text_width,
+                      store_sheet_name, 255, 255, 255);
+    draw_text_clipped(text_x, layout.header_y + 6 + STORE_LINE, text_width,
+                      store_sheet_update ? "MAY NOW ASK TO USE:"
+                                         : "MAY ASK TO USE:",
+                      170, 180, 205);
+    for (size_t row = 0; row < store_sheet_count; row++) {
+        struct rect line = layout.rows[row];
+        bool focus = focused && store_sheet_focus == row;
+        fill(line, focus ? 48 : 38, focus ? 60 : 47, focus ? 92 : 72);
+        uint32_t capability = store_sheet_caps[row];
+        const char *label = "SOMETHING THIS OPOS DOES NOT KNOW";
+        const char *detail = "IT CANNOT BE GIVEN; THE PROGRAM MAY NOT WORK "
+                             "FULLY.";
+        for (size_t i = 0; i < sizeof(store_permissions)
+                                   / sizeof(store_permissions[0]);
+             i++) {
+            if (capability != 0
+                && store_permissions[i].capability == capability) {
+                label = store_permissions[i].label;
+                detail = store_permissions[i].detail;
+            }
+        }
+        int64_t right = capability != 0
+                            && layout.choices[row][0].y == line.y
+                                   + (line.height - STORE_SHEET_BUTTON) / 2
+                        ? layout.choices[row][0].x - 12
+                        : line.x + line.width - 8;
+        draw_text_clipped(line.x + 8, line.y + 6, right - line.x - 8, label,
+                          240, 245, 255);
+        draw_text_clipped(line.x + 8, line.y + 6 + STORE_LINE,
+                          right - line.x - 8, detail, 170, 180, 205);
+        if (capability == 0) {
+            continue;
+        }
+        for (size_t i = 0; i < STORE_CHOICES; i++) {
+            struct rect button = layout.choices[row][i];
+            if (store_sheet_choice[row] == i) {
+                fill(button, 70, 100, 160);
+                draw_text_clipped(button.x + 10,
+                                  button.y + (button.height - CHAR_HEIGHT) / 2,
+                                  button.width - 20, store_choice_labels[i],
+                                  255, 255, 255);
+            } else {
+                fill(button, 43, 52, 78);
+                draw_text_clipped(button.x + 10,
+                                  button.y + (button.height - CHAR_HEIGHT) / 2,
+                                  button.width - 20, store_choice_labels[i],
+                                  150, 160, 185);
+            }
+        }
+    }
+    (void)draw_wrapped(box.x + 20, layout.note_y, box.width - 40,
+                       layout.install.y - 4,
+                       "ASK WHEN NEEDED: THE PROGRAM ASKS YOU THE FIRST TIME "
+                       "IT NEEDS IT. CHANGE ANY OF THIS LATER IN THE "
+                       "SECURITY CENTER.",
+                       150, 160, 185);
+    draw_button(layout.install, store_sheet_update ? "UPDATE" : "INSTALL",
+                focused && store_sheet_focus == store_sheet_count);
+    draw_button(layout.cancel, "CANCEL",
+                focused && store_sheet_focus == store_sheet_count + 1);
+}
+
+static void store_sheet_press(size_t focus) {
+    if (focus == store_sheet_count) {
+        store_sheet_confirm();
+    } else if (focus == store_sheet_count + 1) {
+        store_sheet_open = false;
+    }
+}
+
+static void store_sheet_key(char character) {
+    size_t stops = store_sheet_count + 2;
+    if (character == KEY_ESCAPE) {
+        store_sheet_open = false;
+    } else if (character == '\t' || character == KEY_DOWN) {
+        store_sheet_focus = (store_sheet_focus + 1) % stops;
+    } else if (character == KEY_UP) {
+        store_sheet_focus = (store_sheet_focus + stops - 1) % stops;
+    } else if (character == KEY_LEFT || character == KEY_RIGHT) {
+        if (store_sheet_focus >= store_sheet_count) {
+            store_sheet_focus = store_sheet_focus == store_sheet_count
+                ? store_sheet_count + 1 : store_sheet_count;
+        } else if (store_sheet_caps[store_sheet_focus] != 0) {
+            uint8_t *choice = &store_sheet_choice[store_sheet_focus];
+            *choice = character == KEY_RIGHT
+                ? (uint8_t)((*choice + 1) % STORE_CHOICES)
+                : (uint8_t)((*choice + STORE_CHOICES - 1) % STORE_CHOICES);
+        }
+    } else if (character == '\n' || character == ' ') {
+        if (store_sheet_focus >= store_sheet_count) {
+            store_sheet_press(store_sheet_focus);
+        } else {
+            store_sheet_focus++;
+        }
+    }
+}
+
+static void store_sheet_click(struct rect area, int32_t x, int32_t y) {
+    struct store_sheet_layout layout;
+    store_sheet_layout(area, &layout);
+    for (size_t row = 0; row < store_sheet_count; row++) {
+        if (store_sheet_caps[row] == 0) {
+            continue;
+        }
+        for (size_t i = 0; i < STORE_CHOICES; i++) {
+            if (rect_contains(layout.choices[row][i], x, y)) {
+                store_sheet_choice[row] = (uint8_t)i;
+                store_sheet_focus = row;
+                return;
+            }
+        }
+    }
+    if (rect_contains(layout.install, x, y)) {
+        store_sheet_press(store_sheet_count);
+    } else if (rect_contains(layout.cancel, x, y)) {
+        store_sheet_press(store_sheet_count + 1);
+    }
 }
 
 /* ---- Keys, clicks and the wheel */
@@ -18503,6 +18902,10 @@ static bool store_navigation_key(char key) {
 }
 
 static void store_key(char character) {
+    if (store_sheet_open) {
+        store_sheet_key(character);
+        return;
+    }
     if (character == '\t') {
         store_focus = (store_focus + 1) % STORE_FOCUS_COUNT;
         return;
@@ -18570,6 +18973,10 @@ static void store_key(char character) {
 }
 
 static void store_click(struct rect area, int32_t x, int32_t y) {
+    if (store_sheet_open) {
+        store_sheet_click(area, x, y);
+        return;
+    }
     if (store_page != STORE_PAGE_HOME
         && rect_contains(store_back_rect(area), x, y)) {
         store_back();
@@ -18630,6 +19037,9 @@ static void store_click(struct rect area, int32_t x, int32_t y) {
 
 /* The wheel (positive notches scroll up). */
 static bool store_wheel(struct rect area, int32_t notches) {
+    if (store_sheet_open) {
+        return false;
+    }
     struct rect page = store_page_rect(area);
     if (store_page == STORE_PAGE_LIST) {
         store_filter();

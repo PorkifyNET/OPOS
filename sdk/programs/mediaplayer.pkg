@@ -1,0 +1,10 @@
+format: 1
+id: net.porkify.opos.mediaplayer
+name: Media Player
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.2
+file: files/mediaplayer ../build/mediaplayer exec
+file: files/NOTICES.txt ../third_party/NOTICES.txt
+start: files/mediaplayer Media Player

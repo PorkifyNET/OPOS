@@ -89,3 +89,11 @@ license: GPL-3.0
 official: yes
 summary: Draw and edit pictures, then save them as PNG.
 description: Picasso is the OPOS image editor. Draw with the pen, eraser and spray can in six brush sizes; draw lines, rectangles and ellipses, outlined or filled (hold Shift for straight lines, squares and circles); fill areas with the bucket and pick colors from the picture. The left mouse button paints with the first color and the right button with the second. Open PNG, JPEG and BMP pictures up to 4096 x 4096 and save them as PNG in any folder you choose. Zoom from 25% to 800%, undo and redo, and use keyboard shortcuts such as Ctrl+S, Ctrl+Z and P, E, L, R, O, F for the tools.
+
+[net.porkify.opos.mediaplayer]
+category: sound-video
+license: GPL-3.0
+official: yes
+featured: yes
+summary: Play music and videos: MP3, FLAC, OGG, WAV and MPEG-1 video.
+description: Media Player plays your music and videos. Open MP3, FLAC, Ogg Vorbis and WAV songs or MPEG-1 videos (.mpg) and they go into a playlist: play, pause, skip, jump anywhere with the position bar, repeat one song or the whole list, or shuffle it. Videos stay in step with their sound and can fill the whole screen (F, or double-click the picture). Keys: Space plays and pauses, Left and Right jump 5 seconds (Ctrl: 30), Up and Down change the volume, M mutes, N and P go to the next and previous file, O opens a file. Media Player uses the decoders dr_wav, dr_mp3, dr_flac, stb_vorbis and PL_MPEG, unchanged.

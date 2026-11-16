@@ -22,6 +22,10 @@ of memory for its code and data. It links `build/crt0.o` and
   and `free`, `strtol` and `atoi`, the usual string and memory functions,
   and character classes. There is no floating-point formatting and there
   are no `FILE` streams.
+- `include/math.h`, `assert.h`: `floor`, `ceil`, `fmod`, `sqrt`, `exp`,
+  `log`, `pow`, `sin`, `cos`, `ldexp`, `frexp` and friends, and `assert`.
+  Enough for single-file libraries such as the decoders in
+  `third_party/` (see its README), which the Media Player uses.
 - `include/opos_gfx.h`: drawing into a pixel canvas (rectangles, lines,
   text in the system font) and showing it in the program's window.
 

@@ -113,3 +113,10 @@ official: yes
 featured: yes
 summary: Budgets, lists and sums: work with tables of numbers and open and save Excel files.
 description: Spreadsheet is the OPOS spreadsheet. Type numbers, text, dates and formulas into cells on one or more sheets; about 90 functions such as SUM, AVERAGE, IF, VLOOKUP, SUMIF, COUNTIF, ROUND, TEXT and DATE. Format numbers as currency, percentages, dates or times, make text bold, italic, underlined or colored, fill cells with a color, align them and change column widths. Insert and delete rows and columns, sort, fill down, and see the sum of the selected cells at the bottom. Open and save Excel workbooks (.xlsx), which Excel, LibreOffice and Google Sheets open too, and CSV files. Charts, pictures and merged cells in Excel files are not shown yet. Keys: type to replace a cell, F2 or a double-click to edit it, Enter and Tab to move on, Ctrl+arrows to jump to the end of the data, Ctrl+D and Ctrl+R to fill down and right, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+; for today's date, Ctrl+S to save.
+
+[net.porkify.opos.calculator]
+category: accessories
+license: GPL-3.0
+official: yes
+summary: Add, subtract, multiply and divide, or work with sines, logarithms and powers.
+description: Calculator is the OPOS calculator. Type a whole calculation, like 12 * (3 + 4)^2, and see the answer while you type; press = to keep it in the history, and click an answer in the history to use it again. Standard mode has the four operations, brackets, percent, square roots and squares. Scientific mode adds sine, cosine and tangent in degrees or radians and their inverses, natural and base-10 logarithms, powers, cube roots, factorials, pi and e. Answers have 15 significant digits, so 0.1 + 0.2 is 0.3. Keys: digits, + - * / ^ ( ) % !, Enter for the answer, Backspace, Esc to clear, F9 to change the sign, Ctrl+C to copy the answer and Ctrl+V to paste.

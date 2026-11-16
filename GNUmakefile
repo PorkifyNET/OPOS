@@ -52,7 +52,7 @@ STORE_KEY ?= $(HOME)/.opos-signing/store-key.pem
 STORE_PACKAGES := sdk/examples/hello.pkg sdk/examples/sketch.pkg \
 	sdk/programs/minesweeper.pkg sdk/programs/solitaire.pkg \
 	sdk/programs/picasso.pkg sdk/programs/mediaplayer.pkg \
-	sdk/programs/writer.pkg
+	sdk/programs/writer.pkg sdk/programs/spreadsheet.pkg
 # Linux programs built from pinned sources by store/linux/<name>/build.sh
 # (docs/linux-programs.md). Sources are downloaded once into
 # STORE_SOURCES. LINUX_CC is a static musl compiler: the musl files in

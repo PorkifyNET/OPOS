@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.spreadsheet
+name: Spreadsheet
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.3
+file: files/spreadsheet ../build/spreadsheet exec
+start: files/spreadsheet Spreadsheet

@@ -105,3 +105,11 @@ official: yes
 featured: yes
 summary: Write letters, reports and other documents, and open and save Word files.
 description: Writer is the OPOS word processor. Type on pages that look like the printed result, with headings and a title, bold, italic, underline and strikethrough, text sizes and colors, Noto Sans or Noto Sans Mono, left, centered, right or justified paragraphs, and bulleted or numbered lists with five levels. Open and save Word documents (.docx), which Word, LibreOffice and Google Docs open too, or plain text (.txt). Pictures and tables in Word documents are not shown yet. Keys: Ctrl+B, Ctrl+I and Ctrl+U for bold, italic and underline, Ctrl+1 to Ctrl+3 for headings and Ctrl+0 for normal text, Ctrl+L, Ctrl+E, Ctrl+R and Ctrl+J to align, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+S to save, Tab and Shift+Tab to change a list item's level.
+
+[net.porkify.opos.spreadsheet]
+category: office
+license: GPL-3.0
+official: yes
+featured: yes
+summary: Budgets, lists and sums: work with tables of numbers and open and save Excel files.
+description: Spreadsheet is the OPOS spreadsheet. Type numbers, text, dates and formulas into cells on one or more sheets; about 90 functions such as SUM, AVERAGE, IF, VLOOKUP, SUMIF, COUNTIF, ROUND, TEXT and DATE. Format numbers as currency, percentages, dates or times, make text bold, italic, underlined or colored, fill cells with a color, align them and change column widths. Insert and delete rows and columns, sort, fill down, and see the sum of the selected cells at the bottom. Open and save Excel workbooks (.xlsx), which Excel, LibreOffice and Google Sheets open too, and CSV files. Charts, pictures and merged cells in Excel files are not shown yet. Keys: type to replace a cell, F2 or a double-click to edit it, Enter and Tab to move on, Ctrl+arrows to jump to the end of the data, Ctrl+D and Ctrl+R to fill down and right, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+; for today's date, Ctrl+S to save.

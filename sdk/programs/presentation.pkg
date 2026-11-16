@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.presentation
+name: Presentation
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.3
+file: files/presentation ../build/presentation exec
+start: files/presentation Presentation

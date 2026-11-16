@@ -25,6 +25,8 @@
 #include <opos_gfx.h>
 #include <opos_http.h>
 
+#include "ooxml.h"
+
 OPOS_MANIFEST("Writer", "1.0", OPOS_CAP_CLIPBOARD_READ);
 
 /* ------------------------------------------------------------ constants */
@@ -1610,107 +1612,6 @@ static void do_new(void) {
     say("", false);
 }
 
-static uint8_t *read_whole_file(const char *file, size_t *size) {
-    long fd = opos_open(file, OPOS_O_RDONLY);
-    if (fd < 0) {
-        return NULL;
-    }
-    size_t capacity = 65536, used = 0;
-    uint8_t *data = malloc(capacity);
-    while (data != NULL) {
-        if (used == capacity) {
-            if (capacity >= 256u * 1024 * 1024) {
-                free(data);
-                data = NULL;
-                break;
-            }
-            uint8_t *grown = realloc(data, capacity * 2);
-            if (grown == NULL) {
-                free(data);
-                data = NULL;
-                break;
-            }
-            data = grown;
-            capacity *= 2;
-        }
-        size_t chunk = capacity - used < 65536 ? capacity - used : 65536;
-        long got = opos_read((int)fd, data + used, chunk);
-        if (got < 0) {
-            free(data);
-            data = NULL;
-        } else if (got == 0) {
-            break;
-        } else {
-            used += (size_t)got;
-        }
-    }
-    opos_close((int)fd);
-    *size = used;
-    return data;
-}
-
-static bool write_whole_file(const char *file, const void *data, size_t size) {
-    long fd = opos_open(file, OPOS_O_WRONLY | OPOS_O_CREAT | OPOS_O_TRUNC);
-    bool ok = fd >= 0;
-    size_t done = 0;
-    while (ok && done < size) {
-        size_t chunk = size - done > 1048576 ? 1048576 : size - done;
-        long wrote = opos_write((int)fd, (const uint8_t *)data + done, chunk);
-        if (wrote <= 0) {
-            ok = false;
-        } else {
-            done += (size_t)wrote;
-        }
-    }
-    if (fd >= 0 && opos_close((int)fd) < 0) {
-        ok = false;
-    }
-    return ok;
-}
-
-/* A growing byte buffer for building files. */
-struct buf {
-    char *data;
-    size_t length, capacity;
-    bool failed;
-};
-
-static void buf_put(struct buf *b, const void *data, size_t length) {
-    if (b->failed) {
-        return;
-    }
-    if (b->length + length + 1 > b->capacity) {
-        size_t capacity = b->capacity < 4096 ? 4096 : b->capacity;
-        while (b->length + length + 1 > capacity) {
-            capacity *= 2;
-        }
-        char *grown = realloc(b->data, capacity);
-        if (grown == NULL) {
-            b->failed = true;
-            return;
-        }
-        b->data = grown;
-        b->capacity = capacity;
-    }
-    memcpy(b->data + b->length, data, length);
-    b->length += length;
-    b->data[b->length] = '\0';
-}
-
-static void buf_puts(struct buf *b, const char *text) {
-    buf_put(b, text, strlen(text));
-}
-
-static void buf_byte(struct buf *b, uint8_t value) {
-    buf_put(b, &value, 1);
-}
-
-static void buf_int(struct buf *b, long value) {
-    char digits[24];
-    snprintf(digits, sizeof(digits), "%ld", value);
-    buf_puts(b, digits);
-}
-
 /* Appends one paragraph from text, decoding UTF-8 (other bytes are taken
    as Windows-1252). */
 static const uint16_t cp1252[32] = {
@@ -1719,29 +1620,6 @@ static const uint16_t cp1252[32] = {
     0xfffd, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
     0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0xfffd, 0x017e, 0x0178,
 };
-
-static int utf8_put(char *out, uint32_t code) {
-    if (code < 0x80) {
-        out[0] = (char)code;
-        return 1;
-    }
-    if (code < 0x800) {
-        out[0] = (char)(0xc0 | code >> 6);
-        out[1] = (char)(0x80 | (code & 0x3f));
-        return 2;
-    }
-    if (code < 0x10000) {
-        out[0] = (char)(0xe0 | code >> 12);
-        out[1] = (char)(0x80 | (code >> 6 & 0x3f));
-        out[2] = (char)(0x80 | (code & 0x3f));
-        return 3;
-    }
-    out[0] = (char)(0xf0 | code >> 18);
-    out[1] = (char)(0x80 | (code >> 12 & 0x3f));
-    out[2] = (char)(0x80 | (code >> 6 & 0x3f));
-    out[3] = (char)(0x80 | (code & 0x3f));
-    return 4;
-}
 
 static bool valid_utf8(const uint8_t *s, size_t length) {
     for (size_t i = 0; i < length;) {

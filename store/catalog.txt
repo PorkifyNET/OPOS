@@ -105,3 +105,26 @@ official: yes
 featured: yes
 summary: Write letters, reports and other documents, and open and save Word files.
 description: Writer is the OPOS word processor. Type on pages that look like the printed result, with headings and a title, bold, italic, underline and strikethrough, text sizes and colors, Noto Sans or Noto Sans Mono, left, centered, right or justified paragraphs, and bulleted or numbered lists with five levels. Open and save Word documents (.docx), which Word, LibreOffice and Google Docs open too, or plain text (.txt). Pictures and tables in Word documents are not shown yet. Keys: Ctrl+B, Ctrl+I and Ctrl+U for bold, italic and underline, Ctrl+1 to Ctrl+3 for headings and Ctrl+0 for normal text, Ctrl+L, Ctrl+E, Ctrl+R and Ctrl+J to align, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+S to save, Tab and Shift+Tab to change a list item's level.
+
+[net.porkify.opos.spreadsheet]
+category: office
+license: GPL-3.0
+official: yes
+featured: yes
+summary: Budgets, lists and sums: work with tables of numbers and open and save Excel files.
+description: Spreadsheet is the OPOS spreadsheet. Type numbers, text, dates and formulas into cells on one or more sheets; about 90 functions such as SUM, AVERAGE, IF, VLOOKUP, SUMIF, COUNTIF, ROUND, TEXT and DATE. Format numbers as currency, percentages, dates or times, make text bold, italic, underlined or colored, fill cells with a color, align them and change column widths. Insert and delete rows and columns, sort, fill down, and see the sum of the selected cells at the bottom. Open and save Excel workbooks (.xlsx), which Excel, LibreOffice and Google Sheets open too, and CSV files. Charts, pictures and merged cells in Excel files are not shown yet. Keys: type to replace a cell, F2 or a double-click to edit it, Enter and Tab to move on, Ctrl+arrows to jump to the end of the data, Ctrl+D and Ctrl+R to fill down and right, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+; for today's date, Ctrl+S to save.
+
+[net.porkify.opos.presentation]
+category: office
+license: GPL-3.0
+official: yes
+featured: yes
+summary: Make slide shows and open and save PowerPoint files.
+description: Presentation is the OPOS slide show program. Make slides from layouts with titles, bulleted and numbered lists, text boxes, pictures (PNG, JPEG, BMP), rectangles, ellipses and lines. Make text bold, italic, underlined or struck through, change its size, color and alignment, and give shapes and slides colors. Move and resize shapes with the mouse; duplicate, reorder, hide and delete slides; show them full screen. Open and save PowerPoint presentations (.pptx), which PowerPoint, LibreOffice and Google Slides open too. Charts, tables, animations and speaker notes in PowerPoint files are not shown yet. Keys: F5 to show the slides, Shift+F5 from this one, Space, arrows or a click to go on, Esc to stop; Ctrl+M for a new slide, Ctrl+D to duplicate, Ctrl+B, Ctrl+I and Ctrl+U for bold, italic and underline, Tab to change a list level, Ctrl+Z to undo, Ctrl+S to save.
+
+[net.porkify.opos.calculator]
+category: accessories
+license: GPL-3.0
+official: yes
+summary: Add, subtract, multiply and divide, or work with sines, logarithms and powers.
+description: Calculator is the OPOS calculator. Type a whole calculation, like 12 * (3 + 4)^2, and see the answer while you type; press = to keep it in the history, and click an answer in the history to use it again. Standard mode has the four operations, brackets, percent, square roots and squares. Scientific mode adds sine, cosine and tangent in degrees or radians and their inverses, natural and base-10 logarithms, powers, cube roots, factorials, pi and e. Answers have 15 significant digits, so 0.1 + 0.2 is 0.3. Keys: digits, + - * / ^ ( ) % !, Enter for the answer, Backspace, Esc to clear, F9 to change the sign, Ctrl+C to copy the answer and Ctrl+V to paste.

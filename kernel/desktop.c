@@ -6746,7 +6746,7 @@ static void login_press(int32_t x, int32_t y) {
  * damaged system files. It runs as a login screen (login_active), so no
  * programs, notifications or update checks start behind it.
  */
-#define RECOVERY_PANEL_WIDTH 680
+#define RECOVERY_PANEL_WIDTH 800
 #define RECOVERY_BUTTON_HEIGHT 40
 #define RECOVERY_BUTTON_GAP 10
 #define RECOVERY_REASON_LINES 5
@@ -6760,22 +6760,40 @@ enum recovery_page {
     RECOVERY_PAGE_WORKING,
     /* What the job did, with RESTART NOW and BACK. */
     RECOVERY_PAGE_RESULT,
+    /* RESCUE MY FILES: which accounts, which drive. */
+    RECOVERY_PAGE_RESCUE,
+    /* RESET A PASSWORD: which account, the new password. */
+    RECOVERY_PAGE_PASSWORD,
+    /* START-UP LOG: this start's or the previous start's log. */
+    RECOVERY_PAGE_LOG,
 };
 
+/* Shown in two columns, in this order. */
 enum recovery_action {
     RECOVERY_ACTION_START,
+    RECOVERY_ACTION_SAFE_START,
     RECOVERY_ACTION_UNDO,
     RECOVERY_ACTION_REPAIR,
+    RECOVERY_ACTION_RESCUE,
+    RECOVERY_ACTION_RESET_SETTINGS,
+    RECOVERY_ACTION_RESET_PASSWORD,
+    RECOVERY_ACTION_LOG,
     RECOVERY_ACTION_COMMAND_LINE,
     RECOVERY_ACTION_RESTART,
     RECOVERY_ACTION_SHUT_DOWN,
     RECOVERY_ACTION_COUNT,
 };
+#define RECOVERY_COLUMNS 2
 
 static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
     "START OPOS NORMALLY",
+    "SAFE START",
     "UNDO THE LAST UPDATE",
     "REPAIR SYSTEM FILES",
+    "RESCUE MY FILES",
+    "RESET SETTINGS",
+    "RESET A PASSWORD",
+    "START-UP LOG",
     "COMMAND LINE",
     "RESTART",
     "SHUT DOWN",
@@ -6783,10 +6801,19 @@ static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
 
 static const char *const recovery_action_help[RECOVERY_ACTION_COUNT] = {
     "CONTINUES TO THE LOGIN SCREEN AND THE DESKTOP.",
+    "THE DESKTOP WITH THE BASICS ONLY: STANDARD RESOLUTION, NO SOUND, NO"
+    " UPDATE CHECKS. FOR WHEN SOMETHING ON THE DESKTOP BREAKS.",
     "GOES BACK TO THE VERSION OF OPOS FROM BEFORE THE LAST UPDATE. YOUR"
     " FILES, ACCOUNTS AND PROGRAMS STAY.",
     "CHECKS THE SYSTEM FILES ON THE DISK AND REPLACES DAMAGED OR MISSING"
     " ONES. YOUR FILES STAY.",
+    "COPIES YOUR FILES (DOCUMENTS, PICTURES, MUSIC AND THE REST OF YOUR"
+    " FOLDER) TO A USB STICK OR ANOTHER DRIVE.",
+    "PUTS DISPLAY, SOUND, APPEARANCE AND DESKTOP SETTINGS BACK TO THEIR"
+    " DEFAULTS. FILES, ACCOUNTS AND PASSWORDS STAY.",
+    "SETS A NEW PASSWORD FOR AN ACCOUNT, OR REMOVES IT.",
+    "SHOWS WHAT OPOS REPORTED WHILE IT STARTED, THIS TIME AND THE TIME"
+    " BEFORE. USEFUL WHEN ASKING SOMEONE FOR HELP.",
     "THE TEXT COMMAND LINE, FOR ADVANCED USERS. TYPE DESKTOP TO COME BACK.",
     "RESTARTS THE COMPUTER.",
     "TURNS THE COMPUTER OFF.",
@@ -6816,6 +6843,36 @@ static bool recovery_result_good;
 static bool recovery_result_restart;
 /* The highlighted button of a two-button page (0 or 1). */
 static size_t recovery_pair_selection;
+/* RECOVERY_PAGE_RESCUE: chosen accounts, the drives found (volume
+   numbers), the chosen one, and the focused row (accounts, drives, COPY,
+   BACK). */
+#define RECOVERY_ROW_HEIGHT 36
+#define RECOVERY_HEADING_HEIGHT 30
+/* SAFE START was chosen: no saved display mode, sound or update checks
+   until the next start. */
+static bool safe_start;
+/* RECOVERY_PAGE_CONFIRM asks about UNDO or RESET_SETTINGS. */
+static enum recovery_action recovery_confirming;
+/* RECOVERY_PAGE_PASSWORD: the chosen account and the focused row
+   (accounts, the field, SAVE, BACK). */
+static size_t recovery_password_account;
+static size_t recovery_password_focus;
+static struct text_field recovery_new_password;
+/* RECOVERY_PAGE_LOG: the text shown, where each wrapped line starts, the
+   first line on screen, and whether it is the previous start's log. */
+#define RECOVERY_LOG_LINES 8192
+static char recovery_log_view[RECOVERY_LOG_CAPACITY];
+static size_t recovery_log_view_length;
+static uint32_t recovery_log_line_start[RECOVERY_LOG_LINES];
+static size_t recovery_log_line_count;
+static size_t recovery_log_columns;
+static size_t recovery_log_top;
+static bool recovery_log_showing_previous;
+static bool recovery_rescue_account[ACCOUNT_MAX];
+static size_t recovery_drives[FAT16_MAX_VOLUMES];
+static size_t recovery_drive_count;
+static size_t recovery_drive_volume;
+static size_t recovery_rescue_focus;
 
 static void desktop_start_normal(void);
 static int64_t draw_wrapped(int64_t x, int64_t y, int64_t width,
@@ -6867,7 +6924,8 @@ static void recovery_reason_text(char *text, size_t capacity) {
     switch (recovery_reason()) {
     case RECOVERY_REQUESTED:
         append_text(text, capacity, 0,
-                    "YOU CHOSE OPOS RECOVERY IN THE BOOT MENU.");
+                    "YOU ASKED FOR OPOS RECOVERY (IN THE BOOT MENU OR IN"
+                    " SETTINGS > UPDATES).");
         break;
     case RECOVERY_FAILED_STARTS: {
         size_t at = append_text(text, capacity, 0,
@@ -6895,13 +6953,24 @@ static struct rect recovery_panel_rect(void) {
     int64_t rows = recovery_page == RECOVERY_PAGE_SIGN_IN
         ? (int64_t)recovery_admin_count * LOGIN_ROW_HEIGHT + 2 * 48 + 96
         : recovery_page == RECOVERY_PAGE_MENU
-        ? RECOVERY_ACTION_COUNT
-              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 60
+        ? (RECOVERY_ACTION_COUNT + RECOVERY_COLUMNS - 1) / RECOVERY_COLUMNS
+              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 84
+        : recovery_page == RECOVERY_PAGE_PASSWORD
+        ? 2 * RECOVERY_HEADING_HEIGHT
+              + (int64_t)(accounts_count() + 1) * RECOVERY_ROW_HEIGHT
+              + 16 + RECOVERY_BUTTON_HEIGHT + 40
+        : recovery_page == RECOVERY_PAGE_RESCUE
+        ? 2 * RECOVERY_HEADING_HEIGHT
+              + (int64_t)(accounts_count()
+                          + (recovery_drive_count != 0 ? recovery_drive_count
+                                                       : 1))
+                  * RECOVERY_ROW_HEIGHT
+              + 16 + RECOVERY_BUTTON_HEIGHT + 40
         : RECOVERY_BUTTON_HEIGHT + 40;
     int64_t height = 96 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6) + 24 + rows;
     int64_t width = RECOVERY_PANEL_WIDTH < screen_width() - 20
         ? RECOVERY_PANEL_WIDTH : screen_width() - 20;
-    if (height > screen_height() - 20) {
+    if (height > screen_height() - 20 || recovery_page == RECOVERY_PAGE_LOG) {
         height = screen_height() - 20;
     }
     return (struct rect){(screen_width() - width) / 2,
@@ -6916,10 +6985,14 @@ static int64_t recovery_content_top(void) {
 
 static struct rect recovery_button_rect(size_t index) {
     struct rect panel = recovery_panel_rect();
-    return (struct rect){panel.x + 24,
-                         recovery_content_top() + (int64_t)index
+    int64_t width = (panel.width - 48 - (RECOVERY_COLUMNS - 1) * 12)
+        / RECOVERY_COLUMNS;
+    size_t row = index / RECOVERY_COLUMNS;
+    size_t column = index % RECOVERY_COLUMNS;
+    return (struct rect){panel.x + 24 + (int64_t)column * (width + 12),
+                         recovery_content_top() + (int64_t)row
                              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP),
-                         panel.width - 48, RECOVERY_BUTTON_HEIGHT};
+                         width, RECOVERY_BUTTON_HEIGHT};
 }
 
 /* CONFIRM and RESULT pages: 0 left, 1 right. */
@@ -6929,6 +7002,379 @@ static struct rect recovery_pair_rect(size_t index) {
     return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
                          recovery_content_top(), width,
                          RECOVERY_BUTTON_HEIGHT};
+}
+
+/* Mounted extra FAT volumes (USB sticks, other disks). */
+static void recovery_scan_drives(void) {
+    recovery_drive_count = 0;
+    bool chosen_found = false;
+    for (size_t i = 1; i < FAT16_MAX_VOLUMES; i++) {
+        struct fat16_volume_info info;
+        if (fat16_volume_info(i, &info)) {
+            recovery_drives[recovery_drive_count++] = i;
+            chosen_found |= i == recovery_drive_volume;
+        }
+    }
+    if (!chosen_found) {
+        recovery_drive_volume = recovery_drive_count != 0
+            ? recovery_drives[0] : 0;
+    }
+    size_t rows = accounts_count() + recovery_drive_count + 2;
+    if (recovery_rescue_focus >= rows) {
+        recovery_rescue_focus = rows - 1;
+    }
+}
+
+static void recovery_drive_text(size_t volume, char *text, size_t capacity) {
+    struct fat16_volume_info info;
+    text[0] = '\0';
+    if (!fat16_volume_info(volume, &info)) {
+        return;
+    }
+    size_t at;
+    if (info.label[0] != '\0') {
+        at = append_text(text, capacity, 0, info.label);
+    } else {
+        at = append_decimal(text, capacity,
+                            append_text(text, capacity, 0, "DISK "),
+                            volume + 1);
+    }
+    at = append_text(text, capacity, at, "  ");
+    at = append_decimal(text, capacity, at,
+                        (uint64_t)info.sectors * 512 / (1024 * 1024));
+    at = append_text(text, capacity, at, " MB");
+    struct block_disk_info disk;
+    if (block_disk_info(info.disk, &disk) && disk.removable) {
+        (void)append_text(text, capacity, at, "  USB");
+    }
+}
+
+/* Row `index` of the rescue page: accounts, then drives. */
+static struct rect recovery_rescue_row(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    int64_t y = recovery_content_top() + RECOVERY_HEADING_HEIGHT;
+    if (index >= accounts_count()) {
+        y += RECOVERY_HEADING_HEIGHT;
+    }
+    return (struct rect){panel.x + 24, y + (int64_t)index * RECOVERY_ROW_HEIGHT,
+                         panel.width - 48, RECOVERY_ROW_HEIGHT - 4};
+}
+
+/* COPY (0) and BACK (1) at the bottom of the rescue page. */
+static struct rect recovery_rescue_button(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    size_t rows = accounts_count()
+        + (recovery_drive_count != 0 ? recovery_drive_count : 1);
+    struct rect last = recovery_rescue_row(rows - 1);
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         last.y + last.height + 20, width,
+                         RECOVERY_BUTTON_HEIGHT};
+}
+
+static bool recovery_rescue_ready(void) {
+    bool any = false;
+    for (size_t i = 0; i < accounts_count() && i < ACCOUNT_MAX; i++) {
+        any |= recovery_rescue_account[i];
+    }
+    return any && recovery_drive_count != 0;
+}
+
+static void draw_recovery_rescue(void) {
+    struct rect first = recovery_rescue_row(0);
+    draw_text_clipped(first.x, first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      first.width, "ACCOUNTS TO COPY", 200, 214, 255);
+    size_t accounts = accounts_count();
+    for (size_t i = 0; i < accounts && i < ACCOUNT_MAX; i++) {
+        struct rect row = recovery_rescue_row(i);
+        bool focused = recovery_rescue_focus == i;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[64];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_rescue_account[i] ? "[X] " : "[ ] ");
+        (void)append_text(line, sizeof(line), at, accounts_name(i));
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    struct rect drive_first = recovery_rescue_row(accounts);
+    draw_text_clipped(drive_first.x,
+                      drive_first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      drive_first.width, "COPY TO", 200, 214, 255);
+    if (recovery_drive_count == 0) {
+        draw_text_clipped(drive_first.x + 10,
+                          drive_first.y + (drive_first.height - CHAR_HEIGHT) / 2,
+                          drive_first.width - 20,
+                          "PLUG IN A USB STICK. IT SHOWS UP HERE.",
+                          255, 200, 130);
+    }
+    for (size_t j = 0; j < recovery_drive_count; j++) {
+        struct rect row = recovery_rescue_row(accounts + j);
+        bool focused = recovery_rescue_focus == accounts + j;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[64];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_drives[j] == recovery_drive_volume
+                                    ? "(*) " : "( ) ");
+        recovery_drive_text(recovery_drives[j], line + at, sizeof(line) - at);
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    size_t buttons = accounts + recovery_drive_count;
+    if (recovery_rescue_ready()) {
+        draw_button(recovery_rescue_button(0), "COPY",
+                    recovery_rescue_focus == buttons);
+    } else {
+        draw_text_button(recovery_rescue_button(0), "COPY", false);
+    }
+    draw_button(recovery_rescue_button(1), "BACK",
+                recovery_rescue_focus == buttons + 1);
+}
+
+/* RESET A PASSWORD: accounts are rows 0..n-1 (like the rescue page), the
+   field is row n, under its own heading. */
+static struct rect recovery_password_field(void) {
+    return recovery_rescue_row(accounts_count());
+}
+
+/* SAVE (0) and BACK (1). */
+static struct rect recovery_password_button(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    struct rect field = recovery_password_field();
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         field.y + field.height + 20, width,
+                         RECOVERY_BUTTON_HEIGHT};
+}
+
+static void draw_recovery_password(void) {
+    size_t accounts = accounts_count();
+    struct rect first = recovery_rescue_row(0);
+    draw_text_clipped(first.x, first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      first.width, "ACCOUNT", 200, 214, 255);
+    for (size_t i = 0; i < accounts && i < ACCOUNT_MAX; i++) {
+        struct rect row = recovery_rescue_row(i);
+        bool focused = recovery_password_focus == i;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[80];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_password_account == i ? "(*) "
+                                                               : "( ) ");
+        at = append_text(line, sizeof(line), at, accounts_name(i));
+        if (accounts_is_admin(i)) {
+            at = append_text(line, sizeof(line), at, "  ADMINISTRATOR");
+        }
+        (void)append_text(line, sizeof(line), at,
+                          accounts_has_password(i) ? "" : "  NO PASSWORD");
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    struct rect field = recovery_password_field();
+    draw_text_clipped(field.x, field.y - RECOVERY_HEADING_HEIGHT + 6,
+                      field.width, "NEW PASSWORD (LEAVE EMPTY FOR NONE)",
+                      200, 214, 255);
+    draw_field(field, &recovery_new_password,
+               recovery_password_focus == accounts);
+    draw_button(recovery_password_button(0),
+                recovery_new_password.length == 0 ? "REMOVE PASSWORD"
+                                                  : "SAVE",
+                recovery_password_focus == accounts + 1);
+    draw_button(recovery_password_button(1), "BACK",
+                recovery_password_focus == accounts + 2);
+}
+
+/* ------------------------------------------------ Recovery: start-up log */
+
+static struct rect recovery_log_area(void) {
+    struct rect panel = recovery_panel_rect();
+    return (struct rect){panel.x + 24, panel.y + 80, panel.width - 48,
+                         panel.height - 80 - RECOVERY_BUTTON_HEIGHT - 32};
+}
+
+static size_t recovery_log_visible(void) {
+    int64_t lines = recovery_log_area().height / (CHAR_HEIGHT + 4);
+    return lines > 0 ? (size_t)lines : 1;
+}
+
+/* LOG SWITCH (0) and BACK (1) along the bottom. */
+static struct rect recovery_log_button(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         panel.y + panel.height - RECOVERY_BUTTON_HEIGHT - 16,
+                         width, RECOVERY_BUTTON_HEIGHT};
+}
+
+static void recovery_log_scroll_to_end(void) {
+    size_t visible = recovery_log_visible();
+    recovery_log_top = recovery_log_line_count > visible
+        ? recovery_log_line_count - visible : 0;
+}
+
+/* Splits the text into lines of at most `columns` characters. */
+static void recovery_log_wrap(size_t columns) {
+    recovery_log_columns = columns;
+    recovery_log_line_count = 0;
+    size_t start = 0;
+    while (start < recovery_log_view_length
+           && recovery_log_line_count < RECOVERY_LOG_LINES) {
+        recovery_log_line_start[recovery_log_line_count++] = (uint32_t)start;
+        size_t at = start;
+        while (at < recovery_log_view_length && recovery_log_view[at] != '\n'
+               && at - start < columns) {
+            at++;
+        }
+        start = at < recovery_log_view_length && recovery_log_view[at] == '\n'
+            ? at + 1 : at;
+    }
+}
+
+static void recovery_log_load(bool previous) {
+    recovery_log_showing_previous = previous;
+    size_t length = 0;
+    if (previous) {
+        if (!recovery_log_previous(recovery_log_view,
+                                   sizeof(recovery_log_view), &length)
+            || length == 0) {
+            length = append_text(recovery_log_view,
+                                 sizeof(recovery_log_view), 0,
+                                 "NO LOG IS KEPT FROM AN EARLIER START YET.");
+        }
+    } else {
+        const char *text = recovery_log_text(&length);
+        if (length > sizeof(recovery_log_view)) {
+            length = sizeof(recovery_log_view);
+        }
+        for (size_t i = 0; i < length; i++) {
+            recovery_log_view[i] = text[i];
+        }
+    }
+    recovery_log_view_length = length;
+    recovery_log_columns = 0; /* wrapped when drawn */
+}
+
+static void recovery_log_open_page(void) {
+    recovery_log_load(true);
+    recovery_pair_selection = 1; /* BACK */
+    recovery_page = RECOVERY_PAGE_LOG;
+    recovery_log_top = (size_t)-1; /* the end, once wrapped */
+}
+
+static char lower_ascii(char c) {
+    return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+/* Whether a log line reports a problem (drawn in orange). */
+static bool recovery_log_line_bad(const char *line) {
+    static const char *const words[] = {
+        "fail", "error", "invalid", "could not", "cannot", "damaged",
+    };
+    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
+        for (size_t i = 0; line[i] != '\0'; i++) {
+            size_t j = 0;
+            while (words[w][j] != '\0'
+                   && lower_ascii(line[i + j]) == words[w][j]) {
+                j++;
+            }
+            if (words[w][j] == '\0') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void draw_recovery_log(void) {
+    struct rect area = recovery_log_area();
+    size_t columns = (size_t)(area.width / CHAR_WIDTH);
+    if (columns == 0) {
+        columns = 1;
+    }
+    if (columns != recovery_log_columns) {
+        recovery_log_wrap(columns);
+        if (recovery_log_top == (size_t)-1
+            || recovery_log_top >= recovery_log_line_count) {
+            recovery_log_scroll_to_end();
+        }
+    }
+    fill(area, 14, 18, 28);
+    size_t visible = recovery_log_visible();
+    for (size_t row = 0; row < visible; row++) {
+        size_t index = recovery_log_top + row;
+        if (index >= recovery_log_line_count) {
+            break;
+        }
+        size_t start = recovery_log_line_start[index];
+        size_t end = index + 1 < recovery_log_line_count
+            ? recovery_log_line_start[index + 1] : recovery_log_view_length;
+        char line[160];
+        size_t length = 0;
+        for (size_t i = start; i < end && length + 1 < sizeof(line); i++) {
+            char c = recovery_log_view[i];
+            if (c == '\n') {
+                break;
+            }
+            line[length++] = (c >= ' ' && c <= '~') ? c : ' ';
+        }
+        line[length] = '\0';
+        bool bad = recovery_log_line_bad(line);
+        draw_text_clipped(area.x + 4,
+                          area.y + 4 + (int64_t)row * (CHAR_HEIGHT + 4),
+                          area.width - 8, line, bad ? 255 : 200,
+                          bad ? 170 : 210, bad ? 110 : 225);
+    }
+    /* Where the view is in the whole log. */
+    if (recovery_log_line_count > visible) {
+        int64_t track = area.height - 8;
+        int64_t thumb = track * (int64_t)visible
+            / (int64_t)recovery_log_line_count;
+        if (thumb < 12) {
+            thumb = 12;
+        }
+        int64_t y = area.y + 4 + (track - thumb) * (int64_t)recovery_log_top
+            / (int64_t)(recovery_log_line_count - visible);
+        fill((struct rect){area.x + area.width - 6, y, 4, thumb},
+             110, 160, 255);
+    }
+    draw_button(recovery_log_button(0),
+                recovery_log_showing_previous ? "SHOW THIS START"
+                                              : "SHOW THE START BEFORE",
+                recovery_pair_selection == 0);
+    draw_button(recovery_log_button(1), "BACK", recovery_pair_selection == 1);
+}
+
+static void recovery_log_key(char character) {
+    size_t visible = recovery_log_visible();
+    size_t last = recovery_log_line_count > visible
+        ? recovery_log_line_count - visible : 0;
+    if (character == KEY_UP) {
+        recovery_log_top = recovery_log_top > 0 ? recovery_log_top - 1 : 0;
+    } else if (character == KEY_DOWN) {
+        recovery_log_top = recovery_log_top < last ? recovery_log_top + 1
+                                                   : last;
+    } else if (character == KEY_PAGE_UP) {
+        recovery_log_top = recovery_log_top > visible
+            ? recovery_log_top - visible : 0;
+    } else if (character == KEY_PAGE_DOWN) {
+        recovery_log_top = recovery_log_top + visible < last
+            ? recovery_log_top + visible : last;
+    } else if (character == KEY_HOME) {
+        recovery_log_top = 0;
+    } else if (character == KEY_END) {
+        recovery_log_top = last;
+    } else if (character == KEY_LEFT) {
+        recovery_pair_selection = 0;
+    } else if (character == KEY_RIGHT || character == '\t') {
+        recovery_pair_selection = recovery_pair_selection == 0 ? 1 : 0;
+    } else if (character == KEY_ESCAPE) {
+        recovery_page = RECOVERY_PAGE_MENU;
+    } else if (character == '\n' || character == ' ') {
+        if (recovery_pair_selection == 0) {
+            recovery_log_load(!recovery_log_showing_previous);
+            recovery_log_top = (size_t)-1;
+        } else {
+            recovery_page = RECOVERY_PAGE_MENU;
+        }
+    }
 }
 
 static struct rect recovery_admin_rect(size_t index) {
@@ -6953,6 +7399,9 @@ static struct rect recovery_sign_in_button_rect(size_t index) {
 }
 
 static void draw_recovery(void) {
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+    }
     struct rect panel = recovery_panel_rect();
     fill(panel, 230, 170, 90);
     fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
@@ -6971,11 +7420,16 @@ static void draw_recovery(void) {
         subtitle = "AN ADMINISTRATOR NEEDS TO SIGN IN";
         break;
     case RECOVERY_PAGE_CONFIRM:
-        subtitle = "UNDO THE LAST UPDATE?";
-        text = "THE NEXT START RUNS THE VERSION OF OPOS FROM BEFORE THE LAST"
-               " UPDATE. YOUR FILES, ACCOUNTS AND PROGRAMS STAY. THE NEWER"
-               " VERSION IS KEPT: \"OPOS (PREVIOUS VERSION)\" IN THE BOOT"
-               " MENU STARTS IT, AND UNDOING AGAIN BRINGS IT BACK.";
+        subtitle = recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+            ? "RESET SETTINGS?" : "UNDO THE LAST UPDATE?";
+        text = recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+            ? "THE SCREEN RESOLUTION, VOLUME, BACKGROUND, COLOR THEME,"
+              " TASKBAR AND THE OTHER SETTINGS OF EVERY ACCOUNT GO BACK TO"
+              " THEIR DEFAULTS. FILES, PROGRAMS, ACCOUNTS AND PASSWORDS STAY."
+            : "THE NEXT START RUNS THE VERSION OF OPOS FROM BEFORE THE LAST"
+              " UPDATE. YOUR FILES, ACCOUNTS AND PROGRAMS STAY. THE NEWER"
+              " VERSION IS KEPT: \"OPOS (PREVIOUS VERSION)\" IN THE BOOT"
+              " MENU STARTS IT, AND UNDOING AGAIN BRINGS IT BACK.";
         text_red = 220;
         text_green = 228;
         text_blue = 245;
@@ -6983,6 +7437,29 @@ static void draw_recovery(void) {
     case RECOVERY_PAGE_WORKING:
         subtitle = "PLEASE WAIT. DO NOT TURN THE COMPUTER OFF.";
         text = recovery_work_step;
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
+    case RECOVERY_PAGE_RESCUE:
+        subtitle = "RESCUE MY FILES";
+        text = "CHOOSE THE ACCOUNTS TO COPY AND A USB STICK OR OTHER DRIVE."
+               " THE COPIES GO INTO A NEW OPOS-RESCUE FOLDER ON IT. NOTHING"
+               " ON THIS COMPUTER CHANGES.";
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
+    case RECOVERY_PAGE_LOG:
+        subtitle = recovery_log_showing_previous
+            ? "START-UP LOG: THE START BEFORE THIS ONE"
+            : "START-UP LOG: THIS START";
+        text = "";
+        break;
+    case RECOVERY_PAGE_PASSWORD:
+        subtitle = "RESET A PASSWORD";
+        text = "CHOOSE AN ACCOUNT AND TYPE ITS NEW PASSWORD. THE OLD ONE IS"
+               " NOT NEEDED. FILES STAY.";
         text_red = 220;
         text_green = 228;
         text_blue = 245;
@@ -7009,6 +7486,18 @@ static void draw_recovery(void) {
                  panel.y + 90 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6), text,
                  text_red, text_green, text_blue);
 
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        draw_recovery_rescue();
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        draw_recovery_password();
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_LOG) {
+        draw_recovery_log();
+        return;
+    }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
         struct rect bar = recovery_pair_rect(0);
         bar.width = panel.width - 48;
@@ -7023,7 +7512,8 @@ static void draw_recovery(void) {
     if (recovery_page == RECOVERY_PAGE_CONFIRM
         || recovery_page == RECOVERY_PAGE_RESULT) {
         const char *left = recovery_page == RECOVERY_PAGE_CONFIRM
-            ? "UNDO THE UPDATE"
+            ? (recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+                   ? "RESET SETTINGS" : "UNDO THE UPDATE")
             : recovery_result_restart ? "RESTART NOW" : "BACK";
         const char *right = recovery_page == RECOVERY_PAGE_CONFIRM
             ? "CANCEL"
@@ -7193,11 +7683,189 @@ static void recovery_repair(void) {
     }
 }
 
+static void recovery_rescue(void) {
+    if (!recovery_rescue_ready()) {
+        return;
+    }
+    const char *names[ACCOUNT_MAX];
+    size_t count = 0;
+    for (size_t i = 0; i < accounts_count() && i < ACCOUNT_MAX; i++) {
+        if (recovery_rescue_account[i]) {
+            names[count++] = accounts_name(i);
+        }
+    }
+    char drive[48];
+    recovery_drive_text(recovery_drive_volume, drive, sizeof(drive));
+    console_serial_log("OPOS: OPOS Recovery: rescuing files\n");
+    recovery_begin_work("COUNTING FILES");
+    struct recovery_rescue_result result;
+    const char *error = "UNKNOWN ERROR";
+    if (!recovery_rescue_files(names, count, recovery_drive_volume,
+                               recovery_work_progress, &result, &error)) {
+        recovery_show_result(false, false, error);
+        return;
+    }
+    char text[200];
+    size_t at = append_text(text, sizeof(text), 0,
+                            result.stopped ? "COPYING STOPPED AFTER "
+                                           : "COPIED ");
+    at = append_decimal(text, sizeof(text), at, result.copied);
+    at = append_text(text, sizeof(text), at, " FILES (");
+    at = append_decimal(text, sizeof(text), at,
+                        (result.bytes + 1024 * 1024 - 1) / (1024 * 1024));
+    at = append_text(text, sizeof(text), at, " MB) TO ");
+    /* The drive's name without its size. */
+    size_t name_end = 0;
+    while (drive[name_end] != '\0'
+           && !(drive[name_end] == ' ' && drive[name_end + 1] == ' ')) {
+        name_end++;
+    }
+    drive[name_end] = '\0';
+    at = append_text(text, sizeof(text), at, drive);
+    at = append_text(text, sizeof(text), at, ", FOLDER ");
+    at = append_text(text, sizeof(text), at, result.folder + 7);
+    at = append_text(text, sizeof(text), at, ".");
+    if (result.stopped) {
+        at = append_text(text, sizeof(text), at,
+                         " THE DRIVE IS FULL OR WAS REMOVED.");
+    }
+    if (result.unreadable != 0) {
+        at = append_text(text, sizeof(text), at, " ");
+        at = append_decimal(text, sizeof(text), at, result.unreadable);
+        (void)append_text(text, sizeof(text), at,
+                          " COULD NOT BE READ AND WERE LEFT OUT.");
+    }
+    console_serial_log(result.stopped
+                           ? "OPOS: OPOS Recovery: rescue stopped\n"
+                           : "OPOS: OPOS Recovery: files rescued\n");
+    recovery_show_result(!result.stopped, false, text);
+}
+
+static void recovery_rescue_open(void) {
+    for (size_t i = 0; i < ACCOUNT_MAX; i++) {
+        recovery_rescue_account[i] = true;
+    }
+    recovery_rescue_focus = 0;
+    recovery_page = RECOVERY_PAGE_RESCUE;
+    recovery_scan_drives();
+}
+
+/* Space, Enter or a click on rescue row `index`. */
+static void recovery_rescue_choose(size_t index) {
+    size_t accounts = accounts_count();
+    recovery_rescue_focus = index;
+    if (index < accounts && index < ACCOUNT_MAX) {
+        recovery_rescue_account[index] = !recovery_rescue_account[index];
+    } else if (index < accounts + recovery_drive_count) {
+        recovery_drive_volume = recovery_drives[index - accounts];
+    } else if (index == accounts + recovery_drive_count) {
+        recovery_rescue();
+    } else {
+        recovery_page = RECOVERY_PAGE_MENU;
+    }
+}
+
+static void recovery_reset(void) {
+    console_serial_log("OPOS: OPOS Recovery: resetting settings\n");
+    recovery_begin_work("RESETTING SETTINGS");
+    bool done = recovery_reset_settings();
+    appearance_load();
+    if (done) {
+        console_serial_log("OPOS: OPOS Recovery: settings reset\n");
+        recovery_show_result(true, true,
+            "SETTINGS ARE BACK TO THEIR DEFAULTS. RESTART SO THAT THE"
+            " SCREEN RESOLUTION AND VOLUME CHANGE TOO.");
+    } else {
+        console_serial_log("OPOS: OPOS Recovery: settings reset failed\n");
+        recovery_show_result(false, false,
+            "SOME SETTINGS COULD NOT BE RESET: THE DISK COULD NOT BE"
+            " WRITTEN.");
+    }
+}
+
+static void recovery_password_open(void) {
+    recovery_password_account = 0;
+    recovery_password_focus = 0;
+    field_reset(&recovery_new_password, ACCOUNT_PASSWORD_MAX, false);
+    recovery_page = RECOVERY_PAGE_PASSWORD;
+}
+
+static void recovery_password_save(void) {
+    size_t index = recovery_password_account;
+    if (index >= accounts_count()) {
+        return;
+    }
+    bool removing = recovery_new_password.length == 0;
+    enum account_result result =
+        accounts_set_password(index, recovery_new_password.text);
+    field_reset(&recovery_new_password, ACCOUNT_PASSWORD_MAX, false);
+    char text[120];
+    size_t at = append_text(text, sizeof(text), 0, "THE PASSWORD OF ");
+    at = append_text(text, sizeof(text), at, accounts_name(index));
+    if (result != ACCOUNT_OK) {
+        (void)append_text(text, sizeof(text), at,
+                          " COULD NOT BE CHANGED: THE DISK COULD NOT BE"
+                          " WRITTEN.");
+        recovery_show_result(false, false, text);
+        return;
+    }
+    console_serial_log(removing
+                           ? "OPOS: OPOS Recovery: password removed\n"
+                           : "OPOS: OPOS Recovery: password changed\n");
+    (void)append_text(text, sizeof(text), at,
+                      removing ? " WAS REMOVED. IT SIGNS IN WITHOUT ONE."
+                               : " WAS CHANGED.");
+    recovery_show_result(true, false, text);
+}
+
+/* Enter, Space or a click on password row `index`. */
+static void recovery_password_choose(size_t index) {
+    size_t accounts = accounts_count();
+    recovery_password_focus = index;
+    if (index < accounts) {
+        recovery_password_account = index;
+        recovery_password_focus = accounts; /* on to the field */
+    } else if (index == accounts || index == accounts + 1) {
+        recovery_password_save();
+    } else {
+        recovery_page = RECOVERY_PAGE_MENU;
+    }
+}
+
+/* START OPOS NORMALLY and SAFE START. */
+static void recovery_start(bool safe) {
+    /* The failed-start count stays: a start that fails again comes
+       straight back here, one that lasts clears it. */
+    console_serial_log(safe ? "OPOS: OPOS Recovery: safe start\n"
+                            : "OPOS: OPOS Recovery: starting normally\n");
+    if (safe) {
+        safe_start = true;
+        vmware_set_autofit(false);
+        if (svga_available() && svga_current_mode() != 0) {
+            (void)svga_set_mode(0);
+        }
+        sound_set_muted(true);
+    }
+    recovery_active = false;
+    login_active = false;
+    recovery_set_reason(RECOVERY_NONE);
+    /* The normal login screen decides who uses the desktop. */
+    accounts_logout();
+    desktop_start_normal();
+    if (safe) {
+        set_status("SAFE START: BASICS ONLY. RESTART TO LEAVE IT.");
+    }
+}
+
 /* The left (0) or right (1) button of CONFIRM or RESULT. */
 static void recovery_pair_run(size_t index) {
     if (recovery_page == RECOVERY_PAGE_CONFIRM) {
         if (index == 0) {
-            recovery_undo();
+            if (recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS) {
+                recovery_reset();
+            } else {
+                recovery_undo();
+            }
         } else {
             recovery_page = RECOVERY_PAGE_MENU;
         }
@@ -7217,23 +7885,31 @@ static void recovery_run(enum recovery_action action) {
     switch (action) {
     case RECOVERY_ACTION_UNDO:
         if (recovery_undo_ok) {
+            recovery_confirming = RECOVERY_ACTION_UNDO;
             recovery_pair_selection = 1; /* CANCEL */
             recovery_page = RECOVERY_PAGE_CONFIRM;
         }
         break;
+    case RECOVERY_ACTION_RESET_SETTINGS:
+        recovery_confirming = RECOVERY_ACTION_RESET_SETTINGS;
+        recovery_pair_selection = 1; /* CANCEL */
+        recovery_page = RECOVERY_PAGE_CONFIRM;
+        break;
+    case RECOVERY_ACTION_RESET_PASSWORD:
+        recovery_password_open();
+        break;
+    case RECOVERY_ACTION_LOG:
+        recovery_log_open_page();
+        break;
     case RECOVERY_ACTION_REPAIR:
         recovery_repair();
         break;
+    case RECOVERY_ACTION_RESCUE:
+        recovery_rescue_open();
+        break;
     case RECOVERY_ACTION_START:
-        /* The failed-start count stays: a start that fails again comes
-           straight back here, one that lasts clears it. */
-        console_serial_log("OPOS: OPOS Recovery: starting normally\n");
-        recovery_active = false;
-        login_active = false;
-        recovery_set_reason(RECOVERY_NONE);
-        /* The normal login screen decides who uses the desktop. */
-        accounts_logout();
-        desktop_start_normal();
+    case RECOVERY_ACTION_SAFE_START:
+        recovery_start(action == RECOVERY_ACTION_SAFE_START);
         break;
     case RECOVERY_ACTION_COMMAND_LINE:
         console_serial_log("OPOS: OPOS Recovery: command line\n");
@@ -7272,6 +7948,48 @@ static void recovery_key(char character) {
     if (recovery_page == RECOVERY_PAGE_WORKING) {
         return;
     }
+    if (recovery_page == RECOVERY_PAGE_LOG) {
+        recovery_log_key(character);
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        size_t accounts = accounts_count();
+        size_t rows = accounts + 3;
+        if (character == KEY_UP && recovery_password_focus > 0) {
+            recovery_password_focus--;
+        } else if ((character == KEY_DOWN || character == '\t')
+                   && recovery_password_focus + 1 < rows) {
+            recovery_password_focus++;
+        } else if (character == KEY_ESCAPE) {
+            recovery_page = RECOVERY_PAGE_MENU;
+        } else if (recovery_password_focus == accounts) {
+            if (character == '\n') {
+                recovery_password_save();
+            } else {
+                (void)field_key(&recovery_new_password, character);
+            }
+        } else if (character == '\n' || character == ' ') {
+            recovery_password_choose(recovery_password_focus);
+        }
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+        size_t rows = accounts_count() + recovery_drive_count + 2;
+        if ((character == KEY_UP || character == KEY_LEFT)
+            && recovery_rescue_focus > 0) {
+            recovery_rescue_focus--;
+        } else if ((character == KEY_DOWN || character == KEY_RIGHT
+                    || character == '\t')
+                   && recovery_rescue_focus + 1 < rows) {
+            recovery_rescue_focus++;
+        } else if (character == '\n' || character == ' ') {
+            recovery_rescue_choose(recovery_rescue_focus);
+        } else if (character == KEY_ESCAPE) {
+            recovery_page = RECOVERY_PAGE_MENU;
+        }
+        return;
+    }
     if (recovery_page == RECOVERY_PAGE_CONFIRM
         || recovery_page == RECOVERY_PAGE_RESULT) {
         bool two = recovery_page == RECOVERY_PAGE_CONFIRM
@@ -7288,14 +8006,16 @@ static void recovery_key(char character) {
         }
         return;
     }
+    size_t step = character == KEY_UP || character == KEY_DOWN
+        ? RECOVERY_COLUMNS : 1;
     if ((character == KEY_UP || character == KEY_LEFT)
-        && recovery_selection > 0) {
-        recovery_selection--;
+        && recovery_selection >= step) {
+        recovery_selection -= step;
         recovery_message = "";
     } else if ((character == KEY_DOWN || character == KEY_RIGHT
                 || character == '\t')
-               && recovery_selection + 1 < RECOVERY_ACTION_COUNT) {
-        recovery_selection++;
+               && recovery_selection + step < RECOVERY_ACTION_COUNT) {
+        recovery_selection += step;
         recovery_message = "";
     } else if (character == '\n' || character == ' ') {
         recovery_run((enum recovery_action)recovery_selection);
@@ -7325,6 +8045,53 @@ static void recovery_press(int32_t x, int32_t y) {
         return;
     }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_LOG) {
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(recovery_log_button(i), x, y)) {
+                recovery_pair_selection = i;
+                recovery_log_key('\n');
+                return;
+            }
+        }
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        size_t accounts = accounts_count();
+        for (size_t i = 0; i < accounts; i++) {
+            if (rect_contains(recovery_rescue_row(i), x, y)) {
+                recovery_password_choose(i);
+                return;
+            }
+        }
+        if (rect_contains(recovery_password_field(), x, y)) {
+            recovery_password_focus = accounts;
+            return;
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(recovery_password_button(i), x, y)) {
+                recovery_password_choose(accounts + 1 + i);
+                return;
+            }
+        }
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+        size_t rows = accounts_count() + recovery_drive_count;
+        for (size_t i = 0; i < rows; i++) {
+            if (rect_contains(recovery_rescue_row(i), x, y)) {
+                recovery_rescue_choose(i);
+                return;
+            }
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(recovery_rescue_button(i), x, y)) {
+                recovery_rescue_choose(rows + i);
+                return;
+            }
+        }
         return;
     }
     if (recovery_page == RECOVERY_PAGE_CONFIRM
@@ -7741,7 +8508,7 @@ static void accounts_click(struct rect area, int32_t x, int32_t y) {
  * Settings > UPDATES runs /bin/update --gui (check or install) without a
  * Terminal. Its output comes here (updates_feed): lines starting with '@'
  * carry the state (see sdk/examples/update.c), the rest is the log shown
- * under SHOW DETAILS.
+ * under SHOW LOG.
  */
 #define UPDATES_TEXT 100
 /* Release note lines are word-wrapped when drawn, so they can be longer. */
@@ -7763,6 +8530,7 @@ enum updates_button {
     UPDATES_BUTTON_UPDATE, /* RESTART once installed */
     UPDATES_BUTTON_DETAILS,
     UPDATES_BUTTON_STORE, /* programs: opens the OPOS Store */
+    UPDATES_BUTTON_RECOVERY, /* restart into OPOS Recovery */
     UPDATES_BUTTON_COUNT,
 };
 
@@ -7793,6 +8561,8 @@ static bool updates_button_enabled(size_t button) {
         return !updates_running
             && (updates_status == UPDATES_INSTALLED
                 || (updates_status == UPDATES_AVAILABLE && updates_admin()));
+    case UPDATES_BUTTON_RECOVERY:
+        return !updates_running && !installer_available() && updates_admin();
     default:
         return true;
     }
@@ -7806,8 +8576,10 @@ static const char *updates_button_label(size_t button) {
         return updates_status == UPDATES_INSTALLED ? "RESTART NOW" : "UPDATE";
     case UPDATES_BUTTON_STORE:
         return "OPOS STORE";
+    case UPDATES_BUTTON_RECOVERY:
+        return "RECOVERY";
     default:
-        return updates_details ? "HIDE DETAILS" : "SHOW DETAILS";
+        return updates_details ? "HIDE LOG" : "SHOW LOG";
     }
 }
 
@@ -8164,7 +8936,7 @@ static void draw_updates(struct rect area, bool focused) {
         y += 32;
     }
 
-    /* Release notes, and the log below them under SHOW DETAILS. */
+    /* Release notes, and the log below them under SHOW LOG. */
     int64_t bottom = buttons_top - 10;
     int64_t log_top = bottom;
     if (updates_details) {
@@ -8229,6 +9001,12 @@ static void updates_press(size_t button) {
         break;
     case UPDATES_BUTTON_STORE:
         store_open();
+        break;
+    case UPDATES_BUTTON_RECOVERY:
+        /* The next start opens OPOS Recovery, once. */
+        if (!recovery_request_next_start() || !desktop_power_off(true)) {
+            set_status("COULD NOT RESTART INTO OPOS RECOVERY");
+        }
         break;
     default:
         updates_details = !updates_details;
@@ -8295,8 +9073,12 @@ static void desktop_session_start(void) {
     char greeting[64] = "WELCOME, ";
     append_text(greeting, sizeof(greeting), text_length(greeting),
                 accounts_name(accounts_current()));
-    set_status(greeting);
-    updates_auto_schedule();
+    if (safe_start) {
+        set_status("SAFE START: BASICS ONLY. RESTART TO LEAVE IT.");
+    } else {
+        set_status(greeting);
+        updates_auto_schedule();
+    }
 }
 
 /* Log out: close every window (the editor warns once about unsaved
@@ -8338,6 +9120,9 @@ enum installer_page {
     INSTALLER_RUNNING,
     INSTALLER_DONE,
     INSTALLER_FAILED,
+    /* REPAIR AN INSTALLED OPOS: which one (RUNNING, DONE and FAILED
+       follow, with installer_repairing set). */
+    INSTALLER_REPAIR,
 };
 
 #define INSTALLER_BUTTON_WIDTH (16 * CHAR_WIDTH + 20)
@@ -8356,6 +9141,11 @@ static const char *installer_account_error = "";
 static size_t installer_disk = BLOCK_NO_DISK;
 static size_t installer_disk_scroll;
 static struct installer_disk_summary installer_summaries[BLOCK_MAX_DISKS];
+/* Repair page: installed OPOS volumes found, the chosen one. */
+static bool installer_repairing;
+static size_t installer_repair_volumes[FAT16_MAX_VOLUMES];
+static size_t installer_repair_count;
+static size_t installer_repair_choice;
 
 #define INSTALLER_DISK_ROW_HEIGHT 60
 #define INSTALLER_DISK_LIST_TOP 98
@@ -8382,8 +9172,17 @@ static void installer_scan_disks(void) {
     installer_disk_scroll = 0;
 }
 
+static void installer_repair_open(void) {
+    installer_repairing = true;
+    installer_repair_count = installer_find_installs(
+        installer_repair_volumes, FAT16_MAX_VOLUMES);
+    installer_repair_choice = 0;
+    installer_page = INSTALLER_REPAIR;
+}
+
 static void installer_open(void) {
     if (!windows[WINDOW_INSTALLER].open) {
+        installer_repairing = false;
         installer_page = INSTALLER_WELCOME;
         installer_disk = BLOCK_NO_DISK;
         field_reset(&installer_fields[0], ACCOUNT_NAME_MAX, false);
@@ -8780,6 +9579,12 @@ static struct rect installer_button_rect(struct rect area, bool primary) {
     return (struct rect){x, y, INSTALLER_BUTTON_WIDTH, INSTALLER_BUTTON_HEIGHT};
 }
 
+static struct rect installer_repair_button(struct rect area) {
+    struct rect primary = installer_button_rect(area, true);
+    return (struct rect){area.x + 16, primary.y, INSTALLER_BUTTON_WIDTH,
+                         INSTALLER_BUTTON_HEIGHT};
+}
+
 static const char *installer_primary_label(void) {
     switch (installer_page) {
     case INSTALLER_WELCOME:
@@ -8795,6 +9600,8 @@ static const char *installer_primary_label(void) {
         return "RESTART";
     case INSTALLER_FAILED:
         return "TRY AGAIN";
+    case INSTALLER_REPAIR:
+        return "REPAIR";
     default:
         return NULL;
     }
@@ -8810,6 +9617,7 @@ static const char *installer_back_label(void) {
     case INSTALLER_BOOT:
     case INSTALLER_ACCOUNT:
     case INSTALLER_CONFIRM:
+    case INSTALLER_REPAIR:
         return "BACK";
     case INSTALLER_DONE:
     case INSTALLER_FAILED:
@@ -8830,6 +9638,8 @@ static bool installer_primary_enabled(void) {
     case INSTALLER_BOOT:
         return installer_disk_chosen() && installer_layout_ready()
             && installer_boot_mode_ok(installer_boot_mode);
+    case INSTALLER_REPAIR:
+        return installer_repair_choice < installer_repair_count;
     case INSTALLER_CONFIRM:
         return installer_disk_chosen()
             && (!installer_manual
@@ -8880,12 +9690,35 @@ static void installer_start(void) {
     files_refresh();
 }
 
+static void installer_repair_start(void) {
+    installer_page = INSTALLER_RUNNING;
+    installer_step = "STARTING";
+    installer_percent = 0;
+    draw_scene();
+    const char *error = "UNKNOWN ERROR";
+    size_t volume = installer_repair_volumes[installer_repair_choice];
+    console_serial_log("OPOS: repairing an installed OPOS\n");
+    if (installer_repair_install(volume, installer_progress_update, &error)) {
+        console_serial_log("OPOS: installed OPOS repaired\n");
+        installer_page = INSTALLER_DONE;
+    } else {
+        console_serial_log("OPOS: repairing the installed OPOS failed\n");
+        installer_error = error;
+        installer_page = INSTALLER_FAILED;
+    }
+    files_refresh();
+}
+
 static void installer_primary(void) {
     if (!installer_primary_enabled()) {
         return;
     }
     switch (installer_page) {
+    case INSTALLER_REPAIR:
+        installer_repair_start();
+        break;
     case INSTALLER_WELCOME:
+        installer_repairing = false;
         installer_page = INSTALLER_DISK;
         installer_scan_disks();
         break;
@@ -8917,6 +9750,10 @@ static void installer_primary(void) {
         power_reboot();
         break;
     case INSTALLER_FAILED:
+        if (installer_repairing) {
+            installer_repair_open();
+            break;
+        }
         installer_page = INSTALLER_DISK;
         installer_scan_disks();
         break;
@@ -8928,6 +9765,8 @@ static void installer_primary(void) {
 static void installer_back(void) {
     switch (installer_page) {
     case INSTALLER_DISK:
+    case INSTALLER_REPAIR:
+        installer_repairing = false;
         installer_page = INSTALLER_WELCOME;
         break;
     case INSTALLER_MODE:
@@ -9016,7 +9855,18 @@ static void installer_key(char character) {
         installer_partitions_key(character);
         return;
     }
-    if (installer_page == INSTALLER_DISK
+    if (installer_page == INSTALLER_WELCOME
+        && (character == 'r' || character == 'R')) {
+        installer_repair_open();
+    } else if (installer_page == INSTALLER_REPAIR
+               && (character == KEY_UP || character == KEY_DOWN)) {
+        if (character == KEY_UP && installer_repair_choice > 0) {
+            installer_repair_choice--;
+        } else if (character == KEY_DOWN
+                   && installer_repair_choice + 1 < installer_repair_count) {
+            installer_repair_choice++;
+        }
+    } else if (installer_page == INSTALLER_DISK
         && (character == KEY_UP || character == KEY_DOWN)) {
         installer_disk_move(character == KEY_UP ? -1 : 1);
     } else if (installer_page == INSTALLER_BOOT
@@ -9108,6 +9958,19 @@ static void installer_click(struct rect area, int32_t x, int32_t y) {
         for (size_t i = 0; i < 3; i++) {
             if (rect_contains(installer_field_rect(area, i), x, y)) {
                 installer_focus = i;
+                return;
+            }
+        }
+    }
+    if (installer_page == INSTALLER_WELCOME
+        && rect_contains(installer_repair_button(area), x, y)) {
+        installer_repair_open();
+        return;
+    }
+    if (installer_page == INSTALLER_REPAIR) {
+        for (size_t i = 0; i < installer_repair_count; i++) {
+            if (rect_contains(installer_disk_row(area, i + 2), x, y)) {
+                installer_repair_choice = i;
                 return;
             }
         }
@@ -9224,9 +10087,17 @@ static void draw_installer(struct rect area, bool focused) {
         "CREATE YOUR ACCOUNT",
         "READY TO INSTALL",
         "INSTALLING OPOS", "INSTALLATION COMPLETE", "INSTALLATION FAILED",
+        "REPAIR AN INSTALLED OPOS",
     };
+    const char *heading = headings[installer_page];
+    if (installer_repairing) {
+        heading = installer_page == INSTALLER_RUNNING ? "REPAIRING OPOS"
+            : installer_page == INSTALLER_DONE ? "REPAIR COMPLETE"
+            : installer_page == INSTALLER_FAILED ? "REPAIR FAILED"
+            : heading;
+    }
     draw_text_clipped(area.x + 24, area.y + 24, area.width - 48,
-                      headings[installer_page], 151, 190, 255);
+                      heading, 151, 190, 255);
     fill((struct rect){area.x + 24, area.y + 54, area.width - 48, 1},
          58, 66, 88);
 
@@ -9254,7 +10125,41 @@ static void draw_installer(struct rect area, bool focused) {
                        200, 214, 255);
         installer_line(area, 6, "You can reopen the installer from the Start menu.",
                        200, 214, 255);
+        installer_line(area, 8, "OPOS on this computer no longer starts? Choose",
+                       240, 205, 120);
+        installer_line(area, 9, "REPAIR (or press R) to put its system files back.",
+                       240, 205, 120);
+        draw_button(installer_repair_button(area), "REPAIR", false);
         break;
+    case INSTALLER_REPAIR: {
+        char line[96];
+        size_t at = append_text(line, sizeof(line), 0,
+                                "Puts the system files of OPOS ");
+        at = append_text(line, sizeof(line), at, update_current_version());
+        (void)append_text(line, sizeof(line), at,
+                          " from this media on the disk.");
+        installer_line(area, 0, line, 230, 238, 255);
+        installer_line(area, 1, "Files, accounts, settings and programs stay.",
+                       200, 214, 255);
+        if (installer_repair_count == 0) {
+            installer_line(area, 3, "No installed OPOS was found.", 255, 120,
+                           120);
+            break;
+        }
+        for (size_t i = 0; i < installer_repair_count; i++) {
+            struct rect row = installer_disk_row(area, i + 2);
+            bool chosen = i == installer_repair_choice;
+            fill(row, chosen ? 70 : 32, chosen ? 100 : 40, chosen ? 160 : 62);
+            char text[80];
+            size_t used = append_text(text, sizeof(text), 0,
+                                      chosen ? "(*) " : "( ) ");
+            recovery_drive_text(installer_repair_volumes[i], text + used,
+                                sizeof(text) - used);
+            draw_text_clipped(row.x + 12, row.y + (row.height - CHAR_HEIGHT) / 2,
+                              row.width - 24, text, 240, 245, 255);
+        }
+        break;
+    }
     case INSTALLER_DISK: {
         size_t count = block_disk_count();
         if (count == 0) {
@@ -9633,6 +10538,18 @@ static void draw_installer(struct rect area, bool focused) {
         break;
     }
     case INSTALLER_DONE:
+        if (installer_repairing) {
+            installer_line(area, 0, "The system files of OPOS on the disk "
+                           "were replaced.", 230, 238, 255);
+            installer_line(area, 2, "Remove the installation media, then "
+                           "choose RESTART.", 200, 214, 255);
+            installer_line(area, 3, "The first start checks the system "
+                           "programs again; that can take", 200, 214, 255);
+            installer_line(area, 4, "a few minutes.", 200, 214, 255);
+            installer_line(area, 6, "If it still does not start, choose "
+                           "OPOS Recovery in the boot menu.", 240, 205, 120);
+            break;
+        }
         installer_line(area, 0, "OPOS is installed.", 230, 238, 255);
         installer_line(area, 2, "Remove the installation media, then choose",
                        200, 214, 255);
@@ -9661,7 +10578,9 @@ static void draw_installer(struct rect area, bool focused) {
         break;
     case INSTALLER_FAILED:
         installer_line(area, 0, installer_error, 255, 120, 120);
-        installer_line(area, 2, "Choose TRY AGAIN to go back to the disk page.",
+        installer_line(area, 2, installer_repairing
+                           ? "Choose TRY AGAIN to go back to the repair page."
+                           : "Choose TRY AGAIN to go back to the disk page.",
                        200, 214, 255);
         break;
     }
@@ -18079,6 +18998,12 @@ static bool desktop_step(void) {
     }
     redraw |= toasts_poll();
     updates_auto_poll();
+    /* The start-up log reaches the disk about once a second. */
+    static uint64_t log_flush_tick;
+    if (timer_ticks() >= log_flush_tick) {
+        log_flush_tick = timer_ticks() + 100;
+        recovery_log_flush();
+    }
     if (start_finished_tick != 0 && !recovery_active
         && timer_ticks() >= start_finished_tick) {
         start_finished_tick = (uint64_t)-1; /* once per start */

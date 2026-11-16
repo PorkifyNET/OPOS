@@ -68,5 +68,8 @@ enum account_result accounts_delete(size_t index);
    logged-in account; false when nobody is logged in. */
 bool accounts_personal_settings(uint8_t *flags);
 void accounts_set_personal_settings(uint8_t flags);
+/* Every account's personal settings back to `defaults`; whether it has
+   seen Welcome stays. */
+bool accounts_reset_personal_settings(uint8_t defaults);
 
 #endif

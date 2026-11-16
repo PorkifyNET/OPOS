@@ -193,6 +193,7 @@ static void serial_initialize(void) {
 }
 
 static void serial_write_character(char character) {
+    recovery_log_put(character);
     for (uint32_t timeout = 0; timeout < 1000000; timeout++) {
         if ((io_in8(COM1 + 5) & 0x20) != 0) {
             io_out8(COM1, (uint8_t)character);
@@ -1357,6 +1358,14 @@ void kmain(void) {
 
     /* An update cut short by a power loss is finished first. */
     update_resume();
+    /* An undo of the last update (OPOS Recovery) cut short likewise. */
+    recovery_set_running_kernel(
+        kernel_file != NULL ? kernel_file->address : NULL,
+        kernel_file != NULL ? (size_t)kernel_file->size : 0);
+    if (recovery_undo_resume() == RECOVERY_RESUME_RESTART) {
+        console_write_string("OPOS: previous version restored; restarting\n");
+        power_reboot();
+    }
     /* Then a package install or removal; this also lists the installed
        package folders, including each account's, for permissions.c. */
     accounts_load();
@@ -1520,9 +1529,11 @@ void kmain(void) {
         if (!boot_display_add_recovery_entry()) {
             serial_write_string("OPOS: could not add the OPOS Recovery boot entry\n");
         }
+        /* Settings > UPDATES > RECOVERY (one time). */
+        bool recovery_asked = recovery_take_requested();
         if (root_selection_failed) {
             recovery_why = RECOVERY_SYSTEM_FILES;
-        } else if (recovery_requested) {
+        } else if (recovery_requested || recovery_asked) {
             recovery_why = RECOVERY_REQUESTED;
         } else if (failed_starts >= RECOVERY_FAILED_STARTS_LIMIT) {
             recovery_why = RECOVERY_FAILED_STARTS;
@@ -1537,6 +1548,7 @@ void kmain(void) {
     uint64_t reported_dropped_characters = 0;
     bool boot_shell = root_selection_failed || settings_take_boot_shell_once();
     /* Installation media always starts the desktop with the installer. */
+    recovery_log_flush();
     if (recovery_screen) {
         desktop_run();
     } else if (!boot_shell
@@ -1549,6 +1561,7 @@ void kmain(void) {
               "Type `desktop` to return to OPOS Recovery.\n\n"
             : "\nOPOS RECOVERY COMMAND LINE. Type `desktop` to return to OPOS Recovery.\n\n");
     }
+    recovery_log_flush();
     shell_initialize();
     uint64_t shown_mode_changes = console_mode_changes();
     for (;;) {

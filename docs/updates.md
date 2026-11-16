@@ -3,7 +3,7 @@
 Installed copies of OPOS update themselves from this repository's GitHub
 Releases. Settings > UPDATES checks when it is first opened and shows the
 release notes, an UPDATE button, progress, and the updater's log under
-SHOW DETAILS. In the Terminal or kernel shell, `update` checks and
+SHOW LOG. In the Terminal or kernel shell, `update` checks and
 `update install` installs. Only an administrator can install updates.
 Terminal installs show a summary and require typing `YES` before payload files
 are downloaded. `update install -y` (or `--y`) shows the summary and starts

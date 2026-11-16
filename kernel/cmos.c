@@ -364,3 +364,11 @@ bool settings_take_boot_shell_once(void) {
     settings_set(SETTING_BOOT_SHELL_ONCE, false);
     return true;
 }
+
+uint8_t settings_reset(void) {
+    struct settings_values old = settings_load();
+    uint8_t flags =
+        (uint8_t)(SETTINGS_DEFAULT | (old.flags & SETTING_WELCOME_SEEN));
+    settings_store((struct settings_values){flags, 0, 0});
+    return flags;
+}

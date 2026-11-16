@@ -7,6 +7,7 @@
 #include "fat16.h"
 #include "initramfs.h"
 #include "installer.h"
+#include "package.h"
 #include "partition.h"
 #include "system_root.h"
 #include "vfs.h"
@@ -268,6 +269,55 @@ bool installer_stage_system_root(const char **error) {
         return fail(error, "SYSTEM DISK IS NOT MOUNTED");
     }
     return populate_system_root(NULL, error);
+}
+
+enum installer_repair installer_repair_system_root(
+    installer_progress progress, const char **error) {
+    if (installer_available() || !fat16_system_mounted()) {
+        (void)fail(error, "SYSTEM DISK IS NOT MOUNTED");
+        return INSTALLER_REPAIR_FAILED;
+    }
+    char root[128];
+    if (!system_root_path(root, sizeof(root))) {
+        (void)fail(error, "SYSTEM ROOT NAME IS INVALID");
+        return INSTALLER_REPAIR_FAILED;
+    }
+    size_t root_length = text_length(root);
+    report(progress, "CHECKING SYSTEM FILES", 0);
+    if (system_root_ready(root, root_length)
+        && system_root_verify_tree(root, root_length)) {
+        return INSTALLER_REPAIR_FINE;
+    }
+    if (vfs_disk_root_contains(root, root_length)) {
+        (void)fail(error, "SYSTEM FILES ARE IN USE");
+        return INSTALLER_REPAIR_IN_USE;
+    }
+    /* Not ready while it changes. */
+    char marker[136];
+    size_t at = 0;
+    for (; at < root_length; at++) marker[at] = root[at];
+    static const char ready[] = ".ready";
+    for (size_t i = 0; i < sizeof(ready); i++) marker[at + i] = ready[i];
+    bool not_empty;
+    (void)vfs_remove(marker, text_length(marker), false, &not_empty);
+    block_begin_batch();
+    bool repaired = populate_system_root(progress, error);
+    if (!block_end_batch()) repaired = false;
+    if (!repaired) {
+        report(progress, "REMOVING DAMAGED SYSTEM FILES", 84);
+        if (!package_remove_tree(root)) {
+            (void)fail(error, "REMOVING DAMAGED SYSTEM FILES FAILED");
+            return INSTALLER_REPAIR_FAILED;
+        }
+        block_begin_batch();
+        repaired = populate_system_root(progress, error);
+        if (!block_end_batch()) repaired = false;
+    }
+    if (!repaired) {
+        return INSTALLER_REPAIR_FAILED;
+    }
+    report(progress, "DONE", 100);
+    return INSTALLER_REPAIR_FIXED;
 }
 
 struct install_copy {
@@ -1832,4 +1882,166 @@ bool installer_install_partition(const struct installer_layout *layout,
         report(progress, "INSTALLATION COMPLETE", 100);
     }
     return installed;
+}
+
+/* -------------------------------------------- repair an installed OPOS */
+
+#define REPAIR_PATH 160
+
+static size_t repair_prefix(size_t volume, char *path, size_t capacity) {
+    size_t length = append(path, capacity, 0, "/disk");
+    if (volume != 0) {
+        char digit[2] = {(char)('1' + volume), '\0'};
+        length = append(path, capacity, length, digit);
+    }
+    return length;
+}
+
+static bool repair_is_file(const char *path) {
+    struct vfs_metadata metadata;
+    return vfs_stat(path, text_length(path), &metadata)
+        && metadata.type == VFS_NODE_FILE;
+}
+
+size_t installer_find_installs(size_t *volumes, size_t capacity) {
+    size_t count = 0;
+    for (size_t volume = 0; volume < FAT16_MAX_VOLUMES && count < capacity;
+         volume++) {
+        struct fat16_volume_info info;
+        if (!fat16_volume_info(volume, &info)) {
+            continue;
+        }
+        char path[REPAIR_PATH];
+        size_t length = repair_prefix(volume, path, sizeof(path));
+        append(path, sizeof(path), length, "/boot/kernel.elf");
+        if (!repair_is_file(path)) {
+            continue;
+        }
+        append(path, sizeof(path), length, "/OPOS");
+        struct vfs_metadata metadata;
+        if (vfs_stat(path, text_length(path), &metadata)
+            && metadata.type == VFS_NODE_DIRECTORY) {
+            volumes[count++] = volume;
+        }
+    }
+    return count;
+}
+
+/* Copies `file` to `<target>.new` (verified); the rename comes later. */
+static bool repair_stage(const char *target, const struct payload_file *file) {
+    char side[REPAIR_PATH];
+    append(side, sizeof(side), append(side, sizeof(side), 0, target), ".new");
+    block_begin_batch();
+    bool copied = copy_file(side, file);
+    return block_end_batch() && copied;
+}
+
+static bool repair_swap(const char *target) {
+    char side[REPAIR_PATH];
+    append(side, sizeof(side), append(side, sizeof(side), 0, target), ".new");
+    return vfs_rename(side, text_length(side), target, text_length(target))
+        == VFS_RENAME_OK;
+}
+
+bool installer_repair_install(size_t volume, installer_progress progress,
+                              const char **error) {
+    if (!installer_available()) {
+        return fail(error, "INSTALL FILES MISSING FROM BOOT MEDIA");
+    }
+    size_t volumes[FAT16_MAX_VOLUMES];
+    size_t count = installer_find_installs(volumes, FAT16_MAX_VOLUMES);
+    bool found = false;
+    for (size_t i = 0; i < count; i++) {
+        found |= volumes[i] == volume;
+    }
+    if (!found) {
+        return fail(error, "THE INSTALLED OPOS WAS NOT FOUND");
+    }
+    char prefix[16];
+    (void)repair_prefix(volume, prefix, sizeof(prefix));
+
+    /* What goes where; loaders only where the volume already has them
+       (an EFI system partition elsewhere keeps its own). */
+    struct repair_target {
+        const char *relative;
+        const char *archive_name; /* NULL: kernel_image/initramfs_image */
+        const struct payload_file *image;
+        const char *step;
+        bool always;
+    };
+    static const struct repair_target targets[] = {
+        {"/boot/kernel.elf", NULL, &kernel_image, "COPYING KERNEL", true},
+        {"/boot/initramfs.tar", NULL, &initramfs_image,
+         "COPYING SYSTEM PROGRAMS", true},
+        {"/boot/limine/limine-bios.sys", "limine-bios.sys", NULL,
+         "COPYING BIOS BOOTLOADER", false},
+        {"/EFI/BOOT/BOOTX64.EFI", "BOOTX64.EFI", NULL,
+         "COPYING UEFI BOOTLOADER", false},
+    };
+    enum { TARGETS = sizeof(targets) / sizeof(targets[0]) };
+    bool staged[TARGETS] = {false};
+    char paths[TARGETS][REPAIR_PATH];
+    for (size_t i = 0; i < TARGETS; i++) {
+        append(paths[i], REPAIR_PATH,
+               append(paths[i], REPAIR_PATH, 0, prefix), targets[i].relative);
+        report(progress, targets[i].step, (unsigned)(5 + i * 70 / TARGETS));
+        if (!targets[i].always && !repair_is_file(paths[i])) {
+            continue;
+        }
+        struct payload_file file;
+        if (targets[i].image != NULL) {
+            file = *targets[i].image;
+        } else if (!archive_find(targets[i].archive_name, &file)) {
+            return fail(error, "INSTALL FILES MISSING FROM BOOT MEDIA");
+        }
+        if (file.data == NULL || file.size == 0) {
+            return fail(error, "INSTALL FILES MISSING FROM BOOT MEDIA");
+        }
+        if (file_matches(paths[i], &file)) {
+            continue; /* already right */
+        }
+        if (!repair_stage(paths[i], &file)) {
+            return fail(error, "COPYING FILES FAILED. THE DISK MAY BE FULL"
+                               " OR DAMAGED.");
+        }
+        staged[i] = true;
+    }
+
+    /* Initramfs before kernel, as updates do: a new kernel never starts
+       with an old initramfs. */
+    report(progress, "REPLACING THE OLD FILES", 80);
+    block_begin_batch();
+    bool swapped = true;
+    static const size_t order[] = {1, 0, 2, 3};
+    for (size_t k = 0; k < TARGETS; k++) {
+        size_t i = order[k];
+        if (staged[i] && !repair_swap(paths[i])) {
+            swapped = false;
+            break;
+        }
+    }
+    if (!block_end_batch() || !swapped) {
+        return fail(error, "REPLACING FILES FAILED");
+    }
+
+    /* The next start checks this version's system files and puts them in
+       place again; it also starts normally instead of in Recovery. */
+    report(progress, "PREPARING THE NEXT START", 90);
+    char root[128];
+    if (system_root_path(root, sizeof(root))) {
+        char marker[REPAIR_PATH];
+        size_t at = append(marker, sizeof(marker), 0, prefix);
+        at = append(marker, sizeof(marker), at, root + 5); /* past "/disk" */
+        append(marker, sizeof(marker), at, ".ready");
+        bool not_empty;
+        (void)vfs_remove(marker, text_length(marker), false, &not_empty);
+    }
+    char attempts[REPAIR_PATH];
+    append(attempts, sizeof(attempts),
+           append(attempts, sizeof(attempts), 0, prefix),
+           "/OPOS/BOOT-ATTEMPTS");
+    (void)vfs_write_file(attempts, text_length(attempts),
+                         (const uint8_t *)"0\n", 2);
+    report(progress, "DONE", 100);
+    return true;
 }

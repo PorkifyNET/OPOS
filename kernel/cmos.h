@@ -65,5 +65,9 @@ uint8_t settings_sound_volume(void);
 void settings_set_sound_volume(uint8_t volume);
 /* Returns true once if a one-time boot into the shell was requested. */
 bool settings_take_boot_shell_once(void);
+/* Machine settings back to their defaults (OPOS.CFG and CMOS): desktop on
+   boot, boot display mode, default volume. Welcome stays seen. Returns
+   the new flags. */
+uint8_t settings_reset(void);
 
 #endif

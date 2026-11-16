@@ -120,7 +120,19 @@ VMware check by a human afterwards.
    none to skip.
 5. **Start-up log viewer** and **"REPAIR AN INSTALLED OPOS"** on the live
    ISO/USB, including replacing a damaged kernel or initramfs from that
-   media.
+   media. *Done:* everything written to the serial port is also kept in
+   memory (first 64 KiB of a start) and, on installed systems, saved to
+   `/disk/OPOS/LOG-THIS.TXT` about once a second and on restart/shutdown;
+   the previous start's file becomes `LOG-LAST.TXT`. Recovery's START-UP
+   LOG page shows either, with problem lines in orange. The live
+   installer's first page has REPAIR (or R): it lists mounted FAT volumes
+   with `boot/kernel.elf` and an `OPOS` folder, copies the media's kernel
+   and initramfs (and the Limine loaders the volume already has) to
+   `.new` side files, renames them over the old ones (initramfs first),
+   removes this version's system root `.ready` marker so the next start
+   stages the system files again, and sets the failed-start count to 0.
+   Not covered: a missing `limine.conf` or damaged BIOS boot code, and
+   installs whose EFI files live on a separate EFI partition.
 
 Later ideas, not planned yet: a FAT disk check (lost clusters, cross-linked
 files), restore points of settings and installed programs ("System

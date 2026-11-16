@@ -193,6 +193,7 @@ static void serial_initialize(void) {
 }
 
 static void serial_write_character(char character) {
+    recovery_log_put(character);
     for (uint32_t timeout = 0; timeout < 1000000; timeout++) {
         if ((io_in8(COM1 + 5) & 0x20) != 0) {
             io_out8(COM1, (uint8_t)character);
@@ -1547,6 +1548,7 @@ void kmain(void) {
     uint64_t reported_dropped_characters = 0;
     bool boot_shell = root_selection_failed || settings_take_boot_shell_once();
     /* Installation media always starts the desktop with the installer. */
+    recovery_log_flush();
     if (recovery_screen) {
         desktop_run();
     } else if (!boot_shell
@@ -1559,6 +1561,7 @@ void kmain(void) {
               "Type `desktop` to return to OPOS Recovery.\n\n"
             : "\nOPOS RECOVERY COMMAND LINE. Type `desktop` to return to OPOS Recovery.\n\n");
     }
+    recovery_log_flush();
     shell_initialize();
     uint64_t shown_mode_changes = console_mode_changes();
     for (;;) {

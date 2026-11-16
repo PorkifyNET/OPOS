@@ -229,4 +229,17 @@ enum installer_repair {
 enum installer_repair installer_repair_system_root(
     installer_progress progress, const char **error);
 
+/*
+ * "Repair an installed OPOS" from installation media. An installed OPOS is
+ * a mounted FAT volume with boot/kernel.elf and an OPOS folder. Repairing
+ * copies this media's kernel and initramfs (and the Limine loaders the
+ * volume already has) to side files, renames them over the old ones,
+ * removes the "ready" marker of this version's system root so the next
+ * start puts the system files in place again, and clears the failed-start
+ * count. Accounts, files, settings and programs stay.
+ */
+size_t installer_find_installs(size_t *volumes, size_t capacity);
+bool installer_repair_install(size_t volume, installer_progress progress,
+                              const char **error);
+
 #endif

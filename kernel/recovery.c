@@ -55,6 +55,7 @@ uint32_t recovery_count_start(void) {
     if (counted || !installed()) {
         return failed_starts;
     }
+    recovery_log_open();
     counted = true;
     char text[12];
     size_t length = 0;
@@ -72,6 +73,7 @@ uint32_t recovery_count_start(void) {
 }
 
 void recovery_start_finished(void) {
+    recovery_log_flush();
     if (!counted) {
         return;
     }
@@ -741,5 +743,94 @@ bool recovery_take_requested(void) {
         return false;
     }
     remove_file(REQUEST_PATH);
+    return true;
+}
+
+/* ------------------------------------------------------ start-up log */
+
+#define LOG_THIS "/disk/OPOS/LOG-THIS.TXT"
+#define LOG_LAST "/disk/OPOS/LOG-LAST.TXT"
+static const char log_full_note[] = "\n[THE REST OF THIS START WAS NOT KEPT]\n";
+
+static char log_buffer[RECOVERY_LOG_CAPACITY];
+static volatile size_t log_length;
+static size_t log_saved;
+static bool log_saving;
+static bool log_flushing;
+
+void recovery_log_put(char character) {
+    if (character == '\r') {
+        return;
+    }
+    size_t at = log_length;
+    size_t room = RECOVERY_LOG_CAPACITY - (sizeof(log_full_note) - 1);
+    if (at < room) {
+        log_buffer[at] = character;
+        log_length = at + 1;
+    } else if (at == room) {
+        for (size_t i = 0; i + 1 < sizeof(log_full_note); i++) {
+            log_buffer[at + i] = log_full_note[i];
+        }
+        log_length = RECOVERY_LOG_CAPACITY;
+    }
+}
+
+void recovery_log_open(void) {
+    if (log_saving || !installed()) {
+        return;
+    }
+    if (exists(LOG_THIS)) {
+        (void)replace_file(LOG_THIS, LOG_LAST);
+    }
+    if (!vfs_create_file(LOG_THIS, text_length(LOG_THIS), true)) {
+        return;
+    }
+    log_saving = true;
+    log_saved = 0;
+    recovery_log_flush();
+}
+
+void recovery_log_flush(void) {
+    if (!log_saving || log_flushing || !installed()) {
+        return;
+    }
+    size_t end = log_length;
+    if (end <= log_saved) {
+        return;
+    }
+    /* Disk drivers may log too: those lines go out with the next flush. */
+    log_flushing = true;
+    size_t written = 0;
+    if (vfs_write_at(LOG_THIS, text_length(LOG_THIS), log_saved,
+                     (const uint8_t *)log_buffer + log_saved, end - log_saved, &written)) {
+        log_saved += written;
+    } else {
+        log_saving = false; /* the disk is gone or full: stop trying */
+    }
+    log_flushing = false;
+}
+
+const char *recovery_log_text(size_t *length) {
+    *length = log_length;
+    return log_buffer;
+}
+
+bool recovery_log_previous(char *buffer, size_t capacity, size_t *length) {
+    *length = 0;
+    if (!installed() || capacity == 0) {
+        return false;
+    }
+    size_t size = 0;
+    if (!vfs_file_size(LOG_LAST, text_length(LOG_LAST), &size)) {
+        return false;
+    }
+    size_t want = size < capacity ? size : capacity;
+    size_t read = 0;
+    if (want != 0
+        && !vfs_read_at(LOG_LAST, text_length(LOG_LAST), 0, (uint8_t *)buffer,
+                        want, &read)) {
+        return false;
+    }
+    *length = read;
     return true;
 }

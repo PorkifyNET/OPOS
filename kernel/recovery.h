@@ -107,4 +107,23 @@ bool recovery_request_next_start(void);
 /* Whether that was asked for; clears it. Installed systems only. */
 bool recovery_take_requested(void);
 
+/* ------------------------------------------------------ start-up log */
+
+/*
+ * Everything the kernel writes to the serial port is also kept in memory
+ * (the first RECOVERY_LOG_CAPACITY bytes of this start) and, on installed
+ * systems, saved to /disk/OPOS/LOG-THIS.TXT; the previous start's log is
+ * moved to LOG-LAST.TXT. Recovery shows both.
+ */
+#define RECOVERY_LOG_CAPACITY (64u * 1024u)
+void recovery_log_put(char character);
+/* Rotates the files and starts saving (after the boot volume mounts). */
+void recovery_log_open(void);
+/* Writes what was logged since the last call (cheap when nothing was). */
+void recovery_log_flush(void);
+/* This start's log so far. */
+const char *recovery_log_text(size_t *length);
+/* The previous start's log, read into `buffer`; false when there is none. */
+bool recovery_log_previous(char *buffer, size_t capacity, size_t *length);
+
 #endif

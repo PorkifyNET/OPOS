@@ -20,6 +20,10 @@ main = main.replace('    bool root_selection_failed = false;',
                     '    bool root_selection_failed = false;', 1)
 main = main.replace(launch, '    if (installer_available()) disk_root_smoke_launch();\n'
                     '    bool boot_shell = true;', 1)
+# These tests drive the command line; OPOS Recovery stays closed.
+recovery = '    bool recovery_screen = recovery_why != RECOVERY_NONE;'
+assert main.count(recovery) == 1
+main = main.replace(recovery, '    bool recovery_screen = false;', 1)
 Path('build/root-smoke-main.c').write_text(main)
 
 makefile = Path('GNUmakefile').read_text()

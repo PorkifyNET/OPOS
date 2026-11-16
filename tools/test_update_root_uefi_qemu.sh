@@ -20,6 +20,10 @@ main = main.replace(mount,
 main = main.replace(launch,
                     '    if (!installer_available()) update_root_step();\n'
                     '    bool boot_shell = true;', 1)
+# These tests drive the command line; OPOS Recovery stays closed.
+recovery = '    bool recovery_screen = recovery_why != RECOVERY_NONE;'
+assert main.count(recovery) == 1
+main = main.replace(recovery, '    bool recovery_screen = false;', 1)
 Path('build/update-test-main.c').write_text(main)
 
 probe = Path('tools/test_update_root_probe.c').read_text()

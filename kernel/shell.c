@@ -14,6 +14,7 @@
 #include "nvme.h"
 #include "mouse.h"
 #include "power.h"
+#include "recovery.h"
 #include "scheduler.h"
 #include "storage.h"
 #include "pci.h"
@@ -1137,12 +1138,13 @@ static void execute_command(void) {
             console_write_warning("Usage: reboot\n");
         } else {
             console_write_string("Restarting OPOS...\n");
+            recovery_start_finished();
             power_reboot();
         }
     } else if (command_matches(command, command_length, "shutdown")) {
         if (arguments_length != 0) {
             console_write_warning("Usage: shutdown\n");
-        } else if (!power_shutdown()) {
+        } else if (recovery_start_finished(), !power_shutdown()) {
             console_write_warning("ACPI shutdown is unavailable on this system.\n");
         }
     } else if (command_matches(command, command_length, "run")) {

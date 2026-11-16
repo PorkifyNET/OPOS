@@ -47,6 +47,7 @@
 #include "net.h"
 #include "sound.h"
 #include "nic.h"
+#include "recovery.h"
 
 #define COM1 0x3f8
 #define GLYPH_SCALE 2
@@ -1122,6 +1123,39 @@ static struct limine_file *find_module(const char *name) {
     return NULL;
 }
 
+/* Finds the space-separated word of the kernel command line that starts
+   with `prefix` (e.g. "opos.root=" or "opos.recovery"). Returns the text
+   after the prefix and its length up to the next space, or NULL. */
+static const char *cmdline_word(const char *cmdline, const char *prefix,
+                                size_t *value_length) {
+    *value_length = 0;
+    if (cmdline == NULL) {
+        return NULL;
+    }
+    size_t at = 0;
+    for (;;) {
+        while (cmdline[at] == ' ') {
+            at++;
+        }
+        if (cmdline[at] == '\0') {
+            return NULL;
+        }
+        size_t i = 0;
+        while (prefix[i] != '\0' && cmdline[at + i] == prefix[i]) {
+            i++;
+        }
+        size_t end = at;
+        while (cmdline[end] != '\0' && cmdline[end] != ' ') {
+            end++;
+        }
+        if (prefix[i] == '\0') {
+            *value_length = end - at - i;
+            return cmdline + at + i;
+        }
+        at = end;
+    }
+}
+
 void kmain(void) {
     serial_initialize();
     interrupts_initialize();
@@ -1318,6 +1352,9 @@ void kmain(void) {
         console_write_string("OPOS: no usable IDE, SATA, NVMe or SCSI disk found\n");
     }
 
+    /* Counted before anything below can hang or crash (docs/recovery.md). */
+    uint32_t failed_starts = recovery_count_start();
+
     /* An update cut short by a power loss is finished first. */
     update_resume();
     /* Then a package install or removal; this also lists the installed
@@ -1328,12 +1365,14 @@ void kmain(void) {
     bool root_selection_failed = false;
     const char *cmdline = cmdline_request.response != NULL
         ? cmdline_request.response->cmdline : NULL;
-    static const char root_option[] = "opos.root=";
-    bool root_requested = cmdline != NULL;
-    for (size_t i = 0; root_requested && i < sizeof(root_option) - 1; i++) {
-        root_requested = cmdline[i] != '\0'
-            && cmdline[i] == root_option[i];
-    }
+    size_t root_value_length = 0;
+    const char *root_value = cmdline_word(cmdline, "opos.root=",
+                                          &root_value_length);
+    bool root_requested = root_value != NULL;
+    size_t recovery_value_length = 0;
+    bool recovery_requested = cmdline_word(cmdline, "opos.recovery",
+                                           &recovery_value_length) != NULL
+        && recovery_value_length == 0;
     if (!installer_available() && fat16_system_mounted()) {
         char generation[64];
         char root[128];
@@ -1344,9 +1383,8 @@ void kmain(void) {
             generation_length++;
         }
         if (root_requested) {
-            const char *pin = cmdline + sizeof(root_option) - 1;
-            size_t pin_length = 0;
-            while (pin[pin_length] != '\0') pin_length++;
+            const char *pin = root_value;
+            size_t pin_length = root_value_length;
             /* A pin may name the generation with or without the
                "-<archive hash>" suffix that later kernels add. */
             bool matches = known && (pin_length == generation_length
@@ -1358,7 +1396,7 @@ void kmain(void) {
                 size_t old_size;
                 if (!vfs_file_size("/disk/boot/old/kernel.elf", 25,
                                    &old_size)) {
-                    console_write_error("OPOS: disk system root pin does not match this kernel; recovery shell will start\n");
+                    console_write_error("OPOS: disk system root pin does not match this kernel; OPOS Recovery will start\n");
                     root_selection_failed = true;
                 } else {
                     console_write_string("OPOS: old root pin belongs to previous boot entry; selecting current generation\n");
@@ -1382,7 +1420,7 @@ void kmain(void) {
             if (known && system_root_select(generation, generation_length)) {
                 console_write_string("OPOS: verified disk system root selected\n");
             } else if (known) {
-                console_write_error("OPOS: disk system root verification failed; recovery shell will start\n");
+                console_write_error("OPOS: disk system root verification failed; OPOS Recovery will start\n");
                 root_selection_failed = true;
             }
         }
@@ -1474,17 +1512,42 @@ void kmain(void) {
         }
     }
 
+    /* OPOS Recovery (docs/recovery.md), on installed systems: chosen in
+       the boot menu, after failed starts, or when the system files on the
+       disk are damaged. Its boot menu entry is added once. */
+    enum recovery_reason recovery_why = RECOVERY_NONE;
+    if (!installer_available() && fat16_system_mounted()) {
+        if (!boot_display_add_recovery_entry()) {
+            serial_write_string("OPOS: could not add the OPOS Recovery boot entry\n");
+        }
+        if (root_selection_failed) {
+            recovery_why = RECOVERY_SYSTEM_FILES;
+        } else if (recovery_requested) {
+            recovery_why = RECOVERY_REQUESTED;
+        } else if (failed_starts >= RECOVERY_FAILED_STARTS_LIMIT) {
+            recovery_why = RECOVERY_FAILED_STARTS;
+        }
+    }
+    recovery_set_reason(recovery_why);
+    bool recovery_screen = recovery_why != RECOVERY_NONE;
+    if (recovery_screen) {
+        serial_write_string("OPOS: starting OPOS Recovery\n");
+    }
+
     uint64_t reported_dropped_characters = 0;
     bool boot_shell = root_selection_failed || settings_take_boot_shell_once();
     /* Installation media always starts the desktop with the installer. */
-    if (!boot_shell
+    if (recovery_screen) {
+        desktop_run();
+    } else if (!boot_shell
         && (settings_get(SETTING_AUTOSTART_DESKTOP) || installer_available())) {
         desktop_run();
     }
-    if (root_selection_failed) {
-        shell_set_notice(
-            "\nRECOVERY: the system files on the disk did not pass verification.\n"
-            "If the boot menu has \"OPOS (previous version)\", restart and choose it.\n\n");
+    if (recovery_reason() != RECOVERY_NONE) {
+        shell_set_notice(root_selection_failed
+            ? "\nRECOVERY: the system files on the disk did not pass verification.\n"
+              "Type `desktop` to return to OPOS Recovery.\n\n"
+            : "\nOPOS RECOVERY COMMAND LINE. Type `desktop` to return to OPOS Recovery.\n\n");
     }
     shell_initialize();
     uint64_t shown_mode_changes = console_mode_changes();

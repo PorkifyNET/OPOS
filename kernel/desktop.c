@@ -21,6 +21,7 @@
 #include "mouse.h"
 #include "optical.h"
 #include "power.h"
+#include "recovery.h"
 #include "scheduler.h"
 #include "storage.h"
 #include "sound.h"
@@ -1732,8 +1733,10 @@ static bool terminal_execute(void) {
         terminal_print(i == terminal_length && user_process_kill(process_id)
                        ? "ENDING PROGRAM" : "NO SUCH PROGRAM");
     } else if (text_equals(terminal_line, terminal_length, "reboot")) {
+        recovery_start_finished();
         power_reboot();
     } else if (text_equals(terminal_line, terminal_length, "shutdown")) {
+        recovery_start_finished();
         if (!power_shutdown()) {
             terminal_print("ACPI SHUTDOWN UNAVAILABLE");
         }
@@ -6645,7 +6648,16 @@ static void login_attempt(void) {
     }
 }
 
+static bool recovery_active;
+static void draw_recovery(void);
+static void recovery_key(char character);
+static void recovery_press(int32_t x, int32_t y);
+
 static void draw_login(void) {
+    if (recovery_active) {
+        draw_recovery();
+        return;
+    }
     struct rect panel = login_panel_rect();
     fill(panel, 110, 160, 255);
     fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
@@ -6686,6 +6698,10 @@ static void draw_login(void) {
 }
 
 static void login_key(char character) {
+    if (recovery_active) {
+        recovery_key(character);
+        return;
+    }
     if (character == KEY_UP && login_selection > 0) {
         login_select(login_selection - 1);
     } else if (character == KEY_DOWN) {
@@ -6701,6 +6717,10 @@ static void login_key(char character) {
 }
 
 static void login_press(int32_t x, int32_t y) {
+    if (recovery_active) {
+        recovery_press(x, y);
+        return;
+    }
     for (size_t i = 0; i < accounts_count(); i++) {
         if (rect_contains(login_row_rect(i), x, y)) {
             login_select(i);
@@ -6714,6 +6734,360 @@ static void login_press(int32_t x, int32_t y) {
     } else if (rect_contains(login_button_rect(2), x, y)) {
         if (!desktop_power_off(false)) {
             login_message = "ACPI SHUTDOWN UNAVAILABLE";
+        }
+    }
+}
+
+/* -------------------------------------------------------- OPOS Recovery */
+
+/*
+ * docs/recovery.md. Shown instead of the login screen when main.c set a
+ * recovery reason: chosen in the boot menu, after failed starts, or with
+ * damaged system files. It runs as a login screen (login_active), so no
+ * programs, notifications or update checks start behind it.
+ */
+#define RECOVERY_PANEL_WIDTH 680
+#define RECOVERY_BUTTON_HEIGHT 40
+#define RECOVERY_BUTTON_GAP 10
+#define RECOVERY_REASON_LINES 5
+
+enum recovery_page {
+    RECOVERY_PAGE_SIGN_IN,
+    RECOVERY_PAGE_MENU,
+};
+
+enum recovery_action {
+    RECOVERY_ACTION_START,
+    RECOVERY_ACTION_COMMAND_LINE,
+    RECOVERY_ACTION_RESTART,
+    RECOVERY_ACTION_SHUT_DOWN,
+    RECOVERY_ACTION_COUNT,
+};
+
+static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
+    "START OPOS NORMALLY",
+    "COMMAND LINE",
+    "RESTART",
+    "SHUT DOWN",
+};
+
+static const char *const recovery_action_help[RECOVERY_ACTION_COUNT] = {
+    "CONTINUES TO THE LOGIN SCREEN AND THE DESKTOP.",
+    "THE TEXT COMMAND LINE, FOR ADVANCED USERS. TYPE DESKTOP TO COME BACK.",
+    "RESTARTS THE COMPUTER.",
+    "TURNS THE COMPUTER OFF.",
+};
+
+static enum recovery_page recovery_page;
+/* Kept for this start: coming back from the command line needs no new
+   sign-in. */
+static bool recovery_signed_in;
+static size_t recovery_selection;
+/* The administrators who can sign in (accounts with a password). */
+static size_t recovery_admins[ACCOUNT_MAX];
+static size_t recovery_admin_count;
+static size_t recovery_admin_selection;
+/* An administrator without a password, or ACCOUNT_NONE. */
+static size_t recovery_open_admin = ACCOUNT_NONE;
+static struct text_field recovery_password;
+static const char *recovery_message = "";
+
+static void desktop_start_normal(void);
+static int64_t draw_wrapped(int64_t x, int64_t y, int64_t width,
+                            int64_t bottom, const char *text, uint8_t red,
+                            uint8_t green, uint8_t blue);
+
+/*
+ * Recovery can read every account's files, so it asks for an
+ * administrator's password, unless some administrator has none (that
+ * person could sign in to the desktop without one anyway). The
+ * administrator stays logged in while Recovery is up, so the command line
+ * opens without asking again; START OPOS NORMALLY logs out first.
+ */
+static bool recovery_sign_in_needed(void) {
+    recovery_admin_count = 0;
+    recovery_open_admin = ACCOUNT_NONE;
+    for (size_t i = 0; i < accounts_count() && i < ACCOUNT_MAX; i++) {
+        if (!accounts_is_admin(i)) {
+            continue;
+        }
+        if (accounts_has_password(i)) {
+            recovery_admins[recovery_admin_count++] = i;
+        } else if (recovery_open_admin == ACCOUNT_NONE) {
+            recovery_open_admin = i;
+        }
+    }
+    return recovery_admin_count != 0 && recovery_open_admin == ACCOUNT_NONE;
+}
+
+static void recovery_show(void) {
+    login_active = true;
+    recovery_active = true;
+    recovery_selection = 0;
+    recovery_admin_selection = 0;
+    recovery_message = "";
+    field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
+    bool needed = recovery_sign_in_needed();
+    recovery_page = needed && !recovery_signed_in
+        ? RECOVERY_PAGE_SIGN_IN : RECOVERY_PAGE_MENU;
+    if (!needed && accounts_current() == ACCOUNT_NONE
+        && recovery_open_admin != ACCOUNT_NONE) {
+        (void)accounts_login(recovery_open_admin, "");
+    }
+}
+
+static void recovery_reason_text(char *text, size_t capacity) {
+    text[0] = '\0';
+    switch (recovery_reason()) {
+    case RECOVERY_REQUESTED:
+        append_text(text, capacity, 0,
+                    "YOU CHOSE OPOS RECOVERY IN THE BOOT MENU.");
+        break;
+    case RECOVERY_FAILED_STARTS: {
+        size_t at = append_text(text, capacity, 0,
+                                "OPOS DID NOT START CORRECTLY THE LAST ");
+        at = append_decimal(text, capacity, at, recovery_failed_starts());
+        append_text(text, capacity, at,
+                    " TIMES. IF IT KEEPS FAILING, RESTART AND CHOOSE"
+                    " \"OPOS (PREVIOUS VERSION)\" IN THE BOOT MENU, IF IT"
+                    " IS THERE.");
+        break;
+    }
+    case RECOVERY_SYSTEM_FILES:
+        append_text(text, capacity, 0,
+                    "THE SYSTEM FILES ON THE DISK DID NOT PASS THEIR CHECK."
+                    " STARTING NORMALLY USES THE BUILT-IN COPY INSTEAD."
+                    " YOU CAN ALSO RESTART AND CHOOSE \"OPOS (PREVIOUS"
+                    " VERSION)\" IN THE BOOT MENU, IF IT IS THERE.");
+        break;
+    default:
+        break;
+    }
+}
+
+static struct rect recovery_panel_rect(void) {
+    int64_t rows = recovery_page == RECOVERY_PAGE_SIGN_IN
+        ? (int64_t)recovery_admin_count * LOGIN_ROW_HEIGHT + 2 * 48 + 96
+        : RECOVERY_ACTION_COUNT
+              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 60;
+    int64_t height = 96 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6) + 24 + rows;
+    int64_t width = RECOVERY_PANEL_WIDTH < screen_width() - 20
+        ? RECOVERY_PANEL_WIDTH : screen_width() - 20;
+    if (height > screen_height() - 20) {
+        height = screen_height() - 20;
+    }
+    return (struct rect){(screen_width() - width) / 2,
+                         (screen_height() - height) / 2, width, height};
+}
+
+/* Where the sign-in rows or the buttons start. */
+static int64_t recovery_content_top(void) {
+    return recovery_panel_rect().y + 96
+        + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6) + 24;
+}
+
+static struct rect recovery_button_rect(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    return (struct rect){panel.x + 24,
+                         recovery_content_top() + (int64_t)index
+                             * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP),
+                         panel.width - 48, RECOVERY_BUTTON_HEIGHT};
+}
+
+static struct rect recovery_admin_rect(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    return (struct rect){panel.x + 24,
+                         recovery_content_top() + (int64_t)index
+                             * LOGIN_ROW_HEIGHT,
+                         panel.width - 48, LOGIN_ROW_HEIGHT - 4};
+}
+
+static struct rect recovery_field_rect(void) {
+    struct rect row = recovery_admin_rect(recovery_admin_count);
+    return (struct rect){row.x, row.y + 36, row.width, 36};
+}
+
+static struct rect recovery_sign_in_button_rect(size_t index) {
+    /* 0: CONTINUE, 1: RESTART, 2: SHUT DOWN */
+    struct rect panel = recovery_panel_rect();
+    int64_t width = (panel.width - 48 - 2 * 12) / 3;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         panel.y + panel.height - 56, width, 36};
+}
+
+static void draw_recovery(void) {
+    struct rect panel = recovery_panel_rect();
+    fill(panel, 230, 170, 90);
+    fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
+                       panel.height - 4}, 24, 30, 46);
+    draw_text_clipped(panel.x + 24, panel.y + 20, panel.width - 48,
+                      "OPOS RECOVERY", 255, 200, 130);
+    draw_text_clipped(panel.x + 24, panel.y + 50, panel.width - 48,
+                      recovery_page == RECOVERY_PAGE_SIGN_IN
+                          ? "AN ADMINISTRATOR NEEDS TO SIGN IN"
+                          : "CHOOSE WHAT TO DO",
+                      200, 214, 255);
+    char reason[400];
+    recovery_reason_text(reason, sizeof(reason));
+    draw_wrapped(panel.x + 24, panel.y + 90, panel.width - 48,
+                 panel.y + 90 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6), reason,
+                 240, 225, 200);
+
+    if (recovery_page == RECOVERY_PAGE_SIGN_IN) {
+        for (size_t i = 0; i < recovery_admin_count; i++) {
+            struct rect row = recovery_admin_rect(i);
+            bool selected = i == recovery_admin_selection;
+            uint8_t red = selected ? 70 : 32;
+            uint8_t green = selected ? 100 : 40;
+            uint8_t blue = selected ? 160 : 62;
+            fill(row, red, green, blue);
+            draw_avatar(row.x + 4, row.y + 3, row.height - 6,
+                        recovery_admins[i], red, green, blue);
+            draw_text_clipped(row.x + row.height + 8,
+                              row.y + (row.height - CHAR_HEIGHT) / 2,
+                              row.width - row.height - 18,
+                              accounts_name(recovery_admins[i]),
+                              240, 245, 255);
+        }
+        struct rect field = recovery_field_rect();
+        draw_text_clipped(field.x, field.y - 28, field.width, "PASSWORD:",
+                          200, 214, 255);
+        draw_field(field, &recovery_password, true);
+        draw_text_clipped(field.x, field.y + 44, field.width,
+                          recovery_message, 255, 120, 120);
+        draw_button(recovery_sign_in_button_rect(0), "CONTINUE", true);
+        draw_button(recovery_sign_in_button_rect(1), "RESTART", false);
+        draw_button(recovery_sign_in_button_rect(2), "SHUT DOWN", false);
+        return;
+    }
+
+    for (size_t i = 0; i < RECOVERY_ACTION_COUNT; i++) {
+        draw_button(recovery_button_rect(i), recovery_action_labels[i],
+                    i == recovery_selection);
+    }
+    struct rect last = recovery_button_rect(RECOVERY_ACTION_COUNT - 1);
+    int64_t help_top = last.y + last.height + 16;
+    if (recovery_message[0] != '\0') {
+        draw_text_clipped(panel.x + 24, help_top, panel.width - 48,
+                          recovery_message, 255, 120, 120);
+    } else {
+        draw_wrapped(panel.x + 24, help_top, panel.width - 48,
+                     panel.y + panel.height - 8,
+                     recovery_action_help[recovery_selection],
+                     170, 185, 215);
+    }
+}
+
+static void recovery_sign_in(void) {
+    if (recovery_admin_selection < recovery_admin_count
+        && accounts_login(recovery_admins[recovery_admin_selection],
+                          recovery_password.text)) {
+        recovery_signed_in = true;
+        recovery_page = RECOVERY_PAGE_MENU;
+        recovery_selection = 0;
+        recovery_message = "";
+        console_serial_log("OPOS: OPOS Recovery sign-in accepted\n");
+    } else {
+        recovery_message = "WRONG PASSWORD";
+    }
+    field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
+}
+
+static void recovery_power(bool restart) {
+    if (!desktop_power_off(restart)) {
+        recovery_message = "ACPI SHUTDOWN UNAVAILABLE";
+    }
+}
+
+static void recovery_run(enum recovery_action action) {
+    switch (action) {
+    case RECOVERY_ACTION_START:
+        /* The failed-start count stays: a start that fails again comes
+           straight back here, one that lasts clears it. */
+        console_serial_log("OPOS: OPOS Recovery: starting normally\n");
+        recovery_active = false;
+        login_active = false;
+        recovery_set_reason(RECOVERY_NONE);
+        /* The normal login screen decides who uses the desktop. */
+        accounts_logout();
+        desktop_start_normal();
+        break;
+    case RECOVERY_ACTION_COMMAND_LINE:
+        console_serial_log("OPOS: OPOS Recovery: command line\n");
+        exit_to_shell = true;
+        break;
+    case RECOVERY_ACTION_RESTART:
+        recovery_power(true);
+        break;
+    case RECOVERY_ACTION_SHUT_DOWN:
+        recovery_power(false);
+        break;
+    default:
+        break;
+    }
+}
+
+static void recovery_key(char character) {
+    if (recovery_page == RECOVERY_PAGE_SIGN_IN) {
+        if (character == KEY_UP && recovery_admin_selection > 0) {
+            recovery_admin_selection--;
+            field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
+        } else if (character == KEY_DOWN
+                   && recovery_admin_selection + 1 < recovery_admin_count) {
+            recovery_admin_selection++;
+            field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
+        } else if (character == '\n') {
+            recovery_sign_in();
+        } else if (character == KEY_ESCAPE) {
+            field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
+        } else {
+            recovery_message = "";
+            (void)field_key(&recovery_password, character);
+        }
+        return;
+    }
+    if ((character == KEY_UP || character == KEY_LEFT)
+        && recovery_selection > 0) {
+        recovery_selection--;
+        recovery_message = "";
+    } else if ((character == KEY_DOWN || character == KEY_RIGHT
+                || character == '\t')
+               && recovery_selection + 1 < RECOVERY_ACTION_COUNT) {
+        recovery_selection++;
+        recovery_message = "";
+    } else if (character == '\n' || character == ' ') {
+        recovery_run((enum recovery_action)recovery_selection);
+    }
+}
+
+static void recovery_press(int32_t x, int32_t y) {
+    if (recovery_page == RECOVERY_PAGE_SIGN_IN) {
+        for (size_t i = 0; i < recovery_admin_count; i++) {
+            if (rect_contains(recovery_admin_rect(i), x, y)) {
+                if (i != recovery_admin_selection) {
+                    recovery_admin_selection = i;
+                    field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX,
+                                true);
+                    recovery_message = "";
+                }
+                return;
+            }
+        }
+        if (rect_contains(recovery_sign_in_button_rect(0), x, y)) {
+            recovery_sign_in();
+        } else if (rect_contains(recovery_sign_in_button_rect(1), x, y)) {
+            recovery_power(true);
+        } else if (rect_contains(recovery_sign_in_button_rect(2), x, y)) {
+            recovery_power(false);
+        }
+        return;
+    }
+    for (size_t i = 0; i < RECOVERY_ACTION_COUNT; i++) {
+        if (rect_contains(recovery_button_rect(i), x, y)) {
+            recovery_selection = i;
+            recovery_message = "";
+            recovery_run((enum recovery_action)i);
+            return;
         }
     }
 }
@@ -7630,6 +8004,7 @@ static void updates_click(struct rect area, int32_t x, int32_t y) {
 /* Shut down (false when ACPI cannot) or restart, after the shutdown sound
    (at most 1.5 s). The kernel shell's commands stay silent. */
 static bool desktop_power_off(bool restart) {
+    recovery_start_finished();
     if (system_sound_play(SYSTEM_SOUND_SHUTDOWN)) {
         system_sound_wait(1500);
     }
@@ -7639,8 +8014,14 @@ static bool desktop_power_off(bool restart) {
     return power_shutdown();
 }
 
+/* timer_ticks() at which this start counts as finished (0: not pending). */
+static uint64_t start_finished_tick;
+
 /* After login: the account's places and home folder, default windows. */
 static void desktop_session_start(void) {
+    if (start_finished_tick == 0) {
+        start_finished_tick = timer_ticks() + 60u * 100u;
+    }
     appearance_load();
     files_places_rebuild();
     char home[96];
@@ -11101,7 +11482,12 @@ static void draw_status(void) {
 
 static void draw_scene(void) {
     bool buffered = console_frame_begin();
-    draw_wallpaper();
+    if (recovery_active) {
+        fill((struct rect){0, 0, screen_width(), screen_height()},
+             18, 22, 34);
+    } else {
+        draw_wallpaper();
+    }
     if (login_active) {
         /* No taskbar on the login screen; the background fills the whole
            screen. */
@@ -17435,6 +17821,11 @@ static bool desktop_step(void) {
     }
     redraw |= toasts_poll();
     updates_auto_poll();
+    if (start_finished_tick != 0 && !recovery_active
+        && timer_ticks() >= start_finished_tick) {
+        start_finished_tick = (uint64_t)-1; /* once per start */
+        recovery_start_finished();
+    }
 
     /* The host may resize the screen (VMware "Autofit Guest"). */
     int64_t width_before = screen_width();
@@ -17542,6 +17933,21 @@ static bool desktop_step(void) {
     return false;
 }
 
+/* The session, the login screen, or the desktop without accounts. */
+static void desktop_start_normal(void) {
+    if (accounts_current() != ACCOUNT_NONE) {
+        desktop_session_start();
+    } else if (accounts_login_required()) {
+        login_show();
+    } else if (accounts_count() == 1 && accounts_login(0, "")) {
+        desktop_session_start();
+    } else {
+        layout_load();
+        welcome_open_first_time();
+        window_open(WINDOW_TERMINAL);
+    }
+}
+
 void desktop_run(void) {
     if (screen_width() < 640 || screen_height() < 480) {
         console_write_string("Desktop requires a 640x480 framebuffer.\n");
@@ -17563,6 +17969,7 @@ void desktop_run(void) {
     status_text[0] = '\0';
     exit_to_shell = false;
     login_active = false;
+    recovery_active = false;
     protected_active = false;
     protected_action = PROTECTED_ACTION_NONE;
     protected_grant = PROTECTED_ACTION_NONE;
@@ -17584,16 +17991,10 @@ void desktop_run(void) {
         }
         files_places_rebuild();
         appearance_load();
-        if (accounts_current() != ACCOUNT_NONE) {
-            desktop_session_start();
-        } else if (accounts_login_required()) {
-            login_show();
-        } else if (accounts_count() == 1 && accounts_login(0, "")) {
-            desktop_session_start();
+        if (recovery_reason() != RECOVERY_NONE) {
+            recovery_show();
         } else {
-            layout_load();
-            welcome_open_first_time();
-            window_open(WINDOW_TERMINAL);
+            desktop_start_normal();
         }
     }
 

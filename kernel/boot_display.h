@@ -51,5 +51,9 @@ enum boot_display_result boot_display_configure(uint32_t width,
  * file with such an entry has the copy afterwards. No permission check.
  */
 bool boot_display_add_previous_entry(void);
+/* Adds "OPOS Recovery" (the system kernel with opos.recovery on its
+   command line) after the system entry of every boot menu copy, once.
+   Installed systems only; true when every copy has it. */
+bool boot_display_add_recovery_entry(void);
 
 #endif

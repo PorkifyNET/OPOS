@@ -360,6 +360,8 @@ static size_t rewrite_config(const char *text, size_t length,
 }
 
 #define PREVIOUS_HEADER "/OPOS (previous version)"
+#define RECOVERY_HEADER "/OPOS Recovery"
+#define RECOVERY_OPTION "opos.recovery"
 #define KERNEL_TAIL "/boot/kernel.elf"
 #define OLD_KERNEL_TAIL "/boot/old/kernel.elf"
 
@@ -380,23 +382,24 @@ static bool find_folded(const char *text, size_t start, size_t end,
     return false;
 }
 
-/*
- * Copies text into config_output with a copy of the first OPOS entry that
- * boots .../boot/kernel.elf inserted after it, renamed PREVIOUS_HEADER
- * and booting .../boot/old/kernel.elf. Returns the output length, or 0
- * when there is no such entry or the copy is already there.
- */
-static size_t add_previous_entry(const char *text, size_t length) {
+/* Whether some header line of the config contains `header`. */
+static bool has_header(const char *text, size_t length, const char *header) {
     for (size_t start = 0; start < length;) {
         struct line line = line_at(text, length, start);
         size_t at;
         if (line_is_header(text, line)
-            && find_folded(text, line.start, line.content_end,
-                           PREVIOUS_HEADER, &at)) {
-            return 0;
+            && find_folded(text, line.start, line.content_end, header, &at)) {
+            return true;
         }
         start = line.next;
     }
+    return false;
+}
+
+/* Finds the first OPOS entry whose path is the system kernel:
+   [*found_start, *found_end), up to the next header. */
+static bool find_system_entry(const char *text, size_t length,
+                              size_t *found_start, size_t *found_end) {
     /* The entry: [entry_start, entry_end). */
     size_t entry_start = length;
     size_t entry_end = length;
@@ -433,7 +436,24 @@ static size_t add_previous_entry(const char *text, size_t length) {
         }
         start = line.next;
     }
-    if (entry_start == length) {
+    *found_start = entry_start;
+    *found_end = entry_end;
+    return entry_start != length;
+}
+
+/*
+ * Copies text into config_output with a copy of the first OPOS entry that
+ * boots .../boot/kernel.elf inserted after it, renamed PREVIOUS_HEADER
+ * and booting .../boot/old/kernel.elf. Returns the output length, or 0
+ * when there is no such entry or the copy is already there.
+ */
+static size_t add_previous_entry(const char *text, size_t length) {
+    if (has_header(text, length, PREVIOUS_HEADER)) {
+        return 0;
+    }
+    size_t entry_start;
+    size_t entry_end;
+    if (!find_system_entry(text, length, &entry_start, &entry_end)) {
         return 0;
     }
     size_t used = 0;
@@ -534,6 +554,94 @@ static bool read_config(size_t index, size_t *length) {
     return true;
 }
 
+/*
+ * Copies text into config_output with a copy of the system entry, renamed
+ * RECOVERY_HEADER, inserted after it. The copy starts the same kernel with
+ * RECOVERY_OPTION on its command line (added to an existing cmdline, or as
+ * a new cmdline option). Returns the output length, or 0 when the entry is
+ * already there, there is no system entry, or the output does not fit.
+ */
+static size_t add_recovery_entry(const char *text, size_t length) {
+    if (has_header(text, length, RECOVERY_HEADER)) {
+        return 0;
+    }
+    size_t entry_start;
+    size_t entry_end;
+    if (!find_system_entry(text, length, &entry_start, &entry_end)) {
+        return 0;
+    }
+    size_t used = 0;
+    if (!output_append(&used, text, entry_end)) {
+        return 0;
+    }
+    struct line header = line_at(text, length, entry_start);
+    const char *ending = "\n";
+    size_t ending_length = 1;
+    if (header.next != header.content_end) {
+        ending = text + header.content_end;
+        ending_length = header.next - header.content_end;
+    }
+    if (used != 0 && config_output[used - 1] != '\n'
+        && !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    size_t indent_end = skip_blanks(text, header.start, header.content_end);
+    if (!output_append(&used, text + header.start, indent_end - header.start)
+        || !output_append(&used, RECOVERY_HEADER, text_length(RECOVERY_HEADER))
+        || !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    bool has_cmdline = false;
+    const char *option_indent = "    ";
+    size_t option_indent_length = 4;
+    for (size_t s = header.next; s < entry_end;) {
+        struct line option = line_at(text, length, s);
+        size_t value_start;
+        size_t value_end;
+        if (s == header.next) {
+            option_indent = text + option.start;
+            option_indent_length = skip_blanks(text, option.start,
+                                               option.content_end)
+                - option.start;
+        }
+        if (line_option(text, option, "cmdline", &value_start, &value_end)
+            || line_option(text, option, "kernel_cmdline", &value_start,
+                           &value_end)) {
+            has_cmdline = true;
+            if (!output_append(&used, text + option.start,
+                               value_end - option.start)
+                || (value_end != value_start
+                    && !output_append(&used, " ", 1))
+                || !output_append(&used, RECOVERY_OPTION,
+                                  text_length(RECOVERY_OPTION))
+                || !output_append(&used, text + value_end,
+                                  option.next - value_end)) {
+                return 0;
+            }
+        } else if (!output_append(&used, text + option.start,
+                                  option.next - option.start)) {
+            return 0;
+        }
+        s = option.next;
+    }
+    if (used != 0 && config_output[used - 1] != '\n'
+        && !output_append(&used, ending, ending_length)) {
+        return 0;
+    }
+    if (!has_cmdline
+        && (!output_append(&used, option_indent, option_indent_length)
+            || !output_append(&used, "cmdline: ", 9)
+            || !output_append(&used, RECOVERY_OPTION,
+                              text_length(RECOVERY_OPTION))
+            || !output_append(&used, ending, ending_length))) {
+        return 0;
+    }
+    if (!output_append(&used, text + entry_end, length - entry_end)) {
+        return 0;
+    }
+    return used;
+}
+
 static bool installed(void) {
     return !installer_available() && fat16_system_mounted();
 }
@@ -595,7 +703,10 @@ enum boot_display_result boot_display_configure(uint32_t width,
     return wrote ? BOOT_DISPLAY_OK : BOOT_DISPLAY_NOT_INSTALLED;
 }
 
-bool boot_display_add_previous_entry(void) {
+/* Adds the entry that `build` makes to every boot menu copy that lacks
+   `header`. True when every copy has it afterwards. */
+static bool add_entry_everywhere(const char *header,
+                                 size_t (*build)(const char *, size_t)) {
     if (!installed()) {
         return false;
     }
@@ -606,23 +717,11 @@ bool boot_display_add_previous_entry(void) {
         if (!read_config(index, &length)) {
             continue;
         }
-        size_t at;
-        bool present = false;
-        for (size_t start = 0; start < length;) {
-            struct line line = line_at(config_text, length, start);
-            if (line_is_header(config_text, line)
-                && find_folded(config_text, line.start, line.content_end,
-                               PREVIOUS_HEADER, &at)) {
-                present = true;
-                break;
-            }
-            start = line.next;
-        }
-        if (present) {
+        if (has_header(config_text, length, header)) {
             any = true;
             continue;
         }
-        size_t output_length = add_previous_entry(config_text, length);
+        size_t output_length = build(config_text, length);
         if (output_length == 0) {
             continue;
         }
@@ -637,4 +736,12 @@ bool boot_display_add_previous_entry(void) {
     }
     boot_display_reload();
     return any && !failed;
+}
+
+bool boot_display_add_previous_entry(void) {
+    return add_entry_everywhere(PREVIOUS_HEADER, add_previous_entry);
+}
+
+bool boot_display_add_recovery_entry(void) {
+    return add_entry_everywhere(RECOVERY_HEADER, add_recovery_entry);
 }

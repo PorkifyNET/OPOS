@@ -38,10 +38,16 @@ works when those are what broke.
 ## Who may use it
 
 Recovery can read every account's files and change system files, so it asks
-for an administrator's name and password first, when any administrator has a
-password (`accounts.c`). If no administrator has a password, it opens
-directly, as the login screen does today. "Restart" and "Shut down" never
-need a sign-in.
+an administrator to sign in with their password first (`accounts.c`). If
+some administrator has no password, it opens directly: that person could
+sign in to the desktop without one anyway. "Restart" and "Shut down" never
+need a sign-in. The administrator stays logged in while Recovery is up, so
+COMMAND LINE opens without the shell's own login; START OPOS NORMALLY logs
+out first, so the normal login screen still decides who uses the desktop.
+
+This is a lock against casual use, not against someone with the computer
+in hand: without disk encryption they can read the disk from another
+system.
 
 ## The Recovery screen
 
@@ -49,7 +55,7 @@ A title, the reason Recovery opened (if any), and large buttons:
 
 | Button | What it does |
 | --- | --- |
-| START OPOS NORMALLY | Clears the attempt counter and continues the normal start. |
+| START OPOS NORMALLY | Continues the normal start. The attempt counter stays, so a start that fails again comes straight back to Recovery; one that lasts clears it. With damaged system files on the disk, OPOS runs from the copy in its `initramfs.tar`. |
 | SAFE START | Starts the desktop with the basics only: no startup programs, no saved display mode (firmware/Limine resolution), no sound, no autostarted Store or update checks. For "the desktop starts but something on it breaks". |
 | UNDO THE LAST UPDATE | Shown when `/disk/boot/old/kernel.elf` exists. Swaps the current and previous kernel/initramfs pairs, so the next start runs the previous version, then restarts. Doing it twice gets back to the newer one. |
 | REPAIR SYSTEM FILES | Re-checks the disk system root against the booted `initramfs.tar`, removes a damaged generation and stages it again (`installer_stage_system_root()`). With OPOS installation media present, it can also replace a damaged `kernel.elf`/`initramfs.tar` from that media (same version or newer only). |
@@ -73,7 +79,12 @@ VMware check by a human afterwards.
    `opos.recovery` can be combined), the boot menu entry for new and
    existing installs, the attempt counter, replacing the automatic recovery
    shell, administrator sign-in, START OPOS NORMALLY, COMMAND LINE, RESTART
-   and SHUT DOWN.
+   and SHUT DOWN. *Done:* `kernel/recovery.c` (counter and reason),
+   `boot_display_add_recovery_entry()` (added on every installed start
+   when missing), and the screen in `kernel/desktop.c` (shown as a login
+   screen, so no programs start behind it). The count resets 60 s after a
+   login, and on a restart or shut-down from the desktop, Terminal or
+   shell.
 2. **Undo the last update and repair system files**, including repair from
    installation media.
 3. **Rescue my files** to a USB stick or another disk.

@@ -22,6 +22,9 @@ bool hda_ready(void);
 /* From the timer interrupt: refills the ring. */
 void hda_poll(void);
 
+/* Stops playback, before a reset or power-off. */
+void hda_stop(void);
+
 /*
  * Where samples come from: fills frames stereo frames (left, right
  * interleaved) at out. The default source writes silence. Called from the

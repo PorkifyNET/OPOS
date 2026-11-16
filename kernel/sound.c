@@ -142,6 +142,11 @@ bool sound_output_ready(void) {
     return hda_ready() || es1371_ready();
 }
 
+void sound_stop(void) {
+    hda_stop();
+    es1371_stop();
+}
+
 void sound_poll(void) {
     hda_poll();
     es1371_poll();

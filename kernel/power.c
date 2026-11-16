@@ -5,6 +5,7 @@
 #include "memory.h"
 #include "paging.h"
 #include "power.h"
+#include "sound.h"
 
 #define ACPI_MAX_TABLE_SIZE (1024 * 1024)
 #define ACPI_PM1_SLEEP_TYPE_MASK (7u << 10)
@@ -315,6 +316,7 @@ bool power_shutdown(void) {
         return false;
     }
     __asm__ volatile ("cli" : : : "memory");
+    sound_stop();
     uint16_t value_a = (io_in16(pm1a_control_port)
         & (uint16_t)~(ACPI_PM1_SLEEP_TYPE_MASK | ACPI_PM1_SLEEP_ENABLE))
         | (uint16_t)(sleep_type_a << 10) | ACPI_PM1_SLEEP_ENABLE;
@@ -381,6 +383,7 @@ static void reset_control_register(void) {
  */
 void power_reboot(void) {
     __asm__ volatile ("cli" : : : "memory");
+    sound_stop();
     acpi_reset();
     uint32_t wait_count = 0;
     while ((io_in8(0x64) & 0x02) != 0 && wait_count < 1000000) {

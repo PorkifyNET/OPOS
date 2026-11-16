@@ -1,5 +1,7 @@
-OPOS 0.6.1: a better OPOS Store.
+OPOS 0.6.4: Media Player, updates from Settings, and a VMware restart fix.
 
-- The OPOS Store has a start page with featured programs and categories, plus search: start typing anywhere in the Store to find a program by name, summary or category.
-- Every program has an About page with its description, category, version, size, license, publisher, needed OPOS version and permissions.
-- Store downloads and installs are about 4.5 times faster.
+- Media Player plays music (WAV, MP3, FLAC, Ogg Vorbis) and MPEG-1 videos, with a playlist, volume, repeat, shuffle and full screen.
+- The UPDATE button in Settings installs updates again, and OPOS checks for new versions by itself.
+- Restarting or shutting down OPOS no longer hangs VMware.
+
+VMware users, please read: the restart at the end of this update is still done by your current OPOS version. With VMware's default sound card, VMware may hang at that restart. The VM then cannot be powered off, and VMware shows "Failed to connect pipe to virtual machine". The update itself is already installed by then. To recover, close VMware and end the vmware-vmx.exe process from an administrator command prompt (taskkill /F /IM vmware-vmx.exe; this stops every running VM), or restart Windows. Then start the VM again. From 0.6.4 on, restarts and shutdowns work normally.

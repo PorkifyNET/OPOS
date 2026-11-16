@@ -4,6 +4,7 @@
 
 #include "block.h"
 #include "cmos.h"
+#include "accounts.h"
 #include "fat16.h"
 #include "installer.h"
 #include "recovery.h"
@@ -700,5 +701,45 @@ bool recovery_rescue_files(const char *const *names, size_t count,
     if (progress != NULL) {
         progress("DONE", 100);
     }
+    return true;
+}
+
+/* ------------------------------------------- settings, next start */
+
+#define REQUEST_PATH "/disk/OPOS/RECOVERY-NEXT"
+#define DESKTOP_CONFIG "DESKTOP.CFG"
+
+bool recovery_reset_settings(void) {
+    if (!installed()) {
+        return false;
+    }
+    uint8_t flags = settings_reset();
+    bool ok = accounts_reset_personal_settings(
+        (uint8_t)(flags & SETTINGS_PERSONAL_MASK));
+    remove_file("/disk/OPOS/" DESKTOP_CONFIG);
+    for (size_t i = 0; i < accounts_count(); i++) {
+        char path[RESCUE_PATH];
+        set_text(path, sizeof(path), USERS_ROOT "/", accounts_name(i));
+        size_t used = text_length(path);
+        set_text(path + used, sizeof(path) - used, "/AppData/",
+                 DESKTOP_CONFIG);
+        remove_file(path);
+        ok = ok && !exists(path);
+    }
+    return ok && !exists("/disk/OPOS/" DESKTOP_CONFIG);
+}
+
+bool recovery_request_next_start(void) {
+    static const uint8_t text[] = "1\n";
+    return installed()
+        && vfs_write_file(REQUEST_PATH, text_length(REQUEST_PATH), text,
+                          sizeof(text) - 1);
+}
+
+bool recovery_take_requested(void) {
+    if (!installed() || !exists(REQUEST_PATH)) {
+        return false;
+    }
+    remove_file(REQUEST_PATH);
     return true;
 }

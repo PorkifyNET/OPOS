@@ -107,7 +107,17 @@ VMware check by a human afterwards.
    Recovery page lists accounts (all ticked) and drives (USB sticks show
    up when plugged in).
 4. **Safe start, reset settings, reset a password**, and "RESTART INTO
-   RECOVERY" in Settings.
+   RECOVERY" in Settings. *Done:* the menu is two columns of ten.
+   SAFE START switches to the boot display mode, turns autofit off,
+   mutes sound and skips update checks for that start only (nothing is
+   saved). RESET SETTINGS (with a confirm page) writes default
+   `OPOS.CFG` flags/mode/volume (Welcome stays seen), resets the
+   personal bits of accounts that had their own, and removes every
+   `DESKTOP.CFG`. RESET A PASSWORD sets or removes any account's
+   password. Settings > UPDATES > RECOVERY (administrators) writes
+   `/disk/OPOS/RECOVERY-NEXT` and restarts; the next start removes it and
+   opens Recovery. OPOS has no startup programs yet, so safe start has
+   none to skip.
 5. **Start-up log viewer** and **"REPAIR AN INSTALLED OPOS"** on the live
    ISO/USB, including replacing a damaged kernel or initramfs from that
    media.

@@ -1528,9 +1528,11 @@ void kmain(void) {
         if (!boot_display_add_recovery_entry()) {
             serial_write_string("OPOS: could not add the OPOS Recovery boot entry\n");
         }
+        /* Settings > UPDATES > RECOVERY (one time). */
+        bool recovery_asked = recovery_take_requested();
         if (root_selection_failed) {
             recovery_why = RECOVERY_SYSTEM_FILES;
-        } else if (recovery_requested) {
+        } else if (recovery_requested || recovery_asked) {
             recovery_why = RECOVERY_REQUESTED;
         } else if (failed_starts >= RECOVERY_FAILED_STARTS_LIMIT) {
             recovery_why = RECOVERY_FAILED_STARTS;

@@ -95,4 +95,16 @@ bool recovery_rescue_files(const char *const *names, size_t count,
                            struct recovery_rescue_result *result,
                            const char **error);
 
+/* ------------------------------------------- settings, next start */
+
+/* Machine settings, every account's personal settings and desktop look
+   (DESKTOP.CFG: background, theme, taskbar) back to their defaults.
+   Accounts, passwords, files and programs stay. */
+bool recovery_reset_settings(void);
+
+/* "Restart into Recovery": the next start opens it (one time). */
+bool recovery_request_next_start(void);
+/* Whether that was asked for; clears it. Installed systems only. */
+bool recovery_take_requested(void);
+
 #endif

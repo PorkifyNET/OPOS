@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "accounts.h"
+#include "cmos.h"
 #include "fat16.h"
 #include "permission_grants.h"
 #include "sha256.h"
@@ -526,4 +527,15 @@ void accounts_set_personal_settings(uint8_t flags) {
     accounts[current_account].personal = flags;
     accounts[current_account].flags |= ACCOUNT_FLAG_PERSONAL_SET;
     (void)accounts_save();
+}
+
+bool accounts_reset_personal_settings(uint8_t defaults) {
+    for (size_t i = 0; i < account_count; i++) {
+        if ((accounts[i].flags & ACCOUNT_FLAG_PERSONAL_SET) != 0) {
+            accounts[i].personal = (uint8_t)(
+                (defaults & ~SETTING_WELCOME_SEEN)
+                | (accounts[i].personal & SETTING_WELCOME_SEEN));
+        }
+    }
+    return account_count == 0 || accounts_save();
 }

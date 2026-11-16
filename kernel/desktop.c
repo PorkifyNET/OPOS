@@ -6746,7 +6746,7 @@ static void login_press(int32_t x, int32_t y) {
  * damaged system files. It runs as a login screen (login_active), so no
  * programs, notifications or update checks start behind it.
  */
-#define RECOVERY_PANEL_WIDTH 680
+#define RECOVERY_PANEL_WIDTH 800
 #define RECOVERY_BUTTON_HEIGHT 40
 #define RECOVERY_BUTTON_GAP 10
 #define RECOVERY_REASON_LINES 5
@@ -6762,24 +6762,34 @@ enum recovery_page {
     RECOVERY_PAGE_RESULT,
     /* RESCUE MY FILES: which accounts, which drive. */
     RECOVERY_PAGE_RESCUE,
+    /* RESET A PASSWORD: which account, the new password. */
+    RECOVERY_PAGE_PASSWORD,
 };
 
+/* Shown in two columns, in this order. */
 enum recovery_action {
     RECOVERY_ACTION_START,
+    RECOVERY_ACTION_SAFE_START,
     RECOVERY_ACTION_UNDO,
     RECOVERY_ACTION_REPAIR,
     RECOVERY_ACTION_RESCUE,
+    RECOVERY_ACTION_RESET_SETTINGS,
+    RECOVERY_ACTION_RESET_PASSWORD,
     RECOVERY_ACTION_COMMAND_LINE,
     RECOVERY_ACTION_RESTART,
     RECOVERY_ACTION_SHUT_DOWN,
     RECOVERY_ACTION_COUNT,
 };
+#define RECOVERY_COLUMNS 2
 
 static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
     "START OPOS NORMALLY",
+    "SAFE START",
     "UNDO THE LAST UPDATE",
     "REPAIR SYSTEM FILES",
     "RESCUE MY FILES",
+    "RESET SETTINGS",
+    "RESET A PASSWORD",
     "COMMAND LINE",
     "RESTART",
     "SHUT DOWN",
@@ -6787,12 +6797,17 @@ static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
 
 static const char *const recovery_action_help[RECOVERY_ACTION_COUNT] = {
     "CONTINUES TO THE LOGIN SCREEN AND THE DESKTOP.",
+    "THE DESKTOP WITH THE BASICS ONLY: STANDARD RESOLUTION, NO SOUND, NO"
+    " UPDATE CHECKS. FOR WHEN SOMETHING ON THE DESKTOP BREAKS.",
     "GOES BACK TO THE VERSION OF OPOS FROM BEFORE THE LAST UPDATE. YOUR"
     " FILES, ACCOUNTS AND PROGRAMS STAY.",
     "CHECKS THE SYSTEM FILES ON THE DISK AND REPLACES DAMAGED OR MISSING"
     " ONES. YOUR FILES STAY.",
     "COPIES YOUR FILES (DOCUMENTS, PICTURES, MUSIC AND THE REST OF YOUR"
     " FOLDER) TO A USB STICK OR ANOTHER DRIVE.",
+    "PUTS DISPLAY, SOUND, APPEARANCE AND DESKTOP SETTINGS BACK TO THEIR"
+    " DEFAULTS. FILES, ACCOUNTS AND PASSWORDS STAY.",
+    "SETS A NEW PASSWORD FOR AN ACCOUNT, OR REMOVES IT.",
     "THE TEXT COMMAND LINE, FOR ADVANCED USERS. TYPE DESKTOP TO COME BACK.",
     "RESTARTS THE COMPUTER.",
     "TURNS THE COMPUTER OFF.",
@@ -6827,6 +6842,16 @@ static size_t recovery_pair_selection;
    BACK). */
 #define RECOVERY_ROW_HEIGHT 36
 #define RECOVERY_HEADING_HEIGHT 30
+/* SAFE START was chosen: no saved display mode, sound or update checks
+   until the next start. */
+static bool safe_start;
+/* RECOVERY_PAGE_CONFIRM asks about UNDO or RESET_SETTINGS. */
+static enum recovery_action recovery_confirming;
+/* RECOVERY_PAGE_PASSWORD: the chosen account and the focused row
+   (accounts, the field, SAVE, BACK). */
+static size_t recovery_password_account;
+static size_t recovery_password_focus;
+static struct text_field recovery_new_password;
 static bool recovery_rescue_account[ACCOUNT_MAX];
 static size_t recovery_drives[FAT16_MAX_VOLUMES];
 static size_t recovery_drive_count;
@@ -6883,7 +6908,8 @@ static void recovery_reason_text(char *text, size_t capacity) {
     switch (recovery_reason()) {
     case RECOVERY_REQUESTED:
         append_text(text, capacity, 0,
-                    "YOU CHOSE OPOS RECOVERY IN THE BOOT MENU.");
+                    "YOU ASKED FOR OPOS RECOVERY (IN THE BOOT MENU OR IN"
+                    " SETTINGS > UPDATES).");
         break;
     case RECOVERY_FAILED_STARTS: {
         size_t at = append_text(text, capacity, 0,
@@ -6911,8 +6937,12 @@ static struct rect recovery_panel_rect(void) {
     int64_t rows = recovery_page == RECOVERY_PAGE_SIGN_IN
         ? (int64_t)recovery_admin_count * LOGIN_ROW_HEIGHT + 2 * 48 + 96
         : recovery_page == RECOVERY_PAGE_MENU
-        ? RECOVERY_ACTION_COUNT
+        ? (RECOVERY_ACTION_COUNT + RECOVERY_COLUMNS - 1) / RECOVERY_COLUMNS
               * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 84
+        : recovery_page == RECOVERY_PAGE_PASSWORD
+        ? 2 * RECOVERY_HEADING_HEIGHT
+              + (int64_t)(accounts_count() + 1) * RECOVERY_ROW_HEIGHT
+              + 16 + RECOVERY_BUTTON_HEIGHT + 40
         : recovery_page == RECOVERY_PAGE_RESCUE
         ? 2 * RECOVERY_HEADING_HEIGHT
               + (int64_t)(accounts_count()
@@ -6939,10 +6969,14 @@ static int64_t recovery_content_top(void) {
 
 static struct rect recovery_button_rect(size_t index) {
     struct rect panel = recovery_panel_rect();
-    return (struct rect){panel.x + 24,
-                         recovery_content_top() + (int64_t)index
+    int64_t width = (panel.width - 48 - (RECOVERY_COLUMNS - 1) * 12)
+        / RECOVERY_COLUMNS;
+    size_t row = index / RECOVERY_COLUMNS;
+    size_t column = index % RECOVERY_COLUMNS;
+    return (struct rect){panel.x + 24 + (int64_t)column * (width + 12),
+                         recovery_content_top() + (int64_t)row
                              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP),
-                         panel.width - 48, RECOVERY_BUTTON_HEIGHT};
+                         width, RECOVERY_BUTTON_HEIGHT};
 }
 
 /* CONFIRM and RESULT pages: 0 left, 1 right. */
@@ -7080,6 +7114,58 @@ static void draw_recovery_rescue(void) {
                 recovery_rescue_focus == buttons + 1);
 }
 
+/* RESET A PASSWORD: accounts are rows 0..n-1 (like the rescue page), the
+   field is row n, under its own heading. */
+static struct rect recovery_password_field(void) {
+    return recovery_rescue_row(accounts_count());
+}
+
+/* SAVE (0) and BACK (1). */
+static struct rect recovery_password_button(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    struct rect field = recovery_password_field();
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         field.y + field.height + 20, width,
+                         RECOVERY_BUTTON_HEIGHT};
+}
+
+static void draw_recovery_password(void) {
+    size_t accounts = accounts_count();
+    struct rect first = recovery_rescue_row(0);
+    draw_text_clipped(first.x, first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      first.width, "ACCOUNT", 200, 214, 255);
+    for (size_t i = 0; i < accounts && i < ACCOUNT_MAX; i++) {
+        struct rect row = recovery_rescue_row(i);
+        bool focused = recovery_password_focus == i;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[80];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_password_account == i ? "(*) "
+                                                               : "( ) ");
+        at = append_text(line, sizeof(line), at, accounts_name(i));
+        if (accounts_is_admin(i)) {
+            at = append_text(line, sizeof(line), at, "  ADMINISTRATOR");
+        }
+        (void)append_text(line, sizeof(line), at,
+                          accounts_has_password(i) ? "" : "  NO PASSWORD");
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    struct rect field = recovery_password_field();
+    draw_text_clipped(field.x, field.y - RECOVERY_HEADING_HEIGHT + 6,
+                      field.width, "NEW PASSWORD (LEAVE EMPTY FOR NONE)",
+                      200, 214, 255);
+    draw_field(field, &recovery_new_password,
+               recovery_password_focus == accounts);
+    draw_button(recovery_password_button(0),
+                recovery_new_password.length == 0 ? "REMOVE PASSWORD"
+                                                  : "SAVE",
+                recovery_password_focus == accounts + 1);
+    draw_button(recovery_password_button(1), "BACK",
+                recovery_password_focus == accounts + 2);
+}
+
 static struct rect recovery_admin_rect(size_t index) {
     struct rect panel = recovery_panel_rect();
     return (struct rect){panel.x + 24,
@@ -7123,11 +7209,16 @@ static void draw_recovery(void) {
         subtitle = "AN ADMINISTRATOR NEEDS TO SIGN IN";
         break;
     case RECOVERY_PAGE_CONFIRM:
-        subtitle = "UNDO THE LAST UPDATE?";
-        text = "THE NEXT START RUNS THE VERSION OF OPOS FROM BEFORE THE LAST"
-               " UPDATE. YOUR FILES, ACCOUNTS AND PROGRAMS STAY. THE NEWER"
-               " VERSION IS KEPT: \"OPOS (PREVIOUS VERSION)\" IN THE BOOT"
-               " MENU STARTS IT, AND UNDOING AGAIN BRINGS IT BACK.";
+        subtitle = recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+            ? "RESET SETTINGS?" : "UNDO THE LAST UPDATE?";
+        text = recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+            ? "THE SCREEN RESOLUTION, VOLUME, BACKGROUND, COLOR THEME,"
+              " TASKBAR AND THE OTHER SETTINGS OF EVERY ACCOUNT GO BACK TO"
+              " THEIR DEFAULTS. FILES, PROGRAMS, ACCOUNTS AND PASSWORDS STAY."
+            : "THE NEXT START RUNS THE VERSION OF OPOS FROM BEFORE THE LAST"
+              " UPDATE. YOUR FILES, ACCOUNTS AND PROGRAMS STAY. THE NEWER"
+              " VERSION IS KEPT: \"OPOS (PREVIOUS VERSION)\" IN THE BOOT"
+              " MENU STARTS IT, AND UNDOING AGAIN BRINGS IT BACK.";
         text_red = 220;
         text_green = 228;
         text_blue = 245;
@@ -7144,6 +7235,14 @@ static void draw_recovery(void) {
         text = "CHOOSE THE ACCOUNTS TO COPY AND A USB STICK OR OTHER DRIVE."
                " THE COPIES GO INTO A NEW OPOS-RESCUE FOLDER ON IT. NOTHING"
                " ON THIS COMPUTER CHANGES.";
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
+    case RECOVERY_PAGE_PASSWORD:
+        subtitle = "RESET A PASSWORD";
+        text = "CHOOSE AN ACCOUNT AND TYPE ITS NEW PASSWORD. THE OLD ONE IS"
+               " NOT NEEDED. FILES STAY.";
         text_red = 220;
         text_green = 228;
         text_blue = 245;
@@ -7174,6 +7273,10 @@ static void draw_recovery(void) {
         draw_recovery_rescue();
         return;
     }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        draw_recovery_password();
+        return;
+    }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
         struct rect bar = recovery_pair_rect(0);
         bar.width = panel.width - 48;
@@ -7188,7 +7291,8 @@ static void draw_recovery(void) {
     if (recovery_page == RECOVERY_PAGE_CONFIRM
         || recovery_page == RECOVERY_PAGE_RESULT) {
         const char *left = recovery_page == RECOVERY_PAGE_CONFIRM
-            ? "UNDO THE UPDATE"
+            ? (recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS
+                   ? "RESET SETTINGS" : "UNDO THE UPDATE")
             : recovery_result_restart ? "RESTART NOW" : "BACK";
         const char *right = recovery_page == RECOVERY_PAGE_CONFIRM
             ? "CANCEL"
@@ -7440,11 +7544,107 @@ static void recovery_rescue_choose(size_t index) {
     }
 }
 
+static void recovery_reset(void) {
+    console_serial_log("OPOS: OPOS Recovery: resetting settings\n");
+    recovery_begin_work("RESETTING SETTINGS");
+    bool done = recovery_reset_settings();
+    appearance_load();
+    if (done) {
+        console_serial_log("OPOS: OPOS Recovery: settings reset\n");
+        recovery_show_result(true, true,
+            "SETTINGS ARE BACK TO THEIR DEFAULTS. RESTART SO THAT THE"
+            " SCREEN RESOLUTION AND VOLUME CHANGE TOO.");
+    } else {
+        console_serial_log("OPOS: OPOS Recovery: settings reset failed\n");
+        recovery_show_result(false, false,
+            "SOME SETTINGS COULD NOT BE RESET: THE DISK COULD NOT BE"
+            " WRITTEN.");
+    }
+}
+
+static void recovery_password_open(void) {
+    recovery_password_account = 0;
+    recovery_password_focus = 0;
+    field_reset(&recovery_new_password, ACCOUNT_PASSWORD_MAX, false);
+    recovery_page = RECOVERY_PAGE_PASSWORD;
+}
+
+static void recovery_password_save(void) {
+    size_t index = recovery_password_account;
+    if (index >= accounts_count()) {
+        return;
+    }
+    bool removing = recovery_new_password.length == 0;
+    enum account_result result =
+        accounts_set_password(index, recovery_new_password.text);
+    field_reset(&recovery_new_password, ACCOUNT_PASSWORD_MAX, false);
+    char text[120];
+    size_t at = append_text(text, sizeof(text), 0, "THE PASSWORD OF ");
+    at = append_text(text, sizeof(text), at, accounts_name(index));
+    if (result != ACCOUNT_OK) {
+        (void)append_text(text, sizeof(text), at,
+                          " COULD NOT BE CHANGED: THE DISK COULD NOT BE"
+                          " WRITTEN.");
+        recovery_show_result(false, false, text);
+        return;
+    }
+    console_serial_log(removing
+                           ? "OPOS: OPOS Recovery: password removed\n"
+                           : "OPOS: OPOS Recovery: password changed\n");
+    (void)append_text(text, sizeof(text), at,
+                      removing ? " WAS REMOVED. IT SIGNS IN WITHOUT ONE."
+                               : " WAS CHANGED.");
+    recovery_show_result(true, false, text);
+}
+
+/* Enter, Space or a click on password row `index`. */
+static void recovery_password_choose(size_t index) {
+    size_t accounts = accounts_count();
+    recovery_password_focus = index;
+    if (index < accounts) {
+        recovery_password_account = index;
+        recovery_password_focus = accounts; /* on to the field */
+    } else if (index == accounts || index == accounts + 1) {
+        recovery_password_save();
+    } else {
+        recovery_page = RECOVERY_PAGE_MENU;
+    }
+}
+
+/* START OPOS NORMALLY and SAFE START. */
+static void recovery_start(bool safe) {
+    /* The failed-start count stays: a start that fails again comes
+       straight back here, one that lasts clears it. */
+    console_serial_log(safe ? "OPOS: OPOS Recovery: safe start\n"
+                            : "OPOS: OPOS Recovery: starting normally\n");
+    if (safe) {
+        safe_start = true;
+        vmware_set_autofit(false);
+        if (svga_available() && svga_current_mode() != 0) {
+            (void)svga_set_mode(0);
+        }
+        sound_set_muted(true);
+    }
+    recovery_active = false;
+    login_active = false;
+    recovery_set_reason(RECOVERY_NONE);
+    /* The normal login screen decides who uses the desktop. */
+    accounts_logout();
+    desktop_start_normal();
+    if (safe) {
+        set_status("SAFE START: BASICS ONLY. RESTART TO LEAVE IT.");
+    }
+}
+
 /* The left (0) or right (1) button of CONFIRM or RESULT. */
 static void recovery_pair_run(size_t index) {
     if (recovery_page == RECOVERY_PAGE_CONFIRM) {
         if (index == 0) {
-            recovery_undo();
+            if (recovery_confirming == RECOVERY_ACTION_RESET_SETTINGS) {
+                recovery_reset();
+            } else {
+                recovery_undo();
+            }
         } else {
             recovery_page = RECOVERY_PAGE_MENU;
         }
@@ -7464,9 +7664,18 @@ static void recovery_run(enum recovery_action action) {
     switch (action) {
     case RECOVERY_ACTION_UNDO:
         if (recovery_undo_ok) {
+            recovery_confirming = RECOVERY_ACTION_UNDO;
             recovery_pair_selection = 1; /* CANCEL */
             recovery_page = RECOVERY_PAGE_CONFIRM;
         }
+        break;
+    case RECOVERY_ACTION_RESET_SETTINGS:
+        recovery_confirming = RECOVERY_ACTION_RESET_SETTINGS;
+        recovery_pair_selection = 1; /* CANCEL */
+        recovery_page = RECOVERY_PAGE_CONFIRM;
+        break;
+    case RECOVERY_ACTION_RESET_PASSWORD:
+        recovery_password_open();
         break;
     case RECOVERY_ACTION_REPAIR:
         recovery_repair();
@@ -7475,15 +7684,8 @@ static void recovery_run(enum recovery_action action) {
         recovery_rescue_open();
         break;
     case RECOVERY_ACTION_START:
-        /* The failed-start count stays: a start that fails again comes
-           straight back here, one that lasts clears it. */
-        console_serial_log("OPOS: OPOS Recovery: starting normally\n");
-        recovery_active = false;
-        login_active = false;
-        recovery_set_reason(RECOVERY_NONE);
-        /* The normal login screen decides who uses the desktop. */
-        accounts_logout();
-        desktop_start_normal();
+    case RECOVERY_ACTION_SAFE_START:
+        recovery_start(action == RECOVERY_ACTION_SAFE_START);
         break;
     case RECOVERY_ACTION_COMMAND_LINE:
         console_serial_log("OPOS: OPOS Recovery: command line\n");
@@ -7522,6 +7724,27 @@ static void recovery_key(char character) {
     if (recovery_page == RECOVERY_PAGE_WORKING) {
         return;
     }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        size_t accounts = accounts_count();
+        size_t rows = accounts + 3;
+        if (character == KEY_UP && recovery_password_focus > 0) {
+            recovery_password_focus--;
+        } else if ((character == KEY_DOWN || character == '\t')
+                   && recovery_password_focus + 1 < rows) {
+            recovery_password_focus++;
+        } else if (character == KEY_ESCAPE) {
+            recovery_page = RECOVERY_PAGE_MENU;
+        } else if (recovery_password_focus == accounts) {
+            if (character == '\n') {
+                recovery_password_save();
+            } else {
+                (void)field_key(&recovery_new_password, character);
+            }
+        } else if (character == '\n' || character == ' ') {
+            recovery_password_choose(recovery_password_focus);
+        }
+        return;
+    }
     if (recovery_page == RECOVERY_PAGE_RESCUE) {
         recovery_scan_drives();
         size_t rows = accounts_count() + recovery_drive_count + 2;
@@ -7555,14 +7778,16 @@ static void recovery_key(char character) {
         }
         return;
     }
+    size_t step = character == KEY_UP || character == KEY_DOWN
+        ? RECOVERY_COLUMNS : 1;
     if ((character == KEY_UP || character == KEY_LEFT)
-        && recovery_selection > 0) {
-        recovery_selection--;
+        && recovery_selection >= step) {
+        recovery_selection -= step;
         recovery_message = "";
     } else if ((character == KEY_DOWN || character == KEY_RIGHT
                 || character == '\t')
-               && recovery_selection + 1 < RECOVERY_ACTION_COUNT) {
-        recovery_selection++;
+               && recovery_selection + step < RECOVERY_ACTION_COUNT) {
+        recovery_selection += step;
         recovery_message = "";
     } else if (character == '\n' || character == ' ') {
         recovery_run((enum recovery_action)recovery_selection);
@@ -7592,6 +7817,26 @@ static void recovery_press(int32_t x, int32_t y) {
         return;
     }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_PASSWORD) {
+        size_t accounts = accounts_count();
+        for (size_t i = 0; i < accounts; i++) {
+            if (rect_contains(recovery_rescue_row(i), x, y)) {
+                recovery_password_choose(i);
+                return;
+            }
+        }
+        if (rect_contains(recovery_password_field(), x, y)) {
+            recovery_password_focus = accounts;
+            return;
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(recovery_password_button(i), x, y)) {
+                recovery_password_choose(accounts + 1 + i);
+                return;
+            }
+        }
         return;
     }
     if (recovery_page == RECOVERY_PAGE_RESCUE) {
@@ -8025,7 +8270,7 @@ static void accounts_click(struct rect area, int32_t x, int32_t y) {
  * Settings > UPDATES runs /bin/update --gui (check or install) without a
  * Terminal. Its output comes here (updates_feed): lines starting with '@'
  * carry the state (see sdk/examples/update.c), the rest is the log shown
- * under SHOW DETAILS.
+ * under SHOW LOG.
  */
 #define UPDATES_TEXT 100
 /* Release note lines are word-wrapped when drawn, so they can be longer. */
@@ -8047,6 +8292,7 @@ enum updates_button {
     UPDATES_BUTTON_UPDATE, /* RESTART once installed */
     UPDATES_BUTTON_DETAILS,
     UPDATES_BUTTON_STORE, /* programs: opens the OPOS Store */
+    UPDATES_BUTTON_RECOVERY, /* restart into OPOS Recovery */
     UPDATES_BUTTON_COUNT,
 };
 
@@ -8077,6 +8323,8 @@ static bool updates_button_enabled(size_t button) {
         return !updates_running
             && (updates_status == UPDATES_INSTALLED
                 || (updates_status == UPDATES_AVAILABLE && updates_admin()));
+    case UPDATES_BUTTON_RECOVERY:
+        return !updates_running && !installer_available() && updates_admin();
     default:
         return true;
     }
@@ -8090,8 +8338,10 @@ static const char *updates_button_label(size_t button) {
         return updates_status == UPDATES_INSTALLED ? "RESTART NOW" : "UPDATE";
     case UPDATES_BUTTON_STORE:
         return "OPOS STORE";
+    case UPDATES_BUTTON_RECOVERY:
+        return "RECOVERY";
     default:
-        return updates_details ? "HIDE DETAILS" : "SHOW DETAILS";
+        return updates_details ? "HIDE LOG" : "SHOW LOG";
     }
 }
 
@@ -8448,7 +8698,7 @@ static void draw_updates(struct rect area, bool focused) {
         y += 32;
     }
 
-    /* Release notes, and the log below them under SHOW DETAILS. */
+    /* Release notes, and the log below them under SHOW LOG. */
     int64_t bottom = buttons_top - 10;
     int64_t log_top = bottom;
     if (updates_details) {
@@ -8513,6 +8763,12 @@ static void updates_press(size_t button) {
         break;
     case UPDATES_BUTTON_STORE:
         store_open();
+        break;
+    case UPDATES_BUTTON_RECOVERY:
+        /* The next start opens OPOS Recovery, once. */
+        if (!recovery_request_next_start() || !desktop_power_off(true)) {
+            set_status("COULD NOT RESTART INTO OPOS RECOVERY");
+        }
         break;
     default:
         updates_details = !updates_details;
@@ -8579,8 +8835,12 @@ static void desktop_session_start(void) {
     char greeting[64] = "WELCOME, ";
     append_text(greeting, sizeof(greeting), text_length(greeting),
                 accounts_name(accounts_current()));
-    set_status(greeting);
-    updates_auto_schedule();
+    if (safe_start) {
+        set_status("SAFE START: BASICS ONLY. RESTART TO LEAVE IT.");
+    } else {
+        set_status(greeting);
+        updates_auto_schedule();
+    }
 }
 
 /* Log out: close every window (the editor warns once about unsaved

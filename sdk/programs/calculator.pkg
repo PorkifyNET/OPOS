@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.calculator
+name: Calculator
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.3
+file: files/calculator ../build/calculator exec
+start: files/calculator Calculator

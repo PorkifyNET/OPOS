@@ -121,3 +121,10 @@ official: yes
 featured: yes
 summary: Make slide shows and open and save PowerPoint files.
 description: Presentation is the OPOS slide show program. Make slides from layouts with titles, bulleted and numbered lists, text boxes, pictures (PNG, JPEG, BMP), rectangles, ellipses and lines. Make text bold, italic, underlined or struck through, change its size, color and alignment, and give shapes and slides colors. Move and resize shapes with the mouse; duplicate, reorder, hide and delete slides; show them full screen. Open and save PowerPoint presentations (.pptx), which PowerPoint, LibreOffice and Google Slides open too. Charts, tables, animations and speaker notes in PowerPoint files are not shown yet. Keys: F5 to show the slides, Shift+F5 from this one, Space, arrows or a click to go on, Esc to stop; Ctrl+M for a new slide, Ctrl+D to duplicate, Ctrl+B, Ctrl+I and Ctrl+U for bold, italic and underline, Tab to change a list level, Ctrl+Z to undo, Ctrl+S to save.
+
+[net.porkify.opos.calculator]
+category: accessories
+license: GPL-3.0
+official: yes
+summary: Add, subtract, multiply and divide, or work with sines, logarithms and powers.
+description: Calculator is the OPOS calculator. Type a whole calculation, like 12 * (3 + 4)^2, and see the answer while you type; press = to keep it in the history, and click an answer in the history to use it again. Standard mode has the four operations, brackets, percent, square roots and squares. Scientific mode adds sine, cosine and tangent in degrees or radians and their inverses, natural and base-10 logarithms, powers, cube roots, factorials, pi and e. Answers have 15 significant digits, so 0.1 + 0.2 is 0.3. Keys: digits, + - * / ^ ( ) % !, Enter for the answer, Backspace, Esc to clear, F9 to change the sign, Ctrl+C to copy the answer and Ctrl+V to paste.

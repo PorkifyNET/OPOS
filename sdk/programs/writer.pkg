@@ -1,0 +1,9 @@
+format: 1
+id: net.porkify.opos.writer
+name: Writer
+version: 1.0
+publisher: OPOS
+platform: opos
+requires-opos: 0.6.3
+file: files/writer ../build/writer exec
+start: files/writer Writer

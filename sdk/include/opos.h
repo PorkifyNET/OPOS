@@ -579,6 +579,13 @@ static inline long opos_window_event(struct opos_event *event,
    shape kept, and mouse positions arrive in the picture's pixels. Older
    OPOS versions refuse it with -OPOS_EINVAL. */
 #define OPOS_WINDOW_FULLSCREEN 4u
+/* The close button and Super+Q send OPOS_EVENT_CLOSE but keep the window
+   open: the program asks about unsaved work and exits by itself (or
+   carries on). Without it the window is already gone when CLOSE arrives
+   and the program must exit at once. A program that does not read its
+   events is still closed when the person asks again. Older OPOS versions
+   (before 0.6.6) refuse it with -OPOS_EINVAL. */
+#define OPOS_WINDOW_ASK_CLOSE 8u
 static inline long opos_window_options(uint32_t options) {
     return opos_syscall1(OPOS_SYS_WINDOW_OPTIONS, (long)options);
 }

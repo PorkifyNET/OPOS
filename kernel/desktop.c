@@ -755,6 +755,7 @@ static bool desktop_active;
 /* Programs waiting to read a line typed into the Terminal. */
 static size_t app_input_readers;
 static void app_window_closed(size_t slot);
+static void window_close_request(enum window_kind kind);
 static void app_key(size_t slot, char character);
 static void app_mouse_press(size_t slot, int32_t x, int32_t y,
                             uint32_t button);
@@ -14566,7 +14567,7 @@ static enum desktop_result handle_press(int32_t x, int32_t y,
     window_raise(kind);
     struct rect frame = window_rect(kind);
     if (rect_contains(close_rect(frame), x, y)) {
-        window_close(kind);
+        window_close_request(kind);
     } else if (rect_contains(maximize_rect(frame), x, y)) {
         window_toggle_maximize(kind);
     } else if (rect_contains(minimize_rect(frame), x, y)) {
@@ -14942,7 +14943,7 @@ static enum desktop_result handle_super_key(char character) {
     case 'q':
     case 'Q':
         if (z_count != 0) {
-            window_close(z_order[z_count - 1]);
+            window_close_request(z_order[z_count - 1]);
         }
         break;
     case 'f':
@@ -15145,6 +15146,8 @@ struct app_window {
     bool dirty;            /* new pixels to show */
     bool waiting;          /* the program waits for an event */
     uint64_t close_tick;
+    bool ask_unread;       /* an ASK_CLOSE request the program has not read */
+    uint64_t ask_tick;
     uint32_t requested_width;
     uint32_t requested_height;
     uint32_t *surface;     /* kept for the slot's next program */
@@ -15548,6 +15551,33 @@ static void app_window_closed(size_t slot) {
     }
 }
 
+/* The user asked to close a window (close button, Super+Q). A program
+   with DESKTOP_APP_ASK_CLOSE gets a CLOSE event and keeps its window; it
+   exits by itself, perhaps after asking about unsaved work. If it has not
+   read an earlier request for APP_CLOSE_GRACE_TICKS, it is not
+   responding, and the window closes as usual. */
+static void window_close_request(enum window_kind kind) {
+    if (window_is_app(kind)) {
+        size_t slot = kind - WINDOW_APP;
+        struct app_window *window = &app_windows[slot];
+        if ((window->options & DESKTOP_APP_ASK_CLOSE) != 0
+            && app_window_live(slot)) {
+            uint64_t now = timer_ticks();
+            if (!window->ask_unread) {
+                window->ask_unread = true;
+                window->ask_tick = now;
+                struct desktop_app_event event = {.type = APP_EVENT_CLOSE};
+                app_push(slot, &event);
+                return;
+            }
+            if (now - window->ask_tick <= APP_CLOSE_GRACE_TICKS) {
+                return; /* asked a moment ago */
+            }
+        }
+    }
+    window_close(kind);
+}
+
 /* Frees a slot whose program has ended. */
 static void app_window_release(size_t slot) {
     struct app_window *window = &app_windows[slot];
@@ -15805,7 +15835,8 @@ int64_t desktop_app_window_options(uint64_t owner, uint32_t options) {
         return -9;
     }
     if ((options & ~(uint32_t)(DESKTOP_APP_KEY_STATE | DESKTOP_APP_QUIET
-                               | DESKTOP_APP_FULLSCREEN)) != 0) {
+                               | DESKTOP_APP_FULLSCREEN
+                               | DESKTOP_APP_ASK_CLOSE)) != 0) {
         return -22;
     }
     window->options = options;
@@ -15848,6 +15879,7 @@ int64_t desktop_app_window_event(uint64_t owner,
             break;
         }
         if (window->event_count != 0) {
+            window->ask_unread = false; /* it reads its events */
             *event = window->events[window->event_head];
             window->event_head = (window->event_head + 1) % APP_EVENT_CAPACITY;
             window->event_count--;

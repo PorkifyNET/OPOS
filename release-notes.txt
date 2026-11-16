@@ -1,13 +1,10 @@
-OPOS 0.6.5: OPOS Recovery, so a broken start no longer means losing everything.
+OPOS 0.6.6: programs can now ask "Save changes?" before they close, and the OPOS Store has a full set of office programs.
 
-- OPOS Recovery is a new screen for fixing OPOS without the command line. Open it from the new "OPOS Recovery" entry in the start menu, from Settings > UPDATES > RECOVERY, or let it open by itself after 3 starts in a row that did not finish. An administrator signs in first.
-- UNDO THE LAST UPDATE puts back the version you had before the last update. You can undo again to return to the newer one.
-- REPAIR SYSTEM FILES checks the system files and replaces damaged or missing ones.
-- RESCUE MY FILES copies your accounts' files to a USB stick or another drive.
-- SAFE START starts OPOS once with the basic display mode, sound muted and no update checks. RESET SETTINGS puts the display, appearance and desktop settings back to their defaults (accounts, files and programs stay). RESET A PASSWORD sets or removes an account's password.
-- START-UP LOG shows what happened during this start and the one before.
-- The installation media has a new REPAIR button that fixes an installed OPOS that no longer starts.
-
-The "OPOS Recovery" start menu entry is added the first time 0.6.5 starts.
+- Writer, the new OPOS word processor, is in the OPOS Store (Office). Write documents with headings, bold, italic, underline, colors, lists and alignment on real pages, and open and save Word documents (.docx) and text files.
+- Spreadsheet, the new OPOS spreadsheet, is in the OPOS Store (Office). Work with numbers, text, dates and about 90 functions such as SUM, IF and VLOOKUP, and open and save Excel workbooks (.xlsx) and CSV files.
+- Presentation, the new OPOS slide show program, is in the OPOS Store (Office). Make slides with titles, lists, text boxes, shapes and pictures, show them full screen, and open and save PowerPoint presentations (.pptx).
+- Calculator is in the OPOS Store (Accessories), with a standard and a scientific mode and a history of your calculations.
+- Closing a program with the close button or Super+Q now lets it ask whether to save your changes first, instead of closing at once. Writer, Spreadsheet, Presentation and Picasso use this, so unsaved work is no longer lost by accident. Picasso 1.1 in the OPOS Store is needed for Picasso; update it from the Store.
+- A program that does not respond still closes when you ask a second time.
 
 Updating from 0.6.3 or older: VMware may hang at the restart at the end of the update. The update is already installed by then. Close VMware, end vmware-vmx.exe (taskkill /F /IM vmware-vmx.exe from an administrator command prompt; this stops every running VM) or restart Windows, then start the VM again.

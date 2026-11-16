@@ -25,7 +25,7 @@
 
 #include "png_encode.h"
 
-OPOS_MANIFEST("Picasso", "1.0", 0);
+OPOS_MANIFEST("Picasso", "1.1", 0);
 
 #define TOP_H 40
 #define LEFT_W 76
@@ -114,6 +114,7 @@ static bool shift_held;
 /* Modifier keys held, from key state events: mouse and wheel events
    carry only the mouse buttons. */
 static bool shift_down, ctrl_down;
+static bool close_removes_window; /* OPOS before 0.6.6 */
 static int hover_x = -1, hover_y = -1; /* picture pixel under the mouse */
 static int mouse_x, mouse_y;
 
@@ -1530,7 +1531,13 @@ int main(int argc, char **argv, char **envp) {
     if (!new_picture(NEW_WIDTH, NEW_HEIGHT)) {
         return 1;
     }
-    opos_window_options(OPOS_WINDOW_KEY_STATE);
+    /* Older OPOS versions have no ASK_CLOSE: their close button removes
+       the window before CLOSE arrives, so Picasso cannot ask then. */
+    if (opos_window_options(OPOS_WINDOW_KEY_STATE | OPOS_WINDOW_ASK_CLOSE)
+        < 0) {
+        opos_window_options(OPOS_WINDOW_KEY_STATE);
+        close_removes_window = true;
+    }
     update_title();
     struct opos_event event;
     for (;;) {
@@ -1608,6 +1615,9 @@ int main(int argc, char **argv, char **envp) {
             break;
         }
         case OPOS_EVENT_CLOSE:
+            if (close_removes_window) {
+                opos_exit(0);
+            }
             drawing = -1;
             request(PENDING_CLOSE);
             break;

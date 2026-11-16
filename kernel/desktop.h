@@ -68,6 +68,11 @@ uint64_t desktop_app_window_size(uint64_t owner);
    frame, and the taskbar stays hidden while it is in front. A smaller
    picture is scaled up to fit, keeping its shape. */
 #define DESKTOP_APP_FULLSCREEN 4u
+/* DESKTOP_APP_ASK_CLOSE: the close button and Super+Q send CLOSE but keep
+   the window, so the program can ask about unsaved work and exit by
+   itself. A program that has not taken an earlier CLOSE for a while (it
+   hangs) is closed as usual on the next request. */
+#define DESKTOP_APP_ASK_CLOSE 8u
 int64_t desktop_app_window_options(uint64_t owner, uint32_t options);
 /* Asks for a new content size (a game changing its resolution). The
    floating frame follows on the desktop's next pass, limited to the work

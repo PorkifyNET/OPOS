@@ -97,3 +97,11 @@ official: yes
 featured: yes
 summary: Play music and videos: MP3, FLAC, OGG, WAV and MPEG-1 video.
 description: Media Player plays your music and videos. Open MP3, FLAC, Ogg Vorbis and WAV songs or MPEG-1 videos (.mpg) and they go into a playlist: play, pause, skip, jump anywhere with the position bar, repeat one song or the whole list, or shuffle it. Videos stay in step with their sound and can fill the whole screen (F, or double-click the picture). Keys: Space plays and pauses, Left and Right jump 5 seconds (Ctrl: 30), Up and Down change the volume, M mutes, N and P go to the next and previous file, O opens a file. Media Player uses the decoders dr_wav, dr_mp3, dr_flac, stb_vorbis and PL_MPEG, unchanged.
+
+[net.porkify.opos.writer]
+category: office
+license: GPL-3.0
+official: yes
+featured: yes
+summary: Write letters, reports and other documents, and open and save Word files.
+description: Writer is the OPOS word processor. Type on pages that look like the printed result, with headings and a title, bold, italic, underline and strikethrough, text sizes and colors, Noto Sans or Noto Sans Mono, left, centered, right or justified paragraphs, and bulleted or numbered lists with five levels. Open and save Word documents (.docx), which Word, LibreOffice and Google Docs open too, or plain text (.txt). Pictures and tables in Word documents are not shown yet. Keys: Ctrl+B, Ctrl+I and Ctrl+U for bold, italic and underline, Ctrl+1 to Ctrl+3 for headings and Ctrl+0 for normal text, Ctrl+L, Ctrl+E, Ctrl+R and Ctrl+J to align, Ctrl+Z and Ctrl+Y to undo and redo, Ctrl+S to save, Tab and Shift+Tab to change a list item's level.

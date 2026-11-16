@@ -6760,12 +6760,15 @@ enum recovery_page {
     RECOVERY_PAGE_WORKING,
     /* What the job did, with RESTART NOW and BACK. */
     RECOVERY_PAGE_RESULT,
+    /* RESCUE MY FILES: which accounts, which drive. */
+    RECOVERY_PAGE_RESCUE,
 };
 
 enum recovery_action {
     RECOVERY_ACTION_START,
     RECOVERY_ACTION_UNDO,
     RECOVERY_ACTION_REPAIR,
+    RECOVERY_ACTION_RESCUE,
     RECOVERY_ACTION_COMMAND_LINE,
     RECOVERY_ACTION_RESTART,
     RECOVERY_ACTION_SHUT_DOWN,
@@ -6776,6 +6779,7 @@ static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
     "START OPOS NORMALLY",
     "UNDO THE LAST UPDATE",
     "REPAIR SYSTEM FILES",
+    "RESCUE MY FILES",
     "COMMAND LINE",
     "RESTART",
     "SHUT DOWN",
@@ -6787,6 +6791,8 @@ static const char *const recovery_action_help[RECOVERY_ACTION_COUNT] = {
     " FILES, ACCOUNTS AND PROGRAMS STAY.",
     "CHECKS THE SYSTEM FILES ON THE DISK AND REPLACES DAMAGED OR MISSING"
     " ONES. YOUR FILES STAY.",
+    "COPIES YOUR FILES (DOCUMENTS, PICTURES, MUSIC AND THE REST OF YOUR"
+    " FOLDER) TO A USB STICK OR ANOTHER DRIVE.",
     "THE TEXT COMMAND LINE, FOR ADVANCED USERS. TYPE DESKTOP TO COME BACK.",
     "RESTARTS THE COMPUTER.",
     "TURNS THE COMPUTER OFF.",
@@ -6816,6 +6822,16 @@ static bool recovery_result_good;
 static bool recovery_result_restart;
 /* The highlighted button of a two-button page (0 or 1). */
 static size_t recovery_pair_selection;
+/* RECOVERY_PAGE_RESCUE: chosen accounts, the drives found (volume
+   numbers), the chosen one, and the focused row (accounts, drives, COPY,
+   BACK). */
+#define RECOVERY_ROW_HEIGHT 36
+#define RECOVERY_HEADING_HEIGHT 30
+static bool recovery_rescue_account[ACCOUNT_MAX];
+static size_t recovery_drives[FAT16_MAX_VOLUMES];
+static size_t recovery_drive_count;
+static size_t recovery_drive_volume;
+static size_t recovery_rescue_focus;
 
 static void desktop_start_normal(void);
 static int64_t draw_wrapped(int64_t x, int64_t y, int64_t width,
@@ -6896,7 +6912,14 @@ static struct rect recovery_panel_rect(void) {
         ? (int64_t)recovery_admin_count * LOGIN_ROW_HEIGHT + 2 * 48 + 96
         : recovery_page == RECOVERY_PAGE_MENU
         ? RECOVERY_ACTION_COUNT
-              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 60
+              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 84
+        : recovery_page == RECOVERY_PAGE_RESCUE
+        ? 2 * RECOVERY_HEADING_HEIGHT
+              + (int64_t)(accounts_count()
+                          + (recovery_drive_count != 0 ? recovery_drive_count
+                                                       : 1))
+                  * RECOVERY_ROW_HEIGHT
+              + 16 + RECOVERY_BUTTON_HEIGHT + 40
         : RECOVERY_BUTTON_HEIGHT + 40;
     int64_t height = 96 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6) + 24 + rows;
     int64_t width = RECOVERY_PANEL_WIDTH < screen_width() - 20
@@ -6931,6 +6954,132 @@ static struct rect recovery_pair_rect(size_t index) {
                          RECOVERY_BUTTON_HEIGHT};
 }
 
+/* Mounted extra FAT volumes (USB sticks, other disks). */
+static void recovery_scan_drives(void) {
+    recovery_drive_count = 0;
+    bool chosen_found = false;
+    for (size_t i = 1; i < FAT16_MAX_VOLUMES; i++) {
+        struct fat16_volume_info info;
+        if (fat16_volume_info(i, &info)) {
+            recovery_drives[recovery_drive_count++] = i;
+            chosen_found |= i == recovery_drive_volume;
+        }
+    }
+    if (!chosen_found) {
+        recovery_drive_volume = recovery_drive_count != 0
+            ? recovery_drives[0] : 0;
+    }
+    size_t rows = accounts_count() + recovery_drive_count + 2;
+    if (recovery_rescue_focus >= rows) {
+        recovery_rescue_focus = rows - 1;
+    }
+}
+
+static void recovery_drive_text(size_t volume, char *text, size_t capacity) {
+    struct fat16_volume_info info;
+    text[0] = '\0';
+    if (!fat16_volume_info(volume, &info)) {
+        return;
+    }
+    size_t at;
+    if (info.label[0] != '\0') {
+        at = append_text(text, capacity, 0, info.label);
+    } else {
+        at = append_decimal(text, capacity,
+                            append_text(text, capacity, 0, "DISK "),
+                            volume + 1);
+    }
+    at = append_text(text, capacity, at, "  ");
+    at = append_decimal(text, capacity, at,
+                        (uint64_t)info.sectors * 512 / (1024 * 1024));
+    at = append_text(text, capacity, at, " MB");
+    struct block_disk_info disk;
+    if (block_disk_info(info.disk, &disk) && disk.removable) {
+        (void)append_text(text, capacity, at, "  USB");
+    }
+}
+
+/* Row `index` of the rescue page: accounts, then drives. */
+static struct rect recovery_rescue_row(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    int64_t y = recovery_content_top() + RECOVERY_HEADING_HEIGHT;
+    if (index >= accounts_count()) {
+        y += RECOVERY_HEADING_HEIGHT;
+    }
+    return (struct rect){panel.x + 24, y + (int64_t)index * RECOVERY_ROW_HEIGHT,
+                         panel.width - 48, RECOVERY_ROW_HEIGHT - 4};
+}
+
+/* COPY (0) and BACK (1) at the bottom of the rescue page. */
+static struct rect recovery_rescue_button(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    size_t rows = accounts_count()
+        + (recovery_drive_count != 0 ? recovery_drive_count : 1);
+    struct rect last = recovery_rescue_row(rows - 1);
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         last.y + last.height + 20, width,
+                         RECOVERY_BUTTON_HEIGHT};
+}
+
+static bool recovery_rescue_ready(void) {
+    bool any = false;
+    for (size_t i = 0; i < accounts_count() && i < ACCOUNT_MAX; i++) {
+        any |= recovery_rescue_account[i];
+    }
+    return any && recovery_drive_count != 0;
+}
+
+static void draw_recovery_rescue(void) {
+    struct rect first = recovery_rescue_row(0);
+    draw_text_clipped(first.x, first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      first.width, "ACCOUNTS TO COPY", 200, 214, 255);
+    size_t accounts = accounts_count();
+    for (size_t i = 0; i < accounts && i < ACCOUNT_MAX; i++) {
+        struct rect row = recovery_rescue_row(i);
+        bool focused = recovery_rescue_focus == i;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[64];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_rescue_account[i] ? "[X] " : "[ ] ");
+        (void)append_text(line, sizeof(line), at, accounts_name(i));
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    struct rect drive_first = recovery_rescue_row(accounts);
+    draw_text_clipped(drive_first.x,
+                      drive_first.y - RECOVERY_HEADING_HEIGHT + 6,
+                      drive_first.width, "COPY TO", 200, 214, 255);
+    if (recovery_drive_count == 0) {
+        draw_text_clipped(drive_first.x + 10,
+                          drive_first.y + (drive_first.height - CHAR_HEIGHT) / 2,
+                          drive_first.width - 20,
+                          "PLUG IN A USB STICK. IT SHOWS UP HERE.",
+                          255, 200, 130);
+    }
+    for (size_t j = 0; j < recovery_drive_count; j++) {
+        struct rect row = recovery_rescue_row(accounts + j);
+        bool focused = recovery_rescue_focus == accounts + j;
+        fill(row, focused ? 70 : 32, focused ? 100 : 40, focused ? 160 : 62);
+        char line[64];
+        size_t at = append_text(line, sizeof(line), 0,
+                                recovery_drives[j] == recovery_drive_volume
+                                    ? "(*) " : "( ) ");
+        recovery_drive_text(recovery_drives[j], line + at, sizeof(line) - at);
+        draw_text_clipped(row.x + 10, row.y + (row.height - CHAR_HEIGHT) / 2,
+                          row.width - 20, line, 240, 245, 255);
+    }
+    size_t buttons = accounts + recovery_drive_count;
+    if (recovery_rescue_ready()) {
+        draw_button(recovery_rescue_button(0), "COPY",
+                    recovery_rescue_focus == buttons);
+    } else {
+        draw_text_button(recovery_rescue_button(0), "COPY", false);
+    }
+    draw_button(recovery_rescue_button(1), "BACK",
+                recovery_rescue_focus == buttons + 1);
+}
+
 static struct rect recovery_admin_rect(size_t index) {
     struct rect panel = recovery_panel_rect();
     return (struct rect){panel.x + 24,
@@ -6953,6 +7102,9 @@ static struct rect recovery_sign_in_button_rect(size_t index) {
 }
 
 static void draw_recovery(void) {
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+    }
     struct rect panel = recovery_panel_rect();
     fill(panel, 230, 170, 90);
     fill((struct rect){panel.x + 2, panel.y + 2, panel.width - 4,
@@ -6987,6 +7139,15 @@ static void draw_recovery(void) {
         text_green = 228;
         text_blue = 245;
         break;
+    case RECOVERY_PAGE_RESCUE:
+        subtitle = "RESCUE MY FILES";
+        text = "CHOOSE THE ACCOUNTS TO COPY AND A USB STICK OR OTHER DRIVE."
+               " THE COPIES GO INTO A NEW OPOS-RESCUE FOLDER ON IT. NOTHING"
+               " ON THIS COMPUTER CHANGES.";
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
     case RECOVERY_PAGE_RESULT:
         subtitle = recovery_result_good ? "DONE" : "THAT DID NOT WORK";
         text = recovery_result;
@@ -7009,6 +7170,10 @@ static void draw_recovery(void) {
                  panel.y + 90 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6), text,
                  text_red, text_green, text_blue);
 
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        draw_recovery_rescue();
+        return;
+    }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
         struct rect bar = recovery_pair_rect(0);
         bar.width = panel.width - 48;
@@ -7193,6 +7358,88 @@ static void recovery_repair(void) {
     }
 }
 
+static void recovery_rescue(void) {
+    if (!recovery_rescue_ready()) {
+        return;
+    }
+    const char *names[ACCOUNT_MAX];
+    size_t count = 0;
+    for (size_t i = 0; i < accounts_count() && i < ACCOUNT_MAX; i++) {
+        if (recovery_rescue_account[i]) {
+            names[count++] = accounts_name(i);
+        }
+    }
+    char drive[48];
+    recovery_drive_text(recovery_drive_volume, drive, sizeof(drive));
+    console_serial_log("OPOS: OPOS Recovery: rescuing files\n");
+    recovery_begin_work("COUNTING FILES");
+    struct recovery_rescue_result result;
+    const char *error = "UNKNOWN ERROR";
+    if (!recovery_rescue_files(names, count, recovery_drive_volume,
+                               recovery_work_progress, &result, &error)) {
+        recovery_show_result(false, false, error);
+        return;
+    }
+    char text[200];
+    size_t at = append_text(text, sizeof(text), 0,
+                            result.stopped ? "COPYING STOPPED AFTER "
+                                           : "COPIED ");
+    at = append_decimal(text, sizeof(text), at, result.copied);
+    at = append_text(text, sizeof(text), at, " FILES (");
+    at = append_decimal(text, sizeof(text), at,
+                        (result.bytes + 1024 * 1024 - 1) / (1024 * 1024));
+    at = append_text(text, sizeof(text), at, " MB) TO ");
+    /* The drive's name without its size. */
+    size_t name_end = 0;
+    while (drive[name_end] != '\0'
+           && !(drive[name_end] == ' ' && drive[name_end + 1] == ' ')) {
+        name_end++;
+    }
+    drive[name_end] = '\0';
+    at = append_text(text, sizeof(text), at, drive);
+    at = append_text(text, sizeof(text), at, ", FOLDER ");
+    at = append_text(text, sizeof(text), at, result.folder + 7);
+    at = append_text(text, sizeof(text), at, ".");
+    if (result.stopped) {
+        at = append_text(text, sizeof(text), at,
+                         " THE DRIVE IS FULL OR WAS REMOVED.");
+    }
+    if (result.unreadable != 0) {
+        at = append_text(text, sizeof(text), at, " ");
+        at = append_decimal(text, sizeof(text), at, result.unreadable);
+        (void)append_text(text, sizeof(text), at,
+                          " COULD NOT BE READ AND WERE LEFT OUT.");
+    }
+    console_serial_log(result.stopped
+                           ? "OPOS: OPOS Recovery: rescue stopped\n"
+                           : "OPOS: OPOS Recovery: files rescued\n");
+    recovery_show_result(!result.stopped, false, text);
+}
+
+static void recovery_rescue_open(void) {
+    for (size_t i = 0; i < ACCOUNT_MAX; i++) {
+        recovery_rescue_account[i] = true;
+    }
+    recovery_rescue_focus = 0;
+    recovery_page = RECOVERY_PAGE_RESCUE;
+    recovery_scan_drives();
+}
+
+/* Space, Enter or a click on rescue row `index`. */
+static void recovery_rescue_choose(size_t index) {
+    size_t accounts = accounts_count();
+    recovery_rescue_focus = index;
+    if (index < accounts && index < ACCOUNT_MAX) {
+        recovery_rescue_account[index] = !recovery_rescue_account[index];
+    } else if (index < accounts + recovery_drive_count) {
+        recovery_drive_volume = recovery_drives[index - accounts];
+    } else if (index == accounts + recovery_drive_count) {
+        recovery_rescue();
+    } else {
+        recovery_page = RECOVERY_PAGE_MENU;
+    }
+}
+
 /* The left (0) or right (1) button of CONFIRM or RESULT. */
 static void recovery_pair_run(size_t index) {
     if (recovery_page == RECOVERY_PAGE_CONFIRM) {
@@ -7223,6 +7470,9 @@ static void recovery_run(enum recovery_action action) {
         break;
     case RECOVERY_ACTION_REPAIR:
         recovery_repair();
+        break;
+    case RECOVERY_ACTION_RESCUE:
+        recovery_rescue_open();
         break;
     case RECOVERY_ACTION_START:
         /* The failed-start count stays: a start that fails again comes
@@ -7270,6 +7520,23 @@ static void recovery_key(char character) {
         return;
     }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+        size_t rows = accounts_count() + recovery_drive_count + 2;
+        if ((character == KEY_UP || character == KEY_LEFT)
+            && recovery_rescue_focus > 0) {
+            recovery_rescue_focus--;
+        } else if ((character == KEY_DOWN || character == KEY_RIGHT
+                    || character == '\t')
+                   && recovery_rescue_focus + 1 < rows) {
+            recovery_rescue_focus++;
+        } else if (character == '\n' || character == ' ') {
+            recovery_rescue_choose(recovery_rescue_focus);
+        } else if (character == KEY_ESCAPE) {
+            recovery_page = RECOVERY_PAGE_MENU;
+        }
         return;
     }
     if (recovery_page == RECOVERY_PAGE_CONFIRM
@@ -7325,6 +7592,23 @@ static void recovery_press(int32_t x, int32_t y) {
         return;
     }
     if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_RESCUE) {
+        recovery_scan_drives();
+        size_t rows = accounts_count() + recovery_drive_count;
+        for (size_t i = 0; i < rows; i++) {
+            if (rect_contains(recovery_rescue_row(i), x, y)) {
+                recovery_rescue_choose(i);
+                return;
+            }
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (rect_contains(recovery_rescue_button(i), x, y)) {
+                recovery_rescue_choose(rows + i);
+                return;
+            }
+        }
         return;
     }
     if (recovery_page == RECOVERY_PAGE_CONFIRM

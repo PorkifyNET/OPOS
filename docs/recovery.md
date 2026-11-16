@@ -98,7 +98,14 @@ VMware check by a human afterwards.
    and stages the whole tree when that is not enough (extra files).
    Replacing a damaged `kernel.elf`/`initramfs.tar` from installation media
    moves to step 5.
-3. **Rescue my files** to a USB stick or another disk.
+3. **Rescue my files** to a USB stick or another disk. *Done:*
+   `recovery_rescue_files()` walks each chosen `/disk/Users/<name>`
+   without recursion (24 levels) and copies it to
+   `OPOS-RESCUE-<date>[-2..-9]/<name>` on a mounted extra FAT volume.
+   Unreadable files are skipped and counted; a failed write (drive full
+   or removed) stops the copy and removes the half-written file. The
+   Recovery page lists accounts (all ticked) and drives (USB sticks show
+   up when plugged in).
 4. **Safe start, reset settings, reset a password**, and "RESTART INTO
    RECOVERY" in Settings.
 5. **Start-up log viewer** and **"REPAIR AN INSTALLED OPOS"** on the live

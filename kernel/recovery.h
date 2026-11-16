@@ -70,4 +70,29 @@ enum recovery_resume {
    before the system root is chosen). */
 enum recovery_resume recovery_undo_resume(void);
 
+/* ------------------------------------------------------- rescue files */
+
+struct recovery_rescue_result {
+    size_t copied;
+    /* Files that could not be read (skipped). */
+    size_t unreadable;
+    uint64_t bytes;
+    /* Writing failed (drive full or removed): copying stopped there. */
+    bool stopped;
+    /* Where the copies went, e.g. "/disk2/OPOS-RESCUE-2026-11-16". */
+    char folder[48];
+};
+
+/*
+ * Copies the home folders (/disk/Users/<name>) of the `count` accounts in
+ * `names` to a new OPOS-RESCUE-<date> folder on extra volume `volume`
+ * (1..FAT16_MAX_VOLUMES-1, mounted at /disk<volume+1>). Unreadable files
+ * are skipped and counted; a failed write stops the copy. Returns false
+ * (with *error) only when nothing could start.
+ */
+bool recovery_rescue_files(const char *const *names, size_t count,
+                           size_t volume, recovery_progress progress,
+                           struct recovery_rescue_result *result,
+                           const char **error);
+
 #endif

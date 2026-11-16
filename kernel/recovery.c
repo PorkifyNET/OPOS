@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "block.h"
+#include "cmos.h"
 #include "fat16.h"
 #include "installer.h"
 #include "recovery.h"
@@ -437,4 +438,267 @@ enum recovery_resume recovery_undo_resume(void) {
         remove_undo_files();
     }
     return result;
+}
+
+/* ------------------------------------------------------- rescue files */
+
+#define RESCUE_PATH 512
+#define RESCUE_DEPTH 24
+#define USERS_ROOT "/disk/Users"
+
+struct rescue_walk {
+    char source[RESCUE_PATH];
+    size_t source_length;
+    char target[RESCUE_PATH];
+    size_t target_length;
+    size_t index[RESCUE_DEPTH];
+    /* Path lengths to go back to when a level ends. */
+    size_t source_mark[RESCUE_DEPTH];
+    size_t target_mark[RESCUE_DEPTH];
+};
+
+static struct rescue_walk walk;
+static char rescue_step[96];
+
+static bool path_append(char *path, size_t *length, const char *part,
+                        size_t part_length) {
+    if (*length + 1 + part_length >= RESCUE_PATH) {
+        return false;
+    }
+    path[(*length)++] = '/';
+    for (size_t i = 0; i < part_length; i++) {
+        path[(*length)++] = part[i];
+    }
+    path[*length] = '\0';
+    return true;
+}
+
+static void set_text(char *buffer, size_t capacity, const char *a,
+                     const char *b) {
+    size_t length = 0;
+    for (size_t i = 0; a[i] != '\0' && length + 1 < capacity; i++) {
+        buffer[length++] = a[i];
+    }
+    for (size_t i = 0; b != NULL && b[i] != '\0' && length + 1 < capacity;
+         i++) {
+        buffer[length++] = b[i];
+    }
+    buffer[length] = '\0';
+}
+
+/* Copies one file; false when writing failed (a reading failure counts
+   the file as unreadable and returns true). */
+static bool rescue_copy_file(const char *from, size_t from_length,
+                             const char *to, size_t to_length, size_t size,
+                             struct recovery_rescue_result *result) {
+    if (!vfs_create_file(to, to_length, true)) {
+        return false;
+    }
+    for (size_t offset = 0; offset < size; offset += COPY_CHUNK) {
+        size_t want = size - offset < COPY_CHUNK ? size - offset : COPY_CHUNK;
+        size_t got = 0;
+        if (!vfs_read_at(from, from_length, offset, chunk, want, &got)
+            || got != want) {
+            remove_file(to);
+            result->unreadable++;
+            return true;
+        }
+        size_t written = 0;
+        if (!vfs_write_at(to, to_length, offset, chunk, want, &written)
+            || written != want) {
+            remove_file(to); /* no half file that looks complete */
+            return false;
+        }
+    }
+    result->copied++;
+    result->bytes += size;
+    return true;
+}
+
+static bool is_dot(const struct vfs_directory_entry *entry) {
+    return (entry->name_length == 1 && entry->name[0] == '.')
+        || (entry->name_length == 2 && entry->name[0] == '.'
+            && entry->name[1] == '.');
+}
+
+/* Ends the current entry: back to the folder's own paths, next index. */
+static void rescue_next(size_t depth) {
+    walk.source[walk.source_length] = '\0';
+    walk.target[walk.target_length] = '\0';
+    walk.index[depth]++;
+}
+
+/*
+ * Walks walk.source without recursion. With copy false it only adds up
+ * *total_bytes; with copy true it copies into walk.target, reporting
+ * done/total. Returns false when a write failed.
+ */
+static bool rescue_walk(bool copy, uint64_t *total_bytes, uint64_t total,
+                        uint64_t *done, recovery_progress progress,
+                        struct recovery_rescue_result *result) {
+    size_t depth = 0;
+    walk.index[0] = 0;
+    for (;;) {
+        size_t count = 0;
+        if (!vfs_directory_count(walk.source, walk.source_length, &count)) {
+            count = 0;
+            if (copy && walk.index[depth] == 0) {
+                result->unreadable++;
+            }
+        }
+        if (walk.index[depth] >= count) {
+            if (depth == 0) {
+                return true;
+            }
+            depth--;
+            walk.source_length = walk.source_mark[depth];
+            walk.target_length = walk.target_mark[depth];
+            rescue_next(depth);
+            continue;
+        }
+        struct vfs_directory_entry entry;
+        if (!vfs_directory_entry_at(walk.source, walk.source_length,
+                                    walk.index[depth], &entry)
+            || is_dot(&entry)) {
+            walk.index[depth]++;
+            continue;
+        }
+        size_t source_length = walk.source_length;
+        size_t target_length = walk.target_length;
+        if (!path_append(walk.source, &source_length, entry.name,
+                         entry.name_length)
+            || !path_append(walk.target, &target_length, entry.name,
+                            entry.name_length)) {
+            if (copy) {
+                result->unreadable++;
+            }
+            rescue_next(depth);
+            continue;
+        }
+        if (entry.type == VFS_NODE_DIRECTORY) {
+            if (depth + 1 >= RESCUE_DEPTH) {
+                if (copy) {
+                    result->unreadable++;
+                }
+                rescue_next(depth);
+                continue;
+            }
+            if (copy && !make_directory(walk.target)) {
+                return false;
+            }
+            walk.source_mark[depth] = walk.source_length;
+            walk.target_mark[depth] = walk.target_length;
+            depth++;
+            walk.index[depth] = 0;
+            walk.source_length = source_length;
+            walk.target_length = target_length;
+            continue;
+        }
+        if (copy) {
+            set_text(rescue_step, sizeof(rescue_step), "COPYING ",
+                     walk.source + sizeof(USERS_ROOT));
+            if (progress != NULL) {
+                progress(rescue_step, total == 0 ? 0
+                    : (unsigned)(*done * 100 / total));
+            }
+            if (!rescue_copy_file(walk.source, source_length, walk.target,
+                                  target_length, entry.size, result)) {
+                return false;
+            }
+            *done += entry.size;
+        } else {
+            *total_bytes += entry.size;
+        }
+        rescue_next(depth);
+    }
+}
+
+static size_t append_number(char *text, size_t at, unsigned value,
+                            unsigned digits) {
+    for (unsigned i = digits; i > 0; i--) {
+        text[at + i - 1] = (char)('0' + value % 10);
+        value /= 10;
+    }
+    return at + digits;
+}
+
+bool recovery_rescue_files(const char *const *names, size_t count,
+                           size_t volume, recovery_progress progress,
+                           struct recovery_rescue_result *result,
+                           const char **error) {
+    *result = (struct recovery_rescue_result){0};
+    if (count == 0) {
+        return undo_fail(error, "NO ACCOUNT IS CHOSEN");
+    }
+    struct fat16_volume_info info;
+    if (volume == 0 || volume >= FAT16_MAX_VOLUMES || volume > 8
+        || !fat16_volume_info(volume, &info)) {
+        return undo_fail(error, "THE DRIVE IS GONE. PLUG IT IN AGAIN");
+    }
+    /* "/disk2/OPOS-RESCUE-2026-11-16", then "-2" ... "-9" when taken. */
+    char folder[48] = "/disk0/OPOS-RESCUE-";
+    folder[5] = (char)('1' + volume);
+    size_t at = text_length(folder);
+    struct rtc_time now;
+    if (!rtc_read(&now)) {
+        now = (struct rtc_time){2000, 1, 1, 0, 0, 0};
+    }
+    at = append_number(folder, at, now.year, 4);
+    folder[at++] = '-';
+    at = append_number(folder, at, now.month, 2);
+    folder[at++] = '-';
+    at = append_number(folder, at, now.day, 2);
+    folder[at] = '\0';
+    size_t base = at;
+    struct vfs_metadata metadata;
+    for (char suffix = '2'; vfs_stat(folder, text_length(folder), &metadata);
+         suffix++) {
+        if (suffix > '9') {
+            return undo_fail(error, "THE DRIVE ALREADY HAS 9 RESCUE FOLDERS"
+                                    " FROM TODAY");
+        }
+        folder[base] = '-';
+        folder[base + 1] = suffix;
+        folder[base + 2] = '\0';
+    }
+    if (!make_directory(folder)) {
+        return undo_fail(error, "CANNOT WRITE TO THE DRIVE");
+    }
+    set_text(result->folder, sizeof(result->folder), folder, NULL);
+
+    if (progress != NULL) {
+        progress("COUNTING FILES", 0);
+    }
+    uint64_t total = 0;
+    uint64_t done = 0;
+    for (size_t i = 0; i < count; i++) {
+        set_text(walk.source, sizeof(walk.source), USERS_ROOT "/", names[i]);
+        walk.source_length = text_length(walk.source);
+        walk.target[0] = '\0';
+        walk.target_length = 0;
+        if (vfs_stat(walk.source, walk.source_length, &metadata)) {
+            (void)rescue_walk(false, &total, 0, &done, NULL, result);
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        set_text(walk.source, sizeof(walk.source), USERS_ROOT "/", names[i]);
+        walk.source_length = text_length(walk.source);
+        if (!vfs_stat(walk.source, walk.source_length, &metadata)) {
+            continue; /* no home folder */
+        }
+        set_text(walk.target, sizeof(walk.target), folder, "/");
+        size_t used = text_length(walk.target);
+        set_text(walk.target + used, sizeof(walk.target) - used, names[i],
+                 NULL);
+        walk.target_length = text_length(walk.target);
+        if (!make_directory(walk.target)
+            || !rescue_walk(true, NULL, total, &done, progress, result)) {
+            result->stopped = true;
+            break;
+        }
+    }
+    if (progress != NULL) {
+        progress("DONE", 100);
+    }
+    return true;
 }

@@ -4921,6 +4921,10 @@ static void notifications_session_end(void);
 static bool center_open;
 static void center_show(bool open);
 static void updates_notify_available(void);
+static void updates_auto_schedule(void);
+static void updates_auto_poll(void);
+/* Opens Settings at a page (a click on the "OPOS UPDATES" toast). */
+static void settings_open_updates(void);
 
 /* Settings pages, listed in the window's sidebar. */
 enum settings_category {
@@ -5006,6 +5010,10 @@ static void updates_click(struct rect area, int32_t x, int32_t y);
 static void updates_start(bool install);
 static bool updates_checked;
 static bool updates_running;
+/* The running check was started in the background (updates_auto_poll). */
+static bool updates_auto;
+/* When the next background check runs; 0 when logged out. */
+static uint64_t updates_auto_tick;
 /* The OPOS Store window (see "OPOS Store"), shown on the UPDATES page. */
 static bool store_running;
 static bool store_loaded;
@@ -7335,6 +7343,42 @@ static void updates_finished(bool started, uint64_t exit_status) {
     if (updates_status != UPDATES_INSTALLED) {
         updates_progress = -1;
     }
+    if (updates_auto && updates_status == UPDATES_ERROR) {
+        /* A background check failed (often no network yet): the next
+           visit to UPDATES checks again instead of showing this error. */
+        updates_checked = false;
+    }
+    updates_auto = false;
+}
+
+/*
+ * Background checks: for an administrator, a minute after logging in and
+ * then every 6 hours, so a new version shows up as a notification
+ * (updates_notify_available) without opening Settings. Standard accounts
+ * cannot install, so they are left out.
+ */
+#define UPDATES_AUTO_FIRST_TICKS (60u * 100u)
+#define UPDATES_AUTO_EVERY_TICKS (6u * 60u * 60u * 100u)
+
+static void updates_auto_schedule(void) {
+    updates_auto_tick = timer_ticks() + UPDATES_AUTO_FIRST_TICKS;
+}
+
+static void updates_auto_poll(void) {
+    if (updates_auto_tick == 0 || login_active || protected_active
+        || timer_ticks() < updates_auto_tick) {
+        return;
+    }
+    updates_auto_tick = timer_ticks() + UPDATES_AUTO_EVERY_TICKS;
+    if (!updates_admin() || updates_running || installer_available()
+        || updates_status == UPDATES_INSTALLED) {
+        return;
+    }
+    updates_auto = true;
+    updates_start(false);
+    if (!updates_running) {
+        updates_auto = false;
+    }
 }
 
 /* Draws text word-wrapped in [x, x + width); returns the next line's y,
@@ -7613,6 +7657,7 @@ static void desktop_session_start(void) {
     append_text(greeting, sizeof(greeting), text_length(greeting),
                 accounts_name(accounts_current()));
     set_status(greeting);
+    updates_auto_schedule();
 }
 
 /* Log out: close every window (the editor warns once about unsaved
@@ -7627,6 +7672,7 @@ static void desktop_session_end(void) {
         window_close(z_order[z_count - 1]);
     }
     accounts_logout();
+    updates_auto_tick = 0;
     notify_clear();
     notifications_session_end();
     appearance_load();
@@ -10038,9 +10084,17 @@ static bool toasts_press(int32_t x, int32_t y) {
             continue;
         }
         uint32_t id = toasts[i].id;
+        struct notification entry;
         if (rect_contains(toast_close_rect(toast), x, y)) {
             (void)notify_dismiss(id);
             toast_remove(i);
+        } else if (notify_find(id, &entry)
+                   && text_equals(entry.source, text_length(entry.source),
+                                  "OPOS UPDATES")) {
+            /* "OPOS X IS AVAILABLE": go where it can be installed. */
+            notify_mark_read(id);
+            toast_remove(i);
+            settings_open_updates();
         } else {
             center_show(true);
         }
@@ -11120,6 +11174,10 @@ static void settings_open_category(enum settings_category category) {
     settings_home = false;
     settings_show_category(category);
     settings_in_sidebar = false;
+}
+
+static void settings_open_updates(void) {
+    settings_open_category(CATEGORY_UPDATES);
 }
 
 /* Start > Settings and Super+I: a newly opened Settings starts at home. */
@@ -14742,7 +14800,10 @@ static void app_terminal_show(struct app_job *job) {
 
 static void app_job_waits_for_input(uint64_t process_id) {
     struct app_job *job = app_job_of(process_id);
+    /* The updater and the Store's /bin/pkg show their output on their
+       own pages, so a Terminal would open empty and wait for nothing. */
     if (job != NULL && job->origin != APP_FROM_TERMINAL
+        && job->origin != APP_FROM_UPDATES && job->origin != APP_FROM_STORE
         && app_window_of(process_id) == NULL
         && !windows[WINDOW_TERMINAL].open) {
         app_terminal_wanted = job;
@@ -17373,6 +17434,7 @@ static bool desktop_step(void) {
         redraw = true;
     }
     redraw |= toasts_poll();
+    updates_auto_poll();
 
     /* The host may resize the screen (VMware "Autofit Guest"). */
     int64_t width_before = screen_width();

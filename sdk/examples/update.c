@@ -745,6 +745,12 @@ static bool confirm_install(const char *source, const char *installed,
         printf("\nConfirmed by -y/--y. Downloading and installing.\n");
         return true;
     }
+    if (gui) {
+        /* The UPDATE button in Settings was the confirmation; there is
+           no Terminal to type YES in. */
+        printf("\nConfirmed in Settings. Downloading and installing.\n");
+        return true;
+    }
     printf("\nType YES to download and install, or anything else to cancel: ");
     char answer[16];
     long length = opos_read(OPOS_STDIN, answer, sizeof(answer));

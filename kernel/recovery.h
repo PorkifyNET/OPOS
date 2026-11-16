@@ -2,11 +2,13 @@
 #define OPOS_RECOVERY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
- * OPOS Recovery (docs/recovery.md): why it opened, and the count of
- * starts that never finished, kept in /disk/OPOS/BOOT-ATTEMPTS.
+ * OPOS Recovery (docs/recovery.md): why it opened, the count of starts
+ * that never finished (/disk/OPOS/BOOT-ATTEMPTS), and undoing the last
+ * update.
  */
 
 enum recovery_reason {
@@ -34,5 +36,38 @@ void recovery_set_reason(enum recovery_reason reason);
 enum recovery_reason recovery_reason(void);
 /* The failed-start count recovery_count_start returned. */
 uint32_t recovery_failed_starts(void);
+
+/* Progress of a long Recovery job: what it does, 0-100. */
+typedef void (*recovery_progress)(const char *step, unsigned percent);
+
+/* The kernel file Limine started (to tell which version is running). */
+void recovery_set_running_kernel(const void *image, size_t size);
+
+/* Whether /disk/boot/old holds an earlier kernel and initramfs to go back
+   to, with no update half-installed. */
+bool recovery_undo_available(void);
+
+/*
+ * Swaps the current kernel/initramfs pair with the one in /disk/boot/old,
+ * so the next start runs the version from before the last update (and
+ * "OPOS (previous version)" then starts the newer one). The newer pair is
+ * kept in /disk/boot/undo until the swap is complete, and the step is
+ * recorded in /disk/OPOS/UNDO-STATE so a power cut can be finished at the
+ * next start. On failure sets *error to a short reason.
+ */
+bool recovery_undo_update(recovery_progress progress, const char **error);
+
+enum recovery_resume {
+    RECOVERY_RESUME_NONE,
+    /* An interrupted undo was finished; this start can carry on. */
+    RECOVERY_RESUME_DONE,
+    /* It was finished, but the running kernel is the one that was
+       replaced: restart. */
+    RECOVERY_RESUME_RESTART,
+};
+
+/* Finishes an undo cut short by a power loss (after the disk mounts,
+   before the system root is chosen). */
+enum recovery_resume recovery_undo_resume(void);
 
 #endif

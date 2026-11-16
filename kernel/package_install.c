@@ -174,6 +174,12 @@ static void remove_file(const char *path) {
 }
 
 /* Removes a folder and everything in it, without recursion. */
+static bool remove_tree(const char *root);
+
+bool package_remove_tree(const char *root) {
+    return remove_tree(root);
+}
+
 static bool remove_tree(const char *root) {
     enum vfs_node_type type;
     if (!exists(root, &type)) {

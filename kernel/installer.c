@@ -7,6 +7,7 @@
 #include "fat16.h"
 #include "initramfs.h"
 #include "installer.h"
+#include "package.h"
 #include "partition.h"
 #include "system_root.h"
 #include "vfs.h"
@@ -268,6 +269,55 @@ bool installer_stage_system_root(const char **error) {
         return fail(error, "SYSTEM DISK IS NOT MOUNTED");
     }
     return populate_system_root(NULL, error);
+}
+
+enum installer_repair installer_repair_system_root(
+    installer_progress progress, const char **error) {
+    if (installer_available() || !fat16_system_mounted()) {
+        (void)fail(error, "SYSTEM DISK IS NOT MOUNTED");
+        return INSTALLER_REPAIR_FAILED;
+    }
+    char root[128];
+    if (!system_root_path(root, sizeof(root))) {
+        (void)fail(error, "SYSTEM ROOT NAME IS INVALID");
+        return INSTALLER_REPAIR_FAILED;
+    }
+    size_t root_length = text_length(root);
+    report(progress, "CHECKING SYSTEM FILES", 0);
+    if (system_root_ready(root, root_length)
+        && system_root_verify_tree(root, root_length)) {
+        return INSTALLER_REPAIR_FINE;
+    }
+    if (vfs_disk_root_contains(root, root_length)) {
+        (void)fail(error, "SYSTEM FILES ARE IN USE");
+        return INSTALLER_REPAIR_IN_USE;
+    }
+    /* Not ready while it changes. */
+    char marker[136];
+    size_t at = 0;
+    for (; at < root_length; at++) marker[at] = root[at];
+    static const char ready[] = ".ready";
+    for (size_t i = 0; i < sizeof(ready); i++) marker[at + i] = ready[i];
+    bool not_empty;
+    (void)vfs_remove(marker, text_length(marker), false, &not_empty);
+    block_begin_batch();
+    bool repaired = populate_system_root(progress, error);
+    if (!block_end_batch()) repaired = false;
+    if (!repaired) {
+        report(progress, "REMOVING DAMAGED SYSTEM FILES", 84);
+        if (!package_remove_tree(root)) {
+            (void)fail(error, "REMOVING DAMAGED SYSTEM FILES FAILED");
+            return INSTALLER_REPAIR_FAILED;
+        }
+        block_begin_batch();
+        repaired = populate_system_root(progress, error);
+        if (!block_end_batch()) repaired = false;
+    }
+    if (!repaired) {
+        return INSTALLER_REPAIR_FAILED;
+    }
+    report(progress, "DONE", 100);
+    return INSTALLER_REPAIR_FIXED;
 }
 
 struct install_copy {

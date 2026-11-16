@@ -1357,6 +1357,14 @@ void kmain(void) {
 
     /* An update cut short by a power loss is finished first. */
     update_resume();
+    /* An undo of the last update (OPOS Recovery) cut short likewise. */
+    recovery_set_running_kernel(
+        kernel_file != NULL ? kernel_file->address : NULL,
+        kernel_file != NULL ? (size_t)kernel_file->size : 0);
+    if (recovery_undo_resume() == RECOVERY_RESUME_RESTART) {
+        console_write_string("OPOS: previous version restored; restarting\n");
+        power_reboot();
+    }
     /* Then a package install or removal; this also lists the installed
        package folders, including each account's, for permissions.c. */
     accounts_load();

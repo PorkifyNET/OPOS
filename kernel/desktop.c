@@ -6754,10 +6754,18 @@ static void login_press(int32_t x, int32_t y) {
 enum recovery_page {
     RECOVERY_PAGE_SIGN_IN,
     RECOVERY_PAGE_MENU,
+    /* "Undo the last update?" */
+    RECOVERY_PAGE_CONFIRM,
+    /* A job is running: its step and a progress bar. */
+    RECOVERY_PAGE_WORKING,
+    /* What the job did, with RESTART NOW and BACK. */
+    RECOVERY_PAGE_RESULT,
 };
 
 enum recovery_action {
     RECOVERY_ACTION_START,
+    RECOVERY_ACTION_UNDO,
+    RECOVERY_ACTION_REPAIR,
     RECOVERY_ACTION_COMMAND_LINE,
     RECOVERY_ACTION_RESTART,
     RECOVERY_ACTION_SHUT_DOWN,
@@ -6766,6 +6774,8 @@ enum recovery_action {
 
 static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
     "START OPOS NORMALLY",
+    "UNDO THE LAST UPDATE",
+    "REPAIR SYSTEM FILES",
     "COMMAND LINE",
     "RESTART",
     "SHUT DOWN",
@@ -6773,6 +6783,10 @@ static const char *const recovery_action_labels[RECOVERY_ACTION_COUNT] = {
 
 static const char *const recovery_action_help[RECOVERY_ACTION_COUNT] = {
     "CONTINUES TO THE LOGIN SCREEN AND THE DESKTOP.",
+    "GOES BACK TO THE VERSION OF OPOS FROM BEFORE THE LAST UPDATE. YOUR"
+    " FILES, ACCOUNTS AND PROGRAMS STAY.",
+    "CHECKS THE SYSTEM FILES ON THE DISK AND REPLACES DAMAGED OR MISSING"
+    " ONES. YOUR FILES STAY.",
     "THE TEXT COMMAND LINE, FOR ADVANCED USERS. TYPE DESKTOP TO COME BACK.",
     "RESTARTS THE COMPUTER.",
     "TURNS THE COMPUTER OFF.",
@@ -6791,6 +6805,17 @@ static size_t recovery_admin_selection;
 static size_t recovery_open_admin = ACCOUNT_NONE;
 static struct text_field recovery_password;
 static const char *recovery_message = "";
+/* Whether /disk/boot/old has a version to go back to (checked on show). */
+static bool recovery_undo_ok;
+/* RECOVERY_PAGE_WORKING. */
+static const char *recovery_work_step = "";
+static unsigned recovery_work_percent;
+/* RECOVERY_PAGE_RESULT; recovery_result_restart offers RESTART NOW. */
+static char recovery_result[200];
+static bool recovery_result_good;
+static bool recovery_result_restart;
+/* The highlighted button of a two-button page (0 or 1). */
+static size_t recovery_pair_selection;
 
 static void desktop_start_normal(void);
 static int64_t draw_wrapped(int64_t x, int64_t y, int64_t width,
@@ -6826,6 +6851,7 @@ static void recovery_show(void) {
     recovery_selection = 0;
     recovery_admin_selection = 0;
     recovery_message = "";
+    recovery_undo_ok = recovery_undo_available();
     field_reset(&recovery_password, ACCOUNT_PASSWORD_MAX, true);
     bool needed = recovery_sign_in_needed();
     recovery_page = needed && !recovery_signed_in
@@ -6868,8 +6894,10 @@ static void recovery_reason_text(char *text, size_t capacity) {
 static struct rect recovery_panel_rect(void) {
     int64_t rows = recovery_page == RECOVERY_PAGE_SIGN_IN
         ? (int64_t)recovery_admin_count * LOGIN_ROW_HEIGHT + 2 * 48 + 96
-        : RECOVERY_ACTION_COUNT
-              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 60;
+        : recovery_page == RECOVERY_PAGE_MENU
+        ? RECOVERY_ACTION_COUNT
+              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP) + 60
+        : RECOVERY_BUTTON_HEIGHT + 40;
     int64_t height = 96 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6) + 24 + rows;
     int64_t width = RECOVERY_PANEL_WIDTH < screen_width() - 20
         ? RECOVERY_PANEL_WIDTH : screen_width() - 20;
@@ -6892,6 +6920,15 @@ static struct rect recovery_button_rect(size_t index) {
                          recovery_content_top() + (int64_t)index
                              * (RECOVERY_BUTTON_HEIGHT + RECOVERY_BUTTON_GAP),
                          panel.width - 48, RECOVERY_BUTTON_HEIGHT};
+}
+
+/* CONFIRM and RESULT pages: 0 left, 1 right. */
+static struct rect recovery_pair_rect(size_t index) {
+    struct rect panel = recovery_panel_rect();
+    int64_t width = (panel.width - 48 - 12) / 2;
+    return (struct rect){panel.x + 24 + (int64_t)index * (width + 12),
+                         recovery_content_top(), width,
+                         RECOVERY_BUTTON_HEIGHT};
 }
 
 static struct rect recovery_admin_rect(size_t index) {
@@ -6922,16 +6959,82 @@ static void draw_recovery(void) {
                        panel.height - 4}, 24, 30, 46);
     draw_text_clipped(panel.x + 24, panel.y + 20, panel.width - 48,
                       "OPOS RECOVERY", 255, 200, 130);
-    draw_text_clipped(panel.x + 24, panel.y + 50, panel.width - 48,
-                      recovery_page == RECOVERY_PAGE_SIGN_IN
-                          ? "AN ADMINISTRATOR NEEDS TO SIGN IN"
-                          : "CHOOSE WHAT TO DO",
-                      200, 214, 255);
+    const char *subtitle = "CHOOSE WHAT TO DO";
     char reason[400];
     recovery_reason_text(reason, sizeof(reason));
+    const char *text = reason;
+    uint8_t text_red = 240;
+    uint8_t text_green = 225;
+    uint8_t text_blue = 200;
+    switch (recovery_page) {
+    case RECOVERY_PAGE_SIGN_IN:
+        subtitle = "AN ADMINISTRATOR NEEDS TO SIGN IN";
+        break;
+    case RECOVERY_PAGE_CONFIRM:
+        subtitle = "UNDO THE LAST UPDATE?";
+        text = "THE NEXT START RUNS THE VERSION OF OPOS FROM BEFORE THE LAST"
+               " UPDATE. YOUR FILES, ACCOUNTS AND PROGRAMS STAY. THE NEWER"
+               " VERSION IS KEPT: \"OPOS (PREVIOUS VERSION)\" IN THE BOOT"
+               " MENU STARTS IT, AND UNDOING AGAIN BRINGS IT BACK.";
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
+    case RECOVERY_PAGE_WORKING:
+        subtitle = "PLEASE WAIT. DO NOT TURN THE COMPUTER OFF.";
+        text = recovery_work_step;
+        text_red = 220;
+        text_green = 228;
+        text_blue = 245;
+        break;
+    case RECOVERY_PAGE_RESULT:
+        subtitle = recovery_result_good ? "DONE" : "THAT DID NOT WORK";
+        text = recovery_result;
+        if (recovery_result_good) {
+            text_red = 170;
+            text_green = 235;
+            text_blue = 170;
+        } else {
+            text_red = 255;
+            text_green = 150;
+            text_blue = 140;
+        }
+        break;
+    default:
+        break;
+    }
+    draw_text_clipped(panel.x + 24, panel.y + 50, panel.width - 48,
+                      subtitle, 200, 214, 255);
     draw_wrapped(panel.x + 24, panel.y + 90, panel.width - 48,
-                 panel.y + 90 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6), reason,
-                 240, 225, 200);
+                 panel.y + 90 + RECOVERY_REASON_LINES * (CHAR_HEIGHT + 6), text,
+                 text_red, text_green, text_blue);
+
+    if (recovery_page == RECOVERY_PAGE_WORKING) {
+        struct rect bar = recovery_pair_rect(0);
+        bar.width = panel.width - 48;
+        fill(bar, 58, 66, 88);
+        fill((struct rect){bar.x + 2, bar.y + 2, bar.width - 4,
+                           bar.height - 4}, 32, 40, 62);
+        int64_t done = (bar.width - 4) * (int64_t)recovery_work_percent / 100;
+        fill((struct rect){bar.x + 2, bar.y + 2, done, bar.height - 4},
+             110, 160, 255);
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_CONFIRM
+        || recovery_page == RECOVERY_PAGE_RESULT) {
+        const char *left = recovery_page == RECOVERY_PAGE_CONFIRM
+            ? "UNDO THE UPDATE"
+            : recovery_result_restart ? "RESTART NOW" : "BACK";
+        const char *right = recovery_page == RECOVERY_PAGE_CONFIRM
+            ? "CANCEL"
+            : recovery_result_restart ? "BACK" : NULL;
+        draw_button(recovery_pair_rect(0), left, recovery_pair_selection == 0);
+        if (right != NULL) {
+            draw_button(recovery_pair_rect(1), right,
+                        recovery_pair_selection == 1);
+        }
+        return;
+    }
 
     if (recovery_page == RECOVERY_PAGE_SIGN_IN) {
         for (size_t i = 0; i < recovery_admin_count; i++) {
@@ -6962,8 +7065,18 @@ static void draw_recovery(void) {
     }
 
     for (size_t i = 0; i < RECOVERY_ACTION_COUNT; i++) {
-        draw_button(recovery_button_rect(i), recovery_action_labels[i],
-                    i == recovery_selection);
+        if (i == RECOVERY_ACTION_UNDO && !recovery_undo_ok) {
+            draw_text_button(recovery_button_rect(i),
+                             recovery_action_labels[i], false);
+            if (i == recovery_selection) {
+                struct rect area = recovery_button_rect(i);
+                fill((struct rect){area.x, area.y + area.height - 3,
+                                   area.width, 3}, 110, 160, 255);
+            }
+        } else {
+            draw_button(recovery_button_rect(i), recovery_action_labels[i],
+                        i == recovery_selection);
+        }
     }
     struct rect last = recovery_button_rect(RECOVERY_ACTION_COUNT - 1);
     int64_t help_top = last.y + last.height + 16;
@@ -6973,7 +7086,11 @@ static void draw_recovery(void) {
     } else {
         draw_wrapped(panel.x + 24, help_top, panel.width - 48,
                      panel.y + panel.height - 8,
-                     recovery_action_help[recovery_selection],
+                     recovery_selection == RECOVERY_ACTION_UNDO
+                             && !recovery_undo_ok
+                         ? "NOT AVAILABLE: NO EARLIER VERSION IS KEPT ON"
+                           " THIS COMPUTER. ONE IS KEPT WHEN OPOS UPDATES."
+                         : recovery_action_help[recovery_selection],
                      170, 185, 215);
     }
 }
@@ -6999,8 +7116,114 @@ static void recovery_power(bool restart) {
     }
 }
 
+static void recovery_work_progress(const char *step, unsigned percent) {
+    recovery_work_step = step;
+    recovery_work_percent = percent > 100 ? 100 : percent;
+    draw_scene();
+}
+
+/* installer.c reports staging the system root as 84-94 percent. */
+static void recovery_repair_progress(const char *step, unsigned percent) {
+    unsigned scaled = percent >= 100 ? 100
+        : percent < 84 ? 0 : (percent - 84) * 10;
+    recovery_work_progress(step, scaled > 100 ? 100 : scaled);
+}
+
+static void recovery_show_result(bool good, bool restart, const char *text) {
+    recovery_result_good = good;
+    recovery_result_restart = restart;
+    recovery_result[0] = '\0';
+    append_text(recovery_result, sizeof(recovery_result), 0, text);
+    recovery_pair_selection = 0;
+    recovery_page = RECOVERY_PAGE_RESULT;
+}
+
+static void recovery_begin_work(const char *step) {
+    recovery_page = RECOVERY_PAGE_WORKING;
+    recovery_work_step = step;
+    recovery_work_percent = 0;
+    draw_scene();
+}
+
+static void recovery_undo(void) {
+    console_serial_log("OPOS: OPOS Recovery: undoing the last update\n");
+    recovery_begin_work("CHECKING THE TWO VERSIONS");
+    const char *error = "UNKNOWN ERROR";
+    bool done = recovery_undo_update(recovery_work_progress, &error);
+    recovery_undo_ok = recovery_undo_available();
+    if (done) {
+        console_serial_log("OPOS: OPOS Recovery: update undone\n");
+        recovery_show_result(true, true,
+            "THE PREVIOUS VERSION IS BACK IN PLACE. RESTART TO USE IT."
+            " TO RETURN TO THE NEWER VERSION, UNDO AGAIN OR CHOOSE \"OPOS"
+            " (PREVIOUS VERSION)\" IN THE BOOT MENU.");
+    } else {
+        console_serial_log("OPOS: OPOS Recovery: undo failed\n");
+        recovery_show_result(false, false, error);
+    }
+}
+
+static void recovery_repair(void) {
+    console_serial_log("OPOS: OPOS Recovery: repairing system files\n");
+    recovery_begin_work("CHECKING SYSTEM FILES");
+    const char *error = "UNKNOWN ERROR";
+    switch (installer_repair_system_root(recovery_repair_progress, &error)) {
+    case INSTALLER_REPAIR_FINE:
+        console_serial_log("OPOS: OPOS Recovery: system files are fine\n");
+        recovery_show_result(true, recovery_reason() == RECOVERY_SYSTEM_FILES,
+            "THE SYSTEM FILES ON THE DISK ARE FINE. NOTHING NEEDED"
+            " REPAIRING.");
+        break;
+    case INSTALLER_REPAIR_FIXED:
+        console_serial_log("OPOS: OPOS Recovery: system files repaired\n");
+        recovery_show_result(true, true,
+            "THE SYSTEM FILES ON THE DISK ARE REPAIRED. RESTART TO USE"
+            " THEM.");
+        break;
+    case INSTALLER_REPAIR_IN_USE:
+        recovery_show_result(false, true,
+            "SOME SYSTEM FILES CHANGED WHILE OPOS WAS RUNNING. RESTART:"
+            " OPOS CHECKS THEM WHEN IT STARTS, AND OPENS RECOVERY AGAIN IF"
+            " THEY ARE DAMAGED.");
+        break;
+    default:
+        console_serial_log("OPOS: OPOS Recovery: repair failed\n");
+        recovery_show_result(false, false, error);
+        break;
+    }
+}
+
+/* The left (0) or right (1) button of CONFIRM or RESULT. */
+static void recovery_pair_run(size_t index) {
+    if (recovery_page == RECOVERY_PAGE_CONFIRM) {
+        if (index == 0) {
+            recovery_undo();
+        } else {
+            recovery_page = RECOVERY_PAGE_MENU;
+        }
+        return;
+    }
+    if (recovery_result_restart && index == 0) {
+        recovery_power(true);
+        return;
+    }
+    if (recovery_result_restart || index == 0) {
+        recovery_page = RECOVERY_PAGE_MENU;
+        recovery_message = "";
+    }
+}
+
 static void recovery_run(enum recovery_action action) {
     switch (action) {
+    case RECOVERY_ACTION_UNDO:
+        if (recovery_undo_ok) {
+            recovery_pair_selection = 1; /* CANCEL */
+            recovery_page = RECOVERY_PAGE_CONFIRM;
+        }
+        break;
+    case RECOVERY_ACTION_REPAIR:
+        recovery_repair();
+        break;
     case RECOVERY_ACTION_START:
         /* The failed-start count stays: a start that fails again comes
            straight back here, one that lasts clears it. */
@@ -7046,6 +7269,25 @@ static void recovery_key(char character) {
         }
         return;
     }
+    if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_CONFIRM
+        || recovery_page == RECOVERY_PAGE_RESULT) {
+        bool two = recovery_page == RECOVERY_PAGE_CONFIRM
+            || recovery_result_restart;
+        if (character == KEY_LEFT || character == KEY_UP) {
+            recovery_pair_selection = 0;
+        } else if (two && (character == KEY_RIGHT || character == KEY_DOWN
+                           || character == '\t')) {
+            recovery_pair_selection = 1;
+        } else if (character == '\n' || character == ' ') {
+            recovery_pair_run(recovery_pair_selection);
+        } else if (character == KEY_ESCAPE) {
+            recovery_page = RECOVERY_PAGE_MENU;
+        }
+        return;
+    }
     if ((character == KEY_UP || character == KEY_LEFT)
         && recovery_selection > 0) {
         recovery_selection--;
@@ -7079,6 +7321,22 @@ static void recovery_press(int32_t x, int32_t y) {
             recovery_power(true);
         } else if (rect_contains(recovery_sign_in_button_rect(2), x, y)) {
             recovery_power(false);
+        }
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_WORKING) {
+        return;
+    }
+    if (recovery_page == RECOVERY_PAGE_CONFIRM
+        || recovery_page == RECOVERY_PAGE_RESULT) {
+        bool two = recovery_page == RECOVERY_PAGE_CONFIRM
+            || recovery_result_restart;
+        for (size_t i = 0; i < (two ? 2u : 1u); i++) {
+            if (rect_contains(recovery_pair_rect(i), x, y)) {
+                recovery_pair_selection = i;
+                recovery_pair_run(i);
+                return;
+            }
         }
         return;
     }

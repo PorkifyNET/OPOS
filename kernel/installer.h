@@ -212,4 +212,21 @@ bool installer_install_partition(const struct installer_layout *layout,
 bool installer_install(size_t disk, installer_progress progress,
                        const char **error);
 
+enum installer_repair {
+    /* The disk system root matched the running system's files. */
+    INSTALLER_REPAIR_FINE,
+    /* It did not, and now does (it is used from the next start). */
+    INSTALLER_REPAIR_FIXED,
+    /* It is the selected root of this start and cannot be changed. */
+    INSTALLER_REPAIR_IN_USE,
+    INSTALLER_REPAIR_FAILED,
+};
+
+/* Checks the disk system root of the running version against its
+   initramfs, and rewrites what differs; when that cannot pass (for
+   example extra files), removes the root and stages it again. Installed
+   systems only. On failure sets *error to a short upper-case reason. */
+enum installer_repair installer_repair_system_root(
+    installer_progress progress, const char **error);
+
 #endif

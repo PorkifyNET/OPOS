@@ -211,6 +211,10 @@ struct package_start_entry {
 
 /* Bracket calls made for a program; enter fails while another program
    installs packages or updates the system. */
+/* Removes a folder and everything in it (or one file). True when it is
+   gone afterwards. Kernel callers only: no permission checks. */
+bool package_remove_tree(const char *root);
+
 bool package_call_enter(void);
 void package_call_leave(void);
 bool package_call_busy(void);

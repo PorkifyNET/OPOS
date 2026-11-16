@@ -85,13 +85,25 @@ VMware check by a human afterwards.
    screen, so no programs start behind it). The count resets 60 s after a
    login, and on a restart or shut-down from the desktop, Terminal or
    shell.
-2. **Undo the last update and repair system files**, including repair from
-   installation media.
+2. **Undo the last update and repair system files.** *Done:*
+   `recovery_undo_update()` copies the older pair to `boot/kernel.new` and
+   `boot/initramfs.new` and this pair to `boot/undo/`, then switches by
+   renames (initramfs first, kernel last) recorded in
+   `/disk/OPOS/UNDO-STATE`, so the boot files are never half-written. A
+   start cut short is finished by `recovery_undo_resume()`, which tells by
+   the running kernel's hash whether it still is the newer one (finish and
+   restart) or already the older one (finish and carry on).
+   `installer_repair_system_root()` checks the current generation against
+   the booted `initramfs.tar`, rewrites the files that differ, and removes
+   and stages the whole tree when that is not enough (extra files).
+   Replacing a damaged `kernel.elf`/`initramfs.tar` from installation media
+   moves to step 5.
 3. **Rescue my files** to a USB stick or another disk.
 4. **Safe start, reset settings, reset a password**, and "RESTART INTO
    RECOVERY" in Settings.
 5. **Start-up log viewer** and **"REPAIR AN INSTALLED OPOS"** on the live
-   ISO/USB.
+   ISO/USB, including replacing a damaged kernel or initramfs from that
+   media.
 
 Later ideas, not planned yet: a FAT disk check (lost clusters, cross-linked
 files), restore points of settings and installed programs ("System

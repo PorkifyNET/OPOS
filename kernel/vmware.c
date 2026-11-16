@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "console.h"
+#include "desktop.h"
 #include "svga.h"
 #include "timer.h"
 #include "vmware.h"
@@ -11,6 +12,11 @@
    Linux vmmouse driver. */
 #define BDOOR_MAGIC 0x564d5868u
 #define BDOOR_PORT 0x5658
+#define BDOOR_CMD_GETPTRLOCATION 4
+#define BDOOR_CMD_GETSELLENGTH 6
+#define BDOOR_CMD_GETNEXTPIECE 7
+#define BDOOR_CMD_SETSELLENGTH 8
+#define BDOOR_CMD_SETNEXTPIECE 9
 #define BDOOR_CMD_GETVERSION 10
 #define BDOOR_CMD_MESSAGE 30
 #define BDOOR_CMD_ABSPOINTER_DATA 39
@@ -63,6 +69,26 @@ static uint64_t next_poll_tick;
 static bool autofit_enabled;
 static uint32_t host_width;
 static uint32_t host_height;
+
+/*
+ * Copy and paste with the host, the "version 1" way older VMware Tools
+ * used (backdoor_def.h, copyPasteCompatX11.c): plain text through the
+ * backdoor's selection commands, 4 bytes per call. VMware tells the guest
+ * where the pointer is; X = -100 means it is outside the VM window. When the
+ * pointer comes in, OPOS takes the host's text; when it leaves (and whenever
+ * the OPOS clipboard changes), OPOS hands VMware its own text. Needs
+ * "Enable copy and paste" in the VM's Guest Isolation settings.
+ */
+#define CLIPBOARD_MAX 0xff00u /* MAX_SELECTION_BUFFER_LENGTH in the tools */
+#define POINTER_OUTSIDE (-100)
+#define POINTER_UNKNOWN 0
+#define POINTER_INSIDE 1
+#define POINTER_AWAY 2
+
+static bool clipboard_supported;
+static int pointer_state;
+static uint32_t sent_generation;
+static char clipboard_buffer[CLIPBOARD_MAX + 4];
 
 static void backdoor(struct backdoor_registers *r) {
     __asm__ volatile ("inl %%dx, %%eax"
@@ -353,8 +379,83 @@ static void handle_tclo_command(const char *command, size_t length) {
     }
 }
 
+/* Hands the OPOS clipboard to VMware, which puts it on the host's clipboard
+   once the pointer leaves the VM window. */
+static void clipboard_send(void) {
+    sent_generation = desktop_clipboard_generation();
+    size_t length = desktop_clipboard_get(clipboard_buffer, CLIPBOARD_MAX);
+    if (length > CLIPBOARD_MAX) {
+        length = CLIPBOARD_MAX;
+    }
+    if (length == 0) {
+        return;
+    }
+    for (size_t i = length; i < length + 4; i++) {
+        clipboard_buffer[i] = '\0';
+    }
+    backdoor_command(BDOOR_CMD_SETSELLENGTH, (uint32_t)length, NULL);
+    for (size_t i = 0; i < length; i += 4) {
+        uint32_t piece = (uint32_t)(uint8_t)clipboard_buffer[i]
+            | (uint32_t)(uint8_t)clipboard_buffer[i + 1] << 8
+            | (uint32_t)(uint8_t)clipboard_buffer[i + 2] << 16
+            | (uint32_t)(uint8_t)clipboard_buffer[i + 3] << 24;
+        backdoor_command(BDOOR_CMD_SETNEXTPIECE, piece, NULL);
+    }
+}
+
+/* Takes the host's clipboard text, if VMware offers any. */
+static void clipboard_receive(void) {
+    uint32_t length = backdoor_command(BDOOR_CMD_GETSELLENGTH, 0, NULL);
+    if (length == 0 || length > CLIPBOARD_MAX) {
+        return; /* 0xffffffff: nothing to give, or copy and paste is off */
+    }
+    for (uint32_t i = 0; i < length; i += 4) {
+        uint32_t piece = backdoor_command(BDOOR_CMD_GETNEXTPIECE, 0, NULL);
+        clipboard_buffer[i] = (char)piece;
+        clipboard_buffer[i + 1] = (char)(piece >> 8);
+        clipboard_buffer[i + 2] = (char)(piece >> 16);
+        clipboard_buffer[i + 3] = (char)(piece >> 24);
+    }
+    /* The tools send C strings; stop at the first NUL. */
+    size_t text_end = 0;
+    while (text_end < length && clipboard_buffer[text_end] != '\0') {
+        text_end++;
+    }
+    if (text_end == 0) {
+        return;
+    }
+    /* Same text as OPOS already has: leave it, so nothing is sent back. */
+    static char current[CLIPBOARD_MAX];
+    size_t current_length = desktop_clipboard_get(current, sizeof(current));
+    bool same = current_length == text_end;
+    for (size_t i = 0; same && i < text_end; i++) {
+        same = current[i] == clipboard_buffer[i];
+    }
+    if (!same) {
+        desktop_clipboard_set(clipboard_buffer, text_end);
+    }
+    sent_generation = desktop_clipboard_generation();
+}
+
+static void clipboard_poll(void) {
+    if (!clipboard_supported) {
+        return;
+    }
+    uint32_t location = backdoor_command(BDOOR_CMD_GETPTRLOCATION, 0, NULL);
+    bool outside = (int16_t)(location >> 16) == POINTER_OUTSIDE;
+    if (outside && pointer_state != POINTER_AWAY) {
+        pointer_state = POINTER_AWAY;
+        clipboard_send();
+    } else if (!outside && pointer_state != POINTER_INSIDE) {
+        pointer_state = POINTER_INSIDE;
+        clipboard_receive();
+    } else if (desktop_clipboard_generation() != sent_generation) {
+        clipboard_send();
+    }
+}
+
 void vmware_tools_poll(void) {
-    if (!tclo.open) {
+    if (!backdoor_present) {
         return;
     }
     uint64_t now = timer_ticks();
@@ -362,6 +463,10 @@ void vmware_tools_poll(void) {
         return;
     }
     next_poll_tick = now + TCLO_POLL_TICKS;
+    clipboard_poll();
+    if (!tclo.open) {
+        return;
+    }
 
     /* Send the previous reply (or an empty message), then take at most a
        few commands per poll so a chatty host cannot stall the UI. */
@@ -418,6 +523,16 @@ void vmware_initialize(void) {
     }
     backdoor_present = true;
     mouse_active = mouse_enable();
+    /* QEMU's vmport answers commands it does not know with EAX = 0xffffffff
+       (older versions leave the magic number). Only VMware answers the
+       pointer location, so only VMware gets the clipboard. */
+    uint32_t location = backdoor_command(BDOOR_CMD_GETPTRLOCATION, 0, NULL);
+    clipboard_supported = location != BDOOR_MAGIC && location != 0xffffffffu;
+    pointer_state = POINTER_UNKNOWN;
+    sent_generation = desktop_clipboard_generation();
+    if (clipboard_supported) {
+        console_write_string("OPOS: VMware copy and paste with the host\n");
+    }
     if (channel_open(&tclo, TCLO_PROTOCOL)) {
         register_capabilities();
         set_reply("");

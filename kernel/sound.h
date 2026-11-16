@@ -25,6 +25,9 @@ bool sound_output_ready(void);
 /* From the timer interrupt: refills the card's ring. */
 void sound_poll(void);
 
+/* Stops the sound card's DMA. Called before a reset or power-off. */
+void sound_stop(void);
+
 /* Plays a square wave of frequency Hz (20-20000) for milliseconds over
    everything else (kernel shell "beep"). False without sound or for a
    frequency out of range. */

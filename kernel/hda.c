@@ -789,6 +789,16 @@ bool hda_initialize(void) {
     return false;
 }
 
+/* Stops the output stream's DMA before a reset or power-off. */
+void hda_stop(void) {
+    if (!ready) {
+        return;
+    }
+    ready = false;
+    write32(stream_base + SD_CTL, stream_ctl() & ~SD_CTL_RUN);
+    wait32(stream_base + SD_CTL, SD_CTL_RUN, 0, 10000);
+}
+
 bool hda_ready(void) {
     return ready;
 }

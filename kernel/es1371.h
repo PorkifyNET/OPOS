@@ -16,6 +16,8 @@
 bool es1371_initialize(void);
 bool es1371_ready(void);
 void es1371_poll(void);
+/* Stops playback, before a reset or power-off. */
+void es1371_stop(void);
 void es1371_set_source(void (*source)(int16_t *out, size_t frames));
 void es1371_describe(void (*print)(const char *line));
 

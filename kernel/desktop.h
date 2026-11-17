@@ -91,6 +91,8 @@ uint64_t desktop_screen_size(void);
    up to capacity bytes and returns the clipboard's full length. */
 void desktop_clipboard_set(const char *text, size_t length);
 size_t desktop_clipboard_get(char *out, size_t capacity);
+/* Goes up by one every time the clipboard is set. */
+uint32_t desktop_clipboard_generation(void);
 /* Every process end: its window goes away. */
 void desktop_app_process_exited(uint64_t process_id);
 

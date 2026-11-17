@@ -360,6 +360,9 @@ static bool text_contains(const char *text, const char *needle) {
 
 static char clipboard[CLIPBOARD_CAPACITY];
 static size_t clipboard_length;
+/* Counts clipboard changes, so VMware copy and paste can tell when to send
+   the text to the host. */
+static uint32_t clipboard_generation;
 
 static void clipboard_set(const char *text, size_t length) {
     if (length > CLIPBOARD_CAPACITY) {
@@ -369,6 +372,11 @@ static void clipboard_set(const char *text, size_t length) {
         clipboard[i] = text[i];
     }
     clipboard_length = length;
+    clipboard_generation++;
+}
+
+uint32_t desktop_clipboard_generation(void) {
+    return clipboard_generation;
 }
 
 void desktop_clipboard_set(const char *text, size_t length) {

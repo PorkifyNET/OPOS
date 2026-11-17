@@ -207,6 +207,8 @@ struct script_state {
     struct opos_html_node *pending[MAX_PENDING]; /* inserted scripts */
     int pending_count;
     const struct opos_html_node *current_script;
+    JSValue import_map;                /* <script type="importmap"> imports */
+    int inline_modules;                /* inline module scripts so far */
     int errors;
     bool running;                      /* inside a script call */
 };
@@ -409,6 +411,9 @@ static void note_inserted_scripts(struct script_state *s,
         if (!ran && !queued && s->pending_count < MAX_PENDING) {
             s->pending[s->pending_count++] = node;
         }
+        return;
+    }
+    if (node->tag == HTML_TAG_TEMPLATE) {
         return;
     }
     for (struct opos_html_node *child = node->first_child; child != NULL;
@@ -878,10 +883,13 @@ static JSValue n_matches(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_EXCEPTION;
     }
     struct css_sheet *selectors = css_selector_parse(text);
-    JS_FreeCString(ctx, text);
     if (selectors == NULL) {
-        return JS_ThrowSyntaxError(ctx, "not a valid selector");
+        JSValue error = JS_ThrowSyntaxError(ctx, "'%s' is not a valid "
+                                            "selector", text);
+        JS_FreeCString(ctx, text);
+        return error;
     }
+    JS_FreeCString(ctx, text);
     bool match = css_selector_matches(selectors, node);
     css_free(selectors);
     return JS_NewBool(ctx, match);
@@ -2168,10 +2176,13 @@ static const JSCFunctionListEntry native_functions[] = {
 
 /* -------------------------------------------------------------- running */
 
-static bool is_classic_script(const struct opos_html_node *node) {
+enum script_kind { SCRIPT_NONE, SCRIPT_CLASSIC, SCRIPT_MODULE,
+                   SCRIPT_IMPORTMAP };
+
+static enum script_kind script_kind(const struct opos_html_node *node) {
     const char *type = opos_html_attribute(node, "type");
     if (type == NULL || type[0] == '\0') {
-        return true;
+        return SCRIPT_CLASSIC;
     }
     static const char *const classic[] = {
         "text/javascript", "application/javascript", "text/ecmascript",
@@ -2180,6 +2191,9 @@ static bool is_classic_script(const struct opos_html_node *node) {
     };
     char lower[48];
     size_t i = 0;
+    while (*type == ' ') {
+        type++;
+    }
     for (; type[i] != '\0' && type[i] != ';' && i + 1 < sizeof(lower); i++) {
         char c = type[i];
         lower[i] = c >= 'A' && c <= 'Z' ? (char)(c + 32) : c;
@@ -2190,10 +2204,45 @@ static bool is_classic_script(const struct opos_html_node *node) {
     lower[i] = '\0';
     for (int k = 0; classic[k] != NULL; k++) {
         if (strcmp(lower, classic[k]) == 0) {
-            return true;
+            return SCRIPT_CLASSIC;
         }
     }
-    return false;
+    if (strcmp(lower, "module") == 0) {
+        return SCRIPT_MODULE;
+    }
+    if (strcmp(lower, "importmap") == 0) {
+        return SCRIPT_IMPORTMAP;
+    }
+    return SCRIPT_NONE;
+}
+
+/* Fetches a script's text (with the site's cookies); false after logging
+   why not. Free response with opos_http_free. */
+static bool fetch_script(struct script_state *s, const char *url,
+                         struct opos_http_response *response) {
+    char status[OPOS_HTTP_URL_MAX + 16];
+    snprintf(status, sizeof(status), "Script: %s", url);
+    browser_status(status);
+    cookies_attach(true);
+    long error = opos_http_get(url, SCRIPT_MAX_BYTES, response);
+    cookies_detach();
+    if (s->deadline != 0) {
+        s->deadline = uptime_ms() + SCRIPT_TIME_MS; /* waiting is free */
+    }
+    char line[OPOS_HTTP_URL_MAX + 40];
+    if (error != 0) {
+        snprintf(line, sizeof(line), "could not load %s (%ld)", url, error);
+        log_line(s, "error", line);
+        return false;
+    }
+    if (response->status != 200) {
+        snprintf(line, sizeof(line), "HTTP %ld for %s", response->status,
+                 url);
+        log_line(s, "error", line);
+        opos_http_free(response);
+        return false;
+    }
+    return true;
 }
 
 static void evaluate(struct script_state *s, const char *code, size_t length,
@@ -2208,6 +2257,187 @@ static void evaluate(struct script_state *s, const char *code, size_t length,
     end_call(s);
 }
 
+/* ------------------------------------------------------------- modules */
+
+/* The import map's "imports" entry for a bare specifier: an exact key,
+   or the longest key ending in "/" that starts it. */
+static bool import_map_lookup(struct script_state *s, const char *name,
+                              char *out, size_t capacity) {
+    JSContext *ctx = s->context;
+    if (!JS_IsObject(s->import_map)) {
+        return false;
+    }
+    JSPropertyEnum *names;
+    uint32_t count;
+    if (JS_GetOwnPropertyNames(ctx, &names, &count, s->import_map,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) != 0) {
+        return false;
+    }
+    size_t best = 0;
+    bool found = false;
+    size_t name_length = strlen(name);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *key = JS_AtomToCString(ctx, names[i].atom);
+        if (key == NULL) {
+            continue;
+        }
+        size_t key_length = strlen(key);
+        bool exact = strcmp(key, name) == 0;
+        bool prefix = key_length > 0 && key[key_length - 1] == '/'
+                    && key_length <= name_length
+                    && strncmp(key, name, key_length) == 0;
+        if ((exact || prefix) && (exact || key_length > best)) {
+            JSValue value = JS_GetProperty(ctx, s->import_map, names[i].atom);
+            const char *target = JS_ToCString(ctx, value);
+            if (target != NULL) {
+                snprintf(out, capacity, "%s%s", target,
+                         exact ? "" : name + key_length);
+                found = true;
+                best = exact ? (size_t)-1 : key_length;
+                JS_FreeCString(ctx, target);
+            }
+            JS_FreeValue(ctx, value);
+        }
+        JS_FreeCString(ctx, key);
+        if (best == (size_t)-1) {
+            break;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        JS_FreeAtom(ctx, names[i].atom);
+    }
+    js_free(ctx, names);
+    return found;
+}
+
+/* Module specifiers become absolute URLs: relative to the importing
+   module, or through the page's import map. */
+static char *module_normalize(JSContext *ctx, const char *base,
+                              const char *name, void *opaque) {
+    struct script_state *s = opaque;
+    char mapped[OPOS_HTTP_URL_MAX];
+    const char *spec = name;
+    if (import_map_lookup(s, name, mapped, sizeof(mapped))) {
+        spec = mapped;
+        base = s->page->url;
+    } else {
+        bool relative = name[0] == '/' || strncmp(name, "./", 2) == 0
+                      || strncmp(name, "../", 3) == 0;
+        bool absolute = strstr(name, "://") != NULL
+                     || strncmp(name, "data:", 5) == 0;
+        if (!relative && !absolute) {
+            JS_ThrowTypeError(ctx, "Failed to resolve module specifier "
+                              "\"%s\"", name);
+            return NULL;
+        }
+    }
+    char url[OPOS_HTTP_URL_MAX];
+    if (!opos_url_resolve(base, spec, url, sizeof(url))) {
+        JS_ThrowTypeError(ctx, "bad module address \"%s\"", name);
+        return NULL;
+    }
+    return js_strdup(ctx, url);
+}
+
+/* Compiles module text and sets import.meta.url: the module as a value
+   for JS_EvalFunction, or JS_EXCEPTION. */
+static JSValue module_compile(JSContext *ctx, const char *code,
+                              size_t length, const char *name,
+                              const char *url) {
+    JSValue function = JS_Eval(ctx, code, length, name,
+                               JS_EVAL_TYPE_MODULE
+                               | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(function)) {
+        return function;
+    }
+    JSValue meta = JS_GetImportMeta(ctx, JS_VALUE_GET_PTR(function));
+    if (JS_IsObject(meta)) {
+        JS_SetPropertyStr(ctx, meta, "url", JS_NewString(ctx, url));
+    }
+    JS_FreeValue(ctx, meta);
+    return function;
+}
+
+static JSModuleDef *module_load(JSContext *ctx, const char *url,
+                                void *opaque) {
+    struct script_state *s = opaque;
+    struct opos_http_response response;
+    if (!fetch_script(s, url, &response)) {
+        JS_ThrowTypeError(ctx, "could not load module %s", url);
+        return NULL;
+    }
+    JSValue function = module_compile(ctx, (const char *)response.body,
+                                      response.length, url, url);
+    opos_http_free(&response);
+    if (JS_IsException(function)) {
+        return NULL;
+    }
+    /* The runtime keeps loaded modules. */
+    JSModuleDef *module = JS_VALUE_GET_PTR(function);
+    JS_FreeValue(ctx, function);
+    return module;
+}
+
+/* Runs a module (its imports load first); errors, also later ones from
+   top-level await, are reported. */
+static void run_module(struct script_state *s, const char *code,
+                       size_t length, const char *name, const char *url) {
+    JSContext *ctx = s->context;
+    begin_call(s);
+    JSValue function = module_compile(ctx, code, length, name, url);
+    if (JS_IsException(function)) {
+        report_exception(ctx);
+        end_call(s);
+        return;
+    }
+    JSValue result = JS_EvalFunction(ctx, function);
+    if (JS_IsException(result)) {
+        report_exception(ctx);
+    } else {
+        JS_FreeValue(ctx, call_hook(s, "settle", 1, &result));
+    }
+    JS_FreeValue(ctx, result);
+    end_call(s);
+}
+
+static void read_import_map(struct script_state *s,
+                            const struct opos_html_node *node) {
+    JSContext *ctx = s->context;
+    struct text_buffer b = {0};
+    text_content(&b, node, 0);
+    if (b.data == NULL || b.failed) {
+        free(b.data);
+        return;
+    }
+    JSValue map = JS_ParseJSON(ctx, b.data, b.length, "importmap");
+    free(b.data);
+    if (JS_IsException(map)) {
+        report_exception(ctx);
+        return;
+    }
+    JSValue imports = JS_GetPropertyStr(ctx, map, "imports");
+    JS_FreeValue(ctx, map);
+    if (!JS_IsObject(imports)) {
+        JS_FreeValue(ctx, imports);
+        return;
+    }
+    if (!JS_IsObject(s->import_map)) {
+        JS_FreeValue(ctx, s->import_map);
+        s->import_map = imports;
+        return;
+    }
+    /* A later map adds the keys it has. */
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue object = JS_GetPropertyStr(ctx, global, "Object");
+    JSValue assign = JS_GetPropertyStr(ctx, object, "assign");
+    JSValue args[2] = {s->import_map, imports};
+    JS_FreeValue(ctx, JS_Call(ctx, assign, object, 2, args));
+    JS_FreeValue(ctx, assign);
+    JS_FreeValue(ctx, object);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, imports);
+}
+
 static void run_script(struct script_state *s,
                        const struct opos_html_node *node) {
     JSContext *ctx = s->context;
@@ -2217,52 +2447,55 @@ static void run_script(struct script_state *s,
         return;
     }
     w->ran = true;
-    if (!is_classic_script(node) || opos_html_attribute(node, "nomodule")) {
+    enum script_kind kind = script_kind(node);
+    if (kind == SCRIPT_IMPORTMAP) {
+        read_import_map(s, node);
+        return;
+    }
+    if (kind == SCRIPT_NONE
+        || (kind == SCRIPT_CLASSIC && opos_html_attribute(node, "nomodule"))) {
         return;
     }
     const char *src = opos_html_attribute(node, "src");
-    s->current_script = node;
+    bool loaded = false;
+    s->current_script = kind == SCRIPT_CLASSIC ? node : NULL;
     if (src != NULL) {
         char url[OPOS_HTTP_URL_MAX];
+        struct opos_http_response response;
         if (src[0] != '\0'
-            && opos_url_resolve(s->page->url, src, url, sizeof(url))) {
-            char status[OPOS_HTTP_URL_MAX + 16];
-            snprintf(status, sizeof(status), "Script: %s", url);
-            browser_status(status);
-            struct opos_http_response response;
-            cookies_attach(true);
-            long error = opos_http_get(url, SCRIPT_MAX_BYTES, &response);
-            cookies_detach();
-            if (error == 0) {
-                if (response.status == 200) {
-                    evaluate(s, (const char *)response.body, response.length,
-                             url);
-                } else {
-                    char line[OPOS_HTTP_URL_MAX + 40];
-                    snprintf(line, sizeof(line), "HTTP %ld for %s",
-                             response.status, url);
-                    log_line(s, "error", line);
-                }
-                opos_http_free(&response);
+            && opos_url_resolve(s->page->url, src, url, sizeof(url))
+            && fetch_script(s, url, &response)) {
+            loaded = true;
+            if (kind == SCRIPT_MODULE) {
+                run_module(s, (const char *)response.body, response.length,
+                           url, url);
             } else {
-                char line[OPOS_HTTP_URL_MAX + 40];
-                snprintf(line, sizeof(line), "could not load %s (%ld)", url,
-                         error);
-                log_line(s, "error", line);
+                evaluate(s, (const char *)response.body, response.length,
+                         url);
             }
+            opos_http_free(&response);
         }
     } else {
         struct text_buffer b = {0};
         text_content(&b, node, 0);
         if (b.data != NULL && !b.failed) {
-            evaluate(s, b.data, b.length, s->page->url);
+            if (kind == SCRIPT_MODULE) {
+                /* Each inline module needs a name of its own. */
+                char name[OPOS_HTTP_URL_MAX + 24];
+                snprintf(name, sizeof(name), "%s#module-%d", s->page->url,
+                         ++s->inline_modules);
+                run_module(s, b.data, b.length, name, s->page->url);
+            } else {
+                evaluate(s, b.data, b.length, s->page->url);
+            }
         }
         free(b.data);
     }
     s->current_script = NULL;
-    /* "load" for scripts with src. */
+    /* "load" (or "error") for scripts with src. */
     if (src != NULL) {
-        JSValue args[2] = {wrap(ctx, node), JS_NewString(ctx, "load")};
+        JSValue args[2] = {wrap(ctx, node),
+                           JS_NewString(ctx, loaded ? "load" : "error")};
         begin_call(s);
         JS_FreeValue(ctx, call_hook(s, "fire", 2, args));
         end_call(s);
@@ -2295,6 +2528,9 @@ static void collect_scripts(const struct opos_html_node *node,
                 list[(*count)++] = node;
             }
             continue;
+        }
+        if (node->tag == HTML_TAG_TEMPLATE) {
+            continue; /* template content is inert */
         }
         collect_scripts(node->first_child, list, count, capacity);
     }
@@ -2348,6 +2584,8 @@ void script_page_start(struct page *page) {
     s->element_proto = JS_NULL;
     s->text_proto = JS_NULL;
     s->hooks = JS_UNDEFINED;
+    s->import_map = JS_UNDEFINED;
+    JS_SetModuleLoaderFunc(s->runtime, module_normalize, module_load, s);
     page->script = s;
 
     /* dom.js is "(function (N, setProtos) { ... return hooks; })". */
@@ -2378,14 +2616,26 @@ void script_page_start(struct page *page) {
     s->text_proto = JS_GetPropertyStr(ctx, result, "textProto");
     end_call(s);
 
-    /* Scripts in document order (all as if parsing had finished; async
-       and defer make no difference here). */
+    /* All as if parsing had finished: first the scripts that would block
+       the parser and async ones, in document order; then deferred
+       scripts and modules (deferred unless async), in document order;
+       then DOMContentLoaded. */
     size_t capacity = 1024, count = 0;
     const struct opos_html_node **list = malloc(capacity * sizeof(*list));
     if (list != NULL) {
         collect_scripts(page->doc->root, list, &count, capacity);
-        for (size_t i = 0; i < count && page->script == s; i++) {
-            if (connected(s, list[i])) {
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < count && page->script == s; i++) {
+                enum script_kind kind = script_kind(list[i]);
+                bool later = (kind == SCRIPT_MODULE
+                              && opos_html_attribute(list[i], "async") == NULL)
+                          || (kind == SCRIPT_CLASSIC
+                              && opos_html_attribute(list[i], "defer") != NULL
+                              && opos_html_attribute(list[i], "src") != NULL
+                              && opos_html_attribute(list[i], "async") == NULL);
+                if (later != (pass == 1) || !connected(s, list[i])) {
+                    continue;
+                }
                 run_script(s, list[i]);
                 run_pending(s);
             }
@@ -2422,6 +2672,7 @@ void script_page_end(struct page *page) {
     JS_FreeValue(ctx, s->element_proto);
     JS_FreeValue(ctx, s->text_proto);
     JS_FreeValue(ctx, s->hooks);
+    JS_FreeValue(ctx, s->import_map);
     JS_FreeContext(ctx);
     JS_FreeRuntime(s->runtime);
     free(s);

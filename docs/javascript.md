@@ -157,10 +157,57 @@ timers and the network APIs.
      still passes 22/22; BBC News now hydrates and shows its full front
      page (before, React gave up with "Application error"); GitHub and
      Hacker News load without script errors.
-4. **Modules and more**: `type="module"` and `import`, `async`/`defer`
-   order, `MutationObserver` that reports, `<template>` and custom
-   elements, `<canvas>` 2D drawing.
-5. **Speed**: keep compiled bytecode of large scripts for the session,
+4. **Modules and more** (done): `type="module"` and `import`,
+   `async`/`defer` order, `MutationObserver` that reports, `<template>`
+   and custom elements.
+   - Modules: `<script type="module">` (inline or `src`), static and
+     dynamic `import`, `import.meta.url`, top-level `await`. QuickJS
+     loads each module once per page through `JS_SetModuleLoaderFunc`;
+     the browser fetches it with the page's cookies. `<script
+     type="importmap">` maps bare names (exact keys and `"prefix/"`
+     keys); an unmapped bare name throws `TypeError`. Errors in a
+     module (also after `await`) are reported through the `settle` hook.
+     `nomodule` scripts are skipped. `HTMLScriptElement.supports`.
+   - Order: scripts run in two passes as in browsers. First the
+     classic scripts and async scripts in page order, then `defer`
+     scripts with `src` and non-async modules in page order.
+   - Every change to the tree goes through `N.insert`, `N.remove`,
+     `N.setAttr`, `N.removeAttr` and `N.setData`. dom.js wraps them;
+     while observers or custom elements exist, the wrappers record the
+     change. With neither, nothing extra runs.
+   - `MutationObserver`: `childList`, `attributes` (with
+     `attributeFilter` and `attributeOldValue`), `characterData`,
+     `subtree`; records come in a microtask; `takeRecords`,
+     `disconnect`.
+   - `ResizeObserver`: sizes from the layout, checked after observe,
+     after each timer round and on window `resize`.
+   - `<template>`: `content` is a fragment (the children move there the
+     first time); `innerHTML` on a template reads and writes the
+     content; scripts inside templates never run.
+   - Custom elements: `customElements.define/get/getName/whenDefined/
+     upgrade`, `class X extends HTMLElement` with `new X()`,
+     `createElement` and upgrades of elements already on the page;
+     `connectedCallback`, `disconnectedCallback`,
+     `attributeChangedCallback` for `observedAttributes`.
+   - Selectors: CSS escapes (`.md\:flex`, `.w-1\/2`, `.\31 0`, as
+     Tailwind uses) and `:not(a, b)` with compound selectors (it
+     counts as its most specific argument). Selector errors now name
+     the selector.
+   - Also: `new Image()`, `new Option()`, `new Audio()`.
+   - Not yet: shadow DOM (`attachShadow`), customized built-ins
+     (`is="..."`), `:not()` with combinators inside, module scripts in
+     workers, `import` attributes (JSON modules).
+   - Tested in QEMU: a test page with 15 checks (import map, static and
+     dynamic import, import.meta, nomodule, bad import, run order,
+     MutationObserver, takeRecords, template, custom elements,
+     ResizeObserver, escaped selectors, `:not()`, `new Image`) passes;
+     the step 3 CSS test still passes 17/17 and the network test 22/22;
+     BBC News and GitHub load without script errors (GitHub's popover
+     code needed `:not([attr])` and escaped selectors).
+5. **Canvas 2D**: `<canvas>` with `getContext('2d')` (paths, fills,
+   strokes, text, images, `toDataURL`), drawn into the page. It needs a
+   rasterizer of its own, so it moved out of step 4.
+6. **Speed**: keep compiled bytecode of large scripts for the session,
    lay out only once per batch of changes, and measure heavy sites.
 
 ## Not planned

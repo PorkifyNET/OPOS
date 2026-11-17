@@ -761,12 +761,17 @@ class Element extends Node {
     }
     get nextElementSibling() { return nextElement(this, N.next); }
     get previousElementSibling() { return nextElement(this, N.prev); }
-    get innerHTML() { return N.html(this, false); }
+    get innerHTML() {
+        if (N.name(this) === 'template')
+            return children(this.content).map(c => N.html(c, true)).join('');
+        return N.html(this, false);
+    }
     set innerHTML(markup) {
-        for (const c of children(this)) N.remove(c);
+        const into = N.name(this) === 'template' ? this.content : this;
+        for (const c of children(into)) N.remove(c);
         const fragment = N.fragment(String(markup ?? ''));
         N.inert(fragment);
-        for (const c of children(fragment)) N.insert(this, c, null);
+        for (const c of children(fragment)) N.insert(into, c, null);
     }
     get outerHTML() { return N.html(this, true); }
     set outerHTML(markup) {
@@ -904,6 +909,8 @@ const BOOLEAN_ATTRIBUTES = ['hidden', 'disabled', 'readOnly', 'required',
     'spellcheck', 'translate', 'default', 'playsInline'];
 
 class HTMLElement extends Element {
+    /* Only custom elements are made this way (new MyElement()). */
+    constructor() { return constructCustom(new.target); }
     get style() { return cached(this, 'style', styleFor); }
     set style(v) { N.setAttr(this, 'style', String(v)); }
     get dataset() { return cached(this, 'dataset', datasetFor); }
@@ -1059,9 +1066,15 @@ class HTMLElement extends Element {
     /* <template>; <meta content> */
     get content() {
         if (N.name(this) !== 'template') return N.attr(this, 'content') || '';
-        const fragment = document.createDocumentFragment();
-        for (const c of children(this)) N.insert(fragment, N.clone(c, true), null);
-        return fragment;
+        /* The children move to the fragment the first time. */
+        return cached(this, 'content', element => {
+            const fragment = N.create('#fragment');
+            for (const c of children(element)) raw.insert(fragment, c, null);
+            return fragment;
+        });
+    }
+    set content(v) {
+        if (N.name(this) !== 'template') N.setAttr(this, 'content', String(v));
     }
     /* <canvas>, <video>, <audio>: not drawn or played yet. */
     getContext() { return null; }
@@ -1190,6 +1203,31 @@ for (const type of ELEMENT_TYPES) {
     });
     G[type] = constructor;
 }
+G.HTMLScriptElement.supports = type =>
+    ['classic', 'module', 'importmap'].includes(String(type));
+/* new Image(), new Option(), new Audio(): elements made the old way. */
+function Image(width, height) {
+    const element = N.create('img');
+    if (width !== undefined) N.setAttr(element, 'width', String(width));
+    if (height !== undefined) N.setAttr(element, 'height', String(height));
+    return element;
+}
+Image.prototype = G.HTMLImageElement.prototype;
+function Option(text, value, defaultSelected, selected) {
+    const element = N.create('option');
+    if (text !== undefined) element.textContent = String(text);
+    if (value !== undefined) N.setAttr(element, 'value', String(value));
+    if (defaultSelected) N.setAttr(element, 'selected', '');
+    if (selected) element.selected = true;
+    return element;
+}
+Option.prototype = G.HTMLOptionElement.prototype;
+function Audio(src) {
+    const element = N.create('audio');
+    if (src !== undefined) N.setAttr(element, 'src', String(src));
+    return element;
+}
+Audio.prototype = G.HTMLAudioElement.prototype;
 
 /* ------------------------------------------------------- the document */
 
@@ -1265,7 +1303,7 @@ class Document extends EventTarget {
         return {hasFeature: () => true,
                 createHTMLDocument: () => document};
     }
-    createElement(name) { return N.create(String(name)); }
+    createElement(name) { return createElement(String(name)); }
     createElementNS(ns, name) {
         return N.create(String(name).replace(/^.*:/, ''));
     }
@@ -1577,6 +1615,7 @@ function runTimers(now) {
         }
     }
     flushStorage();
+    if (resizeObservers.size > 0) checkResizes();
     if (netQueue.length > 0) return 0;
     let next = -1;
     const after = N.now();
@@ -2147,6 +2186,333 @@ function flushStorage() {
     N.storageSave(JSON.stringify(Object.fromEntries(persistent._m)));
 }
 
+/* ------------------------------------- mutations and custom elements */
+
+/* Every change to the tree goes through N.insert, N.remove, N.setAttr,
+   N.removeAttr and N.setData; while observers or custom elements exist,
+   these record it. */
+const raw = {insert: N.insert, remove: N.remove, setAttr: N.setAttr,
+             removeAttr: N.removeAttr, setData: N.setData};
+const registrations = [];          /* {observer, target, options} */
+const customDefs = new Map();      /* name -> definition */
+const customByClass = new Map();   /* constructor -> definition */
+const upgraded = new WeakSet();
+const definedWaits = new Map();    /* name -> [resolve] */
+let upgrading = null;
+
+function insideOf(ancestor, node) {
+    if (ancestor === document) return N.connected(node);
+    for (let n = node; n; n = N.parent(n)) if (n === ancestor) return true;
+    return false;
+}
+
+class MutationRecord {
+    constructor(type, target, info) {
+        this.type = type;
+        this.target = target;
+        this.addedNodes = toArray(info.added || []);
+        this.removedNodes = toArray(info.removed || []);
+        this.previousSibling = info.previous || null;
+        this.nextSibling = info.next || null;
+        this.attributeName = info.name || null;
+        this.attributeNamespace = null;
+        this.oldValue = null;
+    }
+}
+
+let deliveryQueued = false;
+const observersWaiting = new Set();
+function queueRecord(type, target, info) {
+    const given = new Set();
+    for (const reg of registrations) {
+        const o = reg.options;
+        if (given.has(reg.observer)) continue;
+        if (reg.target !== target && !(o.subtree && insideOf(reg.target, target)))
+            continue;
+        if (type === 'childList' && !o.childList) continue;
+        if (type === 'attributes' && (!o.attributes || (o.attributeFilter
+                && !o.attributeFilter.includes(info.name)))) continue;
+        if (type === 'characterData' && !o.characterData) continue;
+        const record = new MutationRecord(type, target, info);
+        if ((type === 'attributes' && o.attributeOldValue)
+            || (type === 'characterData' && o.characterDataOldValue))
+            record.oldValue = info.old;
+        given.add(reg.observer);
+        reg.observer._records.push(record);
+        observersWaiting.add(reg.observer);
+    }
+    if (observersWaiting.size > 0 && !deliveryQueued) {
+        deliveryQueued = true;
+        Promise.resolve().then(deliverRecords);
+    }
+}
+function deliverRecords() {
+    deliveryQueued = false;
+    const list = Array.from(observersWaiting);
+    observersWaiting.clear();
+    for (const observer of list) {
+        const records = observer._records.splice(0);
+        if (records.length === 0) continue;
+        try {
+            observer._callback.call(observer, records, observer);
+        } catch (e) {
+            reportError(e);
+        }
+    }
+}
+
+function customCall(element, name, args) {
+    const f = element[name];
+    if (typeof f !== 'function') return;
+    try { f.apply(element, args); } catch (e) { reportError(e); }
+}
+function upgrade(element, def) {
+    if (upgraded.has(element)) return;
+    upgraded.add(element);
+    upgrading = element;
+    try {
+        new def.ctor();
+    } catch (e) {
+        reportError(e);
+    }
+    upgrading = null;
+    for (const name of def.observed) {
+        const value = N.attr(element, name);
+        if (value !== null)
+            customCall(element, 'attributeChangedCallback',
+                       [name, null, value]);
+    }
+    if (N.connected(element)) customCall(element, 'connectedCallback', []);
+}
+/* The custom elements in node's tree (node first). */
+function customIn(node) {
+    if (N.kind(node) !== 1 && !isFragment(node)) return [];
+    const list = N.kind(node) === 1 ? [node] : [];
+    for (const e of N.query(node, '*', true)) list.push(e);
+    return list.filter(e => N.name(e).includes('-'));
+}
+function customConnected(node) {
+    for (const e of customIn(node)) {
+        const def = customDefs.get(N.name(e));
+        if (!def) continue;
+        if (!upgraded.has(e)) upgrade(e, def);
+        else customCall(e, 'connectedCallback', []);
+    }
+}
+function customDisconnected(node) {
+    for (const e of customIn(node))
+        if (upgraded.has(e)) customCall(e, 'disconnectedCallback', []);
+}
+function attributeChanged(element, name, old, value) {
+    if (!upgraded.has(element)) return;
+    const def = customDefs.get(N.name(element));
+    if (def && def.observed.includes(name))
+        customCall(element, 'attributeChangedCallback', [name, old, value]);
+}
+
+const watching = () => registrations.length > 0 || customDefs.size > 0;
+N.insert = (parent, node, before) => {
+    if (!watching()) return raw.insert(parent, node, before);
+    const old = N.parent(node);
+    const was = old !== null && N.connected(node);
+    if (old !== null) {
+        queueRecord('childList', old, {removed: [node], previous: N.prev(node),
+                                       next: N.next(node)});
+        if (was) customDisconnected(node);
+    }
+    const result = raw.insert(parent, node, before);
+    queueRecord('childList', parent, {added: [node], previous: N.prev(node),
+                                      next: N.next(node)});
+    if (customDefs.size > 0 && N.connected(node)) customConnected(node);
+    return result;
+};
+N.remove = node => {
+    if (!watching()) return raw.remove(node);
+    const parent = N.parent(node);
+    const was = parent !== null && N.connected(node);
+    if (parent !== null)
+        queueRecord('childList', parent, {removed: [node],
+                                          previous: N.prev(node),
+                                          next: N.next(node)});
+    const result = raw.remove(node);
+    if (was && customDefs.size > 0) customDisconnected(node);
+    return result;
+};
+N.setAttr = (element, name, value) => {
+    if (!watching()) return raw.setAttr(element, name, value);
+    const key = String(name).toLowerCase();
+    const old = N.attr(element, name);
+    const result = raw.setAttr(element, name, value);
+    queueRecord('attributes', element, {name: key, old});
+    attributeChanged(element, key, old, String(value));
+    return result;
+};
+N.removeAttr = (element, name) => {
+    if (!watching()) return raw.removeAttr(element, name);
+    const key = String(name).toLowerCase();
+    const old = N.attr(element, name);
+    const result = raw.removeAttr(element, name);
+    if (old !== null) {
+        queueRecord('attributes', element, {name: key, old});
+        attributeChanged(element, key, old, null);
+    }
+    return result;
+};
+N.setData = (node, value) => {
+    if (!watching()) return raw.setData(node, value);
+    const old = N.data(node);
+    const result = raw.setData(node, value);
+    queueRecord('characterData', node, {old});
+    return result;
+};
+
+class MutationObserver {
+    constructor(callback) {
+        if (typeof callback !== 'function')
+            throw new TypeError('MutationObserver needs a function');
+        define(this, '_callback', callback);
+        define(this, '_records', []);
+    }
+    observe(target, options = {}) {
+        if (!(target instanceof Node) && target !== document)
+            throw new TypeError('observe: not a Node');
+        const o = Object.assign({}, options);
+        if (o.attributeFilter !== undefined) {
+            o.attributeFilter = Array.from(o.attributeFilter, String);
+            if (o.attributes === undefined) o.attributes = true;
+        }
+        if (o.attributeOldValue && o.attributes === undefined)
+            o.attributes = true;
+        if (o.characterDataOldValue && o.characterData === undefined)
+            o.characterData = true;
+        if (!o.childList && !o.attributes && !o.characterData)
+            throw new TypeError('observe: nothing to observe');
+        const old = registrations.find(r => r.observer === this
+                                            && r.target === target);
+        if (old) old.options = o;
+        else registrations.push({observer: this, target, options: o});
+    }
+    disconnect() {
+        for (let i = registrations.length - 1; i >= 0; i--)
+            if (registrations[i].observer === this) registrations.splice(i, 1);
+        this._records.length = 0;
+    }
+    takeRecords() { return this._records.splice(0); }
+}
+
+const customElements = {
+    define(name, ctor, options) {
+        name = String(name);
+        if (!/^[a-z][a-z0-9._·-￿]*-[a-z0-9._·-￿-]*$/
+                .test(name))
+            throw new DOMException('"' + name + '" is not a valid custom '
+                                   + 'element name', 'SyntaxError');
+        if (customDefs.has(name) || customByClass.has(ctor))
+            throw new DOMException('"' + name + '" is already defined',
+                                   'NotSupportedError');
+        if (typeof ctor !== 'function')
+            throw new TypeError('define: not a constructor');
+        const def = {name, ctor, observed:
+            Array.from(ctor.observedAttributes || [], a => String(a)
+                       .toLowerCase()),
+            extends: options && options.extends};
+        customDefs.set(name, def);
+        customByClass.set(ctor, def);
+        for (const e of N.query(N.root(), name, true)) upgrade(e, def);
+        for (const resolve of definedWaits.get(name) || []) resolve(ctor);
+        definedWaits.delete(name);
+    },
+    get(name) {
+        const def = customDefs.get(String(name));
+        return def ? def.ctor : undefined;
+    },
+    getName(ctor) {
+        const def = customByClass.get(ctor);
+        return def ? def.name : null;
+    },
+    whenDefined(name) {
+        name = String(name);
+        const def = customDefs.get(name);
+        if (def) return Promise.resolve(def.ctor);
+        return new Promise(resolve => {
+            if (!definedWaits.has(name)) definedWaits.set(name, []);
+            definedWaits.get(name).push(resolve);
+        });
+    },
+    upgrade(root) {
+        for (const e of customIn(root)) {
+            const def = customDefs.get(N.name(e));
+            if (def) upgrade(e, def);
+        }
+    },
+};
+/* new MyElement() and upgrades both come here (HTMLElement's
+   constructor). */
+function constructCustom(target) {
+    const def = customByClass.get(target);
+    if (!def) illegal();
+    let element = upgrading;
+    upgrading = null;
+    if (!element) {
+        element = N.create(def.name);
+        upgraded.add(element);
+    }
+    Object.setPrototypeOf(element, target.prototype);
+    return element;
+}
+function createElement(name) {
+    const element = N.create(name);
+    const def = customDefs.get(String(name).toLowerCase());
+    if (def) upgrade(element, def);
+    return element;
+}
+
+/* ResizeObserver: sizes from the layout, checked after each timer round
+   and when the window changes size. */
+const resizeObservers = new Set();
+class ResizeObserver {
+    constructor(callback) {
+        if (typeof callback !== 'function')
+            throw new TypeError('ResizeObserver needs a function');
+        define(this, '_callback', callback);
+        define(this, '_targets', new Map());
+    }
+    observe(target) {
+        if (!this._targets.has(target)) this._targets.set(target, [0, 0]);
+        resizeObservers.add(this);
+        addTimer(checkResizes, 0, [], false);
+    }
+    unobserve(target) {
+        this._targets.delete(target);
+        if (this._targets.size === 0) resizeObservers.delete(this);
+    }
+    disconnect() {
+        this._targets.clear();
+        resizeObservers.delete(this);
+    }
+}
+function checkResizes() {
+    for (const observer of Array.from(resizeObservers)) {
+        const entries = [];
+        for (const [target, last] of observer._targets) {
+            const r = layoutRect(target);
+            const w = r ? r[2] : 0, h = r ? r[3] : 0;
+            if (w === last[0] && h === last[1]) continue;
+            observer._targets.set(target, [w, h]);
+            const size = [{inlineSize: w, blockSize: h}];
+            entries.push({target, contentRect: new DOMRectReadOnly(0, 0, w, h),
+                          borderBoxSize: size, contentBoxSize: size,
+                          devicePixelContentBoxSize: size});
+        }
+        if (entries.length === 0) continue;
+        try {
+            observer._callback.call(observer, entries, observer);
+        } catch (e) {
+            reportError(e);
+        }
+    }
+}
+
 class Observer {
     constructor(callback) { this._callback = callback; }
     observe() {}
@@ -2154,8 +2520,6 @@ class Observer {
     disconnect() {}
     takeRecords() { return []; }
 }
-class MutationObserver extends Observer {}
-class ResizeObserver extends Observer {}
 class IntersectionObserver extends Observer {
     /* Reports everything as visible once, so lazy loaders load. */
     observe(target) {
@@ -2648,6 +3012,7 @@ const api = {
     InputEvent, KeyboardEvent, SubmitEvent, ErrorEvent, ProgressEvent,
     PopStateEvent, HashChangeEvent, URL, URLSearchParams, DOMTokenList,
     Storage, AbortController, AbortSignal, MutationObserver, DOMException,
+    MutationRecord, customElements, Image, Option, Audio,
     fetch, Request, Response, Headers, XMLHttpRequest, crypto, Crypto,
     XMLHttpRequestEventTarget, FormData, Blob, File, TextEncoder,
     TextDecoder, DOMRect, DOMRectReadOnly, StyleSheet, CSSStyleSheet,
@@ -2788,6 +3153,9 @@ return {
     flush: flushStorage,
     /* True while requests wait for the next round. */
     waiting: () => netQueue.length > 0,
+    /* A module's evaluation: its error (also after top-level await) is
+       reported. */
+    settle(promise) { Promise.resolve(promise).then(null, reportError); },
     /* A click (or other mouse event) from the browser; true when a script
        cancelled it. */
     dispatch(target, type, x, y, button) {
@@ -2824,6 +3192,7 @@ return {
         }
         dispatch(which === 'window' ? G : document,
                  new Event(type, {bubbles: true}));
+        if (type === 'resize' && resizeObservers.size > 0) checkResizes();
     },
 };
 })

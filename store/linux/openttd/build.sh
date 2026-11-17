@@ -245,7 +245,7 @@ name: OpenTTD
 version: $PACKAGE_VERSION
 publisher: OpenTTD, OpenGFX, OpenSFX, OpenMSX (built for OPOS)
 platform: linux
-capabilitinetes: 
+capabilities: net
 requires-opos: 0.6.7
 PKG
     (cd "$STAGE" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) |

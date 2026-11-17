@@ -274,6 +274,13 @@ one account. The Store, the index and its key come in step 4.
   own unconfined programs.
 - A program in `<home>/Programs/<folder>` reads its own folder like one
   in `/disk/Programs/<folder>`.
+- Every program may also read, and so start, the files of the other
+  installed packages it can see: everyone's and its own account's, never
+  another account's. Package folders hold only what the installer put
+  there; a program's data lives in `AppData`, which stays private. This
+  lets a game package be played by an engine package (the ScummVM
+  games) and one package start another. A folder in `Programs` that is
+  not an installed package stays private.
 - An account that already has its own copy can still update it after an
   administrator installed the same id for everyone.
 - Start > Programs lists every `start` entry of the account's own and

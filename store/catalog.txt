@@ -128,3 +128,29 @@ license: GPL-3.0
 official: yes
 summary: Add, subtract, multiply and divide, or work with sines, logarithms and powers.
 description: Calculator is the OPOS calculator. Type a whole calculation, like 12 * (3 + 4)^2, and see the answer while you type; press = to keep it in the history, and click an answer in the history to use it again. Standard mode has the four operations, brackets, percent, square roots and squares. Scientific mode adds sine, cosine and tangent in degrees or radians and their inverses, natural and base-10 logarithms, powers, cube roots, factorials, pi and e. Answers have 15 significant digits, so 0.1 + 0.2 is 0.3. Keys: digits, + - * / ^ ( ) % !, Enter for the answer, Backspace, Esc to clear, F9 to change the sign, Ctrl+C to copy the answer and Ctrl+V to paste.
+
+[org.scummvm.scummvm]
+category: games
+license: GPL-3.0-or-later
+featured: yes
+summary: Play classic point-and-click adventure games from your own game files.
+description: ScummVM runs classic adventure and role-playing games, such as Monkey Island, Day of the Tentacle, Broken Sword and Simon the Sorcerer, by replacing their original programs. Games are not included: copy your own game files to OPOS and choose ADD GAME in ScummVM. Two free games, Beneath a Steel Sky and Flight of the Amazon Queen, are in the Store as their own programs. ScummVM is GPL-3.0 or later; its source release is published beside the package in the Store (see SOURCE.txt in the package).
+
+[org.scummvm.bass]
+category: games
+license: Freeware (see readme)
+summary: A science-fiction adventure in a bleak future city. Needs ScummVM.
+description: Beneath a Steel Sky, the 1994 point-and-click adventure by Revolution Software, CD version with speech. You are Robert Foster, stranded in a vast city where the rich live safe underground. Released as freeware with ScummVM; it may be shared for free with its readme. Install ScummVM from the Store too: this program starts the game in ScummVM.
+
+[org.scummvm.fotaq]
+category: games
+license: Freeware (see readme)
+summary: A 1940s jungle adventure with a stranded pilot. Needs ScummVM.
+description: Flight of the Amazon Queen, the 1995 point-and-click adventure by John Passfield and Steve Stamatiadis, CD version with speech. Pilot Joe King crashes in the Amazon jungle and must rescue a kidnapped princess. Released as freeware with ScummVM; it may be shared for free with its readme. Install ScummVM from the Store too: this program starts the game in ScummVM.
+
+[org.dosbox-staging.dosbox-staging]
+category: games
+license: GPL-2.0-or-later
+featured: yes
+summary: Run old DOS games and programs.
+description: DOSBox Staging emulates a DOS PC with sound cards, so old DOS games and programs run on OPOS. Games are not included: put your own DOS games in a folder and mount it in DOSBox (for example MOUNT C followed by the folder). It emulates Sound Blaster, AdLib, Gravis UltraSound and Roland MT-32 (with your own ROM files). DOSBox Staging is GPL-2.0 or later; its source release and the sources of its LGPL libraries are included in the package.

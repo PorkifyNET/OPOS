@@ -382,6 +382,11 @@ store:
 	rm -rf $(BUILD)/store_opk/work-*
 	python3 tools/mkindex.py --output $(STORE) --key $(STORE_KEY) \
 		--catalog store/catalog.txt $(BUILD)/store_opk $(STORE_PREBUILT)
+	# Source releases too big to carry in a package (store/linux/scummvm)
+	# are uploaded beside the packages.
+	if [ -d $(BUILD)/store_opk/source ]; then \
+		cp $(BUILD)/store_opk/source/* $(STORE)/; \
+	fi
 	rm -rf $(BUILD)/store_opk
 
 clean:

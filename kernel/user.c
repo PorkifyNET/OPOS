@@ -80,7 +80,7 @@
 /* Largest program file, and largest interpreter (musl's libc.so is
    about 0.7 MiB). Buffers grow in steps of USER_EXEC_IMAGE_STEP. */
 #define USER_EXEC_IMAGE_STEP (1024 * 1024)
-#define USER_EXEC_IMAGE_MAX (16 * 1024 * 1024)
+#define USER_EXEC_IMAGE_MAX (128 * 1024 * 1024)
 #define USER_INTERPRETER_IMAGE_MAX (4 * 1024 * 1024)
 /* argv, envp and their strings share the stack's top page with the
    auxiliary vector; a set that does not fit gives E2BIG. */
@@ -135,6 +135,12 @@
 #define LINUX_SIGURG 23
 #define LINUX_SIGWINCH 28
 #define LINUX_SIG_IGN 1
+#define LINUX_SA_SIGINFO 0x00000004ULL
+/* SA_SIGINFO handlers get a siginfo_t (signal number, si_code SI_USER)
+   and a zeroed ucontext_t-sized area: OPOS's own frame, not a Linux
+   ucontext, restores the registers, so the context is not filled in. */
+#define LINUX_SIGINFO_SIZE 128
+#define LINUX_UCONTEXT_SIZE 1024
 #define LINUX_SA_RESTORER 0x04000000ULL
 #define LINUX_SA_RESTART 0x10000000ULL
 #define LINUX_SA_NODEFER 0x40000000ULL
@@ -516,6 +522,29 @@ static bool user_image_buffer_reserve(enum user_image_kind kind,
     *buffer = physical_page_to_hhdm(physical);
     *buffer_capacity = capacity;
     return true;
+}
+
+/* A task keeps its buffers for the next program, but not one grown past
+   USER_IMAGE_KEEP for a big program: that goes back once loaded. */
+#define USER_IMAGE_KEEP (16 * 1024 * 1024)
+static void user_image_buffers_trim(size_t task_slot) {
+    if (task_slot >= SCHEDULER_TASK_CAPACITY) {
+        return;
+    }
+    for (size_t kind = 0; kind < USER_IMAGE_KINDS; kind++) {
+        size_t capacity = user_image_capacity[kind][task_slot];
+        if (user_image_buffers[kind][task_slot] == NULL
+            || capacity <= USER_IMAGE_KEEP) {
+            continue;
+        }
+        uint64_t physical = user_image_physical[kind][task_slot];
+        for (size_t i = 0; i < capacity / PAGE_SIZE; i++) {
+            (void)physical_page_free(physical + i * PAGE_SIZE);
+        }
+        user_image_buffers[kind][task_slot] = NULL;
+        user_image_physical[kind][task_slot] = 0;
+        user_image_capacity[kind][task_slot] = 0;
+    }
 }
 
 /* Reads a file into the task's buffer of that kind: 0, or -2 (missing),
@@ -3736,6 +3765,9 @@ static int64_t user_linux_execve(struct user_process *process,
     struct permission_identity next_identity = process->identity;
     permission_apply_program(&next_identity, path, path_length, exec_image,
                              image_size);
+    /* The image is in its pages now. */
+    exec_image = NULL;
+    user_image_buffers_trim(task_slot);
 
     uint64_t old_address_space = process->address_space;
     uint64_t new_address_space = 0;
@@ -6429,7 +6461,7 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
                     (const struct linux_signal_action *)action_address;
                 const uint64_t supported = LINUX_SA_RESTORER
                     | LINUX_SA_RESTART | LINUX_SA_NODEFER
-                    | LINUX_SA_RESETHAND;
+                    | LINUX_SA_RESETHAND | LINUX_SA_SIGINFO;
                 if ((requested->flags & ~supported) != 0
                     || (requested->handler > LINUX_SIG_IGN
                         && (!paging_user_range_valid(requested->handler, 1,
@@ -7155,10 +7187,17 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         for (size_t i = 0; is_self && i < path_length; i++) {
             is_self = path[i] == self_exe[i];
         }
+        /* /proc and /proc/self are directories, not links: musl's
+           realpath("/proc/self/exe") reads each prefix as a link first. */
+        bool is_proc_dir = resolved == 0
+            && (path_length == 5 || path_length == 10);
+        for (size_t i = 0; is_proc_dir && i < path_length; i++) {
+            is_proc_dir = path[i] == self_exe[i];
+        }
         struct vfs_metadata metadata;
         if (resolved != 0) {
             frame->rax = (uint64_t)resolved;
-        } else if (size <= 0) {
+        } else if (size <= 0 || is_proc_dir) {
             frame->rax = (uint64_t)(int64_t)-22;
         } else if (!is_self) {
             frame->rax = (uint64_t)(int64_t)(
@@ -8214,22 +8253,36 @@ bool user_linux_signal_deliver(void *saved_registers) {
             return true;
         }
 
+        bool with_info = (action.flags & LINUX_SA_SIGINFO) != 0;
+        size_t info_size = with_info
+            ? LINUX_SIGINFO_SIZE + LINUX_UCONTEXT_SIZE : 0;
         uintptr_t previous_stack = scheduler_linux_syscall_user_stack();
         if (previous_stack < LINUX_SIGNAL_RED_ZONE_SIZE
-                + sizeof(struct user_signal_frame) + sizeof(uint64_t)) {
+                + sizeof(struct user_signal_frame) + info_size
+                + sizeof(uint64_t)) {
             frame->rax = 128 + signal_number;
             return true;
         }
+        /* siginfo_t and the context area sit above OPOS's frame, which
+           rt_sigreturn finds right above the restorer's return address. */
+        uintptr_t info_address =
+            (previous_stack - LINUX_SIGNAL_RED_ZONE_SIZE - info_size)
+            & ~(uintptr_t)15;
         uintptr_t signal_frame_address =
-            (previous_stack - LINUX_SIGNAL_RED_ZONE_SIZE
-             - sizeof(struct user_signal_frame))
+            (info_address - sizeof(struct user_signal_frame))
             & ~(uintptr_t)15;
         uintptr_t handler_stack = signal_frame_address - sizeof(uint64_t);
         if (!paging_user_range_valid(handler_stack,
-                sizeof(struct user_signal_frame) + sizeof(uint64_t),
-                true, false)) {
+                info_address + info_size - handler_stack, true, false)) {
             frame->rax = 128 + signal_number;
             return true;
+        }
+        if (with_info) {
+            uint8_t *info = (uint8_t *)info_address;
+            for (size_t i = 0; i < info_size; i++) {
+                info[i] = 0;
+            }
+            *(int32_t *)info = (int32_t)signal_number; /* si_signo */
         }
 
         struct user_signal_frame *signal_frame =
@@ -8253,8 +8306,8 @@ bool user_linux_signal_deliver(void *saved_registers) {
                 (struct linux_signal_action) {0};
         }
         frame->rdi = signal_number;
-        frame->rsi = 0;
-        frame->rdx = 0;
+        frame->rsi = with_info ? info_address : 0;
+        frame->rdx = with_info ? info_address + LINUX_SIGINFO_SIZE : 0;
         frame->rax = 0;
         frame->instruction_pointer = action.handler;
         scheduler_linux_syscall_set_user_stack(handler_stack);
@@ -8860,11 +8913,13 @@ enum user_run_result user_process_run_file(
         || image[3] != 'F') {
         return USER_RUN_NOT_PROGRAM;
     }
-    return user_process_run_image(USER_PROGRAM_MODULE_ELF, image, size,
-                                  NULL, 0, path, path_length, identity,
-                                  arguments, arguments_length, process_id,
-                                  exit_status)
-        ? USER_RUN_STARTED : USER_RUN_FAILED;
+    bool started = user_process_run_image(USER_PROGRAM_MODULE_ELF, image,
+                                          size, NULL, 0, path, path_length,
+                                          identity, arguments,
+                                          arguments_length, process_id,
+                                          exit_status);
+    user_image_buffers_trim(scheduler_current_slot());
+    return started ? USER_RUN_STARTED : USER_RUN_FAILED;
 }
 
 bool user_process_kill(uint64_t process_id) {
@@ -9209,6 +9264,7 @@ static void user_child_worker(void *argument) {
                 &job->identity, NULL, 0, &job->process_id,
                 &job->exit_status);
         }
+        user_image_buffers_trim(scheduler_current_slot());
     }
 
     uint64_t flags;

@@ -226,6 +226,13 @@ call was logged.
   replaced buffer's pages are freed. The contiguous allocator carves
   each buffer from never-used memory, so a very large program can fail
   with `ENOMEM` once that memory is used up.
+- **Since the ScummVM package:** a program file may be 128 MiB and an
+  image may load 32768 pages (128 MiB); ScummVM is about 85 MiB. A task
+  frees a buffer grown past 16 MiB once the program is loaded, and the
+  contiguous allocator first looks for a run of free pages, so such a
+  buffer is reused by the next big program instead of carving new
+  memory each time. The bigger page lists cost about 16 MiB of kernel
+  memory.
 - **`mremap` (25).** Shrinks in place, or grows in place when the pages
   after the mapping are free. Otherwise, with `MREMAP_MAYMOVE`, it moves
   the pages to a free run by remapping them, without copying.
@@ -409,7 +416,15 @@ Kernel changes:
   forked child maps the segments with their first permissions.
 - **`readlink` and `readlinkat` (89, 267).** `/proc/self/exe` gives the
   program's path, which musl needs to expand `$ORIGIN`. Other existing
-  paths are not links (`EINVAL`).
+  paths are not links (`EINVAL`), and neither are `/proc` and
+  `/proc/self` (since the DOSBox package): musl's
+  `realpath("/proc/self/exe")` reads each part of the path as a link,
+  and DOSBox Staging finds its `resources` folder that way.
+- **`SA_SIGINFO` (since the DOSBox package).** A handler installed with
+  `SA_SIGINFO` gets a `siginfo_t` with the signal number (`si_code` 0,
+  `SI_USER`) and a context pointer to a zeroed area; OPOS's own frame,
+  not a Linux `ucontext_t`, restores the registers on return. DOSBox
+  Staging's logger installs its crash handlers this way.
 - **`membarrier` (324).** OPOS runs all threads on one CPU, so the
   barrier commands return at once. musl calls it in `dlopen`.
 - **Faults.** A user page fault also logs the faulting address.

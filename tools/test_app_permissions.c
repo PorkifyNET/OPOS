@@ -469,6 +469,28 @@ int main(void) {
                    PERMISSION_WRITE));
     assert(!allows(&packaged, "/disk/Users/Alice/other.txt",
                    PERMISSION_READ));
+    /* Other installed packages read like system files: the account's own
+       and everyone's, never another account's or the account's records. */
+    static const char mine2[] = "/disk/Users/Alice/Programs/org.example.data";
+    assert(vfs_create_directory(mine2, strlen(mine2)));
+    assert(permission_package_folder_add(mine2, 0));
+    assert(allows(&packaged, "/disk/Users/Alice/Programs/org.example.data/d",
+                  PERMISSION_READ));
+    assert(permission_program_may_run(
+        &packaged, "/disk/Users/Alice/Programs/org.example.data/run",
+        strlen("/disk/Users/Alice/Programs/org.example.data/run")));
+    assert(!allows(&packaged, "/disk/Users/Alice/Programs/org.example.data/d",
+                   PERMISSION_WRITE));
+    assert(allows(&packaged, "/disk/Programs/org.example.paint/brush",
+                  PERMISSION_READ));
+    struct permission_identity bob_app = packaged;
+    bob_app.account = 1;
+    assert(!allows(&bob_app, "/disk/Users/Alice/Programs/org.example.data/d",
+                   PERMISSION_READ));
+    /* A folder in Programs that is not an installed package stays private. */
+    assert(vfs_create_directory("/disk/Users/Alice/Programs/loose", 32));
+    assert(!allows(&packaged, "/disk/Users/Alice/Programs/loose/x",
+                   PERMISSION_READ));
     struct permission_identity everyone_app = built_in;
     permission_confine_disk_program(
         &everyone_app, "/disk/Programs/org.example.paint/paint",

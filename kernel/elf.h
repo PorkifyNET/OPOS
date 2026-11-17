@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ELF_MAX_SEGMENT_PAGES 8192
+/* 128 MiB: big static programs such as ScummVM (about 90 MiB loaded). */
+#define ELF_MAX_SEGMENT_PAGES 32768
 #define ELF_MAX_LOAD_SEGMENTS 8
 #define ELF_INTERPRETER_PATH_MAX 256
 

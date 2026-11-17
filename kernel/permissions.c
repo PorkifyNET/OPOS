@@ -693,17 +693,14 @@ bool permission_program_allows(const struct permission_identity *identity,
         if (access != PERMISSION_READ) {
             return false;
         }
-        if (info.owner == PERMISSION_NO_ACCOUNT) {
-            return !shared_read_needs_capability(identity, path, length)
-                || picked(identity, path, length);
-        }
-        if (info.owner != identity->account) {
-            return false;
-        }
-        return !identity->confined
-            || (identity->program_folder[0] != '\0'
-                && begins_component(path, length, identity->program_folder))
-            || picked(identity, path, length);
+        /* Installed program files are readable by every program that may
+           see the package (everyone's, or the account's own), like /usr on
+           Linux: a package folder holds only what the installer put there,
+           never personal data (that is in AppData). So one program can
+           start another, or use its files (a game package played by
+           another package's engine). */
+        return info.owner == PERMISSION_NO_ACCOUNT
+            || info.owner == identity->account;
     case CLASS_USERS:
         return access == PERMISSION_READ;
     case CLASS_HOME:

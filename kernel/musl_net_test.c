@@ -9,12 +9,14 @@
  *                                 (default 8080) and exits
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -44,6 +46,20 @@ static int fetch(const char *host, const char *port) {
     socklen_t length = sizeof(local);
     getsockname(fd, (struct sockaddr *)&local, &length);
     printf("net-test: connected from port %u\n", ntohs(local.sin_port));
+
+    /* ioctl(FIONBIO) is how OpenTTD makes a socket non-blocking: it must
+       show in F_GETFL, and a read with nothing waiting must not block. */
+    int on = 1;
+    int off = 0;
+    char probe;
+    if (ioctl(fd, FIONBIO, &on) != 0
+        || (fcntl(fd, F_GETFL) & O_NONBLOCK) == 0
+        || recv(fd, &probe, 1, 0) != -1 || errno != EAGAIN
+        || ioctl(fd, FIONBIO, &off) != 0
+        || (fcntl(fd, F_GETFL) & O_NONBLOCK) != 0) {
+        printf("net-test: ioctl FIONBIO: %s\n", strerror(errno));
+        return 1;
+    }
 
     char request[256];
     int size = snprintf(request, sizeof(request),

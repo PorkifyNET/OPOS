@@ -8,9 +8,15 @@
  * from mmap, with an inaccessible guard page below it: running off the
  * end stops the program instead of overwriting other memory. If the
  * allocation fails, main runs on the kernel's page.
+ *
+ * The stack is STACK_SIZE bytes, or what the program sets with
+ *     const unsigned long opos_stack_size = 4 << 20;
+ * (a multiple of 4096; the browser needs more for JavaScript).
  */
 #define STACK_SIZE (128 * 1024)
 #define GUARD_SIZE 4096
+
+    .weak opos_stack_size
 
     .section .text
     .global _start
@@ -18,10 +24,15 @@
 _start:
     xorl %ebp, %ebp
     movq %rsp, %r12             /* argc, argv, envp live here */
-
+    movq $STACK_SIZE, %r14
+    movq $opos_stack_size, %rax /* 0 when the program does not set it */
+    testq %rax, %rax
+    jz 2f
+    movq (%rax), %r14
+2:
     movl $9, %eax               /* mmap */
     xorl %edi, %edi
-    movl $(STACK_SIZE + GUARD_SIZE), %esi
+    leaq GUARD_SIZE(%r14), %rsi
     movl $3, %edx               /* read, write */
     movl $0x22, %r10d           /* private, anonymous */
     movq $-1, %r8
@@ -35,7 +46,7 @@ _start:
     movl $GUARD_SIZE, %esi
     xorl %edx, %edx
     syscall
-    leaq (STACK_SIZE + GUARD_SIZE)(%r13), %rsp
+    leaq GUARD_SIZE(%r13,%r14), %rsp
 1:
     movq (%r12), %rdi           /* argc */
     leaq 8(%r12), %rsi          /* argv */

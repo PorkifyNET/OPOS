@@ -63,6 +63,7 @@ struct css_sheet {
     struct rule *rules;
     size_t count, capacity;
     uint32_t next_order;
+    uint32_t order_base;           /* added to rule orders by its chain */
     struct css_sheet *next;
     /* Only on the first sheet of a chain: rules of the whole chain by the
        id, class or tag their last compound needs (see build_index). */
@@ -965,13 +966,32 @@ struct css_sheet *css_append(struct css_sheet *chain, struct css_sheet *sheet) {
         tail = tail->next;
     }
     for (size_t i = 0; i < sheet->count; i++) {
-        sheet->rules[i].order += base;
+        sheet->rules[i].order += base - sheet->order_base;
     }
+    sheet->order_base = base;
     if (tail == NULL) {
         return sheet;
     }
     tail->next = sheet;
     return chain;
+}
+
+struct css_sheet *css_relink(struct css_sheet **sheets, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        index_free(sheets[i]->index);
+        sheets[i]->index = NULL;
+    }
+    uint32_t base = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct css_sheet *sheet = sheets[i];
+        for (size_t r = 0; r < sheet->count; r++) {
+            sheet->rules[r].order += base - sheet->order_base;
+        }
+        sheet->order_base = base;
+        base += sheet->next_order;
+        sheet->next = i + 1 < count ? sheets[i + 1] : NULL;
+    }
+    return count > 0 ? sheets[0] : NULL;
 }
 
 /* --------------------------------------------------------------- matching */
@@ -2006,4 +2026,9 @@ bool css_selector_matches(const struct css_sheet *selectors,
         }
     }
     return false;
+}
+
+void css_unlink_free(struct css_sheet *sheet) {
+    sheet->next = NULL;
+    css_free(sheet);
 }

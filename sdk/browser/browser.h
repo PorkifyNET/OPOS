@@ -184,7 +184,8 @@ enum item_kind {
     ITEM_TEXT,
     ITEM_RECT,     /* filled rectangle */
     ITEM_OUTLINE,  /* one-pixel rectangle outline */
-    ITEM_IMAGE
+    ITEM_IMAGE,
+    ITEM_BOX       /* not drawn: an element's border box (for scripts) */
 };
 
 struct image_ref;
@@ -346,6 +347,11 @@ struct css_sheet;
 struct css_sheet *css_parse(const char *text, size_t length);
 struct css_sheet *css_append(struct css_sheet *chain, struct css_sheet *sheet);
 void css_free(struct css_sheet *chain);
+/* Links the sheets into one chain in this order (each sheet must be
+   on its own or in the chain being relinked); returns its head. */
+struct css_sheet *css_relink(struct css_sheet **sheets, size_t count);
+/* Frees one sheet of a chain (relink the others after). */
+void css_unlink_free(struct css_sheet *sheet);
 void css_reset_variables(void);
 /* True when a media query ("print", "(max-width: 600px)", ...) applies to
    the browser window. */
@@ -388,6 +394,11 @@ struct page {
     size_t image_capacity;
     void *arena;               /* layout scratch (styles) */
     struct css_sheet *sheets;  /* author style sheets, in order */
+    /* Where each sheet of the chain came from (main.c sheets_update). */
+    struct page_sheet *sheet_list;
+    size_t sheet_count;
+    int sheet_fetches;         /* linked sheets fetched so far */
+    size_t sheet_bytes;        /* and their size */
     struct form_field *fields; /* form controls touched so far */
     size_t field_count;
     size_t field_capacity;
@@ -438,6 +449,28 @@ int script_errors(const struct page *page);
 void script_set_data_dir(const char *data_dir);
 /* main.c: shows text in the status bar at once. */
 void browser_status(const char *text);
+/* main.c, for scripts: lays the page out now if a script changed it;
+   the element's border box in window-view pixels (x, y, width,
+   height; false when it has none); the page's scroll offset and size;
+   scrolling it. */
+void browser_layout_now(struct page *page);
+bool browser_element_rect(struct page *page,
+                          const struct opos_html_node *node,
+                          int rect[4]);
+void browser_page_metrics(struct page *page, int *scroll_x,
+                          int *scroll_y, int *width, int *height);
+void browser_scroll_to(struct page *page, int y);
+/* Style sheet text a script set for a <style> element (or, for NULL,
+   the document's adopted sheets) through the CSS object model;
+   NULL when none. */
+const char *script_sheet_text(struct page *page,
+                              const struct opos_html_node *node,
+                              size_t *length);
+/* The page was laid out (scripts need not ask for it again). */
+void script_layout_done(struct page *page);
+/* The page scrolled or the window changed size: fires "scroll" or
+   "resize" at the window. */
+void script_window_event(struct page *page, const char *type);
 
 /* library.c: bookmarks, history and downloads. data_dir "" keeps them
    only in memory. */
@@ -520,6 +553,17 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
                  int width);
 
 void page_free_layout(struct page *page);
+
+/* The border box of node in page coordinates from the last layout:
+   its block box, or the bounds of what it drew. fixed: it stays put
+   in the view. False when it drew nothing. */
+bool page_element_box(const struct page *page,
+                      const struct opos_html_node *node, int box[4],
+                      bool *fixed);
+/* The style node gets from the page's sheets (for getComputedStyle). */
+void page_element_style(struct page *page,
+                        const struct opos_html_node *node,
+                        struct style *style);
 
 /* Frees everything the page owns: layout, document, images. */
 void page_destroy(struct page *page);

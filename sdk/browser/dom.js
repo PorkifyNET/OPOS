@@ -19,7 +19,11 @@ const illegal = () => { throw new TypeError('Illegal constructor'); };
 function show(value, depth) {
     if (typeof value === 'string') return depth ? JSON.stringify(value) : value;
     if (value instanceof Node) return '<' + value.nodeName.toLowerCase() + '>';
-    if (value instanceof Error) return value.name + ': ' + value.message;
+    if (value instanceof Error)
+        return value.name + ': ' + value.message
+            + (value.stack && !depth
+               ? '\n' + String(value.stack).split('\n').filter(Boolean)
+                                           .slice(0, 4).join('\n') : '');
     if (typeof value === 'function') return 'function ' + (value.name || '');
     if (value && typeof value === 'object' && depth < 2) {
         try {
@@ -376,11 +380,23 @@ function insert(parent, node, before) {
         && !(before instanceof Node))
         throw new TypeError('Argument is not a Node');
     if (isFragment(node)) {
-        for (const c of children(node)) N.insert(parent, c, before || null);
+        for (const c of children(node)) {
+            N.insert(parent, c, before || null);
+            noteSheetLink(c);
+        }
         return node;
     }
     N.insert(parent, node, before || null);
+    noteSheetLink(node);
     return node;
+}
+/* A style sheet link a script added: the browser fetches it when it lays
+   the page out (after this script), then "load" fires. */
+function noteSheetLink(node) {
+    if (N.kind(node) === 1 && N.name(node) === 'link'
+        && /(^|\s)stylesheet(\s|$)/i.test(N.attr(node, 'rel') || '')
+        && N.connected(node))
+        addTimer(() => dispatch(node, new Event('load')), 0, [], false);
 }
 const CAMEL = s => s.replace(/-([a-z])/g, (m, c) => c.toUpperCase());
 const KEBAB = s => s.startsWith('--') ? s
@@ -577,11 +593,17 @@ function parseStyle(text) {
     return map;
 }
 function styleFor(element) {
-    const read = () => parseStyle(N.attr(element, 'style'));
-    const write = map => {
-        const text = Array.from(map, ([k, v]) => k + ': ' + v).join('; ');
+    return declaration(() => N.attr(element, 'style') || '', text => {
         if (text) N.setAttr(element, 'style', text);
         else N.removeAttr(element, 'style');
+    });
+}
+/* A CSSStyleDeclaration kept as text: an element's style attribute or a
+   rule's declarations. */
+function declaration(getText, setText) {
+    const read = () => parseStyle(getText());
+    const write = map => {
+        setText(Array.from(map, ([k, v]) => k + ': ' + v).join('; '));
     };
     const api = {
         getPropertyValue(name) { return read().get(KEBAB(name)) || ''; },
@@ -612,7 +634,7 @@ function styleFor(element) {
         get(target, key) {
             if (typeof key !== 'string') return undefined;
             if (key in target) return target[key];
-            if (key === 'cssText') return N.attr(element, 'style') || '';
+            if (key === 'cssText') return getText();
             if (key === 'length') return read().size;
             if (/^\d+$/.test(key)) return target.item(+key);
             if (key === 'cssFloat') key = 'float';
@@ -621,7 +643,7 @@ function styleFor(element) {
         set(target, key, value) {
             if (typeof key !== 'string') return true;
             if (key === 'cssText') {
-                N.setAttr(element, 'style', String(value));
+                setText(String(value));
                 return true;
             }
             if (key === 'cssFloat') key = 'float';
@@ -800,21 +822,53 @@ class Element extends Node {
     getElementsByTagName(t) { return byTag(this, t); }
     getElementsByClassName(c) { return byClass(this, c); }
     getBoundingClientRect() {
-        return {x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0,
-                height: 0, toJSON() { return this; }};
+        const r = layoutRect(this);
+        return r ? new DOMRect(r[0], r[1], r[2], r[3]) : new DOMRect();
     }
-    getClientRects() { return toArray([]); }
-    scrollIntoView() {}
-    scrollTo() {}
-    scrollBy() {}
-    get scrollTop() { return 0; }
-    set scrollTop(v) {}
+    getClientRects() {
+        const r = layoutRect(this);
+        return toArray(r ? [new DOMRect(r[0], r[1], r[2], r[3])] : []);
+    }
+    scrollIntoView(how) {
+        const r = layoutRect(this);
+        if (!r) return;
+        const block = how === false ? 'end'
+            : how && typeof how === 'object' ? how.block || 'start' : 'start';
+        let y = N.metrics()[1] + r[1];
+        if (block === 'center') y -= (N.viewportHeight() - r[3]) / 2;
+        else if (block === 'end') y -= N.viewportHeight() - r[3];
+        else if (block === 'nearest') {
+            if (r[1] >= 0 && r[1] + r[3] <= N.viewportHeight()) return;
+            if (r[1] > 0) y -= N.viewportHeight() - r[3];
+        }
+        N.scrollTo(y);
+    }
+    scrollTo(x, y) { if (isViewport(this)) G.scrollTo(x, y); }
+    scrollBy(x, y) { if (isViewport(this)) G.scrollBy(x, y); }
+    get scrollTop() { return isViewport(this) ? N.metrics()[1] : 0; }
+    set scrollTop(v) { if (isViewport(this)) N.scrollTo(Number(v) || 0); }
     get scrollLeft() { return 0; }
     set scrollLeft(v) {}
-    get scrollWidth() { return 0; }
-    get scrollHeight() { return 0; }
-    get clientWidth() { return 0; }
-    get clientHeight() { return 0; }
+    get scrollWidth() {
+        if (isViewport(this)) return N.metrics()[2];
+        const r = layoutRect(this);
+        return r ? r[2] : 0;
+    }
+    get scrollHeight() {
+        if (isViewport(this)) return N.metrics()[3];
+        const r = layoutRect(this);
+        return r ? r[3] : 0;
+    }
+    get clientWidth() {
+        if (this === N.root()) return N.viewportWidth();
+        const r = layoutRect(this);
+        return r ? r[2] : 0;
+    }
+    get clientHeight() {
+        if (this === N.root()) return N.viewportHeight();
+        const r = layoutRect(this);
+        return r ? r[3] : 0;
+    }
     get clientTop() { return 0; }
     get clientLeft() { return 0; }
     attachShadow() { throw new Error('NotSupportedError: shadow DOM'); }
@@ -856,11 +910,37 @@ class HTMLElement extends Element {
     get innerText() { return N.text(this); }
     set innerText(v) { this.textContent = v; }
     get outerText() { return N.text(this); }
-    get offsetParent() { return N.parent(this); }
-    get offsetTop() { return 0; }
-    get offsetLeft() { return 0; }
-    get offsetWidth() { return 0; }
-    get offsetHeight() { return 0; }
+    /* Positions are given from the page's top left (the body), not from
+       the nearest positioned box. */
+    get offsetParent() {
+        if (this === N.body() || this === N.root() || !layoutRect(this))
+            return null;
+        return N.body();
+    }
+    get offsetTop() {
+        const r = layoutRect(this);
+        return r ? r[1] + N.metrics()[1] : 0;
+    }
+    get offsetLeft() {
+        const r = layoutRect(this);
+        return r ? r[0] : 0;
+    }
+    get offsetWidth() {
+        const r = layoutRect(this);
+        return r ? r[2] : 0;
+    }
+    get offsetHeight() {
+        const r = layoutRect(this);
+        return r ? r[3] : 0;
+    }
+    get sheet() {
+        const name = N.name(this);
+        if (name === 'style') return cached(this, 'sheet', ownedSheet);
+        if (name === 'link' && /(^|\s)stylesheet(\s|$)/i.test(
+                N.attr(this, 'rel') || ''))
+            return cached(this, 'sheet', ownedSheet);
+        return null;
+    }
     get isContentEditable() { return false; }
     click() {
         const event = new MouseEvent('click', {bubbles: true,
@@ -921,6 +1001,10 @@ class HTMLElement extends Element {
         else N.removeAttr(this, 'checked');
     }
     get defaultChecked() { return N.attr(this, 'checked') !== null; }
+    set defaultChecked(v) {
+        if (v) N.setAttr(this, 'checked', '');
+        else N.removeAttr(this, 'checked');
+    }
     get selectedIndex() {
         const v = N.field(this, 2);
         return v === undefined ? -1 : v;
@@ -1152,7 +1236,19 @@ class Document extends EventTarget {
         return toArray(N.query(N.root(), 'a[href], area[href]', true));
     }
     get scripts() { return toArray(N.query(N.root(), 'script', true)); }
-    get styleSheets() { return toArray([]); }
+    get styleSheets() {
+        const list = [];
+        for (const e of N.query(N.root(), 'style, link', true)) {
+            const sheet = e.sheet;
+            if (sheet) list.push(sheet);
+        }
+        return toArray(list);
+    }
+    get adoptedStyleSheets() { return adopted.slice(); }
+    set adoptedStyleSheets(list) {
+        adopted = Array.from(list || []);
+        flushAdopted();
+    }
     get fonts() {
         return {ready: Promise.resolve(), add() {}, load() {
             return Promise.resolve([]); }, check() { return true; },
@@ -2075,6 +2171,31 @@ class IntersectionObserver extends Observer {
 class PerformanceObserver extends Observer {}
 PerformanceObserver.supportedEntryTypes = [];
 
+/* Random numbers from the system; no crypto.subtle yet. */
+class Crypto {
+    getRandomValues(array) {
+        if (!ArrayBuffer.isView(array) || array instanceof Float32Array
+            || array instanceof Float64Array || array instanceof DataView)
+            throw new DOMException('Not an integer array',
+                                   'TypeMismatchError');
+        if (array.byteLength > 65536)
+            throw new DOMException('More than 65536 bytes',
+                                   'QuotaExceededError');
+        new Uint8Array(array.buffer, array.byteOffset, array.byteLength)
+            .set(new Uint8Array(N.random(array.byteLength)));
+        return array;
+    }
+    randomUUID() {
+        const b = this.getRandomValues(new Uint8Array(16));
+        b[6] = b[6] & 15 | 64;
+        b[8] = b[8] & 63 | 128;
+        const h = Array.from(b, x => (x + 256).toString(16).slice(1)).join('');
+        return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16)
+            + '-' + h.slice(16, 20) + '-' + h.slice(20);
+    }
+}
+const crypto = new Crypto();
+
 const performance = {
     now: () => N.now(),
     timeOrigin: Date.now() - N.now(),
@@ -2139,22 +2260,381 @@ const CSS = {
                           .replace(/^(\d)/, '\\3$1 '),
 };
 
-function getComputedStyle(element) {
-    const inline = element && element.style;
-    return new Proxy({}, {
-        get(t, key) {
-            if (key === 'getPropertyValue')
-                return name => inline ? inline.getPropertyValue(name) : '';
-            if (typeof key !== 'string') return undefined;
-            if (key === 'display') {
-                const v = inline && inline.display;
-                return v || (element && N.attr(element, 'hidden') !== null
-                    ? 'none' : 'block');
-            }
-            if (key === 'visibility') return (inline && inline.visibility)
-                                            || 'visible';
-            return inline ? inline[key] : '';
+/* ------------------------------------------------- layout and styles */
+
+class DOMRectReadOnly {
+    constructor(x = 0, y = 0, width = 0, height = 0) {
+        this.x = +x; this.y = +y; this.width = +width; this.height = +height;
+    }
+    get top() { return Math.min(this.y, this.y + this.height); }
+    get bottom() { return Math.max(this.y, this.y + this.height); }
+    get left() { return Math.min(this.x, this.x + this.width); }
+    get right() { return Math.max(this.x, this.x + this.width); }
+    toJSON() {
+        const {x, y, width, height, top, right, bottom, left} = this;
+        return {x, y, width, height, top, right, bottom, left};
+    }
+    static fromRect(r = {}) {
+        return new this(r.x, r.y, r.width, r.height);
+    }
+}
+class DOMRect extends DOMRectReadOnly {}
+
+/* The element's box in the view after laying out what changed, or null
+   when it shows nothing. */
+function layoutRect(element) {
+    flushSheets();
+    return N.rect(element);
+}
+function isViewport(element) {
+    return element === N.root() || element === N.body();
+}
+
+/* Style sheet text split into its top-level rules. */
+function splitRules(text) {
+    text = String(text).replace(/\/\*[\s\S]*?\*\//g, '');
+    const rules = [];
+    let depth = 0, start = 0, quote = '';
+    const push = end => {
+        const rule = text.slice(start, end).trim();
+        if (rule && rule !== ';') rules.push(rule);
+        start = end;
+    };
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (quote) {
+            if (c === '\\') i++;
+            else if (c === quote) quote = '';
+        } else if (c === '"' || c === "'") {
+            quote = c;
+        } else if (c === '{') {
+            depth++;
+        } else if (c === '}') {
+            if (depth > 0 && --depth === 0) push(i + 1);
+        } else if (c === ';' && depth === 0) {
+            push(i + 1);
+        }
+    }
+    return rules;
+}
+
+const GROUP_RULES = {media: 4, supports: 12, layer: 18, container: 0,
+                     document: 13, '-moz-document': 13, scope: 0};
+class CSSRule {
+    constructor(parentRule, sheet) {
+        define(this, '_parent', parentRule || null);
+        define(this, '_sheet', sheet || null);
+    }
+    get parentRule() { return this._parent; }
+    get parentStyleSheet() {
+        return this._sheet || (this._parent && this._parent.parentStyleSheet);
+    }
+    _changed() {
+        const sheet = this.parentStyleSheet;
+        if (sheet) sheet._commit();
+    }
+}
+Object.assign(CSSRule, {STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3,
+    MEDIA_RULE: 4, FONT_FACE_RULE: 5, PAGE_RULE: 6, KEYFRAMES_RULE: 7,
+    KEYFRAME_RULE: 8, NAMESPACE_RULE: 10, SUPPORTS_RULE: 12});
+class CSSStyleRule extends CSSRule {
+    constructor(selector, body, parentRule, sheet) {
+        super(parentRule, sheet);
+        define(this, '_selector', selector);
+        define(this, '_body', body);
+    }
+    get type() { return 1; }
+    get selectorText() { return this._selector; }
+    set selectorText(v) { this._selector = String(v); this._changed(); }
+    get style() {
+        return cached(this, 'style', () => declaration(() => this._body,
+            text => { this._body = text; this._changed(); }));
+    }
+    get cssText() {
+        return this._selector + ' { ' + this._body
+            + (this._body && !this._body.endsWith(';') ? '; }' : ' }');
+    }
+}
+class CSSGroupingRule extends CSSRule {
+    constructor(keyword, prelude, body, parentRule, sheet) {
+        super(parentRule, sheet);
+        define(this, '_keyword', keyword);
+        define(this, '_prelude', prelude);
+        define(this, '_rules', []);
+        for (const t of splitRules(body)) {
+            try { this._rules.push(makeRule(t, this, null)); } catch (e) {}
+        }
+    }
+    get type() { return GROUP_RULES[this._keyword] || 0; }
+    get cssRules() { return toArray(this._rules.slice()); }
+    get conditionText() { return this._prelude.replace(/^@[\w-]+\s*/, ''); }
+    get media() {
+        const text = this.conditionText;
+        const list = toArray(text.split(',').map(s => s.trim())
+                                 .filter(Boolean));
+        define(list, 'mediaText', text);
+        return list;
+    }
+    get name() { return this.conditionText; }
+    insertRule(text, index = 0) {
+        index = Number(index) >>> 0;
+        if (index > this._rules.length)
+            throw new DOMException('Index out of range', 'IndexSizeError');
+        this._rules.splice(index, 0, makeRule(String(text), this, null));
+        this._changed();
+        return index;
+    }
+    deleteRule(index) {
+        index = Number(index) >>> 0;
+        if (index >= this._rules.length)
+            throw new DOMException('Index out of range', 'IndexSizeError');
+        this._rules.splice(index, 1);
+        this._changed();
+    }
+    get cssText() {
+        return this._prelude + ' {\n'
+            + this._rules.map(r => '  ' + r.cssText).join('\n') + '\n}';
+    }
+}
+class CSSOtherRule extends CSSRule {
+    constructor(keyword, text, parentRule, sheet) {
+        super(parentRule, sheet);
+        define(this, '_keyword', keyword);
+        define(this, '_text', text);
+    }
+    get type() {
+        return {'font-face': 5, keyframes: 7, '-webkit-keyframes': 7,
+                import: 3, charset: 2, page: 6, namespace: 10}[this._keyword]
+            || 0;
+    }
+    get name() {
+        const m = /^@[\w-]+\s+([^{\s]+)/.exec(this._text);
+        return m ? m[1] : '';
+    }
+    get href() {
+        const m = /url\(\s*['"]?([^'")]*)|['"]([^'"]*)/.exec(this._text);
+        return m ? m[1] || m[2] || '' : '';
+    }
+    get style() {
+        const open = this._text.indexOf('{');
+        const body = open < 0 ? '' : this._text.slice(open + 1,
+                                                       this._text.lastIndexOf('}'));
+        return declaration(() => body.trim(), () => {});
+    }
+    get cssText() { return this._text; }
+}
+function makeRule(text, parentRule, sheet) {
+    text = String(text).trim();
+    const syntax = () => new DOMException('Failed to parse the rule \''
+                                          + text + '\'', 'SyntaxError');
+    if (text[0] !== '@') {
+        const open = text.indexOf('{');
+        const close = text.lastIndexOf('}');
+        if (open <= 0 || close < open) throw syntax();
+        return new CSSStyleRule(text.slice(0, open).trim(),
+                                text.slice(open + 1, close).trim(),
+                                parentRule, sheet);
+    }
+    const m = /^@([\w-]+)/.exec(text);
+    if (!m) throw syntax();
+    const keyword = m[1].toLowerCase();
+    const open = text.indexOf('{');
+    if (keyword in GROUP_RULES && open > 0) {
+        return new CSSGroupingRule(keyword, text.slice(0, open).trim(),
+                                   text.slice(open + 1, text.lastIndexOf('}')),
+                                   parentRule, sheet);
+    }
+    return new CSSOtherRule(keyword, text, parentRule, sheet);
+}
+
+/* Sheets whose rules changed; their text goes to the browser before the
+   next layout. */
+const sheetsChanged = new Set();
+let adopted = [];
+function flushSheets() {
+    if (sheetsChanged.size === 0) return;
+    const list = Array.from(sheetsChanged);
+    sheetsChanged.clear();
+    let adoptedChanged = false;
+    for (const sheet of list) {
+        const owner = sheet._owner;
+        if (owner && N.name(owner) === 'style')
+            N.setSheet(owner, sheet._disabled ? '' : sheet._text());
+        if (adopted.includes(sheet)) adoptedChanged = true;
+    }
+    if (adoptedChanged) flushAdopted();
+}
+function flushAdopted() {
+    const text = adopted.filter(s => !s._disabled).map(s => s._text())
+                        .join('\n');
+    N.setSheet(null, text || null);
+}
+
+class StyleSheet {}
+class CSSStyleSheet extends StyleSheet {
+    constructor(options) {
+        super();
+        define(this, '_owner', null);
+        define(this, '_rules', []);
+        define(this, '_source', null);   /* the owner's text parsed */
+        define(this, '_edited', false);
+        define(this, '_disabled', Boolean(options && options.disabled));
+        define(this, '_media', options && options.media
+            ? String(options.media) : '');
+    }
+    get type() { return 'text/css'; }
+    get ownerNode() { return this._owner; }
+    get ownerRule() { return null; }
+    get parentStyleSheet() { return null; }
+    get title() {
+        return this._owner ? N.attr(this._owner, 'title') : null;
+    }
+    get href() {
+        return this._owner && N.name(this._owner) === 'link'
+            ? N.resolve(N.attr(this._owner, 'href') || '', N.url()) : null;
+    }
+    get media() {
+        const text = this._owner ? N.attr(this._owner, 'media') || ''
+                                 : this._media;
+        const list = toArray(text.split(',').map(s => s.trim())
+                                 .filter(Boolean));
+        define(list, 'mediaText', text);
+        return list;
+    }
+    get disabled() {
+        if (this._owner && N.name(this._owner) === 'link')
+            return N.attr(this._owner, 'disabled') !== null;
+        return this._disabled;
+    }
+    set disabled(v) {
+        v = Boolean(v);
+        if (this._owner && N.name(this._owner) === 'link') {
+            if (v) N.setAttr(this._owner, 'disabled', '');
+            else N.removeAttr(this._owner, 'disabled');
+            return;
+        }
+        if (v === this._disabled) return;
+        this._disabled = v;
+        this._sync();
+        this._commit(true);
+    }
+    /* Reads the owner <style>'s text again when it changed. */
+    _sync() {
+        const owner = this._owner;
+        if (!owner || N.name(owner) !== 'style') return;
+        const text = N.text(owner);
+        if (text === this._source) return;
+        this._source = text;
+        this._edited = false;
+        this._rules = [];
+        for (const t of splitRules(text)) {
+            try { this._rules.push(makeRule(t, null, this)); } catch (e) {}
+        }
+    }
+    _checkRules() {
+        if (this._owner && N.name(this._owner) === 'link') {
+            const href = this.href || '';
+            if (!href.startsWith(location.origin + '/'))
+                throw new DOMException('Cannot access rules',
+                                       'SecurityError');
+        }
+        this._sync();
+    }
+    get cssRules() {
+        this._checkRules();
+        return toArray(this._rules.slice());
+    }
+    get rules() { return this.cssRules; }
+    _text() { return this._rules.map(r => r.cssText).join('\n'); }
+    _commit(force) {
+        if (this._owner && N.name(this._owner) === 'link') return;
+        this._edited = true;
+        if (sheetsChanged.size === 0) Promise.resolve().then(flushSheets);
+        sheetsChanged.add(this);
+    }
+    insertRule(text, index = 0) {
+        this._checkRules();
+        index = Number(index) >>> 0;
+        if (index > this._rules.length)
+            throw new DOMException('Index out of range', 'IndexSizeError');
+        this._rules.splice(index, 0, makeRule(String(text), null, this));
+        this._commit();
+        return index;
+    }
+    deleteRule(index) {
+        this._checkRules();
+        index = Number(index) >>> 0;
+        if (index >= this._rules.length)
+            throw new DOMException('Index out of range', 'IndexSizeError');
+        this._rules.splice(index, 1);
+        this._commit();
+    }
+    addRule(selector = 'undefined', style = 'undefined', index) {
+        this.insertRule(selector + ' { ' + style + ' }',
+                        index === undefined ? this.cssRules.length : index);
+        return -1;
+    }
+    removeRule(index = 0) { this.deleteRule(index); }
+    replaceSync(text) {
+        if (this._owner)
+            throw new DOMException('Not a constructed sheet',
+                                   'NotAllowedError');
+        this._rules = [];
+        for (const t of splitRules(text)) {
+            try { this._rules.push(makeRule(t, null, this)); } catch (e) {}
+        }
+        this._commit();
+    }
+    replace(text) {
+        try { this.replaceSync(text); } catch (e) { return Promise.reject(e); }
+        return Promise.resolve(this);
+    }
+}
+function ownedSheet(element) {
+    const sheet = new CSSStyleSheet();
+    sheet._owner = element;
+    return sheet;
+}
+
+/* The computed style: what the browser's cascade gives the element (the
+   properties it knows), then its inline style. */
+function getComputedStyle(element, pseudo) {
+    if (!(element instanceof Element))
+        throw new TypeError('getComputedStyle: not an Element');
+    flushSheets();
+    const values = (!pseudo && N.computed(element)) || {};
+    const inline = element.style;
+    const get = name => {
+        name = KEBAB(String(name));
+        if (name === 'css-float') name = 'float';
+        if (Object.prototype.hasOwnProperty.call(values, name))
+            return values[name];
+        return inline.getPropertyValue(name).replace(/\s*!important$/, '');
+    };
+    const names = Object.keys(values);
+    const api = {
+        getPropertyValue: name => get(name),
+        getPropertyPriority: () => '',
+        item: i => names[i] || '',
+        setProperty() {
+            throw new DOMException('Read-only', 'NoModificationAllowedError');
         },
+        removeProperty() {
+            throw new DOMException('Read-only', 'NoModificationAllowedError');
+        },
+        get length() { return names.length; },
+        get cssText() { return ''; },
+        get parentRule() { return null; },
+    };
+    return new Proxy(api, {
+        get(target, key) {
+            if (typeof key !== 'string') return target[key];
+            if (key in target) return target[key];
+            if (/^\d+$/.test(key)) return target.item(+key);
+            return get(key === 'cssFloat' ? 'float' : key);
+        },
+        set() { return true; },
+        has(target, key) { return typeof key === 'string'; },
     });
 }
 
@@ -2168,9 +2648,11 @@ const api = {
     InputEvent, KeyboardEvent, SubmitEvent, ErrorEvent, ProgressEvent,
     PopStateEvent, HashChangeEvent, URL, URLSearchParams, DOMTokenList,
     Storage, AbortController, AbortSignal, MutationObserver, DOMException,
-    fetch, Request, Response, Headers, XMLHttpRequest,
+    fetch, Request, Response, Headers, XMLHttpRequest, crypto, Crypto,
     XMLHttpRequestEventTarget, FormData, Blob, File, TextEncoder,
-    TextDecoder,
+    TextDecoder, DOMRect, DOMRectReadOnly, StyleSheet, CSSStyleSheet,
+    CSSRule, CSSStyleRule, CSSGroupingRule, CSSMediaRule: CSSGroupingRule,
+    CSSSupportsRule: CSSGroupingRule,
     ResizeObserver, IntersectionObserver, PerformanceObserver,
     MediaQueryList, Window,
     localStorage: storageProxy(persistent),
@@ -2181,7 +2663,10 @@ const api = {
     get innerHeight() { return N.viewportHeight(); },
     get outerWidth() { return N.viewportWidth(); },
     get outerHeight() { return N.viewportHeight(); },
-    scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0,
+    get scrollX() { return 0; },
+    get scrollY() { return N.metrics()[1]; },
+    get pageXOffset() { return 0; },
+    get pageYOffset() { return N.metrics()[1]; },
     screenX: 0, screenY: 0, screenLeft: 0, screenTop: 0,
     setTimeout: (fn, ms, ...args) => addTimer(fn, ms, args, false),
     setInterval: (fn, ms, ...args) => addTimer(fn, ms, args, true),
@@ -2204,7 +2689,23 @@ const api = {
     prompt: message => { N.log('alert', String(message)); return null; },
     print() {}, focus() {}, blur() {}, stop() {}, close() {},
     open: url => { if (url) N.navigate(String(url), false); return null; },
-    scroll() {}, scrollTo() {}, scrollBy() {}, moveTo() {}, resizeTo() {},
+    scroll(x, y) { G.scrollTo(x, y); },
+    scrollTo(x, y) {
+        const top = x && typeof x === 'object' ? x.top : y;
+        if (top !== undefined) N.scrollTo(Number(top) || 0);
+    },
+    scrollBy(x, y) {
+        const dy = x && typeof x === 'object' ? x.top : y;
+        N.scrollTo(N.metrics()[1] + (Number(dy) || 0));
+    },
+    moveTo() {}, resizeTo() {},
+    /* Called bare (addEventListener(...)), they act on the window. */
+    addEventListener: (type, listener, options) =>
+        EventTarget.prototype.addEventListener.call(G, type, listener, options),
+    removeEventListener: (type, listener, options) =>
+        EventTarget.prototype.removeEventListener.call(G, type, listener,
+                                                       options),
+    dispatchEvent: event => EventTarget.prototype.dispatchEvent.call(G, event),
     postMessage() {},
     getSelection: () => ({rangeCount: 0, toString: () => '',
                           removeAllRanges() {}, addRange() {},

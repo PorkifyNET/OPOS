@@ -108,12 +108,55 @@ timers and the network APIs.
      checks pass (fetch, redirects, XHR, POST bodies, HttpOnly, CORS
      allowed/blocked/preflight, abort, storage kept after reload,
      pushState). BBC News still loads.
-3. **Styles and layout from scripts**: `<style>` and `<link>` sheets
-   added by scripts, `HTMLStyleElement.sheet` with `insertRule` (CSS in
-   JS, such as styled-components), `getComputedStyle` from the real
-   cascade, and element sizes and positions from the layout
-   (`getBoundingClientRect`, `offsetWidth`, `scrollTop`), so menus and
-   pop-ups can place themselves.
+3. **Styles and layout from scripts** (done, branch `browser/javascript-css`)
+   - Style sheets follow the document: before each layout the browser
+     compares the page's `<style>` and `<link rel="stylesheet">`
+     elements with the sheets it has (`sheets_update` in `main.c`),
+     parses or fetches new ones, keeps unchanged ones and relinks the
+     chain (`css_relink`). Scripts can add, change, remove and disable
+     sheets; a script-added link fires `load` once it is in.
+   - CSS object model: `style.sheet` and `link.sheet`
+     (`CSSStyleSheet`), `cssRules`, `insertRule`/`deleteRule`,
+     `addRule`, rules' `selectorText` and `style`, `@media` and
+     `@supports` groups with their own rules, `document.styleSheets`,
+     `new CSSStyleSheet()` with `replaceSync` and
+     `document.adoptedStyleSheets`. Rules changed this way reach the
+     browser as text (`N.setSheet`) until the element's own text changes.
+     This is what CSS-in-JS libraries (styled-components, emotion) use.
+     Linked sheets from other sites throw `SecurityError` on `cssRules`;
+     same-site linked sheets show no rules yet.
+   - Layout from scripts: every block, table and cell leaves an
+     invisible box item (`ITEM_BOX`) in the display list, so
+     `getBoundingClientRect`, `getClientRects`, `offsetWidth/Height/
+     Top/Left`, `offsetParent` (the body, or null when not shown),
+     `clientWidth/Height` and `scrollWidth/Height` give real sizes;
+     inline elements get the bounds of their text. Asking for a size
+     after a change lays the page out first, as browsers do.
+   - `getComputedStyle` runs the real cascade for the element (display,
+     position, colours, font, margins, padding, borders, width and
+     height from the layout, flex, transform and more; other properties
+     come from the inline style).
+   - Scrolling: `scrollX/scrollY`, `scrollTo`, `scrollBy`,
+     `scrollIntoView` and the root's `scrollTop`; the window gets
+     `scroll` when the user scrolls and `resize` when it changes size.
+   - Also: `DOMRect`, `crypto.getRandomValues` and `randomUUID` (from
+     the system's `getrandom`), a settable `defaultChecked`, and bare
+     `addEventListener(...)` calls acting on the window.
+   - The browser now runs on a 4 MiB stack (`opos_stack_size`, read by
+     the SDK's `crt0.S`; other programs keep 128 KiB) and gives
+     JavaScript 1 MiB of it. React's hydration ran past the old 128 KiB
+     and crashed the browser.
+   - Not yet: positions relative to the nearest positioned box
+     (`offsetTop` is from the page), `visibility: hidden` boxes, CSS
+     custom properties in `getComputedStyle`, element scrolling
+     (`overflow: auto`), `crypto.subtle`.
+   - Tested in QEMU: a test page with 17 checks (sizes, display none,
+     computed styles, insertRule/deleteRule, rule.style, added and
+     removed `<style>`, `disabled`, adopted sheets, scrolling, a
+     script-added link's `load`, crypto) passes; the step 2 network test
+     still passes 22/22; BBC News now hydrates and shows its full front
+     page (before, React gave up with "Application error"); GitHub and
+     Hacker News load without script errors.
 4. **Modules and more**: `type="module"` and `import`, `async`/`defer`
    order, `MutationObserver` that reports, `<template>` and custom
    elements, `<canvas>` 2D drawing.

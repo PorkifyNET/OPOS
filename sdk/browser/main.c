@@ -46,6 +46,8 @@ struct tab {
     struct page page;
     bool have_page;
     int scroll;
+    int script_scroll;         /* scroll offset scripts were told about */
+    int script_width;          /* window width they were told about */
     bool follow_anchor;           /* keep the #fragment target in view */
     char url[OPOS_HTTP_URL_MAX];
     char title[128];              /* the page's <title>, or "" */
@@ -638,6 +640,8 @@ static void paint_page(void) {
             }
             break;
         }
+        case ITEM_BOX:
+            break;
         case ITEM_IMAGE:
             if (item->image != NULL && item->image->state == 1) {
                 image_blend(b.canvas.pixels, (int)b.canvas.stride,
@@ -1129,13 +1133,18 @@ static void paint(void) {
 
 /* --------------------------------------------------------------- loading */
 
+static void sheets_update(struct page *page, const char *base, bool show);
+
 static void relayout(void) {
     if (!T->have_page) {
         return;
     }
     viewport_width_px = viewport_width();
     viewport_height_px = viewport_height();
+    /* Scripts may have added, changed or removed style sheets. */
+    sheets_update(&T->page, T->page.url, false);
     layout_page(&T->page, b.fonts, viewport_width() - 2 * MARGIN);
+    script_layout_done(&T->page);
     build_text();
     /* Images that arrive change the layout, not the text: offsets stay. */
     if (T->selection_anchor > T->text_length) {
@@ -1164,17 +1173,11 @@ static void append(char **out, size_t *used, size_t *capacity, const char *s,
     (*out)[*used] = '\0';
 }
 
-/* Style sheets of one page load: each address once, at most MAX_SHEETS
-   of them and MAX_CSS_BYTES in all (big sites link 20+ sheets). */
+/* Style sheets a page fetches: at most MAX_SHEETS of them and
+   MAX_CSS_BYTES in all (big sites link 20+ sheets). */
 #define MAX_SHEETS 32
 #define MAX_SHEET_BYTES (2u << 20)
 #define MAX_CSS_BYTES (6u << 20)
-
-struct sheet_loads {
-    int count;
-    size_t bytes;
-    char urls[MAX_SHEETS][OPOS_HTTP_URL_MAX];
-};
 
 static bool starts_with_ci(const char *text, const char *prefix);
 
@@ -1249,78 +1252,269 @@ static char *absolute_urls(const char *base, const char *text, size_t length,
     return out;
 }
 
-static __attribute__((noinline)) void fetch_sheet(const char *base,
-                                                      const char *href,
-                                                      struct css_sheet **chain,
-                                                      struct sheet_loads *loads) {
-    char url[OPOS_HTTP_URL_MAX];
-    if (!opos_url_resolve(base, href, url, sizeof(url))) {
-        return;
-    }
-    for (int i = 0; i < loads->count; i++) {
-        if (strcmp(loads->urls[i], url) == 0) {
-            return;
-        }
-    }
-    if (loads->count == MAX_SHEETS || loads->bytes >= MAX_CSS_BYTES) {
-        return;
-    }
-    snprintf(loads->urls[loads->count++], OPOS_HTTP_URL_MAX, "%s", url);
+static __attribute__((noinline)) struct css_sheet *fetch_sheet(
+    const char *url, int number, bool show, size_t *bytes) {
     char text[OPOS_HTTP_URL_MAX + 32];
-    snprintf(text, sizeof(text), "Style %d: %s", loads->count, url);
+    snprintf(text, sizeof(text), "Style %d: %s", number, url);
     set_status(text);
-    paint();
+    if (show) {
+        paint();
+    }
+    struct css_sheet *sheet = NULL;
     struct opos_http_response response;
     if (opos_http_get(url, MAX_SHEET_BYTES, &response) == 0) {
         if (response.status == 200) {
-            loads->bytes += response.length;
+            *bytes += response.length;
             size_t length;
-            char *text = absolute_urls(response.url,
-                                       (const char *)response.body,
-                                       response.length, &length);
-            if (text != NULL) {
-                *chain = css_append(*chain, css_parse(text, length));
-                free(text);
+            char *absolute = absolute_urls(response.url,
+                                           (const char *)response.body,
+                                           response.length, &length);
+            if (absolute != NULL) {
+                sheet = css_parse(absolute, length);
+                free(absolute);
             } else {
-                *chain = css_append(*chain,
-                                    css_parse((const char *)response.body,
-                                              response.length));
+                sheet = css_parse((const char *)response.body,
+                                  response.length);
             }
         }
         opos_http_free(&response);
     }
+    return sheet;
 }
 
-static void collect_sheets(struct opos_html_node *node, struct css_sheet **chain,
-                           const char *base, struct sheet_loads *loads) {
+/* Where a sheet of the page's chain came from: a <style> element (its
+   text), a linked sheet (its address) or the adopted sheets (node NULL,
+   not link). hash: of the text or the address. */
+struct page_sheet {
+    const struct opos_html_node *node;
+    bool link;
+    bool taken;                /* sheets_update: reused */
+    uint32_t hash;
+    struct css_sheet *sheet;   /* NULL: it failed to load */
+};
+
+struct sheet_walk {
+    struct page *page;
+    const char *base;
+    bool show;                 /* paint the status while fetching */
+    struct page_sheet *list;
+    size_t count, capacity;
+    bool changed;
+};
+
+static uint32_t hash_bytes(const char *text, size_t length) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++) {
+        hash = (hash ^ (uint8_t)text[i]) * 16777619u;
+    }
+    return hash;
+}
+
+static bool sheet_room(struct sheet_walk *w) {
+    if (w->count < w->capacity) {
+        return true;
+    }
+    size_t capacity = w->capacity == 0 ? 16 : w->capacity * 2;
+    struct page_sheet *grown = realloc(w->list, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        return false;
+    }
+    w->list = grown;
+    w->capacity = capacity;
+    return true;
+}
+
+/* Moves the page's old entry for this sheet to the new list; false when
+   there is none. */
+static bool sheet_reuse(struct sheet_walk *w, const struct opos_html_node *node,
+                        bool link, uint32_t hash) {
+    struct page *page = w->page;
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        struct page_sheet *old = &page->sheet_list[i];
+        if (!old->taken && old->hash == hash && old->link == link
+            && (link || old->node == node)) {
+            if (i != w->count) {
+                w->changed = true;
+            }
+            old->taken = true;
+            w->list[w->count] = *old;
+            w->list[w->count].node = node;
+            w->list[w->count].taken = false;
+            w->count++;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sheet_add_text(struct sheet_walk *w,
+                           const struct opos_html_node *node,
+                           const char *text, size_t length) {
+    uint32_t hash = hash_bytes(text, length);
+    if (!sheet_room(w) || sheet_reuse(w, node, false, hash)) {
+        return;
+    }
+    w->list[w->count++] = (struct page_sheet){node, false, false, hash,
+                                              css_parse(text, length)};
+    w->changed = true;
+}
+
+static void sheet_add_style(struct sheet_walk *w,
+                            const struct opos_html_node *node) {
+    size_t length;
+    const char *text = script_sheet_text(w->page, node, &length);
+    if (text != NULL) {
+        sheet_add_text(w, node, text, length);
+        return;
+    }
+    size_t total = 0, count = 0;
+    const struct opos_html_node *only = NULL;
+    for (const struct opos_html_node *t = node->first_child; t != NULL;
+         t = t->next_sibling) {
+        if (t->type == HTML_NODE_TEXT) {
+            total += t->text_length;
+            count++;
+            only = t;
+        }
+    }
+    if (count <= 1) {
+        sheet_add_text(w, node, only != NULL ? only->text : "",
+                       only != NULL ? only->text_length : 0);
+        return;
+    }
+    char *joined = malloc(total + 1);
+    if (joined == NULL) {
+        return;
+    }
+    size_t used = 0;
+    for (const struct opos_html_node *t = node->first_child; t != NULL;
+         t = t->next_sibling) {
+        if (t->type == HTML_NODE_TEXT) {
+            memcpy(joined + used, t->text, t->text_length);
+            used += t->text_length;
+        }
+    }
+    joined[used] = '\0';
+    sheet_add_text(w, node, joined, used);
+    free(joined);
+}
+
+static void sheet_add_link(struct sheet_walk *w,
+                           const struct opos_html_node *node,
+                           const char *href) {
+    char url[OPOS_HTTP_URL_MAX];
+    if (!opos_url_resolve(w->base, href, url, sizeof(url))) {
+        return;
+    }
+    uint32_t hash = hash_bytes(url, strlen(url));
+    for (size_t i = 0; i < w->count; i++) {
+        if (w->list[i].link && w->list[i].hash == hash) {
+            return; /* each address once */
+        }
+    }
+    if (!sheet_room(w) || sheet_reuse(w, node, true, hash)) {
+        return;
+    }
+    struct page *page = w->page;
+    struct css_sheet *sheet = NULL;
+    if (page->sheet_fetches < MAX_SHEETS
+        && page->sheet_bytes < MAX_CSS_BYTES) {
+        page->sheet_fetches++;
+        sheet = fetch_sheet(url, page->sheet_fetches, w->show,
+                            &page->sheet_bytes);
+    }
+    w->list[w->count++] = (struct page_sheet){node, true, false, hash, sheet};
+    w->changed = true;
+}
+
+static void sheets_walk(struct sheet_walk *w, struct opos_html_node *node) {
     for (; node != NULL; node = node->next_sibling) {
         if (node->type != HTML_NODE_ELEMENT) {
             continue;
         }
         if (node->tag == HTML_TAG_STYLE) {
             const char *media = opos_html_attribute(node, "media");
-            if (media != NULL && !css_media_matches(media)) {
-                continue;
+            if (media == NULL || css_media_matches(media)) {
+                sheet_add_style(w, node);
             }
-            for (struct opos_html_node *t = node->first_child; t != NULL;
-                 t = t->next_sibling) {
-                if (t->type == HTML_NODE_TEXT) {
-                    *chain = css_append(*chain, css_parse(t->text,
-                                                         t->text_length));
-                }
-            }
-        } else if (node->tag == HTML_TAG_LINK) {
+            continue;
+        }
+        if (node->tag == HTML_TAG_LINK) {
             const char *rel = opos_html_attribute(node, "rel");
             const char *href = opos_html_attribute(node, "href");
             const char *media = opos_html_attribute(node, "media");
             if (rel != NULL && href != NULL && strstr(rel, "stylesheet") != NULL
                 && strstr(rel, "alternate") == NULL
+                && opos_html_attribute(node, "disabled") == NULL
                 && (media == NULL || css_media_matches(media))) {
-                fetch_sheet(base, href, chain, loads);
+                sheet_add_link(w, node, href);
+            }
+            continue;
+        }
+        if (node->tag == HTML_TAG_TEMPLATE) {
+            continue;
+        }
+        sheets_walk(w, node->first_child);
+    }
+}
+
+/* Brings the page's sheets in line with its <style> and <link> elements,
+   which scripts add, change and remove: new ones are parsed or fetched,
+   unchanged ones kept, and the chain relinked when anything changed. */
+static void sheets_update(struct page *page, const char *base, bool show) {
+    if (page->doc == NULL) {
+        return;
+    }
+    struct sheet_walk w;
+    memset(&w, 0, sizeof(w));
+    w.page = page;
+    w.base = base;
+    w.show = show;
+    sheets_walk(&w, page->doc->root);
+    size_t length;
+    const char *adopted = script_sheet_text(page, NULL, &length);
+    if (adopted != NULL) {
+        sheet_add_text(&w, NULL, adopted, length);
+    }
+    bool removed = false;
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        removed |= !page->sheet_list[i].taken;
+    }
+    if (!w.changed && !removed) {
+        free(page->sheet_list);
+        page->sheet_list = w.list;
+        css_forget_matches(page->sheets);
+        return;
+    }
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        struct page_sheet *old = &page->sheet_list[i];
+        if (!old->taken && old->sheet != NULL) {
+            css_unlink_free(old->sheet);
+        }
+    }
+    free(page->sheet_list);
+    page->sheet_list = w.list;
+    page->sheet_count = w.count;
+    struct css_sheet **chain = malloc((w.count + 1) * sizeof(*chain));
+    if (chain == NULL) {
+        /* Keep the sheets apart rather than half linked. */
+        for (size_t i = 0; i < w.count; i++) {
+            if (w.list[i].sheet != NULL) {
+                css_unlink_free(w.list[i].sheet);
             }
         }
-        collect_sheets(node->first_child, chain, base, loads);
+        page->sheet_count = 0;
+        page->sheets = NULL;
+        return;
     }
+    size_t used = 0;
+    for (size_t i = 0; i < w.count; i++) {
+        if (w.list[i].sheet != NULL) {
+            chain[used++] = w.list[i].sheet;
+        }
+    }
+    page->sheets = css_relink(chain, used);
+    free(chain);
 }
 
 /* The first enabled control with the autofocus attribute, or NULL. */
@@ -1542,13 +1736,11 @@ static void install_document(const char *html, size_t length,
     /* @media rules are decided while the sheets are parsed. */
     viewport_width_px = viewport_width();
     viewport_height_px = viewport_height();
-    static struct sheet_loads loads;
-    loads.count = 0;
-    loads.bytes = 0;
-    collect_sheets(doc->root, &T->page.sheets, url, &loads);
     snprintf(T->page.url, sizeof(T->page.url), "%s", url);
+    sheets_update(&T->page, url, true);
     T->have_page = true;
     T->scroll = 0;
+    T->script_scroll = 0;
     clear_selection();
     b.field_selecting = false;
     b.field_selection = NULL;
@@ -2341,7 +2533,85 @@ static long scripts_tick(void) {
         }
     }
     scripts_apply();
+    /* The shown page hears when it scrolled or the window resized. */
+    if (T->have_page && T->page.script != NULL) {
+        if (T->script_width != b.width) {
+            bool first = T->script_width == 0;
+            T->script_width = b.width;
+            if (!first) {
+                script_window_event(&T->page, "resize");
+            }
+        }
+        if (T->script_scroll != T->scroll) {
+            T->script_scroll = T->scroll;
+            script_window_event(&T->page, "scroll");
+        }
+        scripts_apply();
+    }
     return next;
+}
+
+/* --------------------------------------------- layout asked by scripts */
+
+static struct tab *tab_of(const struct page *page) {
+    for (int i = 0; i < b.tab_count; i++) {
+        if (&b.tabs[i]->page == page) {
+            return b.tabs[i];
+        }
+    }
+    return NULL;
+}
+
+void browser_layout_now(struct page *page) {
+    struct tab *tab = tab_of(page);
+    if (tab == NULL || !tab->have_page) {
+        return;
+    }
+    struct tab *shown = T;
+    b.tab = tab;
+    int keep = T->scroll;
+    relayout();
+    T->scroll = keep;
+    clamp_scroll();
+    b.tab = shown;
+    b.dirty = true;
+}
+
+bool browser_element_rect(struct page *page, const struct opos_html_node *node,
+                          int rect[4]) {
+    struct tab *tab = tab_of(page);
+    bool fixed;
+    if (tab == NULL || !page_element_box(page, node, rect, &fixed)) {
+        return false;
+    }
+    rect[0] += MARGIN;
+    rect[1] += MARGIN - (fixed ? 0 : tab->scroll);
+    return true;
+}
+
+void browser_page_metrics(struct page *page, int *scroll_x, int *scroll_y,
+                          int *width, int *height) {
+    struct tab *tab = tab_of(page);
+    *scroll_x = 0;
+    *scroll_y = tab != NULL ? tab->scroll : 0;
+    *width = page->content_width + 2 * MARGIN;
+    *height = page->content_height + 2 * MARGIN;
+}
+
+void browser_scroll_to(struct page *page, int y) {
+    struct tab *tab = tab_of(page);
+    if (tab == NULL) {
+        return;
+    }
+    struct tab *shown = T;
+    b.tab = tab;
+    T->scroll = y;
+    T->follow_anchor = false;
+    clamp_scroll();
+    /* The page asked for it: no scroll event back for this one. */
+    T->script_scroll = T->scroll;
+    b.tab = shown;
+    b.dirty = true;
 }
 
 /* A click at a page element: true when a script cancelled it. (x, y) are
@@ -2501,7 +2771,12 @@ static void click_control(const struct opos_html_node *node) {
         } else {
             form_check_radio(&T->page, node);
         }
-        if (script_click(node, b.press_x, b.press_y)) {
+        bool cancelled = script_click(node, b.press_x, b.press_y);
+        field = form_field(&T->page, node); /* a layout may move it */
+        if (field == NULL) {
+            return;
+        }
+        if (cancelled) {
             field->checked = was;
         } else {
             script_changed(node, true, true);
@@ -3714,6 +3989,10 @@ static bool resize(int width, int height) {
     b.dirty = true;
     return true;
 }
+
+/* JavaScript (React and the like) recurses deeply: a 4 MiB stack instead
+   of the SDK's 128 KiB (crt0.S). */
+__attribute__((used)) const unsigned long opos_stack_size = 4ul << 20;
 
 int main(int argc, char **argv) {
     if (opos_window_create("BROWSER", 900, 640) < 0) {

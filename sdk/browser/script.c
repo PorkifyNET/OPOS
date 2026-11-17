@@ -15,6 +15,7 @@
  * script has finished (script_take_navigation).
  */
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,7 +31,7 @@
 #define SCRIPT_MAX_BYTES (4u << 20)   /* one external script */
 #define SCRIPT_TIME_MS 5000           /* one script, timer or event */
 #define JS_MEMORY_LIMIT (384u << 20)
-#define JS_STACK_LIMIT (256u << 10)   /* programs have a 512 KiB stack */
+#define JS_STACK_LIMIT (1u << 20)   /* of the 4 MiB stack (opos_stack_size) */
 #define MAX_PENDING 128
 #define LOG_MAX 64
 #define JS_FETCH_MAX_BYTES (16u << 20) /* one fetch or XMLHttpRequest */
@@ -192,6 +193,9 @@ struct script_state {
     JSValue element_proto, text_proto;
     JSValue hooks;                     /* what dom.js returned */
     bool dirty;                        /* the tree changed */
+    bool stale;                        /* not laid out since it changed */
+    struct sheet_text *sheet_texts;    /* CSS object model sheets */
+    size_t sheet_text_count;
     bool title_changed;
     long long deadline;                /* uptime ms; 0: no limit */
     long long started;                 /* uptime ms at page start */
@@ -592,7 +596,7 @@ static JSValue n_set_data(JSContext *ctx, JSValueConst this_val, int argc,
     }
     bool ok = opos_html_set_text(s->page->doc, node, text, length);
     JS_FreeCString(ctx, text);
-    s->dirty = true;
+    s->dirty = s->stale = true;
     return ok ? JS_UNDEFINED : JS_ThrowOutOfMemory(ctx);
 }
 
@@ -623,7 +627,7 @@ static JSValue n_attr(JSContext *ctx, JSValueConst this_val, int argc,
 static void note_change(struct script_state *s,
                         const struct opos_html_node *node) {
     (void)node;
-    s->dirty = true;
+    s->dirty = s->stale = true;
 }
 
 static JSValue n_set_attr(JSContext *ctx, JSValueConst this_val, int argc,
@@ -721,7 +725,7 @@ static JSValue n_insert(JSContext *ctx, JSValueConst this_val, int argc,
     if (!opos_html_insert(parent, node, before)) {
         return JS_ThrowTypeError(ctx, "HierarchyRequestError");
     }
-    s->dirty = true;
+    s->dirty = s->stale = true;
     if (connected(s, parent)) {
         note_inserted_scripts(s, node);
     }
@@ -738,7 +742,7 @@ static JSValue n_remove(JSContext *ctx, JSValueConst this_val, int argc,
     }
     if (node->parent != NULL) {
         opos_html_remove(node);
-        s->dirty = true;
+        s->dirty = s->stale = true;
     }
     return JS_UNDEFINED;
 }
@@ -993,7 +997,7 @@ static JSValue n_field(JSContext *ctx, JSValueConst this_val, int argc,
                 field->option = index;
             }
         }
-        s->dirty = true;
+        s->dirty = s->stale = true;
         return JS_UNDEFINED;
     }
     if (what == 1) {
@@ -1521,6 +1525,32 @@ static JSValue n_decode(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_NewStringLen(ctx, (const char *)data, length);
 }
 
+/* N.random(n): an ArrayBuffer of n random bytes (at most 65536). */
+static JSValue n_random(JSContext *ctx, JSValueConst this_val, int argc,
+                        JSValueConst *argv) {
+    (void)this_val;
+    int32_t n = 0;
+    if (argc < 1 || JS_ToInt32(ctx, &n, argv[0]) != 0) {
+        return JS_EXCEPTION;
+    }
+    if (n < 0 || n > 65536) {
+        return JS_ThrowRangeError(ctx, "too many random bytes");
+    }
+    uint8_t bytes[256];
+    uint8_t *buffer = n <= (int32_t)sizeof(bytes) ? bytes : malloc((size_t)n);
+    if (buffer == NULL) {
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    long got = n == 0 ? 0 : opos_syscall3(318 /* getrandom */, (long)buffer,
+                                          n, 0);
+    JSValue result = got == n ? JS_NewArrayBufferCopy(ctx, buffer, (size_t)n)
+                              : JS_ThrowInternalError(ctx, "no randomness");
+    if (buffer != bytes) {
+        free(buffer);
+    }
+    return result;
+}
+
 /* N.encode(string): its UTF-8 bytes as an ArrayBuffer. */
 static JSValue n_encode(JSContext *ctx, JSValueConst this_val, int argc,
                         JSValueConst *argv) {
@@ -1733,11 +1763,361 @@ static JSValue n_navigate_history(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* ----------------------------------------------------- styles and layout */
+
+/* Sheet text set through the CSS object model (insertRule ...) for a
+   <style> element, or for node NULL the document's adopted sheets. It
+   holds while the element's own text stays what it was (hash). */
+struct sheet_text {
+    const struct opos_html_node *node;
+    char *text;
+    size_t length;
+    uint32_t hash;
+};
+
+static uint32_t child_text_hash(const struct opos_html_node *node) {
+    uint32_t hash = 2166136261u;
+    if (node == NULL) {
+        return hash;
+    }
+    for (const struct opos_html_node *t = node->first_child; t != NULL;
+         t = t->next_sibling) {
+        if (t->type == HTML_NODE_TEXT) {
+            for (size_t i = 0; i < t->text_length; i++) {
+                hash = (hash ^ (uint8_t)t->text[i]) * 16777619u;
+            }
+        }
+    }
+    return hash;
+}
+
+static struct sheet_text *sheet_text_find(struct script_state *s,
+                                          const struct opos_html_node *node) {
+    for (size_t i = 0; i < s->sheet_text_count; i++) {
+        if (s->sheet_texts[i].node == node) {
+            return &s->sheet_texts[i];
+        }
+    }
+    return NULL;
+}
+
+/* N.setSheet(node or null, text or null) */
+static JSValue n_set_sheet(JSContext *ctx, JSValueConst this_val, int argc,
+                           JSValueConst *argv) {
+    (void)this_val;
+    struct script_state *s = state_of(ctx);
+    const struct opos_html_node *node = argc > 0 && !JS_IsNull(argv[0])
+                                      ? unwrap(argv[0]) : NULL;
+    if (argc > 0 && !JS_IsNull(argv[0]) && node == NULL) {
+        return JS_UNDEFINED;
+    }
+    struct sheet_text *entry = sheet_text_find(s, node);
+    if (argc < 2 || JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+        if (entry != NULL) {
+            free(entry->text);
+            *entry = s->sheet_texts[--s->sheet_text_count];
+            s->dirty = s->stale = true;
+        }
+        return JS_UNDEFINED;
+    }
+    size_t length;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[1]);
+    if (text == NULL) {
+        return JS_EXCEPTION;
+    }
+    char *copy = malloc(length + 1);
+    if (copy == NULL) {
+        JS_FreeCString(ctx, text);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    memcpy(copy, text, length + 1);
+    JS_FreeCString(ctx, text);
+    if (entry == NULL) {
+        struct sheet_text *grown = realloc(
+            s->sheet_texts, (s->sheet_text_count + 1) * sizeof(*grown));
+        if (grown == NULL) {
+            free(copy);
+            return JS_ThrowOutOfMemory(ctx);
+        }
+        s->sheet_texts = grown;
+        entry = &grown[s->sheet_text_count++];
+        entry->node = node;
+    } else {
+        free(entry->text);
+    }
+    entry->text = copy;
+    entry->length = length;
+    entry->hash = child_text_hash(node);
+    s->dirty = s->stale = true;
+    return JS_UNDEFINED;
+}
+
+const char *script_sheet_text(struct page *page,
+                              const struct opos_html_node *node,
+                              size_t *length) {
+    struct script_state *s = page->script;
+    if (s == NULL) {
+        return NULL;
+    }
+    struct sheet_text *entry = sheet_text_find(s, node);
+    if (entry == NULL || (node != NULL && entry->hash != child_text_hash(node))) {
+        return NULL;
+    }
+    *length = entry->length;
+    return entry->text;
+}
+
+void script_layout_done(struct page *page) {
+    if (page->script != NULL) {
+        page->script->stale = false;
+    }
+}
+
+/* Scripts that ask for sizes get the layout of the document as it is
+   now. */
+static void layout_fresh(struct script_state *s) {
+    if (s->stale) {
+        s->stale = false;
+        browser_layout_now(s->page);
+    }
+}
+
+/* N.rect(node): [x, y, width, height] in the view, or null. */
+static JSValue n_rect(JSContext *ctx, JSValueConst this_val, int argc,
+                      JSValueConst *argv) {
+    (void)this_val;
+    NODE_ARG(node, 0);
+    struct script_state *s = state_of(ctx);
+    layout_fresh(s);
+    int rect[4];
+    if (!browser_element_rect(s->page, node, rect)) {
+        return JS_NULL;
+    }
+    JSValue list = JS_NewArray(ctx);
+    for (int i = 0; i < 4; i++) {
+        JS_SetPropertyUint32(ctx, list, (uint32_t)i, JS_NewInt32(ctx, rect[i]));
+    }
+    return list;
+}
+
+/* N.metrics(): [scrollX, scrollY, page width, page height]. */
+static JSValue n_metrics(JSContext *ctx, JSValueConst this_val, int argc,
+                         JSValueConst *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    struct script_state *s = state_of(ctx);
+    layout_fresh(s);
+    int v[4];
+    browser_page_metrics(s->page, &v[0], &v[1], &v[2], &v[3]);
+    JSValue list = JS_NewArray(ctx);
+    for (int i = 0; i < 4; i++) {
+        JS_SetPropertyUint32(ctx, list, (uint32_t)i, JS_NewInt32(ctx, v[i]));
+    }
+    return list;
+}
+
+/* N.scrollTo(y) */
+static JSValue n_scroll_to(JSContext *ctx, JSValueConst this_val, int argc,
+                           JSValueConst *argv) {
+    (void)this_val;
+    struct script_state *s = state_of(ctx);
+    double y = 0;
+    if (argc < 1 || JS_ToFloat64(ctx, &y, argv[0]) != 0) {
+        return JS_EXCEPTION;
+    }
+    if (y != y) {
+        return JS_UNDEFINED;
+    }
+    layout_fresh(s);
+    browser_scroll_to(s->page, y < 0 ? 0 : y > 1e8 ? 100000000 : (int)y);
+    return JS_UNDEFINED;
+}
+
+static void put(JSContext *ctx, JSValue object, const char *name,
+                const char *format, ...) {
+    char text[96];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    JS_SetPropertyStr(ctx, object, name, JS_NewString(ctx, text));
+}
+
+static void put_colour(JSContext *ctx, JSValue object, const char *name,
+                       uint32_t colour, int alpha) {
+    int r = (int)(colour >> 16 & 255), g = (int)(colour >> 8 & 255);
+    int b = (int)(colour & 255);
+    if (alpha >= 255) {
+        put(ctx, object, name, "rgb(%d, %d, %d)", r, g, b);
+    } else if (alpha <= 0) {
+        put(ctx, object, name, "rgba(0, 0, 0, 0)");
+    } else {
+        put(ctx, object, name, "rgba(%d, %d, %d, 0.%02d)", r, g, b,
+            alpha * 100 / 255);
+    }
+}
+
+static const char *display_name(const struct style *st,
+                                const struct opos_html_node *node) {
+    enum display d = st->out_of_flow ? st->flow_display : st->display;
+    switch (d) {
+    case DISPLAY_NONE: return "none";
+    case DISPLAY_INLINE: return "inline";
+    case DISPLAY_BLOCK:
+        return st->flex ? "flex" : st->grid ? "grid" : "block";
+    case DISPLAY_LIST_ITEM: return "list-item";
+    case DISPLAY_TABLE: return "table";
+    case DISPLAY_TABLE_PART:
+        return node->tag == HTML_TAG_TR ? "table-row"
+             : node->tag == HTML_TAG_THEAD ? "table-header-group"
+             : node->tag == HTML_TAG_TFOOT ? "table-footer-group"
+             : node->tag == HTML_TAG_CAPTION ? "table-caption"
+             : "table-row-group";
+    case DISPLAY_TABLE_CELL: return "table-cell";
+    case DISPLAY_INLINE_BLOCK:
+        return st->flex ? "inline-flex" : st->grid ? "inline-grid"
+                                                   : "inline-block";
+    case DISPLAY_CONTENTS: return "contents";
+    }
+    return "block";
+}
+
+static void put_offset(JSContext *ctx, JSValue object, const char *name,
+                       const struct style *st, int side) {
+    if (!st->offset_set[side]) {
+        put(ctx, object, name, "auto");
+    } else {
+        put(ctx, object, name, st->offset_pct[side] ? "%d%%" : "%dpx",
+            st->offset[side]);
+    }
+}
+
+/* N.computed(node): the element's computed style as
+   {"property-name": "value"} for the properties the browser knows. */
+static JSValue n_computed(JSContext *ctx, JSValueConst this_val, int argc,
+                          JSValueConst *argv) {
+    (void)this_val;
+    NODE_ARG(node, 0);
+    if (node->type != HTML_NODE_ELEMENT) {
+        return JS_NULL;
+    }
+    struct script_state *s = state_of(ctx);
+    layout_fresh(s);
+    struct style st;
+    page_element_style(s->page, node, &st);
+    JSValue o = JS_NewObject(ctx);
+    static const char *const sides[4] = {"top", "right", "bottom", "left"};
+    static const char *const positions[] = {"static", "relative", "absolute",
+                                            "fixed", "sticky"};
+    static const char *const aligns[] = {"left", "center", "right"};
+    static const char *const flex_align[] = {"normal", "flex-start", "center",
+                                             "flex-end"};
+    static const char *const justify[] = {"flex-start", "center", "flex-end",
+                                          "space-between"};
+    char name[40];
+    put(ctx, o, "display", "%s", display_name(&st, node));
+    put(ctx, o, "position", "%s", positions[st.position <= POS_STICKY
+                                            ? st.position : 0]);
+    put(ctx, o, "visibility", "%s", st.invisible ? "hidden" : "visible");
+    put(ctx, o, "opacity", "%s", st.opacity_zero ? "0" : "1");
+    put_colour(ctx, o, "color", st.colour, 255);
+    put_colour(ctx, o, "background-color", st.background,
+               st.has_background ? st.background_alpha : 0);
+    put(ctx, o, "background-image", "none");
+    put(ctx, o, "font-size", "%dpx", st.font_size);
+    put(ctx, o, "font-weight", "%s", st.bold ? "700" : "400");
+    put(ctx, o, "font-style", "%s", st.italic ? "italic" : "normal");
+    put(ctx, o, "font-family", "%s", st.mono ? "monospace" : "sans-serif");
+    put(ctx, o, "line-height", "normal");
+    const char *decoration = st.underline ? "underline"
+                           : st.strike ? "line-through" : "none";
+    put(ctx, o, "text-decoration-line", "%s", decoration);
+    put(ctx, o, "text-decoration", "%s", decoration);
+    put(ctx, o, "text-align", "%s", aligns[st.align <= ALIGN_RIGHT
+                                           ? st.align : 0]);
+    put(ctx, o, "white-space", "%s", st.pre ? "pre" : "normal");
+    for (int i = 0; i < 4; i++) {
+        snprintf(name, sizeof(name), "margin-%s", sides[i]);
+        put(ctx, o, name, "%dpx", st.margin[i]);
+        snprintf(name, sizeof(name), "padding-%s", sides[i]);
+        put(ctx, o, name, "%dpx", st.padding[i]);
+        snprintf(name, sizeof(name), "border-%s-width", sides[i]);
+        put(ctx, o, name, "%dpx", st.border);
+        snprintf(name, sizeof(name), "border-%s-style", sides[i]);
+        put(ctx, o, name, "%s", st.border > 0 ? "solid" : "none");
+        snprintf(name, sizeof(name), "border-%s-color", sides[i]);
+        put_colour(ctx, o, name, st.border_colour, 255);
+        put_offset(ctx, o, sides[i], &st, i);
+    }
+    put(ctx, o, "box-sizing", "%s", st.border_box ? "border-box"
+                                                  : "content-box");
+    int rect[4] = {0, 0, 0, 0};
+    if (browser_element_rect(s->page, node, rect)) {
+        int frame_x = st.border_box ? 0 : st.padding[LEFT] + st.padding[RIGHT]
+                                          + 2 * st.border;
+        int frame_y = st.border_box ? 0 : st.padding[TOP] + st.padding[BOTTOM]
+                                          + 2 * st.border;
+        put(ctx, o, "width", "%dpx", rect[2] > frame_x ? rect[2] - frame_x : 0);
+        put(ctx, o, "height", "%dpx",
+            rect[3] > frame_y ? rect[3] - frame_y : 0);
+    } else {
+        put(ctx, o, "width", "auto");
+        put(ctx, o, "height", "auto");
+    }
+    if (st.max_width >= 0) {
+        put(ctx, o, "max-width", "%dpx", st.max_width);
+    } else if (st.max_width_pct >= 0) {
+        put(ctx, o, "max-width", "%d%%", st.max_width_pct);
+    } else {
+        put(ctx, o, "max-width", "none");
+    }
+    put(ctx, o, "float", "%s", st.float_side == 1 ? "left"
+                             : st.float_side == 2 ? "right" : "none");
+    put(ctx, o, "clear", "%s", st.clear_both ? "both" : "none");
+    put(ctx, o, "flex-direction", "%s", st.flex_column ? "column" : "row");
+    put(ctx, o, "flex-wrap", "%s", st.flex_wrap ? "wrap" : "nowrap");
+    put(ctx, o, "flex-grow", "%d", st.flex_grow);
+    put(ctx, o, "flex-shrink", "%s", st.no_shrink ? "0" : "1");
+    put(ctx, o, "justify-content", "%s", justify[st.justify >= 0
+                                                 && st.justify <= 3
+                                                 ? st.justify : 0]);
+    put(ctx, o, "align-items", "%s", flex_align[st.align_items <= 3
+                                                ? st.align_items : 0]);
+    put(ctx, o, "gap", "%dpx", st.gap);
+    put(ctx, o, "list-style-type", "%s", st.no_marker ? "none"
+                                       : st.ordered ? "decimal" : "disc");
+    if (st.translate[0] != 0 || st.translate[1] != 0) {
+        int dx = st.translate_pct[0] && rect[2] > 0
+               ? rect[2] * st.translate[0] / 100 : st.translate[0];
+        int dy = st.translate_pct[1] && rect[3] > 0
+               ? rect[3] * st.translate[1] / 100 : st.translate[1];
+        put(ctx, o, "transform", "matrix(1, 0, 0, 1, %d, %d)", dx, dy);
+    } else {
+        put(ctx, o, "transform", "none");
+    }
+    put(ctx, o, "z-index", "auto");
+    put(ctx, o, "overflow", "visible");
+    put(ctx, o, "overflow-x", "visible");
+    put(ctx, o, "overflow-y", "visible");
+    put(ctx, o, "cursor", "auto");
+    put(ctx, o, "pointer-events", "auto");
+    put(ctx, o, "content", "none");
+    put(ctx, o, "direction", "ltr");
+    return o;
+}
+
 static const JSCFunctionListEntry native_functions[] = {
     JS_CFUNC_DEF("http", 6, n_http),
+    JS_CFUNC_DEF("setSheet", 2, n_set_sheet),
+    JS_CFUNC_DEF("rect", 1, n_rect),
+    JS_CFUNC_DEF("metrics", 0, n_metrics),
+    JS_CFUNC_DEF("scrollTo", 1, n_scroll_to),
+    JS_CFUNC_DEF("computed", 1, n_computed),
     JS_CFUNC_DEF("navigateHistory", 1, n_navigate_history),
     JS_CFUNC_DEF("decode", 1, n_decode),
     JS_CFUNC_DEF("encode", 1, n_encode),
+    JS_CFUNC_DEF("random", 1, n_random),
     JS_CFUNC_DEF("cookie", 0, n_cookie),
     JS_CFUNC_DEF("setCookie", 1, n_set_cookie),
     JS_CFUNC_DEF("storageLoad", 0, n_storage_load),
@@ -1942,6 +2322,7 @@ void script_page_start(struct page *page) {
     }
     s->page = page;
     s->started = uptime_ms();
+    s->stale = true; /* not laid out yet */
     s->runtime = JS_NewRuntime2(&pool_functions, NULL);
     if (s->runtime == NULL) {
         free(s);
@@ -2034,6 +2415,10 @@ void script_page_end(struct page *page) {
         }
     }
     free(s->wrappers);
+    for (size_t i = 0; i < s->sheet_text_count; i++) {
+        free(s->sheet_texts[i].text);
+    }
+    free(s->sheet_texts);
     JS_FreeValue(ctx, s->element_proto);
     JS_FreeValue(ctx, s->text_proto);
     JS_FreeValue(ctx, s->hooks);
@@ -2200,4 +2585,12 @@ bool script_runs_javascript_url(struct page *page, const char *url) {
 
 int script_errors(const struct page *page) {
     return page->script != NULL ? page->script->errors : 0;
+}
+
+void script_window_event(struct page *page, const char *type) {
+    struct script_state *s = page->script;
+    if (s == NULL || s->running) {
+        return;
+    }
+    fire(s, "window", type);
 }

@@ -55,7 +55,7 @@ category: games
 license: GPL-2.0
 featured: yes
 summary: Build a transport empire of railways, roads, ships and planes.
-description: OpenTTD, the open-source transport tycoon game: build railways, roads, ships and planes and connect towns and industries. Comes with the OpenGFX graphics, OpenSFX sounds and OpenMSX music, played through the FluidSynth synthesizer. OpenTTD, OpenGFX and OpenMSX are GPL-2.0, OpenSFX is CC BY-SA 3.0 and FluidSynth is LGPL-2.1; their source releases are included in the package.
+description: OpenTTD, the open-source transport tycoon game: build railways, roads, ships and planes and connect towns and industries. Play alone or online: join multiplayer servers and download extra graphics, vehicles, scenarios and AIs from the online content service (asks for the network). Comes with the OpenGFX graphics, OpenSFX sounds and OpenMSX music, played through the FluidSynth synthesizer. OpenTTD, OpenGFX and OpenMSX are GPL-2.0, OpenSFX is CC BY-SA 3.0 and FluidSynth is LGPL-2.1; their source releases are included in the package.
 
 [net.busybox.busybox]
 category: system

@@ -10,8 +10,14 @@
 # music go through SDL's OPOS audio driver. OpenTTD's FluidSynth music
 # driver renders the OpenMSX MIDI files with the GeneralUser GS SoundFont;
 # the Start menu entry is openttd-start (start.c), which points OpenTTD at
-# that SoundFont. No PNG, FreeType, ICU or curl: the game uses its sprite
-# font and cannot download online content. OpenTTD's source is not changed.
+# that SoundFont. The package asks for the network (capabilities: net), so
+# multiplayer, the server list and the online content window work over
+# OPOS's IPv4 sockets (OpenTTD skips IPv6 addresses it cannot open). No
+# PNG, FreeType, ICU or curl: the game uses its sprite font, and without
+# curl it downloads online content through its own TCP content protocol
+# instead of HTTP, which OpenTTD does by itself. OpenTTD sets its sockets
+# non-blocking with ioctl(FIONBIO), which needs OPOS 0.6.7. OpenTTD's
+# source is not changed.
 #
 # OpenTTD is C++, so this recipe needs a musl cross toolchain with g++
 # (musl-cross-make), not LINUX_CC: set MUSL_CROSS to its prefix, for
@@ -22,10 +28,10 @@
 OUT=$1
 CACHE=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
-VERSION=14.1
+VERSION=15.3
 # The package version: OpenTTD's, plus a fourth number for OPOS rebuilds.
-PACKAGE_VERSION=14.1.0.4
-OPENGFX=7.1
+PACKAGE_VERSION=15.3.0.1
+OPENGFX=8.0
 OPENSFX=1.0.3
 OPENMSX=0.4.2
 FLUIDSYNTH=2.6.1
@@ -40,13 +46,15 @@ if [ ! -x "${CROSS}g++" ]; then
     exit 1
 fi
 SOURCE=$(fetch "https://cdn.openttd.org/openttd-releases/$VERSION/openttd-$VERSION-source.tar.xz" \
-    2c14c8f01f44148c4f2c88c169a30abcdb002eb128a92b9adb76baa76b013494 \
+    5ea21eea7d59c78a42071924ac18c6bc0116088f2e96b14cfee9369175973be7 \
     "$CACHE")
 GFX=$(fetch "https://cdn.openttd.org/opengfx-releases/$OPENGFX/opengfx-$OPENGFX-all.zip" \
-    928fcf34efd0719a3560cbab6821d71ce686b6315e8825360fba87a7a94d7846 \
+    43a0c1dabf39cb865394f3a6cc36d4da5c10ecfaaf55652043104806810903be \
     "$CACHE")
-GFX_SOURCE=$(fetch "https://cdn.openttd.org/opengfx-releases/$OPENGFX/opengfx-$OPENGFX-source.tar.xz" \
-    5322524ffd854cb65d1a4f156d84a3573c4156d08c3757aafd1b8fa3cda41f5a \
+# OpenGFX 8.0 has no source tarball on cdn.openttd.org: its source is the
+# release tag on GitHub (the archive is named 8.0.tar.gz there).
+GFX_SOURCE=$(fetch "https://github.com/OpenTTD/OpenGFX/archive/refs/tags/$OPENGFX.tar.gz" \
+    0c3575cf70fb3ccaa2c2a8d3525598d10534a1f4401fa70a98814ecab5287e56 \
     "$CACHE")
 SFX=$(fetch "https://cdn.openttd.org/opensfx-releases/$OPENSFX/opensfx-$OPENSFX-all.zip" \
     e0a218b7dd9438e701503b0f84c25a97c1c11b7c2f025323fb19d6db16ef3759 \
@@ -209,7 +217,7 @@ recipe is store/linux/openttd in the OPOS repository. openttd-start
 (OPOS, see start.c there) runs openttd with the SoundFont below.
 
 baseset/ holds OpenGFX $OPENGFX (GPL-2.0; source
-source/opengfx-$OPENGFX-source.tar.xz), OpenSFX $OPENSFX (CC BY-SA 3.0)
+source/opengfx-$OPENGFX.tar.gz), OpenSFX $OPENSFX (CC BY-SA 3.0)
 and OpenMSX $OPENMSX (GPL-2.0; source
 source/openmsx-$OPENMSX-source.tar.xz). Each set's license.txt and
 readme.txt with its credits are inside its .tar file, or for OpenMSX in
@@ -225,7 +233,8 @@ tar -xzOf "$FLUID_SOURCE" "fluidsynth-$FLUIDSYNTH/LICENSE" > "$STAGE/LICENSE.flu
 tar -xzOf "$ZLIB_SOURCE" "zlib-$ZLIB/LICENSE" > "$STAGE/LICENSE.zlib"
 tar -xzOf "$XZ_SOURCE" "xz-$XZ/COPYING" > "$STAGE/LICENSE.liblzma"
 mkdir -p "$STAGE/source"
-cp "$SOURCE" "$GFX_SOURCE" "$MSX_SOURCE" "$STAGE/source/"
+cp "$SOURCE" "$MSX_SOURCE" "$STAGE/source/"
+cp "$GFX_SOURCE" "$STAGE/source/opengfx-$OPENGFX.tar.gz"
 cp "$FLUID_SOURCE" "$STAGE/source/fluidsynth-$FLUIDSYNTH.tar.gz"
 
 {
@@ -236,7 +245,8 @@ name: OpenTTD
 version: $PACKAGE_VERSION
 publisher: OpenTTD, OpenGFX, OpenSFX, OpenMSX (built for OPOS)
 platform: linux
-requires-opos: 0.6.0
+capabilitinetes: 
+requires-opos: 0.6.7
 PKG
     (cd "$STAGE" && find . -type f | sed 's|^\./||' | LC_ALL=C sort) |
     while read -r f; do

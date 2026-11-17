@@ -274,7 +274,10 @@ the desktop restores the defaults when a program from the Terminal ends.
 - **`poll` and `select`:** report standard input readable when keys are
   waiting.
 - **Other ioctls:** `FIONREAD`, `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`,
-  `TCFLSH`, `TCSBRK` and `TIOCSWINSZ` are accepted.
+  `TCFLSH`, `TCSBRK` and `TIOCSWINSZ` are accepted. On a socket or pipe,
+  `FIONBIO` sets or clears non-blocking mode like `fcntl(F_SETFL,
+  O_NONBLOCK)` (OpenTTD uses it for every socket); any other ioctl there
+  is `ENOTTY`.
 - **`TIOCGWINSZ`:** reports the Terminal window's size.
 - **`TERM`:** set to `xterm`.
 

@@ -143,9 +143,9 @@ then verifies `EPIPE` and resource reuse.
 (`SO_ERROR`, `SO_TYPE`) work for `AF_INET` `SOCK_STREAM` (TCP) and
 `SOCK_DGRAM` (UDP) sockets on top of `kernel/net.c`. `read`, `write`,
 `writev`, `close`, `fstat` (`S_IFSOCK`) and `fork` sharing work on socket
-descriptors. `SOCK_NONBLOCK`, `MSG_DONTWAIT` and `fcntl(F_SETFL, O_NONBLOCK)`
-give `EAGAIN`/`EINPROGRESS`; `MSG_PEEK`, IPv6, `AF_UNIX` and `socketpair`
-are not supported. Blocking calls poll the network card and wait one timer
+descriptors. `SOCK_NONBLOCK`, `MSG_DONTWAIT`, `fcntl(F_SETFL, O_NONBLOCK)`
+and `ioctl(FIONBIO)` (what OpenTTD uses) give `EAGAIN`/`EINPROGRESS`;
+`MSG_PEEK`, IPv6, `AF_UNIX` and `socketpair` are not supported. Blocking calls poll the network card and wait one timer
 tick at a time, so a killed process leaves them with `EINTR`.
 
 Limits are system-wide: 8 TCP connections, 4 listening ports with up to 8

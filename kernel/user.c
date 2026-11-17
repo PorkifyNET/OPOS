@@ -6936,8 +6936,25 @@ bool user_linux_syscall_dispatch(void *saved_registers) {
         uintptr_t argument = (uintptr_t)frame->rdx;
         bool console = user_descriptor_console(process, descriptor);
         if (!console) {
-            frame->rax = (uint64_t)(int64_t)(
-                user_file_descriptor(process, descriptor) == NULL ? -9 : -25);
+            struct user_file_descriptor *file =
+                user_file_descriptor(process, descriptor);
+            if (file == NULL) {
+                frame->rax = (uint64_t)(int64_t)-9;
+                return false;
+            }
+            if (request == 0x5421) {
+                /* FIONBIO: the same as fcntl(F_SETFL, O_NONBLOCK), which
+                   is how OpenTTD makes its sockets non-blocking. */
+                if (!paging_user_range_valid(argument, sizeof(int32_t),
+                                             false, false)) {
+                    frame->rax = (uint64_t)(int64_t)-14;
+                    return false;
+                }
+                file->nonblocking = *(const int32_t *)argument != 0;
+                frame->rax = 0;
+                return false;
+            }
+            frame->rax = (uint64_t)(int64_t)-25;
             return false;
         }
         if (request == 0x5401) { /* TCGETS */

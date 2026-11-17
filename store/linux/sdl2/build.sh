@@ -22,6 +22,8 @@ SOURCE=$(fetch "https://github.com/libsdl-org/SDL/releases/download/release-$VER
 DIR=$(work sdl2 "$OUT")
 tar -xzf "$SOURCE" -C "$DIR"
 SRC=$DIR/SDL2-$VERSION
+# Source paths in the library read /build/..., not the builder's folders.
+PATH_MAP=-ffile-prefix-map=$(cd "$OUT" && pwd)=/build
 
 # The OPOS driver goes next to the dummy driver, whose sources configure
 # already compiles (--enable-video-dummy), and SDL tries it first.
@@ -55,7 +57,7 @@ rm -rf "$PREFIX"
 # no audio driver, as before); joysticks and haptics use SDL's dummy
 # drivers.
 (cd "$SRC" && CC="$LINUX_CC" \
-    CFLAGS="-O2 -DSDL_VIDEO_DRIVER_OPOS=1 -DSDL_AUDIO_DRIVER_OPOS=1" \
+    CFLAGS="-O2 -DSDL_VIDEO_DRIVER_OPOS=1 -DSDL_AUDIO_DRIVER_OPOS=1 $PATH_MAP" \
     LDFLAGS=-static ./configure --prefix="$PREFIX" \
     --disable-shared --enable-static \
     --enable-video-dummy --disable-video-offscreen \

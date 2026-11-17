@@ -191,9 +191,66 @@ uint64_t memory_free_pages(void) {
     return pages;
 }
 
+/*
+ * Takes count adjacent pages that are all on the free list, so a big block
+ * freed earlier (a large program's image buffer) can be handed out again.
+ * Scans the bitmap, then unlinks the run's pages from the list in one walk.
+ * Returns 0 when no such run exists.
+ */
+static uint64_t take_free_run(uint64_t count) {
+    if (free_list_pages < count) {
+        return 0;
+    }
+    for (size_t i = 0; i < usable_range_count; i++) {
+        const struct usable_range *range = &usable_ranges[i];
+        uint64_t pages = (range->next - range->start) / PAGE_SIZE;
+        uint64_t run = 0;
+        for (uint64_t p = 0; p < pages; p++) {
+            uint64_t index = range->first_index + p;
+            if (run == 0 && index % 8 == 0 && p + 8 <= pages
+                && free_bitmap[index / 8] == 0) {
+                p += 7; /* a byte of pages in use */
+                continue;
+            }
+            if ((free_bitmap[index / 8] & (1u << (index % 8))) == 0) {
+                run = 0;
+                continue;
+            }
+            if (++run < count) {
+                continue;
+            }
+            uint64_t first = p + 1 - count;
+            uint64_t start = range->start + first * PAGE_SIZE;
+            uint64_t end = start + count * PAGE_SIZE;
+            for (uint64_t q = first; q <= p; q++) {
+                uint64_t bit = range->first_index + q;
+                free_bitmap[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+            }
+            struct free_page **link = &free_pages;
+            uint64_t taken = 0;
+            while (*link != NULL && taken < count) {
+                uint64_t physical = (uint64_t)(uintptr_t)*link - direct_map_offset;
+                if (physical >= start && physical < end) {
+                    *link = (*link)->next;
+                    taken++;
+                } else {
+                    link = &(*link)->next;
+                }
+            }
+            free_list_pages -= taken;
+            return start;
+        }
+    }
+    return 0;
+}
+
 uint64_t physical_pages_alloc_contiguous(uint64_t count) {
     if (count == 0 || count > UINT64_MAX / PAGE_SIZE) {
         return 0;
+    }
+    uint64_t reused = take_free_run(count);
+    if (reused != 0) {
+        return reused;
     }
     /*
      * Carve the block from the untouched tail of a usable range. Pages there

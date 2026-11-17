@@ -54,6 +54,38 @@ C++ compiler. The package carries the source releases of OpenTTD,
 OpenGFX, OpenMSX (GPL-2.0) and FluidSynth (LGPL-2.1). It needs OPOS 0.6.0. Add it with
 `STORE_LINUX="lua sqlite sdl2 openttd"`.
 
+`linux/scummvm/build.sh` (opt-in) builds ScummVM 2026.4.0 against that
+SDL with zlib, libpng, libmad (MP3), Ogg Vorbis and FLAC for game
+speech and music, its default stable engines and no network support.
+The program is about 85 MB, so it needs an OPOS kernel with the raised
+program size limits (the release after 0.6.6). The Start menu runs `scummvm-start`
+(`linux/scummvm/start.c`), which points ScummVM at the package's
+`data/` folder (themes, translations, engine data files). No games are
+included. It needs `MUSL_CROSS` like OpenTTD. ScummVM's source release
+(GPL-3.0 or later) is 210 MB, so it is not inside the package: the
+recipe puts `scummvm-<version>.tar.xz` in `build/store/` beside the
+packages, and it must be uploaded to the Store release with them (the
+package's `SOURCE.txt` points there). libmad's source is in the package.
+
+`linux/scummvm-games/build.sh` (opt-in) packages the two freeware games
+the ScummVM team gives away, unchanged and each with its readme as
+`LICENSE`: Beneath a Steel Sky (`org.scummvm.bass`) and Flight of the
+Amazon Queen (`org.scummvm.fotaq`), both CD versions with speech. Their
+Start menu entry (`linux/scummvm-games/game-start.c`) runs the ScummVM
+package's `scummvm-start` on the game folder, so ScummVM must be
+installed too.
+
+`linux/dosbox-staging/build.sh` (opt-in) builds DOSBox Staging 0.83.1
+against that SDL, with its libraries (SDL_image, iir1, libmt32emu,
+FluidSynth, SpeexDSP, Opus, zlib-ng, libpng, alsa-lib, asio) built
+static first. OPOS has no OpenGL, so DOSBox falls back to drawing with
+SDL's renderer; an empty `libGL.a` stand-in satisfies its CMake check.
+It needs the OPOS kernel after 0.6.6 too (`SA_SIGINFO` handlers, a
+44 MB program). The recipe needs `MUSL_CROSS`, `cmake` and
+`pkg-config`, and carries the sources of DOSBox Staging and its LGPL
+libraries. Add all three with
+`STORE_LINUX="lua sqlite sdl2 scummvm scummvm-games dosbox-staging"`.
+
 Upload everything in `build/store/` as the assets of a new release of
 `PorkifyNET/opos-packages`. OPOS reads
 `releases/latest/download/index` from there. See `docs/packages.md`.

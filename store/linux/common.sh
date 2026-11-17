@@ -42,6 +42,31 @@ work() {
     echo "$dir"
 }
 
+# map_build_paths OUT TOOLS: prints a CROSS prefix for musl cross tools
+# that record source paths under OUT as /build (and the tools' own folder
+# as /musl-cross), so __FILE__ strings in the programs do not carry the
+# builder's folders or user name. The tools sit in the new folder TOOLS:
+# the compilers are small scripts, everything else links to the real tool.
+map_build_paths() {
+    out=$(cd "$1" && pwd)
+    real=${MUSL_CROSS:-$HOME/musl-cross/bin/x86_64-linux-musl-}
+    root=$(dirname "$(dirname "$real")")
+    prefix=$(basename "$real")
+    mkdir -p "$2"
+    tools=$(cd "$2" && pwd)
+    for tool in "$real"*; do
+        ln -s "$tool" "$tools/$(basename "$tool")"
+    done
+    for tool in gcc g++ cc c++; do
+        [ -e "$real$tool" ] || continue
+        rm -f "$tools/$prefix$tool"
+        printf '#!/bin/sh\nexec "%s" "-ffile-prefix-map=%s=/build" "-ffile-prefix-map=%s=/musl-cross" "$@"\n' \
+            "$real$tool" "$out" "$root" > "$tools/$prefix$tool"
+        chmod +x "$tools/$prefix$tool"
+    done
+    echo "$tools/$prefix"
+}
+
 # package STAGE OUT: builds the .opk from STAGE/package.pkg into OUT.
 package() {
     cp "$MUSL_LICENSE" "$1/LICENSE.musl"

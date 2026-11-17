@@ -77,7 +77,7 @@ enum menu_action {
     MENU_OPEN_NEW_TAB, MENU_COPY_LINK, MENU_BOOKMARK_LINK, MENU_DOWNLOAD_LINK,
     MENU_BACK, MENU_FORWARD, MENU_RELOAD, MENU_BOOKMARK_PAGE, MENU_COPY,
     MENU_NEW_TAB, MENU_CLOSE_TAB, MENU_BOOKMARKS, MENU_HISTORY,
-    MENU_DOWNLOADS, MENU_COOKIES, MENU_COUNT
+    MENU_DOWNLOADS, MENU_COOKIES, MENU_JAVASCRIPT, MENU_COUNT
 };
 
 struct browser {
@@ -143,6 +143,13 @@ static void clamp_scroll(void) {
 static void set_status(const char *text) {
     snprintf(b.status, sizeof(b.status), "%s", text);
     b.dirty = true;
+}
+
+static void paint(void);
+
+void browser_status(const char *text) {
+    set_status(text);
+    paint();
 }
 
 static void set_address(const char *url) {
@@ -822,6 +829,9 @@ static const char *menu_label(enum menu_action action) {
     case MENU_HISTORY: return "History";
     case MENU_DOWNLOADS: return "Downloads";
     case MENU_COOKIES: return "Cookies";
+    case MENU_JAVASCRIPT:
+        return scripting_enabled ? "Turn JavaScript off"
+                                 : "Turn JavaScript on";
     default: return "";
     }
 }
@@ -1544,7 +1554,14 @@ static void install_document(const char *html, size_t length,
     b.field_selection = NULL;
     T->dropdown = NULL;
     T->page.focus = find_autofocus(doc->body);
-    set_title(doc->title);
+    /* Web pages run their scripts before the first layout. */
+    if (scripting_enabled && (starts_with_ci(url, "http://")
+                              || starts_with_ci(url, "https://"))) {
+        script_page_start(&T->page);
+        script_take_dirty(&T->page);
+        script_take_title(&T->page);
+    }
+    set_title(T->page.doc->title);
     scroll_to_fragment(url);
 }
 
@@ -2248,6 +2265,130 @@ static void refresh_controls(void) {
     b.dirty = true;
 }
 
+/* ------------------------------------------------------------ scripts */
+
+/* Applies what the shown page's scripts asked for: a new title, a
+   navigation, a changed document. */
+static void scripts_apply(void) {
+    if (!T->have_page || T->page.script == NULL) {
+        return;
+    }
+    if (script_take_title(&T->page)) {
+        set_title(T->page.doc->title);
+        b.dirty = true;
+    }
+    char url[OPOS_HTTP_URL_MAX];
+    bool replace;
+    if (script_take_navigation(&T->page, url, sizeof(url), &replace)) {
+        navigate(url, !replace);
+        return;
+    }
+    if (script_take_dirty(&T->page)) {
+        refresh_controls();
+    }
+}
+
+/* Runs due timers in every tab; returns milliseconds until the next one
+   (-1: none). Tabs in the background run theirs at most once a second
+   and are laid out again when shown. */
+static long scripts_tick(void) {
+    static long long background_due;
+    long long now = uptime_ms();
+    bool background = now >= background_due;
+    if (background) {
+        background_due = now + 1000;
+    }
+    long next = -1;
+    for (int i = 0; i < b.tab_count; i++) {
+        struct tab *tab = b.tabs[i];
+        if (!tab->have_page || tab->page.script == NULL
+            || (tab != T && !background)) {
+            continue;
+        }
+        long wait = script_run_timers(&tab->page);
+        if (tab != T) {
+            script_take_dirty(&tab->page); /* tab_switch lays it out */
+            wait = wait < 0 ? -1 : 1000;
+        }
+        if (wait >= 0 && (next < 0 || wait < next)) {
+            next = wait;
+        }
+    }
+    scripts_apply();
+    return next;
+}
+
+/* A click at a page element: true when a script cancelled it. (x, y) are
+   window coordinates. */
+static bool script_click(const struct opos_html_node *target, int x, int y) {
+    if (!T->have_page || T->page.script == NULL) {
+        return false;
+    }
+    if (target == NULL) {
+        target = T->page.doc->body;
+    }
+    return script_event(&T->page, target, "click", x - MARGIN,
+                        y - CHROME_HEIGHT, 0);
+}
+
+/* "input" and "change" after the user changed a control. */
+static void script_changed(const struct opos_html_node *node, bool input,
+                           bool change) {
+    if (T->page.script == NULL || node == NULL) {
+        return;
+    }
+    if (input) {
+        script_event(&T->page, node, "input", 0, 0, 0);
+    }
+    if (change) {
+        script_event(&T->page, node, "change", 0, 0, 0);
+    }
+}
+
+/* The DOM's KeyboardEvent key and keyCode for an OPOS key. */
+static int key_name(uint32_t key, char *out, size_t capacity) {
+    static const struct {
+        uint32_t key;
+        const char *name;
+        int code;
+    } named[] = {
+        {'\n', "Enter", 13}, {'\b', "Backspace", 8}, {'\t', "Tab", 9},
+        {OPOS_KEY_ESCAPE, "Escape", 27}, {OPOS_KEY_UP, "ArrowUp", 38},
+        {OPOS_KEY_DOWN, "ArrowDown", 40}, {OPOS_KEY_LEFT, "ArrowLeft", 37},
+        {OPOS_KEY_RIGHT, "ArrowRight", 39}, {OPOS_KEY_DELETE, "Delete", 46},
+        {OPOS_KEY_HOME, "Home", 36}, {OPOS_KEY_END, "End", 35},
+        {OPOS_KEY_PAGE_UP, "PageUp", 33},
+        {OPOS_KEY_PAGE_DOWN, "PageDown", 34},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        if (named[i].key == key) {
+            snprintf(out, capacity, "%s", named[i].name);
+            return named[i].code;
+        }
+    }
+    char utf8[5] = {0};
+    if (key < 0x80) {
+        utf8[0] = (char)key;
+    } else if (key < 0x800) {
+        utf8[0] = (char)(0xc0 | key >> 6);
+        utf8[1] = (char)(0x80 | (key & 0x3f));
+    } else if (key < 0x10000) {
+        utf8[0] = (char)(0xe0 | key >> 12);
+        utf8[1] = (char)(0x80 | ((key >> 6) & 0x3f));
+        utf8[2] = (char)(0x80 | (key & 0x3f));
+    } else {
+        utf8[0] = (char)(0xf0 | key >> 18);
+        utf8[1] = (char)(0x80 | ((key >> 12) & 0x3f));
+        utf8[2] = (char)(0x80 | ((key >> 6) & 0x3f));
+        utf8[3] = (char)(0x80 | (key & 0x3f));
+    }
+    snprintf(out, capacity, "%s", utf8);
+    if (key >= 'a' && key <= 'z') {
+        return (int)key - 32;
+    }
+    return key == ' ' ? 32 : key < 0x80 ? (int)key : 0;
+}
+
 static void set_focus(const struct opos_html_node *node) {
     if (T->have_page && T->page.focus != node) {
         T->page.focus = node;
@@ -2262,6 +2403,10 @@ static void submit_form(const struct opos_html_node *control,
     const struct opos_html_node *form = form_of(control);
     if (form == NULL) {
         return;
+    }
+    if (T->page.script != NULL
+        && script_event(&T->page, form, "submit", 0, 0, 0)) {
+        return; /* the page's script handles it */
     }
     size_t length = 0;
     char *data = form_encode(&T->page, form, submitter, &length);
@@ -2320,6 +2465,27 @@ static void click_control(const struct opos_html_node *node) {
     }
     struct form_field *field = form_field(&T->page, node);
     if (field == NULL) {
+        return;
+    }
+    if (field->kind == FIELD_CHECKBOX || field->kind == FIELD_RADIO) {
+        /* The box changes first; a cancelled click puts it back. */
+        bool was = field->checked;
+        if (field->kind == FIELD_CHECKBOX) {
+            field->checked = !field->checked;
+        } else {
+            form_check_radio(&T->page, node);
+        }
+        if (script_click(node, b.press_x, b.press_y)) {
+            field->checked = was;
+        } else {
+            script_changed(node, true, true);
+        }
+        T->page.focus = node;
+        refresh_controls();
+        return;
+    }
+    if (script_click(node, b.press_x, b.press_y)) {
+        refresh_controls();
         return;
     }
     switch (field->kind) {
@@ -2946,7 +3112,43 @@ static void open_main_menu(void) {
     menu_add(MENU_HISTORY);
     menu_add(MENU_DOWNLOADS);
     menu_add(MENU_COOKIES);
+    menu_add(MENU_JAVASCRIPT);
     menu_place(menu_button_x() + 28 - MENU_WIDTH, BUTTON_Y + 30);
+}
+
+/* JavaScript is on unless the file "javascript-off" is in the browser's
+   data folder. */
+static void javascript_setting_path(char *out, size_t capacity) {
+    snprintf(out, capacity, "%s/javascript-off", b.data_dir);
+}
+
+static void javascript_load_setting(void) {
+    char path[200];
+    javascript_setting_path(path, sizeof(path));
+    long fd = b.data_dir[0] != '\0' ? opos_open(path, OPOS_O_RDONLY) : -1;
+    scripting_enabled = fd < 0;
+    if (fd >= 0) {
+        opos_close((int)fd);
+    }
+}
+
+static void javascript_toggle(void) {
+    scripting_enabled = !scripting_enabled;
+    if (b.data_dir[0] != '\0') {
+        char path[200];
+        javascript_setting_path(path, sizeof(path));
+        if (scripting_enabled) {
+            opos_unlink(path);
+        } else {
+            long fd = opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT
+                                          | OPOS_O_TRUNC);
+            if (fd >= 0) {
+                opos_close((int)fd);
+            }
+        }
+    }
+    set_status(scripting_enabled ? "JavaScript is on" : "JavaScript is off");
+    reload();
 }
 
 static bool quit; /* the last tab was closed */
@@ -2977,6 +3179,7 @@ static void menu_run(enum menu_action action) {
     case MENU_HISTORY: navigate("about:history", true); break;
     case MENU_DOWNLOADS: navigate("about:downloads", true); break;
     case MENU_COOKIES: navigate("about:cookies", true); break;
+    case MENU_JAVASCRIPT: javascript_toggle(); break;
     default: break;
     }
 }
@@ -3099,6 +3302,8 @@ static void on_click(int x, int y) {
     const struct opos_html_node *control = page_control_at(
         &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
         T->scroll);
+    b.press_x = x;
+    b.press_y = y;
     if (control != NULL) {
         struct form_field *field = form_field(&T->page, control);
         bool select_field = is_text_field(field)
@@ -3147,10 +3352,27 @@ static void on_release(void) {
     const struct display_item *item = page_item_at(
         &T->page, b.press_x - MARGIN,
         b.press_y - CHROME_HEIGHT - MARGIN + T->scroll, T->scroll);
+    const struct opos_html_node *link = item != NULL ? item->link : NULL;
     char url[OPOS_HTTP_URL_MAX];
-    if (link_target(item, url, sizeof(url))) {
-        const char *target = opos_html_attribute(item->link, "target");
-        if (opos_html_attribute(item->link, "download") != NULL
+    bool has_url = link_target(item, url, sizeof(url));
+    if (script_click(item != NULL ? item->element : NULL, b.press_x,
+                     b.press_y)) {
+        return; /* a script handled the click */
+    }
+    const char *href = link != NULL ? opos_html_attribute(link, "href")
+                                    : NULL;
+    while (href != NULL && (*href == ' ' || *href == '\n' || *href == '\t')) {
+        href++;
+    }
+    if (href != NULL && starts_with_ci(href, "javascript:")) {
+        if (!script_runs_javascript_url(&T->page, href)) {
+            set_status("This link needs JavaScript");
+        }
+        return;
+    }
+    if (has_url) {
+        const char *target = opos_html_attribute(link, "target");
+        if (opos_html_attribute(link, "download") != NULL
             && strncmp(url, "about:", 6) != 0) {
             download_url(url);
         } else if (target != NULL && strcmp(target, "_blank") == 0) {
@@ -3292,8 +3514,37 @@ static void on_key(uint32_t key, uint32_t modifiers) {
         b.dirty = true;
         return;
     }
+    if (T->have_page && T->page.script != NULL && !T->editing
+        && !T->finding && !ctrl) {
+        char name[16];
+        int code = key_name(key, name, sizeof(name));
+        int keys = shift ? 1 : 0;
+        bool cancelled = script_key(&T->page, T->page.focus, "keydown",
+                                    name, code, keys);
+        if (key >= ' ' || key == '\n') {
+            cancelled |= script_key(&T->page, T->page.focus, "keypress",
+                                    name, code, keys);
+        }
+        if (cancelled) {
+            script_key(&T->page, T->page.focus, "keyup", name, code, keys);
+            b.dirty = true;
+            return;
+        }
+    }
     if (T->have_page && T->page.focus != NULL && !T->editing && !T->finding
         && field_key(key, ctrl, (modifiers & OPOS_MOD_SHIFT) != 0)) {
+        bool edit = key >= ' ' || key == '\b' || key == OPOS_KEY_DELETE
+                 || (ctrl && (key == 'v' || key == 'V' || key == 'x'
+                              || key == 'X'));
+        if (edit && T->page.focus != NULL) {
+            script_changed(T->page.focus, true, false);
+        }
+        if (!ctrl && T->page.script != NULL) {
+            char name[16];
+            int code = key_name(key, name, sizeof(name));
+            script_key(&T->page, T->page.focus, "keyup", name, code,
+                       shift ? 1 : 0);
+        }
         return;
     }
     if (key == '\t' && T->have_page && !T->editing && !T->finding) {
@@ -3474,6 +3725,7 @@ int main(int argc, char **argv) {
     }
     library_open(b.data_dir);
     cookies_open(b.data_dir);
+    javascript_load_setting();
 
     tab_open(argc > 1 ? argv[1] : NULL, true);
     if (T == NULL) {
@@ -3482,6 +3734,7 @@ int main(int argc, char **argv) {
 
     struct opos_event event;
     while (!quit) {
+        long timer_wait = scripts_tick();
         if (b.dirty) {
             paint();
         }
@@ -3497,8 +3750,13 @@ int main(int argc, char **argv) {
             if (load_next_image()) {
                 continue;
             }
-            /* While downloads run, wake up to show their progress. */
-            got = opos_window_event(&event, downloads_running() ? 250 : -1);
+            /* While downloads run, wake up to show their progress; wake
+               up for the next script timer too. */
+            long wait = downloads_running() ? 250 : -1;
+            if (timer_wait >= 0 && (wait < 0 || timer_wait < wait)) {
+                wait = timer_wait < 4 ? 4 : timer_wait;
+            }
+            got = opos_window_event(&event, wait);
         }
         if (got <= 0) {
             if (got < 0) {

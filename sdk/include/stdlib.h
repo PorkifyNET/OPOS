@@ -30,5 +30,10 @@ void qsort(void *base, size_t count, size_t size,
            int (*compare)(const void *, const void *));
 
 __attribute__((noreturn)) void exit(int status);
+/* Ends the program with status 134. */
+__attribute__((noreturn)) void abort(void);
+
+/* Stack memory that goes away when the calling function returns. */
+#define alloca(size) __builtin_alloca(size)
 
 #endif

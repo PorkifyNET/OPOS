@@ -1572,3 +1572,257 @@ struct opos_html_node *opos_html_find(struct opos_html_node *node,
     }
     return NULL;
 }
+
+/* ---------------------------------------------------------------- editing */
+
+struct opos_html_node *opos_html_create_element(struct opos_html_doc *doc,
+                                                const char *name) {
+    struct arena *arena = doc->arena;
+    char lower[64];
+    size_t length = lower_name(name, strlen(name), lower, sizeof(lower));
+    struct opos_html_node *node = arena_alloc(arena, sizeof(*node));
+    if (node == NULL) {
+        return NULL;
+    }
+    memset(node, 0, sizeof(*node));
+    node->type = HTML_NODE_ELEMENT;
+    const struct tag_info *info = tag_lookup(lower, length);
+    node->tag = info->tag;
+    node->name = info->name != NULL ? info->name
+                                    : arena_string(arena, lower, length);
+    if (node->name == NULL) {
+        return NULL;
+    }
+    arena->nodes++;
+    return node;
+}
+
+struct opos_html_node *opos_html_create_text(struct opos_html_doc *doc,
+                                             const char *text, size_t length) {
+    struct arena *arena = doc->arena;
+    struct opos_html_node *node = arena_alloc(arena, sizeof(*node));
+    if (node == NULL) {
+        return NULL;
+    }
+    memset(node, 0, sizeof(*node));
+    node->type = HTML_NODE_TEXT;
+    node->text = arena_string(arena, text, length);
+    if (node->text == NULL) {
+        return NULL;
+    }
+    node->text_length = length;
+    arena->nodes++;
+    return node;
+}
+
+bool opos_html_set_text(struct opos_html_doc *doc, struct opos_html_node *node,
+                        const char *text, size_t length) {
+    char *copy = arena_string(doc->arena, text, length);
+    if (copy == NULL) {
+        return false;
+    }
+    node->text = copy;
+    node->text_length = length;
+    return true;
+}
+
+bool opos_html_set_attribute(struct opos_html_doc *doc,
+                             struct opos_html_node *node, const char *name,
+                             const char *value) {
+    struct arena *arena = doc->arena;
+    char lower[128];
+    size_t length = lower_name(name, strlen(name), lower, sizeof(lower));
+    char *copy = arena_string(arena, value, strlen(value));
+    if (copy == NULL) {
+        return false;
+    }
+    struct opos_html_attr **tail = &node->attributes;
+    for (; *tail != NULL; tail = &(*tail)->next) {
+        if (strcmp((*tail)->name, lower) == 0) {
+            (*tail)->value = copy;
+            return true;
+        }
+    }
+    struct opos_html_attr *attr = arena_alloc(arena, sizeof(*attr));
+    if (attr == NULL) {
+        return false;
+    }
+    attr->name = arena_string(arena, lower, length);
+    if (attr->name == NULL) {
+        return false;
+    }
+    attr->value = copy;
+    attr->next = NULL;
+    *tail = attr;
+    return true;
+}
+
+bool opos_html_remove_attribute(struct opos_html_node *node,
+                                const char *name) {
+    char lower[128];
+    lower_name(name, strlen(name), lower, sizeof(lower));
+    for (struct opos_html_attr **link = &node->attributes; *link != NULL;
+         link = &(*link)->next) {
+        if (strcmp((*link)->name, lower) == 0) {
+            *link = (*link)->next;
+            return true;
+        }
+    }
+    return false;
+}
+
+void opos_html_remove(struct opos_html_node *node) {
+    struct opos_html_node *parent = node->parent;
+    if (parent == NULL) {
+        return;
+    }
+    if (node->previous_sibling != NULL) {
+        node->previous_sibling->next_sibling = node->next_sibling;
+    } else {
+        parent->first_child = node->next_sibling;
+    }
+    if (node->next_sibling != NULL) {
+        node->next_sibling->previous_sibling = node->previous_sibling;
+    } else {
+        parent->last_child = node->previous_sibling;
+    }
+    node->parent = NULL;
+    node->next_sibling = NULL;
+    node->previous_sibling = NULL;
+}
+
+bool opos_html_insert(struct opos_html_node *parent,
+                      struct opos_html_node *node,
+                      struct opos_html_node *before) {
+    if (before != NULL && before->parent != parent) {
+        return false;
+    }
+    /* A node cannot go inside itself. */
+    for (const struct opos_html_node *up = parent; up != NULL;
+         up = up->parent) {
+        if (up == node) {
+            return false;
+        }
+    }
+    if (before == node) {
+        return true;
+    }
+    opos_html_remove(node);
+    if (before == NULL) {
+        node_append(parent, node);
+        return true;
+    }
+    node->parent = parent;
+    node->next_sibling = before;
+    node->previous_sibling = before->previous_sibling;
+    if (before->previous_sibling != NULL) {
+        before->previous_sibling->next_sibling = node;
+    } else {
+        parent->first_child = node;
+    }
+    before->previous_sibling = node;
+    return true;
+}
+
+static struct opos_html_node *copy_tree(struct arena *arena,
+                                        const struct opos_html_node *from,
+                                        bool deep, int depth) {
+    struct opos_html_node *node = arena_alloc(arena, sizeof(*node));
+    if (node == NULL) {
+        return NULL;
+    }
+    memset(node, 0, sizeof(*node));
+    node->type = from->type;
+    node->tag = from->tag;
+    if (from->type == HTML_NODE_TEXT) {
+        node->text = arena_string(arena, from->text, from->text_length);
+        node->text_length = from->text_length;
+        if (node->text == NULL) {
+            return NULL;
+        }
+    } else {
+        node->name = from->tag != HTML_TAG_UNKNOWN
+            ? info_for(from->tag)->name
+            : arena_string(arena, from->name, strlen(from->name));
+        if (node->name == NULL) {
+            return NULL;
+        }
+        struct opos_html_attr **tail = &node->attributes;
+        for (const struct opos_html_attr *a = from->attributes; a != NULL;
+             a = a->next) {
+            struct opos_html_attr *attr = arena_alloc(arena, sizeof(*attr));
+            if (attr == NULL) {
+                return NULL;
+            }
+            attr->name = arena_string(arena, a->name, strlen(a->name));
+            attr->value = arena_string(arena, a->value, strlen(a->value));
+            if (attr->name == NULL || attr->value == NULL) {
+                return NULL;
+            }
+            attr->next = NULL;
+            *tail = attr;
+            tail = &attr->next;
+        }
+    }
+    arena->nodes++;
+    if (deep && depth < MAX_DEPTH) {
+        for (const struct opos_html_node *child = from->first_child;
+             child != NULL; child = child->next_sibling) {
+            struct opos_html_node *copy = copy_tree(arena, child, true,
+                                                    depth + 1);
+            if (copy == NULL) {
+                return NULL;
+            }
+            node_append(node, copy);
+        }
+    }
+    return node;
+}
+
+struct opos_html_node *opos_html_clone(struct opos_html_doc *doc,
+                                       const struct opos_html_node *node,
+                                       bool deep) {
+    return copy_tree(doc->arena, node, deep, 0);
+}
+
+struct opos_html_node *opos_html_parse_fragment(struct opos_html_doc *doc,
+                                                const char *markup,
+                                                size_t length) {
+    struct opos_html_doc *parsed = opos_html_parse(markup, length, "utf-8");
+    if (parsed == NULL) {
+        return NULL;
+    }
+    struct arena *arena = doc->arena;
+    struct opos_html_node *holder = arena_alloc(arena, sizeof(*holder));
+    if (holder != NULL) {
+        memset(holder, 0, sizeof(*holder));
+        holder->type = HTML_NODE_ELEMENT;
+        holder->tag = HTML_TAG_UNKNOWN;
+        holder->name = "#fragment";
+        /* Leading <style>, <script>, <meta> and the like went to <head>. */
+        const struct opos_html_node *parts[2] = {parsed->head, parsed->body};
+        for (int i = 0; i < 2 && holder != NULL; i++) {
+            for (const struct opos_html_node *child = parts[i]->first_child;
+                 child != NULL; child = child->next_sibling) {
+                struct opos_html_node *copy = copy_tree(arena, child, true, 0);
+                if (copy == NULL) {
+                    holder = NULL;
+                    break;
+                }
+                node_append(holder, copy);
+            }
+        }
+    }
+    opos_html_free(parsed);
+    return holder;
+}
+
+bool opos_html_is_void(const struct opos_html_node *node) {
+    return node->type == HTML_NODE_ELEMENT
+        && (flags_of(node) & F_VOID) != 0;
+}
+
+bool opos_html_is_raw(const struct opos_html_node *node) {
+    return node->type == HTML_NODE_ELEMENT
+        && (flags_of(node) & (F_RAW | F_RCDATA)) != 0;
+}

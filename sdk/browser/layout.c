@@ -1163,6 +1163,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
             text->underline = style->underline;
             text->strike = style->strike;
             text->link = style->link;
+            text->element = style->element;
             break;
         }
         case IT_IMAGE: {
@@ -1172,6 +1173,9 @@ static void emit_line(struct ctx *c, size_t count, int used,
             if (image != NULL) {
                 image->image = item->image;
                 image->link = style->link;
+                image->element = item->image != NULL
+                    && item->image->node != NULL ? item->image->node
+                                                 : style->element;
                 image->colour = 0x00d8d8d8;
             }
             break;
@@ -3500,6 +3504,7 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
 }
 
 void page_destroy(struct page *page) {
+    script_page_end(page);
     form_fields_free(page);
     css_free(page->sheets);
     style_sheets = NULL;

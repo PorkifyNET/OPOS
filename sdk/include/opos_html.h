@@ -113,4 +113,43 @@ struct opos_html_node *opos_html_find(struct opos_html_node *node,
 size_t opos_html_decode_entities(const char *text, size_t length, char *out,
                                  size_t capacity);
 
+/*
+ * Editing the tree (for scripts). New nodes and strings live in doc's
+ * arena and go away with the document; a removed node stays valid and
+ * can be inserted again. The calls that allocate return NULL or false
+ * when memory runs out.
+ */
+struct opos_html_node *opos_html_create_element(struct opos_html_doc *doc,
+                                                const char *name);
+struct opos_html_node *opos_html_create_text(struct opos_html_doc *doc,
+                                             const char *text, size_t length);
+bool opos_html_set_text(struct opos_html_doc *doc, struct opos_html_node *node,
+                        const char *text, size_t length);
+/* Adds the attribute or replaces its value; name is lower-cased. */
+bool opos_html_set_attribute(struct opos_html_doc *doc,
+                             struct opos_html_node *node, const char *name,
+                             const char *value);
+bool opos_html_remove_attribute(struct opos_html_node *node,
+                                const char *name);
+/* Takes node out of its parent (if any). */
+void opos_html_remove(struct opos_html_node *node);
+/* Moves node into parent before `before` (NULL: at the end). False when
+   before is not a child of parent or node contains parent. */
+bool opos_html_insert(struct opos_html_node *parent,
+                      struct opos_html_node *node,
+                      struct opos_html_node *before);
+/* A copy without a parent; deep copies the children too. */
+struct opos_html_node *opos_html_clone(struct opos_html_doc *doc,
+                                       const struct opos_html_node *node,
+                                       bool deep);
+/* Parses markup (for innerHTML) into a new parentless element named
+   "#fragment" whose children are the parsed nodes. */
+struct opos_html_node *opos_html_parse_fragment(struct opos_html_doc *doc,
+                                                const char *markup,
+                                                size_t length);
+/* Elements without an end tag (<br>, <img> ...) and elements whose
+   content is raw text (<script>, <style>, <textarea> ...). */
+bool opos_html_is_void(const struct opos_html_node *node);
+bool opos_html_is_raw(const struct opos_html_node *node);
+
 #endif

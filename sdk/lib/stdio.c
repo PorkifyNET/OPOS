@@ -114,6 +114,84 @@ static void put_number(struct sink *sink, const struct spec *spec,
                count);
 }
 
+/* Fixed notation; digits come from repeated multiplication, so the last
+   ones may be off. Huge values print as "1e+N". */
+static void put_double(struct sink *sink, const struct spec *spec,
+                       double value) {
+    char digits[64];
+    size_t count = 0;
+    bool negative = value < 0 || (value == 0 && 1 / value < 0);
+    if (negative) {
+        value = -value;
+    }
+    const char *sign = negative ? "-" : spec->plus ? "+"
+                     : spec->space ? " " : "";
+    struct spec plain = *spec;
+    plain.precision = -1;
+    if (value != value) {
+        put_padded(sink, &plain, sign, "nan", 3);
+        return;
+    }
+    if (value > 1.7976931348623157e308) {
+        put_padded(sink, &plain, sign, "inf", 3);
+        return;
+    }
+    if (value > 1e18) {
+        int exponent = 0;
+        while (value >= 10) {
+            value /= 10;
+            exponent++;
+        }
+        digits[count++] = (char)('0' + (int)value);
+        digits[count++] = 'e';
+        digits[count++] = '+';
+        char tmp[8];
+        int n = 0;
+        do {
+            tmp[n++] = (char)('0' + exponent % 10);
+            exponent /= 10;
+        } while (exponent != 0 && n < 8);
+        while (n > 0 && count < sizeof(digits)) {
+            digits[count++] = tmp[--n];
+        }
+        put_padded(sink, &plain, sign, digits, count);
+        return;
+    }
+    int precision = spec->precision < 0 ? 6 : spec->precision;
+    if (precision > 30) {
+        precision = 30;
+    }
+    double rounding = 0.5;
+    for (int i = 0; i < precision; i++) {
+        rounding /= 10;
+    }
+    value += rounding;
+    unsigned long long whole = (unsigned long long)value;
+    double fraction = value - (double)whole;
+    char tmp[24];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + whole % 10);
+        whole /= 10;
+    } while (whole != 0);
+    while (n > 0) {
+        digits[count++] = tmp[--n];
+    }
+    if (precision > 0) {
+        digits[count++] = '.';
+        for (int i = 0; i < precision; i++) {
+            fraction *= 10;
+            int digit = (int)fraction;
+            if (digit > 9) {
+                digit = 9;
+            }
+            digits[count++] = (char)('0' + digit);
+            fraction -= digit;
+        }
+    }
+    put_padded(sink, &plain, sign, digits, count);
+}
+
 static void format(struct sink *sink, const char *text, va_list arguments) {
     for (; *text != '\0'; text++) {
         if (*text != '%') {
@@ -229,6 +307,16 @@ static void format(struct sink *sink, const char *text, va_list arguments) {
             put_padded(sink, &spec, "", string, length);
             break;
         }
+        case 'f':
+        case 'F':
+        case 'e':
+        case 'E':
+        case 'g':
+        case 'G':
+        case 'a':
+        case 'A':
+            put_double(sink, &spec, va_arg(arguments, double));
+            break;
         case '%':
             put(sink, '%');
             break;
@@ -305,4 +393,60 @@ int putchar(int character) {
     char c = (char)character;
     opos_write(OPOS_STDOUT, &c, 1);
     return (unsigned char)c;
+}
+
+/* FILE streams: only standard output and standard error. */
+struct opos_file {
+    int fd;
+};
+
+static struct opos_file standard_output = {OPOS_STDOUT};
+static struct opos_file standard_error = {OPOS_STDERR};
+FILE *stdout = &standard_output;
+FILE *stderr = &standard_error;
+
+int vfprintf(FILE *stream, const char *text, va_list arguments) {
+    return print_to(stream->fd, text, arguments);
+}
+
+int fprintf(FILE *stream, const char *text, ...) {
+    va_list arguments;
+    va_start(arguments, text);
+    int length = print_to(stream->fd, text, arguments);
+    va_end(arguments);
+    return length;
+}
+
+size_t fwrite(const void *data, size_t size, size_t count, FILE *stream) {
+    size_t total = size * count;
+    size_t done = 0;
+    while (done < total) {
+        size_t chunk = total - done > 256 ? 256 : total - done;
+        long written = opos_write(stream->fd, (const char *)data + done,
+                                  chunk);
+        if (written <= 0) {
+            break;
+        }
+        done += (size_t)written;
+    }
+    return size != 0 ? done / size : 0;
+}
+
+int fputc(int character, FILE *stream) {
+    char c = (char)character;
+    return fwrite(&c, 1, 1, stream) == 1 ? (unsigned char)c : EOF;
+}
+
+int putc(int character, FILE *stream) {
+    return fputc(character, stream);
+}
+
+int fputs(const char *text, FILE *stream) {
+    size_t length = strlen(text);
+    return fwrite(text, 1, length, stream) == length ? 0 : EOF;
+}
+
+int fflush(FILE *stream) {
+    (void)stream;
+    return 0;
 }

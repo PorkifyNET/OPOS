@@ -8,7 +8,7 @@ The browser is a native SDK program, `/bin/browser`, built from `sdk/browser/`. 
 
 - The system font is a 5x9 ASCII bitmap at integer scales. The browser uses stb_truetype and the Noto Sans fonts in `/share/fonts/` instead.
 - SDK programs are compiled with SSE enabled, so `float` and `double` work for layout. The SDK `printf` cannot print floating-point numbers.
-- There is no JavaScript engine. Pages that need JavaScript will render poorly or not at all. This is expected, and the plan does not include JavaScript until much later.
+- JavaScript runs in QuickJS since 2026-11-17 (`sdk/browser/script.c` and `dom.js`); the plan and what works are in `docs/javascript.md`.
 - A program may map at most 1 GiB (`USER_MMAP_MAX_PAGES`; 64 MiB before OPOS 0.6.0), as far as free memory allows.
 - The network stack is polled and socket calls move at most 64 KiB each, so large pages load slowly. RX interrupts would help and are a separate task.
 
@@ -29,7 +29,7 @@ Each milestone is tested in QEMU before the next one starts.
 5. **CSS subset.** Done. `css.c` and `style.c`: selectors, specificity, the cascade, custom properties, and colour, background, font, margin, padding, border, width, display, float, flex and a grid subset. Lengths: px, pt, em, rem, %, vw, vh, vmin and vmax. Since 2026-11-15 also: inline-block, inline-flex and inline-grid boxes, collapsing (and negative) vertical margins, and `::before`/`::after` text from `content`. Not done: `height`, `position`, `overflow` clipping, background images, `:has()`/`:is()`/`:not()`.
    - Fonts: a character the page font lacks comes from a fallback font listed in `/share/fonts/fallback.txt` (`sdk/lib/ttf.c`). The ISO carries all of Latin (Vietnamese too), symbols, Armenian, Georgian, Thai and Ethiopic. Chinese, Japanese and Korean come with the Store package "Chinese, Japanese, Korean fonts". Not done: right-to-left text and shaping, so Arabic, Hebrew, Persian and the Indic scripts still show as boxes, and emoji in colour.
 6. **Forms and tables.** Mostly done. Tables and flexbox lay out. Forms work: click or Tab into a field and edit at a visible caret; arrows, Home, End, Delete, Backspace, mouse/Shift selection and Ctrl+A/C/X/V work in text fields and text areas. Password fields stay masked, checkboxes and radio buttons toggle, and selects open a drop-down list. A submit button or Enter in a text field sends the form by GET or POST (`application/x-www-form-urlencoded`, `formaction`/`formmethod` too). Tested with a local echo server and a DuckDuckGo Lite search. Not done: `multipart/form-data`, file uploads and reset buttons.
-8. **Later.** Cookies, fonts for more scripts, SVG, and a JavaScript engine (a separate project).
+8. **Later.** Cookies, fonts for more scripts and SVG are done. JavaScript is a project of its own: see `docs/javascript.md`.
 
 ## Test pages
 

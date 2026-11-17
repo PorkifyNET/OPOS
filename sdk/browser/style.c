@@ -2288,6 +2288,7 @@ bool style_compute_pseudo(const struct opos_html_node *element, int which,
 void style_compute(const struct opos_html_node *element,
                    const struct style *parent, struct style *style) {
     style_inherit(style, parent);
+    style->element = element;
 
     switch (element->tag) {
     case HTML_TAG_HEAD: case HTML_TAG_SCRIPT: case HTML_TAG_STYLE:
@@ -2301,6 +2302,9 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_OPTION: case HTML_TAG_OPTGROUP: case HTML_TAG_COLGROUP:
     case HTML_TAG_COL: case HTML_TAG_DIALOG:
         style->display = DISPLAY_NONE;
+        break;
+    case HTML_TAG_NOSCRIPT:
+        style->display = scripting_enabled ? DISPLAY_NONE : DISPLAY_INLINE;
         break;
     case HTML_TAG_HTML:
         style->display = DISPLAY_BLOCK;
@@ -2316,9 +2320,7 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_ASIDE: case HTML_TAG_MAIN: case HTML_TAG_HGROUP:
     case HTML_TAG_FORM: case HTML_TAG_LEGEND: case HTML_TAG_FIGCAPTION:
     case HTML_TAG_DETAILS: case HTML_TAG_SUMMARY: case HTML_TAG_DT:
-    case HTML_TAG_NOSCRIPT:
-        style->display = element->tag == HTML_TAG_NOSCRIPT ? DISPLAY_INLINE
-                                                           : DISPLAY_BLOCK;
+        style->display = DISPLAY_BLOCK;
         break;
     case HTML_TAG_ADDRESS:
         style->display = DISPLAY_BLOCK;

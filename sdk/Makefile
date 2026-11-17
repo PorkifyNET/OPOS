@@ -63,11 +63,30 @@ $(BEARSSL): $(BEARSSL_OBJECTS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
-BROWSER_SOURCES := $(wildcard browser/*.c)
-BROWSER_HEADERS := $(wildcard browser/*.h)
+# QuickJS (third_party/quickjs, MIT licence, unchanged) for the browser's
+# JavaScript. Only SDK headers are used (-nostdinc); quickjs-opos/ holds
+# single-threaded pthread stand-ins.
+QUICKJS := $(BUILD)/libquickjs.a
+QUICKJS_SOURCES := $(addprefix third_party/quickjs/,quickjs.c libregexp.c \
+	libunicode.c cutils.c dtoa.c)
+QUICKJS_OBJECTS := $(patsubst third_party/quickjs/%.c,$(BUILD)/quickjs/%.o,$(QUICKJS_SOURCES))
+QUICKJS_CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -nostdinc \
+	-isystem $(shell $(CC) -print-file-name=include) -Ithird_party/quickjs-opos \
+	-DCONFIG_VERSION='"2026-06-04"' -DNDEBUG -fwrapv -w
 
-$(BUILD)/browser: $(BROWSER_SOURCES) $(BROWSER_HEADERS) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
-	$(CC) $(CFLAGS) -Ibrowser $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BROWSER_SOURCES) $(LIBRARIES)
+$(BUILD)/quickjs/%.o: third_party/quickjs/%.c $(wildcard third_party/quickjs/*.h) $(HEADERS) third_party/quickjs-opos/pthread.h
+	@mkdir -p $(dir $@)
+	$(CC) $(QUICKJS_CFLAGS) -c $< -o $@
+
+$(QUICKJS): $(QUICKJS_OBJECTS)
+	rm -f $@
+	$(AR) rcs $@ $^
+
+BROWSER_SOURCES := $(wildcard browser/*.c)
+BROWSER_HEADERS := $(wildcard browser/*.h) browser/dom.js
+
+$(BUILD)/browser: $(BROWSER_SOURCES) $(BROWSER_HEADERS) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(QUICKJS) $(HEADERS) opos.ld
+	$(CC) $(CFLAGS) -Ibrowser -isystem third_party/quickjs $(LDFLAGS) -o $@ $(BUILD)/crt0.o $(BROWSER_SOURCES) -Wl,--start-group $(LIBRARY) $(BEARSSL) $(QUICKJS) -Wl,--end-group -lgcc
 
 $(BUILD)/%: programs/%.c $(wildcard programs/*.h) $(BUILD)/crt0.o $(LIBRARY) $(BEARSSL) $(HEADERS) opos.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD)/crt0.o $< $(LIBRARIES)

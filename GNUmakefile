@@ -34,7 +34,7 @@ SDK_NOTIFY := sdk/build/notify
 SDK_FONTTEST := sdk/build/fonttest
 SDK_BROWSER := sdk/build/browser
 FONTS := $(wildcard data/fonts/*.ttf data/fonts/OFL.txt data/fonts/fallback.txt)
-SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/examples/play.c sdk/examples/notify.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h) sdk/include/opos_tls.h sdk/include/opos_image.h
+SDK_SOURCES := $(wildcard sdk/include/*.h sdk/lib/*.c sdk/src/*.S) sdk/opos.ld sdk/Makefile sdk/examples/notepad.c sdk/examples/fetch.c sdk/examples/update.c sdk/examples/pkg.c sdk/examples/play.c sdk/examples/notify.c sdk/lib/image.c sdk/stb/stb_truetype.h sdk/examples/fonttest.c $(wildcard sdk/browser/*.c sdk/browser/*.h sdk/browser/*.js sdk/third_party/quickjs/*.[ch] sdk/third_party/quickjs-opos/*.h) sdk/include/sys/time.h sdk/include/opos_tls.h sdk/include/opos_image.h
 # Bundled backgrounds (rendered by tools/mkwallpapers.py), shipped in the
 # initramfs as /share/wallpapers.
 WALLPAPERS := $(wildcard data/wallpapers/*.png)
@@ -279,6 +279,8 @@ $(INITRAMFS): $(WALLPAPERS) $(FONTS) $(SDK_FONTTEST) $(SDK_BROWSER) $(CA_BUNDLE)
 	cp $(SDK_PLAY) $(BUILD)/initramfs_root/bin/play
 	cp $(SDK_NOTIFY) $(BUILD)/initramfs_root/bin/notify
 	cp $(SDK_BROWSER) $(BUILD)/initramfs_root/bin/browser
+	mkdir -p $(BUILD)/initramfs_root/share/licenses
+	cp sdk/third_party/quickjs/LICENSE $(BUILD)/initramfs_root/share/licenses/quickjs.txt
 	cp $(SDK_FONTTEST) $(BUILD)/initramfs_root/tests/fonttest
 	mkdir -p $(BUILD)/initramfs_root/share/fonts
 	cp $(FONTS) $(BUILD)/initramfs_root/share/fonts/

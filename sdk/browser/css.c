@@ -619,7 +619,7 @@ static bool media_feature(const char **p) {
         return strncmp(value, "no-preference", 13) == 0;
     }
     if (FEATURE("forced-colors")) {
-        return strncmp(value, "none", 4) == 0;
+        return strncmp(value, "enabled", 7) == 0;
     }
     if (FEATURE("hover") || FEATURE("any-hover")) {
         return !has_value || strncmp(value, "hover", 5) == 0;
@@ -641,7 +641,8 @@ static bool media_feature(const char **p) {
         return strncmp(value, "browser", 7) == 0;
     }
     if (FEATURE("scripting")) {
-        return strncmp(value, "none", 4) == 0;
+        return strncmp(value, scripting_enabled ? "enabled" : "none",
+                       scripting_enabled ? 7 : 4) == 0;
     }
     if (FEATURE("update")) {
         return strncmp(value, "fast", 4) == 0;
@@ -1961,4 +1962,48 @@ bool css_apply_pseudo(const struct css_sheet *chain,
 void css_reset_variables(void) {
     /* Custom properties live in per-element scopes (freed with the
        sheets); nothing global is left to reset. */
+}
+
+void css_forget_matches(struct css_sheet *chain) {
+    if (chain != NULL) {
+        index_free(chain->index);
+        chain->index = NULL;
+    }
+}
+
+/* --------------------------------------------------------- selector lists */
+
+struct css_sheet *css_selector_parse(const char *selectors) {
+    size_t length = strlen(selectors);
+    if (length == 0 || strcspn(selectors, "{};") != length) {
+        return NULL;
+    }
+    char *text = malloc(length + 4);
+    if (text == NULL) {
+        return NULL;
+    }
+    memcpy(text, selectors, length);
+    memcpy(text + length, "{}", 3);
+    struct css_sheet *sheet = css_parse(text, length + 2);
+    free(text);
+    if (sheet != NULL && sheet->count == 0) {
+        css_free(sheet);
+        return NULL;
+    }
+    return sheet;
+}
+
+bool css_selector_matches(const struct css_sheet *selectors,
+                          const struct opos_html_node *node) {
+    if (node->type != HTML_NODE_ELEMENT) {
+        return false;
+    }
+    for (size_t i = 0; i < selectors->count; i++) {
+        const struct rule *rule = &selectors->rules[i];
+        if (rule->pseudo == 0
+            && match_from(node, rule->parts, rule->part_count - 1)) {
+            return true;
+        }
+    }
+    return false;
 }

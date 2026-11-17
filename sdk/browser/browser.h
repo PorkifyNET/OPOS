@@ -138,6 +138,8 @@ struct style {
     int grid_size[12];               /* px, percent or fr*100 */
     char grid_kind[12];              /* p px, c percent, f fr, a auto */
     int grid_fill_min;               /* repeat(auto-fill, minmax(N, 1fr)) */
+    /* The element this style was computed for (text inherits it). */
+    const struct opos_html_node *element;
 };
 
 #define TOP 0
@@ -190,6 +192,8 @@ struct image_ref;
 struct display_item {
     enum item_kind kind;
     int x, y, width, height;   /* the item's box; text: y is the line top */
+    /* Text and images: the element they belong to (for script events). */
+    const struct opos_html_node *element;
     uint32_t colour;
     uint8_t transparency;      /* rectangles: 0 opaque, 255 invisible */
     /* text */
@@ -359,6 +363,14 @@ void css_apply_block(struct style *style, const char *text,
 void apply_declaration(struct style *style, const char *name,
                        size_t name_length, const char *value,
                        const struct style *parent);
+/* Drops the matched rules cached for elements (after scripts changed the
+   document). */
+void css_forget_matches(struct css_sheet *chain);
+/* A selector list for querySelector and matches(); NULL when no selector
+   in it is supported. Free it with css_free. */
+struct css_sheet *css_selector_parse(const char *selectors);
+bool css_selector_matches(const struct css_sheet *selectors,
+                          const struct opos_html_node *node);
 /* The style sheets used by style_compute (set by layout_page). */
 extern const struct css_sheet *style_sheets;
 
@@ -384,7 +396,40 @@ struct page {
        it was not laid out). */
     const struct opos_html_node *anchor;
     int anchor_y;
+    struct script_state *script; /* JavaScript (script.c), or NULL */
 };
+
+/* True when pages run their scripts (the browser's JavaScript setting):
+   <noscript> is hidden and @media (scripting: enabled) matches. */
+extern bool scripting_enabled;
+
+/* script.c: JavaScript. script_page_start runs the page's scripts and its
+   DOMContentLoaded and load events; page_destroy calls script_page_end. */
+void script_page_start(struct page *page);
+void script_page_end(struct page *page);
+/* Runs the timers that are due; returns milliseconds until the next one,
+   or -1 for none. */
+long script_run_timers(struct page *page);
+/* A mouse event ("click") at target from the user; true when a script
+   cancelled its default action. */
+bool script_event(struct page *page, const struct opos_html_node *target,
+                  const char *type, int x, int y, int button);
+/* A key event ("keydown") at target (NULL: the body); modifiers: 1 Shift,
+   2 Ctrl, 4 Alt. True when a script cancelled it. */
+bool script_key(struct page *page, const struct opos_html_node *target,
+                const char *type, const char *key, int code, int modifiers);
+/* True once after scripts changed the document (lay it out again). */
+bool script_take_dirty(struct page *page);
+/* True once after a script set document.title. */
+bool script_take_title(struct page *page);
+/* A navigation a script asked for (location.href = ...). */
+bool script_take_navigation(struct page *page, char *url, size_t capacity,
+                            bool *replace);
+/* Runs a javascript: URL on the page; false when it is not one. */
+bool script_runs_javascript_url(struct page *page, const char *url);
+int script_errors(const struct page *page);
+/* main.c: shows text in the status bar at once. */
+void browser_status(const char *text);
 
 /* library.c: bookmarks, history and downloads. data_dir "" keeps them
    only in memory. */

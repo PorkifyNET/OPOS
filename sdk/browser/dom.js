@@ -1131,8 +1131,8 @@ class Document extends EventTarget {
     set location(v) { location.href = v; }
     get domain() { return location.hostname; }
     get referrer() { return ''; }
-    get cookie() { return ''; }
-    set cookie(v) {}
+    get cookie() { return N.cookie(); }
+    set cookie(v) { N.setCookie(String(v)); }
     get readyState() { return readyState; }
     get characterSet() { return 'UTF-8'; }
     get charset() { return 'UTF-8'; }
@@ -1456,7 +1456,16 @@ function addTimer(fn, delay, args, repeat) {
     return id;
 }
 function runTimers(now) {
-    /* Timers due now, in order; those they add wait for the next round. */
+    /* Network requests waiting since the last round, then timers due now,
+       in order; those they add wait for the next round. */
+    for (const run of netQueue.splice(0)) {
+        try {
+            run();
+        } catch (e) {
+            reportError(e);
+        }
+    }
+    now = N.now();
     const due = [];
     for (const [id, t] of timerList) if (t.at <= now) due.push([id, t]);
     due.sort((a, b) => a[1].at - b[1].at || a[0] - b[0]);
@@ -1471,6 +1480,8 @@ function runTimers(now) {
             reportError(e);
         }
     }
+    flushStorage();
+    if (netQueue.length > 0) return 0;
     let next = -1;
     const after = N.now();
     for (const t of timerList.values()) {
@@ -1481,13 +1492,27 @@ function runTimers(now) {
 }
 
 class Storage {
-    constructor() { define(this, '_m', new Map()); }
+    constructor() {
+        define(this, '_m', new Map());
+        define(this, '_changed', () => {});
+    }
     get length() { return this._m.size; }
     key(i) { return Array.from(this._m.keys())[i] ?? null; }
     getItem(k) { k = String(k); return this._m.has(k) ? this._m.get(k) : null; }
-    setItem(k, v) { this._m.set(String(k), String(v)); }
-    removeItem(k) { this._m.delete(String(k)); }
-    clear() { this._m.clear(); }
+    setItem(k, v) {
+        k = String(k);
+        v = String(v);
+        let size = 0;
+        for (const [key, value] of this._m)
+            if (key !== k) size += key.length + value.length;
+        if (size + k.length + v.length > 2500000)
+            throw new DOMException('The quota has been exceeded.',
+                                   'QuotaExceededError');
+        this._m.set(k, v);
+        this._changed();
+    }
+    removeItem(k) { if (this._m.delete(String(k))) this._changed(); }
+    clear() { this._m.clear(); this._changed(); }
 }
 
 class MediaQueryList extends EventTarget {
@@ -1510,7 +1535,8 @@ class AbortSignal extends EventTarget {
     }
     static timeout(ms) {
         const c = new AbortController();
-        addTimer(() => c.abort(new Error('TimeoutError')), ms, [], false);
+        addTimer(() => c.abort(new DOMException('signal timed out',
+                                                'TimeoutError')), ms, [], false);
         return c.signal;
     }
 }
@@ -1524,9 +1550,505 @@ class AbortController {
         if (this.signal.aborted) return;
         this.signal.aborted = true;
         this.signal.reason = reason === undefined
-            ? new Error('AbortError') : reason;
+            ? new DOMException('signal is aborted without reason',
+                               'AbortError') : reason;
         dispatch(this.signal, new Event('abort'));
     }
+}
+
+/* ------------------------------------------------------------ network */
+
+class DOMException extends Error {
+    constructor(message = '', name = 'Error') {
+        super(message);
+        this.name = name;
+    }
+}
+
+class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') { return new Uint8Array(N.encode(String(s))); }
+}
+class TextDecoder {
+    constructor(label = 'utf-8') { this.encoding = String(label).toLowerCase(); }
+    decode(data) {
+        if (data === undefined) return '';
+        return N.decode(toBuffer(data));
+    }
+}
+
+/* Any body-like value as an ArrayBuffer of its own. */
+function toBuffer(data) {
+    if (data instanceof ArrayBuffer) return data.slice(0);
+    if (ArrayBuffer.isView(data))
+        return data.buffer.slice(data.byteOffset,
+                                 data.byteOffset + data.byteLength);
+    if (data instanceof Blob) return data._bytes.buffer.slice(0);
+    return N.encode(String(data));
+}
+
+function joinBytes(parts) {
+    let size = 0;
+    for (const p of parts) size += p.byteLength;
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.byteLength; }
+    return out;
+}
+
+class Blob {
+    constructor(parts = [], options = {}) {
+        define(this, '_bytes', joinBytes(Array.from(parts,
+            p => new Uint8Array(toBuffer(p)))));
+        this.type = String(options.type || '').toLowerCase();
+    }
+    get size() { return this._bytes.byteLength; }
+    text() { return Promise.resolve(N.decode(this._bytes.buffer.slice(0))); }
+    arrayBuffer() { return Promise.resolve(this._bytes.buffer.slice(0)); }
+    bytes() { return Promise.resolve(this._bytes.slice()); }
+    slice(start = 0, end = this.size, type = '') {
+        return new Blob([this._bytes.slice(start, end)], {type});
+    }
+}
+class File extends Blob {
+    constructor(parts, name, options = {}) {
+        super(parts, options);
+        this.name = String(name);
+        this.lastModified = options.lastModified || Date.now();
+    }
+}
+
+class FormData {
+    constructor(form) {
+        define(this, '_list', []);
+        if (!form) return;
+        for (const el of form.elements) {
+            const name = el.getAttribute('name');
+            const type = (el.getAttribute('type') || '').toLowerCase();
+            if (!name || el.hasAttribute('disabled')
+                || el.tagName === 'BUTTON' || el.tagName === 'FIELDSET'
+                || el.tagName === 'OUTPUT' || el.tagName === 'OBJECT'
+                || ['submit', 'button', 'reset', 'image', 'file']
+                       .includes(type)
+                || ((type === 'checkbox' || type === 'radio') && !el.checked))
+                continue;
+            this.append(name, type === 'checkbox' || type === 'radio'
+                ? (el.getAttribute('value') ?? 'on') : el.value);
+        }
+    }
+    append(name, value, filename) {
+        this._list.push([String(name), value instanceof Blob
+            ? (value instanceof File && filename === undefined ? value
+               : new File([value], filename ?? 'blob', {type: value.type}))
+            : String(value)]);
+    }
+    set(name, value, filename) {
+        name = String(name);
+        const i = this._list.findIndex(e => e[0] === name);
+        this.delete(name);
+        this.append(name, value, filename);
+        if (i >= 0) this._list.splice(i, 0, this._list.pop());
+    }
+    get(name) {
+        const e = this._list.find(e => e[0] === String(name));
+        return e ? e[1] : null;
+    }
+    getAll(name) {
+        return this._list.filter(e => e[0] === String(name)).map(e => e[1]);
+    }
+    has(name) { return this._list.some(e => e[0] === String(name)); }
+    delete(name) {
+        name = String(name);
+        define(this, '_list', this._list.filter(e => e[0] !== name));
+    }
+    forEach(fn, self) {
+        for (const [k, v] of this._list) fn.call(self, v, k, this);
+    }
+    *entries() { yield* this._list.map(e => [e[0], e[1]]); }
+    *keys() { for (const e of this._list) yield e[0]; }
+    *values() { for (const e of this._list) yield e[1]; }
+    [Symbol.iterator]() { return this.entries(); }
+}
+
+class Headers {
+    constructor(init) {
+        define(this, '_m', new Map());
+        if (init instanceof Headers) init.forEach((v, k) => this.append(k, v));
+        else if (Array.isArray(init)) for (const [k, v] of init)
+            this.append(k, v);
+        else if (init) for (const k of Object.keys(init))
+            this.append(k, init[k]);
+    }
+    append(k, v) {
+        k = String(k).toLowerCase();
+        v = String(v).trim();
+        this._m.set(k, this._m.has(k) ? this._m.get(k) + ', ' + v : v);
+    }
+    set(k, v) { this._m.set(String(k).toLowerCase(), String(v).trim()); }
+    get(k) { return this._m.get(String(k).toLowerCase()) ?? null; }
+    has(k) { return this._m.has(String(k).toLowerCase()); }
+    delete(k) { this._m.delete(String(k).toLowerCase()); }
+    forEach(fn, self) {
+        for (const [k, v] of this.entries()) fn.call(self, v, k, this);
+    }
+    getSetCookie() { return []; }
+    *entries() {
+        yield* Array.from(this._m.entries()).sort((a, b) =>
+            a[0] < b[0] ? -1 : 1);
+    }
+    *keys() { for (const [k] of this.entries()) yield k; }
+    *values() { for (const [, v] of this.entries()) yield v; }
+    [Symbol.iterator]() { return this.entries(); }
+}
+
+function parseHeaders(text) {
+    const h = new Headers();
+    for (const line of String(text).split('\n')) {
+        const i = line.indexOf(':');
+        if (i > 0) h.append(line.slice(0, i).trim(), line.slice(i + 1).trim());
+    }
+    return h;
+}
+
+/* A request body as what N.http sends, and the Content-Type it implies. */
+function encodeBody(body) {
+    if (body === undefined || body === null) return [undefined, null];
+    if (typeof body === 'string') return [body, 'text/plain;charset=UTF-8'];
+    if (body instanceof URLSearchParams)
+        return [body.toString(),
+                'application/x-www-form-urlencoded;charset=UTF-8'];
+    if (body instanceof FormData) {
+        const boundary = '----OPOSFormBoundary'
+            + Math.random().toString(36).slice(2);
+        const parts = [];
+        const text = s => new Uint8Array(N.encode(s));
+        const quote = s => String(s).replace(/"/g, '%22')
+                                    .replace(/\r?\n|\r/g, ' ');
+        for (const [name, value] of body._list) {
+            let head = '--' + boundary + '\r\nContent-Disposition: form-data; '
+                + 'name="' + quote(name) + '"';
+            if (value instanceof File)
+                head += '; filename="' + quote(value.name) + '"\r\n'
+                    + 'Content-Type: '
+                    + (value.type || 'application/octet-stream');
+            parts.push(text(head + '\r\n\r\n'));
+            parts.push(value instanceof Blob ? value._bytes : text(value));
+            parts.push(text('\r\n'));
+        }
+        parts.push(text('--' + boundary + '--\r\n'));
+        return [joinBytes(parts).buffer,
+                'multipart/form-data; boundary=' + boundary];
+    }
+    if (body instanceof Blob) return [toBuffer(body), body.type || null];
+    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body))
+        return [toBuffer(body), null];
+    return [String(body), 'text/plain;charset=UTF-8'];
+}
+
+const statusTexts = {200: 'OK', 201: 'Created', 202: 'Accepted',
+    204: 'No Content', 206: 'Partial Content', 301: 'Moved Permanently',
+    302: 'Found', 304: 'Not Modified', 400: 'Bad Request',
+    401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+    405: 'Method Not Allowed', 409: 'Conflict', 429: 'Too Many Requests',
+    500: 'Internal Server Error', 502: 'Bad Gateway',
+    503: 'Service Unavailable'};
+
+class Response {
+    constructor(body = null, init = {}) {
+        const [data, type] = encodeBody(body);
+        define(this, '_buffer', data === undefined ? new ArrayBuffer(0)
+                                                   : toBuffer(data));
+        this.status = init.status ?? 200;
+        this.statusText = init.statusText ?? (statusTexts[this.status] || '');
+        this.headers = new Headers(init.headers);
+        if (type && !this.headers.has('content-type'))
+            this.headers.set('content-type', type);
+        this.url = '';
+        this.redirected = false;
+        this.type = 'default';
+        this.bodyUsed = false;
+    }
+    get ok() { return this.status >= 200 && this.status < 300; }
+    get body() { return null; }
+    _take() {
+        if (this.bodyUsed)
+            return Promise.reject(new TypeError('Body has already been read'));
+        this.bodyUsed = true;
+        return Promise.resolve(this._buffer);
+    }
+    arrayBuffer() { return this._take(); }
+    bytes() { return this._take().then(b => new Uint8Array(b)); }
+    text() { return this._take().then(b => N.decode(b)); }
+    json() { return this.text().then(t => JSON.parse(t)); }
+    blob() {
+        return this._take().then(b => new Blob([b],
+            {type: this.headers.get('content-type') || ''}));
+    }
+    formData() {
+        return this.text().then(t => {
+            const f = new FormData();
+            for (const [k, v] of new URLSearchParams(t)) f.append(k, v);
+            return f;
+        });
+    }
+    clone() {
+        const r = new Response(this._buffer.slice(0), {status: this.status,
+            statusText: this.statusText, headers: this.headers});
+        Object.assign(r, {url: this.url, redirected: this.redirected,
+                          type: this.type});
+        return r;
+    }
+    static json(data, init = {}) {
+        const r = new Response(JSON.stringify(data), init);
+        r.headers.set('content-type', 'application/json');
+        return r;
+    }
+    static error() {
+        const r = new Response(null, {status: 0});
+        r.type = 'error';
+        return r;
+    }
+    static redirect(url, status = 302) {
+        return new Response(null, {status, headers: {location: url}});
+    }
+}
+
+class Request {
+    constructor(input, init = {}) {
+        const from = input instanceof Request ? input : null;
+        this.url = from ? from.url
+            : N.resolve(String(input), null) || String(input);
+        this.method = String(init.method || (from && from.method) || 'GET')
+            .toUpperCase();
+        this.headers = new Headers(init.headers || (from && from.headers));
+        define(this, '_body', 'body' in init ? init.body
+                                             : from ? from._body : null);
+        this.credentials = init.credentials || (from && from.credentials)
+            || 'same-origin';
+        this.mode = init.mode || (from && from.mode) || 'cors';
+        this.cache = init.cache || 'default';
+        this.redirect = init.redirect || 'follow';
+        this.referrer = 'about:client';
+        this.signal = init.signal || (from && from.signal)
+            || new AbortController().signal;
+    }
+    clone() { return new Request(this); }
+    text() { return Promise.resolve(String(this._body ?? '')); }
+    json() { return this.text().then(JSON.parse); }
+}
+
+/* Requests run one after another between timers and events (the page
+   waits while one runs). */
+const netQueue = [];
+
+/* Runs one request: returns {status, url, headers, body} or throws. */
+function httpNow(method, url, headers, body, credentials) {
+    const [data, implied] = encodeBody(body);
+    let type = headers.get('content-type');
+    if (type === null && implied !== null) type = implied;
+    const lines = [];
+    headers.forEach((v, k) => { if (k !== 'content-type')
+        lines.push(k + ': ' + v); });
+    return N.http(method, url, lines.join('\n'), type, data,
+                  credentials || 'same-origin');
+}
+
+function abortError() {
+    return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function fetch(input, init = {}) {
+    let request;
+    try {
+        request = new Request(input, init);
+    } catch (e) {
+        return Promise.reject(e);
+    }
+    return new Promise((resolve, reject) => {
+        const signal = request.signal;
+        if (signal.aborted) { reject(signal.reason || abortError()); return; }
+        netQueue.push(() => {
+            if (signal.aborted) { reject(signal.reason || abortError()); return; }
+            let r;
+            try {
+                r = httpNow(request.method, request.url, request.headers,
+                            request._body,
+                            request.credentials === 'include'
+                                ? 'include' : request.credentials);
+            } catch (e) {
+                reject(e instanceof TypeError ? e : new TypeError(String(e)));
+                return;
+            }
+            const response = new Response(null, {status: r.status,
+                headers: parseHeaders(r.headers)});
+            define(response, '_buffer', r.body);
+            response.url = r.url;
+            response.redirected = r.url !== request.url.replace(/#.*/, '');
+            response.type = 'basic';
+            resolve(response);
+        });
+    });
+}
+
+class XMLHttpRequestEventTarget extends EventTarget {}
+addHandlerProperties(XMLHttpRequestEventTarget.prototype);
+
+class XMLHttpRequest extends XMLHttpRequestEventTarget {
+    constructor() {
+        super();
+        this.readyState = 0;
+        this.status = 0;
+        this.statusText = '';
+        this.responseType = '';
+        this.responseURL = '';
+        this.timeout = 0;
+        this.withCredentials = false;
+        this.upload = new XMLHttpRequestEventTarget();
+        this.onreadystatechange = null;
+        define(this, '_headers', new Headers());
+        define(this, '_response', null);
+        define(this, '_responseHeaders', new Headers());
+        define(this, '_sent', 0);
+    }
+    _state(n) {
+        this.readyState = n;
+        dispatch(this, new Event('readystatechange'));
+    }
+    _progress(type, loaded) {
+        dispatch(this, new ProgressEvent(type));
+    }
+    open(method, url, async = true) {
+        define(this, '_method', String(method).toUpperCase());
+        define(this, '_url', N.resolve(String(url), null) || String(url));
+        define(this, '_async', async !== false);
+        define(this, '_headers', new Headers());
+        this._sent++;
+        this.status = 0;
+        this.statusText = '';
+        this._response = null;
+        this._state(1);
+    }
+    setRequestHeader(k, v) { this._headers.append(k, v); }
+    overrideMimeType() {}
+    getResponseHeader(k) { return this._responseHeaders.get(k); }
+    getAllResponseHeaders() {
+        let s = '';
+        this._responseHeaders.forEach((v, k) => { s += k + ': ' + v + '\r\n'; });
+        return s;
+    }
+    abort() {
+        this._sent++;
+        if (this.readyState === 1 || this.readyState === 3) {
+            this._state(4);
+            this._progress('abort');
+            this._progress('loadend');
+        }
+        this.readyState = 0;
+    }
+    send(body = null) {
+        if (this.readyState !== 1)
+            throw new DOMException('The object is not open.',
+                                   'InvalidStateError');
+        const ticket = this._sent;
+        const method = this._method;
+        const run = () => {
+            if (ticket !== this._sent) return; /* aborted or opened again */
+            let r;
+            try {
+                r = httpNow(method, this._url, this._headers,
+                            method === 'GET' || method === 'HEAD'
+                                ? null : body,
+                            this.withCredentials ? 'include' : 'same-origin');
+            } catch (e) {
+                this.readyState = 4;
+                this.status = 0;
+                dispatch(this, new Event('readystatechange'));
+                this._progress('error');
+                this._progress('loadend');
+                return;
+            }
+            this.status = r.status;
+            this.statusText = statusTexts[r.status] || '';
+            this.responseURL = r.url;
+            define(this, '_responseHeaders', parseHeaders(r.headers));
+            define(this, '_body', r.body);
+            this._state(2);
+            this._state(3);
+            this._state(4);
+            this._progress('load');
+            this._progress('loadend');
+        };
+        this._progress('loadstart');
+        if (this._async) netQueue.push(run);
+        else run();
+    }
+    get responseText() {
+        if (this.responseType !== '' && this.responseType !== 'text')
+            throw new DOMException('responseType is not text',
+                                   'InvalidStateError');
+        return this._body ? N.decode(this._body) : '';
+    }
+    get responseXML() { return null; }
+    get response() {
+        if (!this._body || this.readyState !== 4)
+            return this.responseType === '' || this.responseType === 'text'
+                ? '' : null;
+        switch (this.responseType) {
+        case 'arraybuffer': return this._body.slice(0);
+        case 'blob': return new Blob([this._body],
+            {type: this._responseHeaders.get('content-type') || ''});
+        case 'json':
+            try { return JSON.parse(N.decode(this._body)); }
+            catch (e) { return null; }
+        default: return N.decode(this._body);
+        }
+    }
+}
+Object.assign(XMLHttpRequest, {UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2,
+                               LOADING: 3, DONE: 4});
+
+/* localStorage is kept per site (saved after the timer round that
+   changed it); sessionStorage only for the page. Both also answer
+   storage.key = value and storage.key. */
+function storageProxy(storage) {
+    return new Proxy(storage, {
+        get(t, k) {
+            if (typeof k !== 'string' || k in t) {
+                const v = Reflect.get(t, k, t);
+                return typeof v === 'function' ? v.bind(t) : v;
+            }
+            return t.getItem(k);
+        },
+        set(t, k, v) {
+            if (typeof k !== 'string' || k in t) return Reflect.set(t, k, v);
+            t.setItem(k, v);
+            return true;
+        },
+        has(t, k) { return k in t || t._m.has(k); },
+        deleteProperty(t, k) { t.removeItem(k); return true; },
+        ownKeys(t) { return Array.from(t._m.keys()); },
+        getOwnPropertyDescriptor(t, k) {
+            return t._m.has(k) ? {value: t._m.get(k), writable: true,
+                                  enumerable: true, configurable: true}
+                               : undefined;
+        },
+    });
+}
+
+let storageDirty = false;
+const persistent = new Storage();
+try {
+    const saved = N.storageLoad();
+    if (saved) for (const [k, v] of Object.entries(JSON.parse(saved)))
+        persistent._m.set(k, String(v));
+} catch (e) {
+    /* a damaged file starts empty */
+}
+define(persistent, '_changed', () => { storageDirty = true; });
+function flushStorage() {
+    if (!storageDirty) return;
+    storageDirty = false;
+    N.storageSave(JSON.stringify(Object.fromEntries(persistent._m)));
 }
 
 class Observer {
@@ -1567,7 +2089,7 @@ const navigator = {
     userAgent: 'Mozilla/5.0 (OPOS; x86_64) OPOSBrowser/0.7',
     appName: 'Netscape', appVersion: '5.0 (OPOS)', appCodeName: 'Mozilla',
     product: 'Gecko', vendor: '', platform: 'OPOS', language: 'en-US',
-    languages: ['en-US', 'en'], onLine: true, cookieEnabled: false,
+    languages: ['en-US', 'en'], onLine: true, cookieEnabled: true,
     doNotTrack: '1', hardwareConcurrency: 1, maxTouchPoints: 0,
     webdriver: false, pdfViewerEnabled: false, plugins: [], mimeTypes: [],
     javaEnabled: () => false,
@@ -1587,15 +2109,29 @@ const screen = {
                   addEventListener() {}},
 };
 
+/* pushState changes the address without loading it; going back loads the
+   earlier address again (there is no popstate). */
+let historyLength = 1;
 const history = {
-    get length() { return 1; },
+    get length() { return historyLength; },
     state: null,
     scrollRestoration: 'auto',
-    back() {}, forward() {}, go() {},
-    /* The address does not change yet; the state is kept. */
-    pushState(state) { this.state = state; },
-    replaceState(state) { this.state = state; },
+    back() { N.navigateHistory(-1); },
+    forward() { N.navigateHistory(1); },
+    go(n) { if (n) N.navigateHistory(Number(n) || 0); },
+    pushState(state, title, url) {
+        if (url !== undefined && url !== null) N.pushUrl(String(url), false);
+        historyLength++;
+        this.state = state === undefined ? null : structuredCopy(state);
+    },
+    replaceState(state, title, url) {
+        if (url !== undefined && url !== null) N.pushUrl(String(url), true);
+        this.state = state === undefined ? null : structuredCopy(state);
+    },
 };
+function structuredCopy(v) {
+    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
+}
 
 const CSS = {
     supports: () => false,
@@ -1631,10 +2167,14 @@ const api = {
     CustomEvent, UIEvent, MouseEvent, PointerEvent, WheelEvent, FocusEvent,
     InputEvent, KeyboardEvent, SubmitEvent, ErrorEvent, ProgressEvent,
     PopStateEvent, HashChangeEvent, URL, URLSearchParams, DOMTokenList,
-    Storage, AbortController, AbortSignal, MutationObserver,
+    Storage, AbortController, AbortSignal, MutationObserver, DOMException,
+    fetch, Request, Response, Headers, XMLHttpRequest,
+    XMLHttpRequestEventTarget, FormData, Blob, File, TextEncoder,
+    TextDecoder,
     ResizeObserver, IntersectionObserver, PerformanceObserver,
     MediaQueryList, Window,
-    localStorage: new Storage(), sessionStorage: new Storage(),
+    localStorage: storageProxy(persistent),
+    sessionStorage: storageProxy(new Storage()),
     name: '', closed: false, isSecureContext: true, origin: '',
     devicePixelRatio: 1, length: 0,
     get innerWidth() { return N.viewportWidth(); },
@@ -1743,6 +2283,10 @@ return {
     elementProto: HTMLElement.prototype,
     textProto: Text.prototype,
     runTimers,
+    /* Saves localStorage before the page goes. */
+    flush: flushStorage,
+    /* True while requests wait for the next round. */
+    waiting: () => netQueue.length > 0,
     /* A click (or other mouse event) from the browser; true when a script
        cancelled it. */
     dispatch(target, type, x, y, button) {

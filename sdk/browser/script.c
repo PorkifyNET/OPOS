@@ -14,6 +14,7 @@
  * Navigation asked for by a script (location.href = ...) waits until the
  * script has finished (script_take_navigation).
  */
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -32,6 +33,8 @@
 #define JS_STACK_LIMIT (256u << 10)   /* programs have a 512 KiB stack */
 #define MAX_PENDING 128
 #define LOG_MAX 64
+#define JS_FETCH_MAX_BYTES (16u << 20) /* one fetch or XMLHttpRequest */
+#define STORAGE_MAX_BYTES (5u << 20)  /* localStorage of one site */
 
 #ifndef DOM_JS_PATH
 #define DOM_JS_PATH "browser/dom.js"
@@ -194,6 +197,9 @@ struct script_state {
     long long started;                 /* uptime ms at page start */
     char navigation[OPOS_HTTP_URL_MAX];
     bool navigation_replace;
+    char pushed[OPOS_HTTP_URL_MAX];   /* history.pushState URL, or "" */
+    bool push_replace;
+    int history_step;                  /* history.go(n) asked for */
     struct opos_html_node *pending[MAX_PENDING]; /* inserted scripts */
     int pending_count;
     const struct opos_html_node *current_script;
@@ -1139,7 +1145,604 @@ static JSValue n_media(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_NewBool(ctx, match);
 }
 
+/* ------------------------------------------------------------ network */
+
+/* "https://Example.com:443/a" -> "https://example.com" (the default port
+   left out). False for URLs that are not http or https. */
+static bool url_origin(const char *url, char *out, size_t capacity) {
+    bool secure;
+    if (strncasecmp(url, "https://", 8) == 0) {
+        secure = true;
+        url += 8;
+    } else if (strncasecmp(url, "http://", 7) == 0) {
+        secure = false;
+        url += 7;
+    } else {
+        return false;
+    }
+    size_t length = strcspn(url, "/?#");
+    const char *at = memchr(url, '@', length);
+    if (at != NULL) {
+        length -= (size_t)(at + 1 - url);
+        url = at + 1;
+    }
+    char host[300];
+    if (length == 0 || length >= sizeof(host)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        host[i] = (char)tolower((unsigned char)url[i]);
+    }
+    host[length] = '\0';
+    char *colon = strrchr(host, ':');
+    if (colon != NULL && strchr(colon, ']') == NULL
+        && strcmp(colon + 1, secure ? "443" : "80") == 0) {
+        *colon = '\0';
+    }
+    snprintf(out, capacity, "%s://%s", secure ? "https" : "http", host);
+    return true;
+}
+
+/* Header names a page may not set: the browser sets them itself. */
+static bool forbidden_header(const char *name, size_t length) {
+    static const char *const names[] = {
+        "accept-charset", "accept-encoding", "access-control-request-headers",
+        "access-control-request-method", "connection", "content-length",
+        "cookie", "cookie2", "date", "dnt", "expect", "host", "keep-alive",
+        "origin", "referer", "te", "trailer", "transfer-encoding", "upgrade",
+        "user-agent", "via",
+    };
+    if ((length >= 6 && strncasecmp(name, "proxy-", 6) == 0)
+        || (length >= 4 && strncasecmp(name, "sec-", 4) == 0)) {
+        return true;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strlen(names[i]) == length && strncasecmp(name, names[i], length)
+                                              == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A header a cross-origin request may send without asking the server
+   first (CORS "safelisted"). */
+static bool simple_header(const char *name, size_t length, const char *value) {
+    if ((length == 6 && strncasecmp(name, "accept", 6) == 0)
+        || (length == 15 && strncasecmp(name, "accept-language", 15) == 0)
+        || (length == 16 && strncasecmp(name, "content-language", 16) == 0)) {
+        return true;
+    }
+    if (length == 12 && strncasecmp(name, "content-type", 12) == 0) {
+        return strncasecmp(value, "text/plain", 10) == 0
+            || strncasecmp(value, "multipart/form-data", 19) == 0
+            || strncasecmp(value, "application/x-www-form-urlencoded", 33)
+                   == 0;
+    }
+    return false;
+}
+
+/* The value of header name (lower case) in "Name: value\n" lines, copied
+   to out; false when it is missing. */
+static bool find_header(const char *headers, const char *name, char *out,
+                        size_t capacity) {
+    size_t length = strlen(name);
+    for (const char *line = headers; line != NULL && *line != '\0';) {
+        const char *end = strchr(line, '\n');
+        size_t line_length = end != NULL ? (size_t)(end - line)
+                                         : strlen(line);
+        if (line_length > length && line[length] == ':'
+            && strncasecmp(line, name, length) == 0) {
+            const char *value = line + length + 1;
+            while (*value == ' ' || *value == '\t') {
+                value++;
+            }
+            size_t value_length = (size_t)(line + line_length - value);
+            while (value_length > 0 && (value[value_length - 1] == ' '
+                                        || value[value_length - 1] == '\r')) {
+                value_length--;
+            }
+            snprintf(out, capacity, "%.*s", (int)value_length, value);
+            return true;
+        }
+        line = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
+/* Whether a cross-origin response may be shown to the page from origin
+   (credentials: cookies were sent). */
+static bool cors_allows(const char *headers, const char *origin,
+                        bool credentials) {
+    char allow[300];
+    if (!find_header(headers, "access-control-allow-origin", allow,
+                     sizeof(allow))) {
+        return false;
+    }
+    if (credentials) {
+        char yes[16];
+        return strcmp(allow, origin) == 0
+            && find_header(headers, "access-control-allow-credentials", yes,
+                           sizeof(yes))
+            && strcmp(yes, "true") == 0;
+    }
+    return strcmp(allow, "*") == 0 || strcmp(allow, origin) == 0;
+}
+
+static bool list_has(const char *list, const char *word, size_t length) {
+    for (const char *p = list; *p != '\0';) {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        size_t n = strcspn(p, ", ");
+        if (n == 1 && *p == '*') {
+            return true;
+        }
+        if (n == length && strncasecmp(p, word, length) == 0) {
+            return true;
+        }
+        p += n;
+    }
+    return false;
+}
+
+/* N.http(method, url, headers, contentType, body, credentials): one
+   request, run to its end (the page waits). headers are "Name: value\n"
+   lines; body is a string, an ArrayBuffer or undefined; credentials is
+   "omit", "same-origin" or "include". Returns {status, url, headers,
+   body (ArrayBuffer)}, or throws a TypeError like browsers do for network
+   and CORS errors.
+
+   Cookies go only to the page's own site (cookies of other sites are
+   never sent: SameSite is not tracked). Requests to other sites carry an
+   Origin header, are asked first with OPTIONS when they are not simple,
+   and their answers reach the page only when the server allows it with
+   Access-Control-Allow-Origin. */
+static JSValue n_http(JSContext *ctx, JSValueConst this_val, int argc,
+                      JSValueConst *argv) {
+    (void)this_val;
+    struct script_state *s = state_of(ctx);
+    if (argc < 6) {
+        return JS_ThrowTypeError(ctx, "Failed to fetch");
+    }
+    const char *method = JS_ToCString(ctx, argv[0]);
+    const char *address = JS_ToCString(ctx, argv[1]);
+    const char *given = JS_ToCString(ctx, argv[2]);
+    const char *type = JS_IsString(argv[3]) ? JS_ToCString(ctx, argv[3])
+                                            : NULL;
+    const char *mode = JS_ToCString(ctx, argv[5]);
+    char *headers = NULL, *ask = NULL;
+    const char *body = NULL, *body_text = NULL;
+    size_t body_length = 0;
+    struct opos_http_response response;
+    memset(&response, 0, sizeof(response));
+    JSValue result = JS_UNDEFINED;
+    const char *failure = "Failed to fetch";
+    char url[OPOS_HTTP_URL_MAX], page_origin[300], target_origin[300];
+    if (method == NULL || address == NULL || given == NULL || mode == NULL
+        || !opos_url_resolve(s->page->url, address, url, sizeof(url))
+        || !url_origin(url, target_origin, sizeof(target_origin))) {
+        goto out;
+    }
+    url[strcspn(url, "#")] = '\0';
+    bool same = url_origin(s->page->url, page_origin, sizeof(page_origin))
+        && strcmp(page_origin, target_origin) == 0;
+    bool credentials = same && strcmp(mode, "omit") != 0;
+    if (!JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
+        if (JS_IsString(argv[4])) {
+            body_text = JS_ToCStringLen(ctx, &body_length, argv[4]);
+            body = body_text;
+        } else {
+            body = (const char *)JS_GetArrayBuffer(ctx, &body_length,
+                                                   argv[4]);
+        }
+        if (body == NULL) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            goto out;
+        }
+    }
+    /* The page's headers as "Name: value\r\n" lines, without forbidden
+       ones; simple says whether CORS needs a preflight. */
+    size_t given_length = strlen(given);
+    headers = malloc(given_length * 2 + 400);
+    ask = malloc(given_length + 64);
+    if (headers == NULL || ask == NULL) {
+        goto out;
+    }
+    size_t used = 0, ask_used = 0;
+    bool simple = strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0
+               || strcmp(method, "POST") == 0;
+    ask[0] = '\0';
+    for (const char *line = given; *line != '\0';) {
+        size_t length = strcspn(line, "\n");
+        const char *colon = memchr(line, ':', length);
+        if (colon != NULL && colon > line) {
+            size_t name_length = (size_t)(colon - line);
+            const char *value = colon + 1;
+            while (*value == ' ') {
+                value++;
+            }
+            size_t value_length = (size_t)(line + length - value);
+            bool ok = memchr(line, '\r', length) == NULL;
+            for (size_t i = 0; ok && i < name_length; i++) {
+                ok = line[i] > 32 && line[i] < 127;
+            }
+            if (ok && !forbidden_header(line, name_length)) {
+                used += (size_t)sprintf(headers + used, "%.*s: %.*s\r\n",
+                                        (int)name_length, line,
+                                        (int)value_length, value);
+                if (!simple_header(line, name_length, value)) {
+                    simple = false;
+                    ask_used += (size_t)sprintf(ask + ask_used, "%s%.*s",
+                                                ask_used > 0 ? "," : "",
+                                                (int)name_length, line);
+                }
+            }
+        }
+        line += length + (line[length] == '\n');
+    }
+    if (type != NULL && !simple_header("content-type", 12, type)) {
+        simple = false;
+        ask_used += (size_t)sprintf(ask + ask_used, "%scontent-type",
+                                    ask_used > 0 ? "," : "");
+    }
+    if (!same) {
+        used += (size_t)sprintf(headers + used, "Origin: %s\r\n",
+                                page_origin[0] != '\0' ? page_origin
+                                                       : "null");
+    }
+    headers[used] = '\0';
+
+    char status[OPOS_HTTP_URL_MAX + 16];
+    snprintf(status, sizeof(status), "Loading %s", url);
+    browser_status(status);
+    if (!same && !simple) {
+        /* Preflight: may the page send this? */
+        char *pre = malloc(ask_used + 600);
+        if (pre == NULL) {
+            goto out;
+        }
+        sprintf(pre, "Origin: %s\r\nAccess-Control-Request-Method: %s\r\n",
+                page_origin[0] != '\0' ? page_origin : "null", method);
+        if (ask_used > 0) {
+            sprintf(pre + strlen(pre),
+                    "Access-Control-Request-Headers: %s\r\n", ask);
+        }
+        struct opos_http_response check;
+        long error = opos_http_request("OPTIONS", url, pre, NULL, NULL, 0,
+                                       64 << 10, &check);
+        free(pre);
+        char allowed[512] = "";
+        bool ok = error == 0 && check.status >= 200 && check.status < 300
+            && check.headers != NULL
+            && cors_allows(check.headers, page_origin, false);
+        if (ok && strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0
+            && strcmp(method, "POST") != 0) {
+            ok = find_header(check.headers, "access-control-allow-methods",
+                             allowed, sizeof(allowed))
+              && list_has(allowed, method, strlen(method));
+        }
+        for (const char *p = ask; ok && *p != '\0';) {
+            size_t n = strcspn(p, ",");
+            ok = find_header(check.headers, "access-control-allow-headers",
+                             allowed, sizeof(allowed))
+              && list_has(allowed, p, n);
+            p += n + (p[n] == ',');
+        }
+        opos_http_free(&check);
+        if (!ok) {
+            failure = "Failed to fetch (blocked by CORS)";
+            goto out;
+        }
+    }
+    if (credentials) {
+        cookies_attach(true);
+    }
+    long error = opos_http_request(method, url, headers, type, body,
+                                   body_length, JS_FETCH_MAX_BYTES,
+                                   &response);
+    if (credentials) {
+        cookies_detach();
+    }
+    if (error != 0) {
+        goto out;
+    }
+    /* The answer may come from another site after redirects. */
+    char final_origin[300];
+    if (!url_origin(response.url, final_origin, sizeof(final_origin))) {
+        goto out;
+    }
+    if (strcmp(final_origin, page_origin) != 0
+        && !cors_allows(response.headers != NULL ? response.headers : "",
+                        page_origin, credentials)) {
+        failure = "Failed to fetch (blocked by CORS)";
+        goto out;
+    }
+    /* Set-Cookie never reaches scripts. */
+    if (response.headers != NULL) {
+        char *write = response.headers;
+        for (char *line = response.headers; *line != '\0';) {
+            size_t length = strcspn(line, "\n");
+            size_t next = length + (line[length] == '\n');
+            if (!(length > 11 && strncasecmp(line, "set-cookie", 10) == 0
+                  && (line[10] == ':' || line[10] == '2'))) {
+                memmove(write, line, next);
+                write += next;
+            }
+            line += next;
+        }
+        *write = '\0';
+    }
+    result = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, result, "status",
+                      JS_NewInt32(ctx, (int32_t)response.status));
+    JS_SetPropertyStr(ctx, result, "url", JS_NewString(ctx, response.url));
+    JS_SetPropertyStr(ctx, result, "headers",
+                      JS_NewString(ctx, response.headers != NULL
+                                            ? response.headers : ""));
+    JS_SetPropertyStr(ctx, result, "body",
+                      JS_NewArrayBufferCopy(ctx, response.body,
+                                            response.length));
+out:
+    /* The wait for the network does not count against the script. */
+    if (s->deadline != 0) {
+        s->deadline = uptime_ms() + SCRIPT_TIME_MS;
+    }
+    opos_http_free(&response);
+    free(headers);
+    free(ask);
+    JS_FreeCString(ctx, method);
+    JS_FreeCString(ctx, address);
+    JS_FreeCString(ctx, given);
+    JS_FreeCString(ctx, type);
+    JS_FreeCString(ctx, mode);
+    JS_FreeCString(ctx, body_text);
+    if (JS_IsUndefined(result)) {
+        return JS_ThrowTypeError(ctx, "%s", failure);
+    }
+    return result;
+}
+
+/* N.decode(arrayBuffer): the bytes as UTF-8 text. */
+static JSValue n_decode(JSContext *ctx, JSValueConst this_val, int argc,
+                        JSValueConst *argv) {
+    (void)this_val;
+    size_t length = 0;
+    uint8_t *data = argc > 0 ? JS_GetArrayBuffer(ctx, &length, argv[0])
+                             : NULL;
+    if (data == NULL) {
+        return JS_EXCEPTION;
+    }
+    /* Skip a byte order mark. */
+    if (length >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) {
+        data += 3;
+        length -= 3;
+    }
+    return JS_NewStringLen(ctx, (const char *)data, length);
+}
+
+/* N.encode(string): its UTF-8 bytes as an ArrayBuffer. */
+static JSValue n_encode(JSContext *ctx, JSValueConst this_val, int argc,
+                        JSValueConst *argv) {
+    (void)this_val;
+    size_t length = 0;
+    const char *text = argc > 0 ? JS_ToCStringLen(ctx, &length, argv[0])
+                                : NULL;
+    if (text == NULL) {
+        return JS_EXCEPTION;
+    }
+    JSValue buffer = JS_NewArrayBufferCopy(ctx, (const uint8_t *)text,
+                                           length);
+    JS_FreeCString(ctx, text);
+    return buffer;
+}
+
+/* N.cookie(): document.cookie. N.setCookie(text): document.cookie = text.
+   Only for http and https pages. */
+static JSValue n_cookie(JSContext *ctx, JSValueConst this_val, int argc,
+                        JSValueConst *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    struct script_state *s = state_of(ctx);
+    char origin[300];
+    if (!url_origin(s->page->url, origin, sizeof(origin))) {
+        return JS_NewString(ctx, "");
+    }
+    char *out = malloc(OPOS_HTTP_COOKIE_MAX);
+    if (out == NULL) {
+        return JS_NewString(ctx, "");
+    }
+    cookies_for_script(s->page->url, out, OPOS_HTTP_COOKIE_MAX);
+    JSValue text = JS_NewString(ctx, out);
+    free(out);
+    return text;
+}
+
+static JSValue n_set_cookie(JSContext *ctx, JSValueConst this_val, int argc,
+                            JSValueConst *argv) {
+    (void)this_val;
+    struct script_state *s = state_of(ctx);
+    const char *text = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (text == NULL) {
+        return JS_EXCEPTION;
+    }
+    char origin[300];
+    if (url_origin(s->page->url, origin, sizeof(origin))) {
+        cookies_set_from_script(s->page->url, text);
+    }
+    JS_FreeCString(ctx, text);
+    return JS_UNDEFINED;
+}
+
+/* localStorage lives in data_dir/storage/<origin>, one file per site:
+   the JSON text dom.js writes. */
+static char storage_dir[200];
+
+void script_set_data_dir(const char *data_dir) {
+    if (data_dir[0] == '\0') {
+        storage_dir[0] = '\0';
+        return;
+    }
+    snprintf(storage_dir, sizeof(storage_dir), "%s/storage", data_dir);
+    opos_mkdir(storage_dir);
+}
+
+static bool storage_path(struct script_state *s, char *out, size_t capacity) {
+    char origin[300];
+    if (storage_dir[0] == '\0'
+        || !url_origin(s->page->url, origin, sizeof(origin))) {
+        return false;
+    }
+    /* "https://example.com:8080" -> "https_example.com_8080" */
+    char name[300];
+    size_t n = 0;
+    for (const char *p = origin; *p != '\0' && n + 1 < sizeof(name); p++) {
+        if (*p == ':' && p[1] == '/' && p[2] == '/') {
+            name[n++] = '_';
+            p += 2;
+        } else if (isalnum((unsigned char)*p) || *p == '.' || *p == '-') {
+            name[n++] = *p;
+        } else {
+            name[n++] = '_';
+        }
+    }
+    name[n] = '\0';
+    snprintf(out, capacity, "%s/%s", storage_dir, name);
+    return true;
+}
+
+static JSValue n_storage_load(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    char path[400];
+    if (!storage_path(state_of(ctx), path, sizeof(path))) {
+        return JS_NULL;
+    }
+    long fd = opos_open(path, OPOS_O_RDONLY);
+    if (fd < 0) {
+        return JS_NULL;
+    }
+    size_t used = 0, capacity = 16384;
+    char *data = malloc(capacity);
+    while (data != NULL) {
+        if (used + 4096 > capacity) {
+            if (capacity >= STORAGE_MAX_BYTES * 2) {
+                break;
+            }
+            char *bigger = realloc(data, capacity * 2);
+            if (bigger == NULL) {
+                break;
+            }
+            data = bigger;
+            capacity *= 2;
+        }
+        long got = opos_read((int)fd, data + used, 4096);
+        if (got <= 0) {
+            break;
+        }
+        used += (size_t)got;
+    }
+    opos_close((int)fd);
+    if (data == NULL) {
+        return JS_NULL;
+    }
+    JSValue text = JS_NewStringLen(ctx, data, used);
+    free(data);
+    return text;
+}
+
+static JSValue n_storage_save(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv) {
+    (void)this_val;
+    char path[400], temporary[410];
+    size_t length = 0;
+    const char *text = argc > 0 ? JS_ToCStringLen(ctx, &length, argv[0])
+                                : NULL;
+    if (text == NULL) {
+        return JS_EXCEPTION;
+    }
+    bool ok = length <= STORAGE_MAX_BYTES * 2
+        && storage_path(state_of(ctx), path, sizeof(path));
+    if (ok) {
+        snprintf(temporary, sizeof(temporary), "%s.new", path);
+        opos_unlink(temporary);
+        long fd = opos_open(temporary, OPOS_O_WRONLY | OPOS_O_CREAT
+                                           | OPOS_O_TRUNC);
+        ok = fd >= 0;
+        if (ok) {
+            size_t done = 0;
+            while (ok && done < length) {
+                long wrote = opos_write((int)fd, text + done, length - done);
+                ok = wrote > 0;
+                done += ok ? (size_t)wrote : 0;
+            }
+            opos_close((int)fd);
+        }
+        if (ok) {
+            opos_unlink(path);
+            ok = opos_rename(temporary, path) == 0;
+        }
+        if (!ok) {
+            opos_unlink(temporary);
+        }
+    }
+    JS_FreeCString(ctx, text);
+    return JS_NewBool(ctx, ok);
+}
+
+/* N.pushUrl(url, replace): history.pushState/replaceState. Only a URL of
+   the page's own site; the page is not loaded again. */
+static JSValue n_push_url(JSContext *ctx, JSValueConst this_val, int argc,
+                          JSValueConst *argv) {
+    (void)this_val;
+    struct script_state *s = state_of(ctx);
+    const char *given = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (given == NULL) {
+        return JS_EXCEPTION;
+    }
+    char url[OPOS_HTTP_URL_MAX], one[300], two[300];
+    bool ok = opos_url_resolve(s->page->url, given, url, sizeof(url))
+        && url_origin(url, one, sizeof(one))
+        && url_origin(s->page->url, two, sizeof(two))
+        && strcmp(one, two) == 0;
+    JS_FreeCString(ctx, given);
+    if (!ok) {
+        return JS_ThrowTypeError(ctx, "SecurityError: not the page's origin");
+    }
+    bool replace = argc > 1 && JS_ToBool(ctx, argv[1]);
+    /* A push not yet taken by the browser stays a push. */
+    s->push_replace = s->pushed[0] == '\0' ? replace
+                                           : s->push_replace && replace;
+    snprintf(s->page->url, sizeof(s->page->url), "%s", url);
+    snprintf(s->pushed, sizeof(s->pushed), "%s", url);
+    return JS_UNDEFINED;
+}
+
+/* N.navigateHistory(step): history.back(), forward() and go(n). */
+static JSValue n_navigate_history(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t step = 0;
+    if (argc > 0 && JS_ToInt32(ctx, &step, argv[0]) == 0 && step != 0) {
+        state_of(ctx)->history_step = step < -50 ? -50 : step > 50 ? 50
+                                                                  : step;
+    }
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry native_functions[] = {
+    JS_CFUNC_DEF("http", 6, n_http),
+    JS_CFUNC_DEF("navigateHistory", 1, n_navigate_history),
+    JS_CFUNC_DEF("decode", 1, n_decode),
+    JS_CFUNC_DEF("encode", 1, n_encode),
+    JS_CFUNC_DEF("cookie", 0, n_cookie),
+    JS_CFUNC_DEF("setCookie", 1, n_set_cookie),
+    JS_CFUNC_DEF("storageLoad", 0, n_storage_load),
+    JS_CFUNC_DEF("storageSave", 1, n_storage_save),
+    JS_CFUNC_DEF("pushUrl", 2, n_push_url),
     JS_CFUNC_DEF("media", 1, n_media),
     JS_CFUNC_DEF("kind", 1, n_kind),
     JS_CFUNC_DEF("name", 1, n_name),
@@ -1419,6 +2022,11 @@ void script_page_end(struct page *page) {
         return;
     }
     JSContext *ctx = s->context;
+    if (!s->running && JS_IsObject(s->hooks)) {
+        begin_call(s);
+        JS_FreeValue(ctx, call_hook(s, "flush", 0, NULL));
+        end_call(s);
+    }
     for (size_t i = 0; i < s->wrapper_size; i++) {
         if (s->wrappers[i].node != NULL) {
             JS_SetOpaque(s->wrappers[i].object, NULL);
@@ -1451,6 +2059,13 @@ long script_run_timers(struct page *page) {
         JS_ToFloat64(ctx, &wait, next);
     }
     JS_FreeValue(ctx, next);
+    /* Promise callbacks that ran after the timers may have started new
+       requests. */
+    JSValue waiting = call_hook(s, "waiting", 0, NULL);
+    if (JS_ToBool(ctx, waiting) > 0) {
+        wait = 0;
+    }
+    JS_FreeValue(ctx, waiting);
     return wait < 0 ? -1 : wait > 1e9 ? 1000000000 : (long)wait;
 }
 
@@ -1526,6 +2141,28 @@ bool script_take_navigation(struct page *page, char *url, size_t capacity,
     snprintf(url, capacity, "%s", s->navigation);
     *replace = s->navigation_replace;
     s->navigation[0] = '\0';
+    return true;
+}
+
+int script_take_history_step(struct page *page) {
+    struct script_state *s = page->script;
+    if (s == NULL) {
+        return 0;
+    }
+    int step = s->history_step;
+    s->history_step = 0;
+    return step;
+}
+
+bool script_take_url(struct page *page, char *url, size_t capacity,
+                     bool *replace) {
+    struct script_state *s = page->script;
+    if (s == NULL || s->pushed[0] == '\0') {
+        return false;
+    }
+    snprintf(url, capacity, "%s", s->pushed);
+    *replace = s->push_replace;
+    s->pushed[0] = '\0';
     return true;
 }
 

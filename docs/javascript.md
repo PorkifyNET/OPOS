@@ -27,8 +27,9 @@ timers and the network APIs.
   for the same element and properties set on it stay.
 - **Nothing waits.** Scripts run one at a time on the browser's own
   thread. A script, timer or event gets 5 seconds before it is stopped
-  (an "interrupted" error). Navigation that a script asks for
-  (`location.href = ...`) happens once it returns. `Atomics.wait` is off.
+  (an "interrupted" error); time spent waiting for the network does not
+  count. Navigation that a script asks for (`location.href = ...`)
+  happens once it returns. `Atomics.wait` is off.
 - **Memory.** QuickJS's many small blocks come from per-size free lists
   (`script.c`), because the SDK `malloc` keeps one sorted list and slows
   down with hundreds of thousands of blocks.
@@ -64,7 +65,7 @@ timers and the network APIs.
    - Window: `setTimeout`/`setInterval`, `requestAnimationFrame`,
      promises and `queueMicrotask`, `console` (to the Terminal),
      `location`, `URL`, `URLSearchParams`, `navigator`, `screen`,
-     `localStorage`/`sessionStorage` (kept for the page only),
+     `localStorage`/`sessionStorage` (step 2 keeps `localStorage`),
      `matchMedia`, `atob`/`btoa`, and stand-ins for
      `IntersectionObserver` (reports everything visible),
      `MutationObserver` and `ResizeObserver` (never report).
@@ -72,10 +73,41 @@ timers and the network APIs.
      clicks, a cancelled link, typing, 19 language checks) works fully;
      GitHub, Hacker News and BBC News load and run their scripts without
      crashing.
-2. **Network and storage**: `fetch` and `XMLHttpRequest` (async, run in
-   the main loop between events), `document.cookie` (needs HttpOnly in
-   the cookie jar), `localStorage` kept per site in
-   `~/AppData/Browser`, `history.pushState` changing the address bar.
+2. **Network and storage** (done, branch `browser/javascript-net`)
+   - `fetch` (`Request`, `Response`, `Headers`, `AbortController`) and
+     `XMLHttpRequest` (async and sync, `responseType` text, json,
+     arraybuffer and blob). Requests wait in a queue and run one by one
+     in the main loop between timers and events; the page waits while one
+     runs (there are no threads). Bodies: strings, `URLSearchParams`,
+     `FormData` (sent as multipart), `Blob`, `ArrayBuffer` and typed
+     arrays. Also `TextEncoder`, `TextDecoder`, `Blob`, `File`,
+     `FormData` and `DOMException`.
+   - The SDK HTTP library gained `opos_http_request` (any method, extra
+     headers, the response's headers in `response.headers`).
+   - Safety: cookies go only with requests to the page's own site
+     (scheme, host and port); requests to other sites never carry
+     cookies, because SameSite is not tracked. Requests to other sites
+     send `Origin`; requests that are not "simple" (other methods or
+     headers) are first asked with `OPTIONS` (CORS preflight); answers
+     reach the page only with a matching `Access-Control-Allow-Origin`.
+     Pages cannot set `Cookie`, `Host`, `Origin`, `Referer` and the other
+     forbidden headers, and never see `Set-Cookie`.
+   - `document.cookie` reads and sets cookies without the HttpOnly ones;
+     the jar records HttpOnly (a ninth field in `cookies.txt`; cookies
+     saved before this stay hidden from scripts).
+   - `localStorage` is kept per site in `~/AppData/Browser/storage/`
+     (about 5 MB each), saved after each timer round that changed it and
+     when the page closes. Tabs of the same site do not see each other's
+     changes until they load again. `sessionStorage` lasts for the page.
+     Both also work as `localStorage.key = value`.
+   - `history.pushState`/`replaceState` change the address bar and the
+     tab's back list without loading; Back to such an entry loads it
+     (there is no `popstate` yet). `history.back()`, `forward()` and
+     `go(n)` work like the toolbar buttons.
+   - Tested in QEMU with a test server on two ports (two origins): 22
+     checks pass (fetch, redirects, XHR, POST bodies, HttpOnly, CORS
+     allowed/blocked/preflight, abort, storage kept after reload,
+     pushState). BBC News still loads.
 3. **Styles and layout from scripts**: `<style>` and `<link>` sheets
    added by scripts, `HTMLStyleElement.sheet` with `insertRule` (CSS in
    JS, such as styled-components), `getComputedStyle` from the real

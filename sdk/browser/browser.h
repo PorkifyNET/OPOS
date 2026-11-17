@@ -425,9 +425,17 @@ bool script_take_title(struct page *page);
 /* A navigation a script asked for (location.href = ...). */
 bool script_take_navigation(struct page *page, char *url, size_t capacity,
                             bool *replace);
+/* history.go(n), back() (-1) and forward() (1); 0 when none. */
+int script_take_history_step(struct page *page);
+/* The address a script set with history.pushState (replace: with
+   replaceState); page->url already has it. */
+bool script_take_url(struct page *page, char *url, size_t capacity,
+                     bool *replace);
 /* Runs a javascript: URL on the page; false when it is not one. */
 bool script_runs_javascript_url(struct page *page, const char *url);
 int script_errors(const struct page *page);
+/* Where localStorage is kept: data_dir/storage ("": only in memory). */
+void script_set_data_dir(const char *data_dir);
 /* main.c: shows text in the status bar at once. */
 void browser_status(const char *text);
 
@@ -462,6 +470,11 @@ void cookies_open(const char *data_dir);
 void cookies_attach(bool store);
 void cookies_detach(void);
 void cookies_save(void);
+/* document.cookie: the cookies a script on url may read (no HttpOnly
+   ones), and storing one "name=value; attributes" string from a script
+   (no HttpOnly attribute, cannot replace an HttpOnly cookie). */
+void cookies_for_script(const char *url, char *out, size_t capacity);
+void cookies_set_from_script(const char *url, const char *text);
 /* Calls each for every site with cookies, sorted by name; returns the
    number of sites. */
 int cookies_sites(void (*each)(void *context, int index, const char *site,

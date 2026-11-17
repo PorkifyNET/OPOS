@@ -34,6 +34,8 @@ struct opos_http_response {
     char content_type[128];               /* "text/html; charset=utf-8" */
     uint8_t *body;                        /* malloc'd, always NUL-terminated */
     size_t length;                        /* bytes in body, without the NUL */
+    char *headers;                        /* malloc'd "Name: value\n" lines of
+                                             the last response, or NULL */
 };
 
 /* Downloads url. body is NULL on error. Never returns more than max_body
@@ -47,6 +49,17 @@ long opos_http_get(const char *url, size_t max_body,
 long opos_http_post(const char *url, const char *content_type,
                     const void *body, size_t length, size_t max_body,
                     struct opos_http_response *response);
+
+/* Any request: method ("GET", "PUT", "DELETE", "HEAD", ...; NULL: GET, or
+   POST with content_type), extra headers as whole "Name: value\r\n" lines
+   (NULL: none; an "Accept:" line replaces the default one), and a body
+   (sent with Content-Length when not NULL, and for POST, PUT and PATCH).
+   Redirects are followed like opos_http_post. response->headers holds the
+   final response's headers. */
+long opos_http_request(const char *method, const char *url,
+                       const char *headers, const char *content_type,
+                       const void *body, size_t length, size_t max_body,
+                       struct opos_http_response *response);
 
 /* Receives a downloaded body piece by piece. A negative result stops the
    download, and opos_http_download returns it. */

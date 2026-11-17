@@ -2216,22 +2216,26 @@ static enum load_result load_request(const char *url, const char *post,
 
 /* Loads url in the current tab; with record, it becomes the newest entry
    of the tab's back/forward list. */
+/* Makes T->url the newest entry of the tab's back/forward list. */
+static void history_record(void) {
+    if (T->history_position + 1 < T->history_count) {
+        T->history_count = T->history_position + 1;
+    }
+    if (T->history_count == HISTORY_MAX) {
+        memmove(T->history[0], T->history[1],
+                (HISTORY_MAX - 1) * sizeof(T->history[0]));
+        T->history_count--;
+    }
+    snprintf(T->history[T->history_count], sizeof(T->history[0]), "%s",
+             T->url);
+    T->history_position = T->history_count++;
+}
+
 static void navigate_request(const char *url, bool record, const char *post,
                              size_t post_length) {
     T->editing = false;
     if (load_request(url, post, post_length, false) == LOAD_SHOWN && record) {
-        if (T->history_position + 1 < T->history_count) {
-            T->history_count = T->history_position + 1;
-        }
-        if (T->history_count == HISTORY_MAX) {
-            memmove(T->history[0], T->history[1],
-                    (HISTORY_MAX - 1) * sizeof(T->history[0]));
-            T->history_count--;
-        }
-        /* Where redirects ended up. */
-        snprintf(T->history[T->history_count], sizeof(T->history[0]), "%s",
-                 T->url);
-        T->history_position = T->history_count++;
+        history_record(); /* where redirects ended up */
     }
     b.dirty = true;
 }
@@ -2267,8 +2271,10 @@ static void refresh_controls(void) {
 
 /* ------------------------------------------------------------ scripts */
 
+static void go_history(int step);
+
 /* Applies what the shown page's scripts asked for: a new title, a
-   navigation, a changed document. */
+   navigation, a new address, a changed document. */
 static void scripts_apply(void) {
     if (!T->have_page || T->page.script == NULL) {
         return;
@@ -2282,6 +2288,26 @@ static void scripts_apply(void) {
     if (script_take_navigation(&T->page, url, sizeof(url), &replace)) {
         navigate(url, !replace);
         return;
+    }
+    int step = script_take_history_step(&T->page);
+    if (step != 0) {
+        go_history(step);
+        return;
+    }
+    if (script_take_url(&T->page, url, sizeof(url), &replace)) {
+        /* history.pushState: a new address without loading it. Going
+           back to it later loads it. */
+        snprintf(T->url, sizeof(T->url), "%s", url);
+        if (!T->editing) {
+            set_address(url);
+        }
+        if (replace && T->history_position >= 0) {
+            snprintf(T->history[T->history_position],
+                     sizeof(T->history[0]), "%s", url);
+        } else {
+            history_record();
+        }
+        b.dirty = true;
     }
     if (script_take_dirty(&T->page)) {
         refresh_controls();
@@ -3725,6 +3751,7 @@ int main(int argc, char **argv) {
     }
     library_open(b.data_dir);
     cookies_open(b.data_dir);
+    script_set_data_dir(b.data_dir);
     javascript_load_setting();
 
     tab_open(argc > 1 ? argv[1] : NULL, true);

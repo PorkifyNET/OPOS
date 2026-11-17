@@ -14,6 +14,9 @@ size_t strlen(const char *text);
 size_t strnlen(const char *text, size_t limit);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, size_t length);
+/* Compare ignoring ASCII case. */
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, size_t length);
 char *strcpy(char *destination, const char *source);
 char *strncpy(char *destination, const char *source, size_t length);
 char *strcat(char *destination, const char *source);

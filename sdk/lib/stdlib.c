@@ -6,6 +6,8 @@
  * has a 16-byte header; returned memory is 16-byte aligned.
  */
 #include <ctype.h>
+#include <errno.h>
+#include <malloc.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -147,6 +149,12 @@ void *realloc(void *memory, size_t size) {
     return bigger;
 }
 
+size_t malloc_usable_size(void *memory) {
+    return memory != NULL ? ((struct block *)memory - 1)->size : 0;
+}
+
+int errno;
+
 static void swap_bytes(unsigned char *a, unsigned char *b, size_t size) {
     for (size_t i = 0; i < size; i++) {
         unsigned char t = a[i];
@@ -262,4 +270,8 @@ long atol(const char *text) {
 
 void exit(int status) {
     opos_exit(status);
+}
+
+void abort(void) {
+    opos_exit(134);
 }

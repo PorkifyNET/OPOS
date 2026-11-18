@@ -138,6 +138,8 @@ struct style {
     int grid_size[12];               /* px, percent or fr*100 */
     char grid_kind[12];              /* p px, c percent, f fr, a auto */
     int grid_fill_min;               /* repeat(auto-fill, minmax(N, 1fr)) */
+    /* The element this style was computed for (text inherits it). */
+    const struct opos_html_node *element;
 };
 
 #define TOP 0
@@ -182,7 +184,8 @@ enum item_kind {
     ITEM_TEXT,
     ITEM_RECT,     /* filled rectangle */
     ITEM_OUTLINE,  /* one-pixel rectangle outline */
-    ITEM_IMAGE
+    ITEM_IMAGE,
+    ITEM_BOX       /* not drawn: an element's border box (for scripts) */
 };
 
 struct image_ref;
@@ -190,6 +193,8 @@ struct image_ref;
 struct display_item {
     enum item_kind kind;
     int x, y, width, height;   /* the item's box; text: y is the line top */
+    /* Text and images: the element they belong to (for script events). */
+    const struct opos_html_node *element;
     uint32_t colour;
     uint8_t transparency;      /* rectangles: 0 opaque, 255 invisible */
     /* text */
@@ -300,6 +305,8 @@ struct image_ref {
     uint32_t *scaled;          /* cached copy at scaled_width/height */
     int scaled_width, scaled_height;
     uint32_t scaled_colour;
+    bool canvas;               /* a <canvas>: pixels come from canvas.c */
+    unsigned canvas_version;   /* of the cached scaled copy */
 };
 
 /* image.c */
@@ -342,6 +349,11 @@ struct css_sheet;
 struct css_sheet *css_parse(const char *text, size_t length);
 struct css_sheet *css_append(struct css_sheet *chain, struct css_sheet *sheet);
 void css_free(struct css_sheet *chain);
+/* Links the sheets into one chain in this order (each sheet must be
+   on its own or in the chain being relinked); returns its head. */
+struct css_sheet *css_relink(struct css_sheet **sheets, size_t count);
+/* Frees one sheet of a chain (relink the others after). */
+void css_unlink_free(struct css_sheet *sheet);
 void css_reset_variables(void);
 /* True when a media query ("print", "(max-width: 600px)", ...) applies to
    the browser window. */
@@ -359,6 +371,14 @@ void css_apply_block(struct style *style, const char *text,
 void apply_declaration(struct style *style, const char *name,
                        size_t name_length, const char *value,
                        const struct style *parent);
+/* Drops the matched rules cached for elements (after scripts changed the
+   document). */
+void css_forget_matches(struct css_sheet *chain);
+/* A selector list for querySelector and matches(); NULL when no selector
+   in it is supported. Free it with css_free. */
+struct css_sheet *css_selector_parse(const char *selectors);
+bool css_selector_matches(const struct css_sheet *selectors,
+                          const struct opos_html_node *node);
 /* The style sheets used by style_compute (set by layout_page). */
 extern const struct css_sheet *style_sheets;
 
@@ -376,6 +396,11 @@ struct page {
     size_t image_capacity;
     void *arena;               /* layout scratch (styles) */
     struct css_sheet *sheets;  /* author style sheets, in order */
+    /* Where each sheet of the chain came from (main.c sheets_update). */
+    struct page_sheet *sheet_list;
+    size_t sheet_count;
+    int sheet_fetches;         /* linked sheets fetched so far */
+    size_t sheet_bytes;        /* and their size */
     struct form_field *fields; /* form controls touched so far */
     size_t field_count;
     size_t field_capacity;
@@ -384,7 +409,85 @@ struct page {
        it was not laid out). */
     const struct opos_html_node *anchor;
     int anchor_y;
+    struct script_state *script; /* JavaScript (script.c), or NULL */
 };
+
+/* True when pages run their scripts (the browser's JavaScript setting):
+   <noscript> is hidden and @media (scripting: enabled) matches. */
+extern bool scripting_enabled;
+
+/* script.c: JavaScript. script_page_start runs the page's scripts and its
+   DOMContentLoaded and load events; page_destroy calls script_page_end. */
+void script_page_start(struct page *page);
+void script_page_end(struct page *page);
+/* Runs the timers that are due; returns milliseconds until the next one,
+   or -1 for none. */
+long script_run_timers(struct page *page);
+/* A mouse event ("click") at target from the user; true when a script
+   cancelled its default action. */
+bool script_event(struct page *page, const struct opos_html_node *target,
+                  const char *type, int x, int y, int button);
+/* A key event ("keydown") at target (NULL: the body); modifiers: 1 Shift,
+   2 Ctrl, 4 Alt. True when a script cancelled it. */
+bool script_key(struct page *page, const struct opos_html_node *target,
+                const char *type, const char *key, int code, int modifiers);
+/* True once after scripts changed the document (lay it out again). */
+bool script_take_dirty(struct page *page);
+/* True once after a script set document.title. */
+bool script_take_title(struct page *page);
+/* A navigation a script asked for (location.href = ...). */
+bool script_take_navigation(struct page *page, char *url, size_t capacity,
+                            bool *replace);
+/* history.go(n), back() (-1) and forward() (1); 0 when none. */
+int script_take_history_step(struct page *page);
+/* The address a script set with history.pushState (replace: with
+   replaceState); page->url already has it. */
+bool script_take_url(struct page *page, char *url, size_t capacity,
+                     bool *replace);
+/* Runs a javascript: URL on the page; false when it is not one. */
+bool script_runs_javascript_url(struct page *page, const char *url);
+int script_errors(const struct page *page);
+/* Where localStorage is kept: data_dir/storage ("": only in memory). */
+void script_set_data_dir(const char *data_dir);
+/* main.c: shows text in the status bar at once. */
+void browser_status(const char *text);
+/* main.c, for scripts: lays the page out now if a script changed it;
+   the element's border box in window-view pixels (x, y, width,
+   height; false when it has none); the page's scroll offset and size;
+   scrolling it. */
+void browser_layout_now(struct page *page);
+bool browser_element_rect(struct page *page,
+                          const struct opos_html_node *node,
+                          int rect[4]);
+void browser_page_metrics(struct page *page, int *scroll_x,
+                          int *scroll_y, int *width, int *height);
+void browser_scroll_to(struct page *page, int y);
+/* Style sheet text a script set for a <style> element (or, for NULL,
+   the document's adopted sheets) through the CSS object model;
+   NULL when none. */
+const char *script_sheet_text(struct page *page,
+                              const struct opos_html_node *node,
+                              size_t *length);
+/* The page was laid out (scripts need not ask for it again). */
+void script_layout_done(struct page *page);
+/* The page scrolled or the window changed size: fires "scroll" or
+   "resize" at the window. */
+void script_window_event(struct page *page, const char *type);
+
+/* canvas.c: <canvas> surfaces. canvas_size is the size of the element's
+   attributes (300 x 150 by default); canvas_pixels gives a canvas's
+   0xAARRGGBB pixels and a version that changes with every drawing (NULL
+   before a script draws); canvas_take_painted says whether any canvas
+   changed since it was last asked; canvas_page_end frees a page's
+   canvases and script-loaded images. */
+void canvas_size(const struct opos_html_node *node, int *width, int *height);
+const uint32_t *canvas_pixels(const struct opos_html_node *node, int *width,
+                              int *height, unsigned *version);
+bool canvas_take_painted(void);
+void canvas_page_end(struct page *page);
+/* main.c: the browser's fonts (0 sans, 1 bold, 2 italic, 3 bold italic,
+   4 mono, 5 mono bold). */
+struct opos_font *browser_font(int index);
 
 /* library.c: bookmarks, history and downloads. data_dir "" keeps them
    only in memory. */
@@ -417,6 +520,11 @@ void cookies_open(const char *data_dir);
 void cookies_attach(bool store);
 void cookies_detach(void);
 void cookies_save(void);
+/* document.cookie: the cookies a script on url may read (no HttpOnly
+   ones), and storing one "name=value; attributes" string from a script
+   (no HttpOnly attribute, cannot replace an HttpOnly cookie). */
+void cookies_for_script(const char *url, char *out, size_t capacity);
+void cookies_set_from_script(const char *url, const char *text);
 /* Calls each for every site with cookies, sorted by name; returns the
    number of sites. */
 int cookies_sites(void (*each)(void *context, int index, const char *site,
@@ -462,6 +570,17 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
                  int width);
 
 void page_free_layout(struct page *page);
+
+/* The border box of node in page coordinates from the last layout:
+   its block box, or the bounds of what it drew. fixed: it stays put
+   in the view. False when it drew nothing. */
+bool page_element_box(const struct page *page,
+                      const struct opos_html_node *node, int box[4],
+                      bool *fixed);
+/* The style node gets from the page's sheets (for getComputedStyle). */
+void page_element_style(struct page *page,
+                        const struct opos_html_node *node,
+                        struct style *style);
 
 /* Frees everything the page owns: layout, document, images. */
 void page_destroy(struct page *page);

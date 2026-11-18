@@ -98,6 +98,28 @@ int strncmp(const char *a, const char *b, size_t length) {
     return 0;
 }
 
+static int fold(unsigned char ch) {
+    return ch >= 'A' && ch <= 'Z' ? ch + 32 : ch;
+}
+
+int strcasecmp(const char *a, const char *b) {
+    while (*a != '\0' && fold((unsigned char)*a) == fold((unsigned char)*b)) {
+        a++;
+        b++;
+    }
+    return fold((unsigned char)*a) - fold((unsigned char)*b);
+}
+
+int strncasecmp(const char *a, const char *b, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        int x = fold((unsigned char)a[i]), y = fold((unsigned char)b[i]);
+        if (x != y || a[i] == '\0') {
+            return x - y;
+        }
+    }
+    return 0;
+}
+
 char *strcpy(char *destination, const char *source) {
     size_t i = 0;
     do {

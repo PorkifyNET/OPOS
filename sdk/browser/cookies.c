@@ -9,7 +9,7 @@
  * Cookies with an expiry date are kept in cookies.txt in the data folder,
  * one per line:
  *   domain TAB host-only TAB path TAB secure TAB expires TAB created TAB
- *   name TAB value
+ *   name TAB value TAB flags (1: HttpOnly)
  * Session cookies (no expiry date) last only while the browser runs.
  *
  * There is no full Public Suffix List: a Domain attribute without a dot,
@@ -39,6 +39,7 @@ struct cookie {
     long long created;
     bool host_only;
     bool secure;
+    bool http_only; /* hidden from document.cookie */
 };
 
 static struct cookie *jar;
@@ -316,7 +317,7 @@ static bool attribute_is(const char *name, size_t length, const char *word) {
 
 /* Puts a parsed cookie into the jar, replacing one with the same name,
    domain and path. Takes name and value. */
-static void jar_store(struct cookie *c) {
+static void jar_store(struct cookie *c, bool script) {
     long long t = now();
     for (int i = 0; i < cookie_count; i++) {
         struct cookie *old = &jar[i];
@@ -324,6 +325,10 @@ static void jar_store(struct cookie *c) {
             && strcmp(old->domain, c->domain) == 0
             && strcmp(old->path, c->path) == 0
             && old->host_only == c->host_only) {
+            if (script && old->http_only) {
+                cookie_free(c); /* scripts cannot replace HttpOnly cookies */
+                return;
+            }
             c->created = old->created;
             cookie_remove(i);
             break;
@@ -343,9 +348,10 @@ static void jar_store(struct cookie *c) {
     }
 }
 
-static void cookie_set(void *context, const char *url_text,
-                       const char *header) {
-    (void)context;
+/* Stores the cookie in a Set-Cookie header (script: from document.cookie,
+   which may not set or replace HttpOnly cookies). */
+static void cookie_store(const char *url_text, const char *header,
+                         bool script) {
     struct cookie_url url;
     if (jar == NULL || !url_parse(url_text, &url)) {
         return;
@@ -444,6 +450,11 @@ static void cookie_set(void *context, const char *url_text,
             }
         } else if (attribute_is(attr, attr_length, "secure")) {
             c.secure = true;
+        } else if (attribute_is(attr, attr_length, "httponly")) {
+            if (script) {
+                return;
+            }
+            c.http_only = true;
         }
     }
     if (!have_path) {
@@ -492,7 +503,13 @@ static void cookie_set(void *context, const char *url_text,
     c.value[value_length] = '\0';
     c.created = t > last_created ? t : last_created + 1;
     last_created = c.created;
-    jar_store(&c);
+    jar_store(&c, script);
+}
+
+static void cookie_set(void *context, const char *url_text,
+                       const char *header) {
+    (void)context;
+    cookie_store(url_text, header, false);
 }
 
 static int compare_order(const void *one, const void *other) {
@@ -505,9 +522,10 @@ static int compare_order(const void *one, const void *other) {
     return a->created < b->created ? -1 : a->created > b->created;
 }
 
-static void cookie_get(void *context, const char *url_text, char *out,
-                       size_t capacity) {
-    (void)context;
+/* Writes the "a=1; b=2" list of cookies for url (script: without the
+   HttpOnly ones). */
+static void cookie_list(const char *url_text, char *out, size_t capacity,
+                        bool script) {
     out[0] = '\0';
     struct cookie_url url;
     if (jar == NULL || cookie_count == 0 || !url_parse(url_text, &url)) {
@@ -524,7 +542,7 @@ static void cookie_get(void *context, const char *url_text, char *out,
         bool host = c->host_only ? strcmp(url.host, c->domain) == 0
                                  : domain_match(url.host, c->domain);
         if (host && path_match(url.path, c->path)
-            && (!c->secure || url.secure)) {
+            && (!c->secure || url.secure) && !(script && c->http_only)) {
             matches[count++] = c;
         }
     }
@@ -541,6 +559,22 @@ static void cookie_get(void *context, const char *url_text, char *out,
                                  matches[i]->value);
     }
     free(matches);
+}
+
+static void cookie_get(void *context, const char *url_text, char *out,
+                       size_t capacity) {
+    (void)context;
+    cookie_list(url_text, out, capacity, false);
+}
+
+void cookies_for_script(const char *url, char *out, size_t capacity) {
+    cookie_list(url, out, capacity, true);
+}
+
+void cookies_set_from_script(const char *url, const char *text) {
+    if (strchr(text, '\n') == NULL && strchr(text, '\r') == NULL) {
+        cookie_store(url, text, true);
+    }
 }
 
 /* ---------------------------------------------------------------- file */
@@ -609,6 +643,11 @@ static void load(void) {
             strcpy(c.path, path);
             c.host_only = host_only[0] == '1';
             c.secure = secure[0] == '1';
+            /* The ninth field, flags, came with JavaScript (bit 0:
+               HttpOnly). Older files did not record HttpOnly, so their
+               cookies stay hidden from scripts. */
+            char *flags;
+            c.http_only = !field(&at, &flags) || (strtol(flags, NULL, 10) & 1);
             c.expires = strtol(expires, NULL, 10);
             c.created = strtol(created, NULL, 10);
             c.name = strdup(name);
@@ -649,10 +688,11 @@ void cookies_save(void) {
         if (c->expires == 0) {
             continue;
         }
-        int length = snprintf(line, capacity, "%s\t%d\t%s\t%d\t%lld\t%lld\t%s\t%s\n",
+        int length = snprintf(line, capacity,
+                              "%s\t%d\t%s\t%d\t%lld\t%lld\t%s\t%s\t%d\n",
                               c->domain, c->host_only ? 1 : 0, c->path,
                               c->secure ? 1 : 0, c->expires, c->created,
-                              c->name, c->value);
+                              c->name, c->value, c->http_only ? 1 : 0);
         ok = length > 0 && (size_t)length < capacity
           && opos_write((int)fd, line, (size_t)length) == length;
     }

@@ -310,6 +310,261 @@ float cosf(float x) {
     return (float)cos(x);
 }
 
+double tan(double x) {
+    return sin(x) / cos(x);
+}
+
+double trunc(double x) {
+    return x < 0.0 ? ceil(x) : floor(x);
+}
+
+/* Halfway cases go away from zero. */
+double round(double x) {
+    if (!(fabs(x) < 4503599627370496.0)) {
+        return x;
+    }
+    double whole = trunc(x);
+    if (fabs(x - whole) >= 0.5) {
+        whole += x < 0.0 ? -1.0 : 1.0;
+    }
+    return whole == 0.0 ? copysign(0.0, x) : whole;
+}
+
+/* In the current rounding mode (normally to nearest, ties to even). */
+long lrint(double x) {
+    long result;
+    __asm__("cvtsd2si %1, %0" : "=r"(result) : "x"(x));
+    return result;
+}
+
+double rint(double x) {
+    if (!(fabs(x) < 4503599627370496.0)) {
+        return x;
+    }
+    double whole = (double)lrint(x);
+    return whole == 0.0 ? copysign(0.0, x) : whole;
+}
+
+double nearbyint(double x) {
+    return rint(x);
+}
+
+double modf(double x, double *whole) {
+    if (isinf(x)) {
+        *whole = x;
+        return copysign(0.0, x);
+    }
+    *whole = trunc(x);
+    return copysign(x - *whole, x);
+}
+
+double copysign(double x, double sign) {
+    return from_raw((to_raw(x) & ~((uint64_t)1 << 63))
+                    | (to_raw(sign) & ((uint64_t)1 << 63)));
+}
+
+double fmin(double x, double y) {
+    if (isnan(x)) {
+        return y;
+    }
+    if (isnan(y)) {
+        return x;
+    }
+    if (x == y) {
+        return signbit(x) ? x : y;
+    }
+    return x < y ? x : y;
+}
+
+double fmax(double x, double y) {
+    if (isnan(x)) {
+        return y;
+    }
+    if (isnan(y)) {
+        return x;
+    }
+    if (x == y) {
+        return signbit(x) ? y : x;
+    }
+    return x > y ? x : y;
+}
+
+double hypot(double x, double y) {
+    x = fabs(x);
+    y = fabs(y);
+    if (isinf(x) || isinf(y)) {
+        return HUGE_VAL;
+    }
+    if (isnan(x) || isnan(y)) {
+        return NAN;
+    }
+    double big = x > y ? x : y;
+    double small = x > y ? y : x;
+    if (big == 0.0) {
+        return 0.0;
+    }
+    double ratio = small / big;
+    return big * sqrt(1.0 + ratio * ratio);
+}
+
+double cbrt(double x) {
+    if (x == 0.0 || isnan(x) || isinf(x)) {
+        return x;
+    }
+    double a = fabs(x);
+    double r = exp(log(a) / 3.0);
+    /* Two Newton steps make whole cubes come out whole. */
+    r -= (r * r * r - a) / (3.0 * r * r);
+    r -= (r * r * r - a) / (3.0 * r * r);
+    return x < 0.0 ? -r : r;
+}
+
+double log2(double x) {
+    int exponent;
+    if (x > 0.0 && !isinf(x) && frexp(x, &exponent) == 0.5) {
+        return exponent - 1; /* exact for powers of two */
+    }
+    return log(x) * 1.44269504088896340736;
+}
+
+double log1p(double x) {
+    if (fabs(x) < 1e-4) {
+        /* x - x^2/2 + x^3/3 - x^4/4 */
+        return x * (1.0 - x * (0.5 - x * (1.0 / 3.0 - x * 0.25)));
+    }
+    return log(1.0 + x);
+}
+
+double expm1(double x) {
+    if (fabs(x) < 0.5) {
+        double term = x;
+        double sum = x;
+        for (int i = 2; i <= 18; i++) {
+            term *= x / i;
+            sum += term;
+        }
+        return sum;
+    }
+    return exp(x) - 1.0;
+}
+
+double sinh(double x) {
+    if (fabs(x) < 0.5) {
+        double e = expm1(x);
+        return 0.5 * (e + e / (e + 1.0));
+    }
+    double e = exp(fabs(x));
+    double result = 0.5 * (e - 1.0 / e);
+    return x < 0.0 ? -result : result;
+}
+
+double cosh(double x) {
+    double e = exp(fabs(x));
+    return 0.5 * (e + 1.0 / e);
+}
+
+double tanh(double x) {
+    if (fabs(x) > 22.0) {
+        return x < 0.0 ? -1.0 : 1.0;
+    }
+    double e = expm1(2.0 * fabs(x));
+    double result = e / (e + 2.0);
+    return x < 0.0 ? -result : result;
+}
+
+double asinh(double x) {
+    double a = fabs(x);
+    double result = a > 1e8 ? log(a) + 6.93147180559945309417e-01
+                            : log1p(a + a * a / (1.0 + sqrt(1.0 + a * a)));
+    return x < 0.0 ? -result : result;
+}
+
+double acosh(double x) {
+    if (x < 1.0) {
+        return NAN;
+    }
+    if (x > 1e8) {
+        return log(x) + 6.93147180559945309417e-01;
+    }
+    return log(x + sqrt(x * x - 1.0));
+}
+
+double atanh(double x) {
+    double a = fabs(x);
+    if (a > 1.0) {
+        return NAN;
+    }
+    double result = 0.5 * log1p(2.0 * a / (1.0 - a));
+    return x < 0.0 ? -result : result;
+}
+
+/* atan: |x| > 1 uses pi/2 - atan(1/x); then two halvings,
+   atan(x) = 2 atan(x / (1 + sqrt(1 + x^2))), bring |x| below 0.21,
+   where the Taylor series to x^39 is enough. */
+double atan(double x) {
+    if (isnan(x)) {
+        return x;
+    }
+    double a = fabs(x);
+    bool invert = a > 1.0;
+    if (invert) {
+        a = 1.0 / a;
+    }
+    a = a / (1.0 + sqrt(1.0 + a * a));
+    a = a / (1.0 + sqrt(1.0 + a * a));
+    double a2 = a * a;
+    double power = a;
+    double sum = 0.0;
+    for (int i = 1; i <= 39; i += 2) {
+        double term = power / i;
+        sum += (i & 2) ? -term : term;
+        power *= a2;
+    }
+    double result = 4.0 * sum;
+    if (invert) {
+        result = M_PI / 2 - result;
+    }
+    return x < 0.0 ? -result : result;
+}
+
+double atan2(double y, double x) {
+    if (isnan(x) || isnan(y)) {
+        return NAN;
+    }
+    if (x == 0.0 && y == 0.0) {
+        return signbit(x) ? copysign(M_PI, y) : y;
+    }
+    if (isinf(x) && isinf(y)) {
+        double angle = x > 0.0 ? M_PI / 4 : 3 * M_PI / 4;
+        return copysign(angle, y);
+    }
+    if (x == 0.0 || isinf(y)) {
+        return copysign(M_PI / 2, y);
+    }
+    if (isinf(x)) {
+        return x > 0.0 ? copysign(0.0, y) : copysign(M_PI, y);
+    }
+    double angle = atan(fabs(y / x));
+    if (x < 0.0) {
+        angle = M_PI - angle;
+    }
+    return copysign(angle, y);
+}
+
+double asin(double x) {
+    if (!(fabs(x) <= 1.0)) {
+        return NAN;
+    }
+    return atan2(x, sqrt((1.0 - x) * (1.0 + x)));
+}
+
+double acos(double x) {
+    if (!(fabs(x) <= 1.0)) {
+        return NAN;
+    }
+    return atan2(sqrt((1.0 - x) * (1.0 + x)), x);
+}
+
 void opos_assert_failed(const char *expression, const char *file, int line) {
     eprintf("%s:%d: assertion failed: %s\n", file, line, expression);
     opos_exit(134);

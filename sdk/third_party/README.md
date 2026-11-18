@@ -16,5 +16,22 @@ upstream; OPOS only sets their documented configuration macros, such as
 `NOTICES.txt` holds their license notices; it ships in every package
 that uses them.
 
+## QuickJS (the browser's JavaScript engine)
+
+`quickjs/` holds the engine files of QuickJS 2026-06-04 by Fabrice
+Bellard and Charlie Gordon (MIT, see `quickjs/LICENSE`), unchanged from
+the release tarball `https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz`
+(SHA-256 `b376e839b322978313d929fd20663b11ba58b75df5a46c126dd19ea2fa70ad2a`).
+Only the files the engine needs are kept: `quickjs.c`, `libregexp.c`,
+`libunicode.c`, `cutils.c`, `dtoa.c`, their headers, `LICENSE` and
+`VERSION`. The SDK Makefile builds them into `build/libquickjs.a` with
+only SDK headers; `quickjs-opos/pthread.h` (written for OPOS) stands in
+for the pthread calls, since OPOS programs have one thread. The licence
+ships in the system as `/share/licenses/quickjs.txt`.
+
+To update it, unpack the new release, copy the same files over, rebuild
+the browser and update the version and SHA-256 above and the
+`CONFIG_VERSION` in the SDK Makefile.
+
 To update one, download the new upstream file, check that it builds and
 plays, and update its row here (commit and `sha256sum`).

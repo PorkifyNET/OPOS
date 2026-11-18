@@ -44,6 +44,8 @@ struct part {
     int attr_count;
     bool first_child, last_child, link, root;
     uint8_t pseudo;                /* PSEUDO_BEFORE/AFTER: ::before/::after */
+    struct part *nots;             /* :not(a, b): none may match (malloc) */
+    int not_count;
 };
 
 struct rule {
@@ -63,6 +65,7 @@ struct css_sheet {
     struct rule *rules;
     size_t count, capacity;
     uint32_t next_order;
+    uint32_t order_base;           /* added to rule orders by its chain */
     struct css_sheet *next;
     /* Only on the first sheet of a chain: rules of the whole chain by the
        id, class or tag their last compound needs (see build_index). */
@@ -145,9 +148,118 @@ static bool is_ident(char c) {
 
 /* ------------------------------------------------------------ selectors */
 
-static bool parse_compound(char **cursor, struct part *part) {
-    char *p = *cursor;
+/* Reads the identifier at p, removing CSS escapes in place ("md\:flex"
+   becomes "md:flex", "\31 0" becomes "10"): returns where reading
+   stopped; *length is the identifier's length from p. */
+static char *scan_ident(char *p, size_t *length) {
+    char *read = p, *write = p;
+    while (*read != '\0') {
+        if (*read == '\\') {
+            if (read[1] == '\0' || read[1] == '\n') {
+                break;
+            }
+            read++;
+            if (isxdigit((unsigned char)*read)) {
+                uint32_t code = 0;
+                for (int i = 0; i < 6 && isxdigit((unsigned char)*read); i++) {
+                    char h = *read++;
+                    code = code * 16 + (uint32_t)(h <= '9' ? h - '0'
+                                                  : (h | 32) - 'a' + 10);
+                }
+                if (*read == ' ' || *read == '\t' || *read == '\n') {
+                    read++;
+                }
+                if (code > 0x10ffff) {
+                    code = 0xfffd;
+                }
+                /* UTF-8 is never longer than the escape it came from
+                   ("\0" is too short for U+FFFD). */
+                if (code == 0) {
+                    *write++ = '?';
+                } else if (code < 0x80) {
+                    *write++ = (char)code;
+                } else if (code < 0x800) {
+                    *write++ = (char)(0xc0 | code >> 6);
+                    *write++ = (char)(0x80 | (code & 63));
+                } else if (code < 0x10000) {
+                    *write++ = (char)(0xe0 | code >> 12);
+                    *write++ = (char)(0x80 | (code >> 6 & 63));
+                    *write++ = (char)(0x80 | (code & 63));
+                } else {
+                    *write++ = (char)(0xf0 | code >> 18);
+                    *write++ = (char)(0x80 | (code >> 12 & 63));
+                    *write++ = (char)(0x80 | (code >> 6 & 63));
+                    *write++ = (char)(0x80 | (code & 63));
+                }
+            } else {
+                *write++ = *read++;
+            }
+        } else if (is_ident(*read)) {
+            *write++ = *read++;
+        } else {
+            break;
+        }
+    }
+    *length = (size_t)(write - p);
+    return read;
+}
+
+static bool parse_compound(char **cursor, struct part *part, bool inner);
+
+/* Frees the :not() lists in parts[0..count). */
+static void free_nots(struct part *parts, int count) {
+    for (int i = 0; i < count; i++) {
+        free(parts[i].nots);
+        parts[i].nots = NULL;
+        parts[i].not_count = 0;
+    }
+}
+
+/* Reads the list inside :not( ... ) at *cursor (on the '('). Only
+   compound selectors are allowed, and no :not() inside them. */
+static bool parse_not(char **cursor, struct part *part) {
+    char *p = *cursor + 1;
+    for (;;) {
+        p = skip_blank(p);
+        struct part inner;
+        if (!parse_compound(&p, &inner, true) || inner.pseudo != 0) {
+            return false;
+        }
+        struct part *grown = realloc(part->nots, (size_t)(part->not_count + 1)
+                                                 * sizeof(*grown));
+        if (grown == NULL) {
+            return false;
+        }
+        part->nots = grown;
+        part->nots[part->not_count++] = inner;
+        p = skip_blank(p);
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p != ')') {
+            return false;
+        }
+        *cursor = p + 1;
+        return true;
+    }
+}
+
+static bool parse_compound_body(char **cursor, struct part *part, bool inner);
+
+/* inner: inside :not(), where another :not() is not allowed. */
+static bool parse_compound(char **cursor, struct part *part, bool inner) {
     memset(part, 0, sizeof(*part));
+    if (!parse_compound_body(cursor, part, inner)) {
+        free_nots(part, 1);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_compound_body(char **cursor, struct part *part,
+                                bool inner) {
+    char *p = *cursor;
     bool any = false;
     for (;;) {
         char c = *p;
@@ -158,29 +270,27 @@ static bool parse_compound(char **cursor, struct part *part) {
                    && part->id == NULL && part->class_count == 0
                    && part->attr_count == 0) {
             char *start = p;
-            while (is_ident(*p)) {
-                p++;
-            }
+            size_t length;
+            p = scan_ident(p, &length);
             part->tag = start;
-            part->tag_length = (size_t)(p - start);
+            part->tag_length = length;
             any = true;
         } else if (c == '#' || c == '.') {
             char *start = ++p;
-            while (is_ident(*p)) {
-                p++;
-            }
-            if (p == start) {
+            size_t length;
+            p = scan_ident(p, &length);
+            if (length == 0) {
                 return false;
             }
             if (c == '#') {
                 part->id = start;
-                part->id_length = (size_t)(p - start);
+                part->id_length = length;
             } else {
                 if (part->class_count == MAX_CLASSES) {
                     return false;
                 }
                 part->classes[part->class_count] = start;
-                part->class_lengths[part->class_count++] = (size_t)(p - start);
+                part->class_lengths[part->class_count++] = length;
             }
             any = true;
         } else if (c == '[') {
@@ -190,11 +300,10 @@ static bool parse_compound(char **cursor, struct part *part) {
             struct attr_test *test = &part->attrs[part->attr_count++];
             p = skip_blank(p + 1);
             char *start = p;
-            while (is_ident(*p)) {
-                p++;
-            }
+            size_t length;
+            p = scan_ident(p, &length);
             test->name = start;
-            test->name_length = (size_t)(p - start);
+            test->name_length = length;
             p = skip_blank(p);
             test->op = OP_EXISTS;
             if (*p == '=') {
@@ -275,7 +384,7 @@ static bool parse_compound(char **cursor, struct part *part) {
                         break;
                     }
                 }
-                if (!matched) {
+                if (!matched && (inner || !parse_not(&p, part))) {
                     return false;
                 }
             } else {
@@ -305,7 +414,7 @@ static bool parse_selector(char *start, char *end, struct part *parts,
             ok = false;
             break;
         }
-        if (!parse_compound(&p, &parts[n])) {
+        if (!parse_compound(&p, &parts[n], false)) {
             ok = false;
             break;
         }
@@ -319,6 +428,19 @@ static bool parse_selector(char *start, char *end, struct part *parts,
            + parts[n].first_child + parts[n].last_child + parts[n].link
            + parts[n].root;
         c += (parts[n].tag != NULL) + (parts[n].pseudo != 0);
+        /* :not() counts as its most specific argument. */
+        uint32_t most = 0;
+        for (int i = 0; i < parts[n].not_count; i++) {
+            const struct part *x = &parts[n].nots[i];
+            uint32_t one = (uint32_t)(x->id != NULL) << 16
+                | ((uint32_t)x->class_count + (uint32_t)x->attr_count
+                   + x->first_child + x->last_child + x->link + x->root) << 8
+                | (uint32_t)(x->tag != NULL);
+            most = one > most ? one : most;
+        }
+        a += most >> 16;
+        b += most >> 8 & 0xff;
+        c += most & 0xff;
         n++;
         char *after = skip_blank(p);
         combinator = 0;
@@ -334,6 +456,10 @@ static bool parse_selector(char *start, char *end, struct part *parts,
         p = after;
     }
     *end = saved;
+    if (!ok) {
+        free_nots(parts, n);
+        n = 0;
+    }
     *count = n;
     *specificity = a << 16 | b << 8 | c;
     return ok && n > 0;
@@ -619,7 +745,7 @@ static bool media_feature(const char **p) {
         return strncmp(value, "no-preference", 13) == 0;
     }
     if (FEATURE("forced-colors")) {
-        return strncmp(value, "none", 4) == 0;
+        return strncmp(value, "enabled", 7) == 0;
     }
     if (FEATURE("hover") || FEATURE("any-hover")) {
         return !has_value || strncmp(value, "hover", 5) == 0;
@@ -641,7 +767,8 @@ static bool media_feature(const char **p) {
         return strncmp(value, "browser", 7) == 0;
     }
     if (FEATURE("scripting")) {
-        return strncmp(value, "none", 4) == 0;
+        return strncmp(value, scripting_enabled ? "enabled" : "none",
+                       scripting_enabled ? 7 : 4) == 0;
     }
     if (FEATURE("update")) {
         return strncmp(value, "fast", 4) == 0;
@@ -872,8 +999,11 @@ static void parse_rules(struct css_sheet *sheet, char *p, char *limit) {
                     if (add_rule(sheet, &rule)) {
                         used = true;
                     } else {
+                        free_nots(rule.parts, count);
                         free(rule.parts);
                     }
+                } else {
+                    free_nots(parts, count);
                 }
             }
             if (*comma == '\0') {
@@ -935,6 +1065,7 @@ void css_free(struct css_sheet *sheet) {
         struct css_sheet *next = sheet->next;
         const char *last_normal = NULL;
         for (size_t i = 0; i < sheet->count; i++) {
+            free_nots(sheet->rules[i].parts, sheet->rules[i].part_count);
             free(sheet->rules[i].parts);
             if (sheet->rules[i].normal != last_normal) {
                 free((void *)sheet->rules[i].normal);
@@ -964,13 +1095,32 @@ struct css_sheet *css_append(struct css_sheet *chain, struct css_sheet *sheet) {
         tail = tail->next;
     }
     for (size_t i = 0; i < sheet->count; i++) {
-        sheet->rules[i].order += base;
+        sheet->rules[i].order += base - sheet->order_base;
     }
+    sheet->order_base = base;
     if (tail == NULL) {
         return sheet;
     }
     tail->next = sheet;
     return chain;
+}
+
+struct css_sheet *css_relink(struct css_sheet **sheets, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        index_free(sheets[i]->index);
+        sheets[i]->index = NULL;
+    }
+    uint32_t base = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct css_sheet *sheet = sheets[i];
+        for (size_t r = 0; r < sheet->count; r++) {
+            sheet->rules[r].order += base - sheet->order_base;
+        }
+        sheet->order_base = base;
+        base += sheet->next_order;
+        sheet->next = i + 1 < count ? sheets[i + 1] : NULL;
+    }
+    return count > 0 ? sheets[0] : NULL;
 }
 
 /* --------------------------------------------------------------- matching */
@@ -1127,6 +1277,11 @@ static bool part_matches(const struct opos_html_node *node,
     }
     if (part->root && node->tag != HTML_TAG_HTML) {
         return false;
+    }
+    for (int i = 0; i < part->not_count; i++) {
+        if (part_matches(node, &part->nots[i])) {
+            return false;
+        }
     }
     return true;
 }
@@ -1961,4 +2116,53 @@ bool css_apply_pseudo(const struct css_sheet *chain,
 void css_reset_variables(void) {
     /* Custom properties live in per-element scopes (freed with the
        sheets); nothing global is left to reset. */
+}
+
+void css_forget_matches(struct css_sheet *chain) {
+    if (chain != NULL) {
+        index_free(chain->index);
+        chain->index = NULL;
+    }
+}
+
+/* --------------------------------------------------------- selector lists */
+
+struct css_sheet *css_selector_parse(const char *selectors) {
+    size_t length = strlen(selectors);
+    if (length == 0 || strcspn(selectors, "{};") != length) {
+        return NULL;
+    }
+    char *text = malloc(length + 4);
+    if (text == NULL) {
+        return NULL;
+    }
+    memcpy(text, selectors, length);
+    memcpy(text + length, "{}", 3);
+    struct css_sheet *sheet = css_parse(text, length + 2);
+    free(text);
+    if (sheet != NULL && sheet->count == 0) {
+        css_free(sheet);
+        return NULL;
+    }
+    return sheet;
+}
+
+bool css_selector_matches(const struct css_sheet *selectors,
+                          const struct opos_html_node *node) {
+    if (node->type != HTML_NODE_ELEMENT) {
+        return false;
+    }
+    for (size_t i = 0; i < selectors->count; i++) {
+        const struct rule *rule = &selectors->rules[i];
+        if (rule->pseudo == 0
+            && match_from(node, rule->parts, rule->part_count - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void css_unlink_free(struct css_sheet *sheet) {
+    sheet->next = NULL;
+    css_free(sheet);
 }

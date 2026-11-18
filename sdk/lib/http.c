@@ -1,7 +1,8 @@
 /*
  * HTTP/HTTPS client: see include/opos_http.h.
  *
- * One request per connection ("Connection: close"). The response body is
+ * GET and HEAD keep the connection for the next request to the same
+ * server (see pool); others close it. The response body is
  * read into memory, chunked coding is removed while reading, and gzip or
  * deflate content coding is undone afterwards. opos_http_download instead
  * passes a successful body to a sink as it arrives and asks for no
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <opos_http.h>
 #include <opos_tls.h>
@@ -267,6 +269,78 @@ static void connection_close(struct connection *c) {
     c->fd = -1;
 }
 
+/* Idle keep-alive connections, so that the next GET to the same server
+   skips the TCP and TLS handshakes. Servers drop idle connections, so a
+   request on a pooled one is sent again on a new one if it fails before
+   the status line. */
+#define POOL_SIZE 6
+#define POOL_IDLE_MS 30000
+
+static struct pooled {
+    bool used;
+    bool secure;
+    char host[256];
+    unsigned port;
+    long fd;
+    struct opos_tls *tls;
+    long long since;
+} pool[POOL_SIZE];
+
+static long long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void pool_drop(struct pooled *p) {
+    struct connection c = {.fd = p->fd, .tls = p->tls};
+    connection_close(&c);
+    p->used = false;
+}
+
+static bool pool_take(const struct url *url, struct connection *c) {
+    long long now = now_ms();
+    for (int i = 0; i < POOL_SIZE; i++) {
+        struct pooled *p = &pool[i];
+        if (p->used && now - p->since > POOL_IDLE_MS) {
+            pool_drop(p);
+        }
+        if (p->used && p->secure == url->secure && p->port == url->port
+            && strcmp(p->host, url->host) == 0) {
+            c->fd = p->fd;
+            c->tls = p->tls;
+            p->used = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void pool_put(const struct url *url, struct connection *c) {
+    struct pooled *slot = &pool[0];
+    for (int i = 0; i < POOL_SIZE; i++) {
+        if (!pool[i].used) {
+            slot = &pool[i];
+            break;
+        }
+        if (pool[i].since < slot->since) {
+            slot = &pool[i];
+        }
+    }
+    if (slot->used) {
+        pool_drop(slot);
+    }
+    slot->used = true;
+    slot->secure = url->secure;
+    snprintf(slot->host, sizeof(slot->host), "%s", url->host);
+    slot->port = url->port;
+    slot->fd = c->fd;
+    slot->tls = c->tls;
+    slot->since = now_ms();
+    c->fd = -1;
+    c->tls = NULL;
+}
+
 /* >0 bytes ready, 0 at the end of the stream, <0 on an error. */
 static long fill(struct connection *c) {
     if (c->position < c->length) {
@@ -466,12 +540,63 @@ void opos_http_free(struct opos_http_response *response) {
     free(response->body);
     response->body = NULL;
     response->length = 0;
+    free(response->headers);
+    response->headers = NULL;
 }
 
-/* One request, following redirects. post_type != NULL sends a POST with
-   post_body; a 301, 302 or 303 redirect turns it into a GET, a 307 or 308
-   redirect repeats the POST. */
-static long http_request(const char *address, const char *post_type,
+/* True when the extra headers already have a line named name (lower
+   case, with the colon: "accept:"). */
+static bool has_header(const char *headers, const char *name) {
+    size_t length = strlen(name);
+    for (const char *line = headers; line != NULL && *line != '\0';) {
+        size_t i = 0;
+        while (i < length && tolower((unsigned char)line[i]) == name[i]) {
+            i++;
+        }
+        if (i == length) {
+            return true;
+        }
+        line = strchr(line, '\n');
+        line = line != NULL ? line + 1 : NULL;
+    }
+    return false;
+}
+
+/* Extra request headers must be whole "Name: value\r\n" lines without
+   other control characters, so they cannot add a second request. */
+static bool headers_ok(const char *headers) {
+    if (headers == NULL) {
+        return true;
+    }
+    size_t length = strlen(headers);
+    if (length > 0 && (length < 2 || headers[length - 1] != '\n'
+                       || headers[length - 2] != '\r')) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        unsigned char ch = (unsigned char)headers[i];
+        if (ch == '\r' && headers[i + 1] != '\n') {
+            return false;
+        }
+        if (ch == '\n' && (i == 0 || headers[i - 1] != '\r'
+                           || headers[i + 1] == '\r')) {
+            return false; /* bare LF or an empty line */
+        }
+        if (ch < 32 && ch != '\r' && ch != '\n' && ch != '\t') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* One request, following redirects. method NULL means POST when post_type
+   is set and GET otherwise. A body (post_body, or any POST, PUT or PATCH)
+   is sent with Content-Length, and with Content-Type when post_type is
+   set. A 301, 302 or 303 redirect turns the request into a GET without
+   a body; a 307 or 308 redirect repeats it. extra_headers are more
+   "Name: value\r\n" lines. */
+static long http_request(const char *method, const char *address,
+                         const char *extra_headers, const char *post_type,
                          const void *post_body, size_t post_length,
                          size_t max_body, opos_http_sink sink,
                          void *sink_context,
@@ -480,17 +605,34 @@ static long http_request(const char *address, const char *post_type,
     if (strlen(address) >= OPOS_HTTP_URL_MAX) {
         return -OPOS_ENAMETOOLONG;
     }
+    if (!headers_ok(extra_headers)) {
+        return -OPOS_EINVAL;
+    }
+    char verb[16];
+    snprintf(verb, sizeof(verb), "%s",
+             method != NULL ? method : post_type != NULL ? "POST" : "GET");
+    for (size_t i = 0; verb[i] != '\0'; i++) {
+        if (!isalpha((unsigned char)verb[i])) {
+            return -OPOS_EINVAL;
+        }
+    }
+    bool send_body = post_type != NULL || post_body != NULL
+        || strcmp(verb, "POST") == 0 || strcmp(verb, "PUT") == 0
+        || strcmp(verb, "PATCH") == 0;
+    size_t extra_length = extra_headers != NULL ? strlen(extra_headers) : 0;
     char location[OPOS_HTTP_URL_MAX];
     strcpy(location, address);
     struct connection *c = malloc(sizeof(*c));
     char *line = malloc(HEADER_MAX);
-    char *request = malloc(REQUEST_MAX);
+    char *request = malloc(REQUEST_MAX + extra_length);
     char *cookies = malloc(OPOS_HTTP_COOKIE_MAX + 16);
     struct url *url = malloc(sizeof(*url));
+    char *headers = malloc(HEADER_MAX);
+    size_t headers_used = 0;
     long result = -OPOS_ENOMEM;
     struct body body = {NULL, 0, 0, max_body, 0, NULL, NULL};
     if (c == NULL || line == NULL || request == NULL || url == NULL
-        || cookies == NULL) {
+        || cookies == NULL || headers == NULL) {
         goto done;
     }
     for (int redirects = 0;; redirects++) {
@@ -498,15 +640,23 @@ static long http_request(const char *address, const char *post_type,
             result = -OPOS_EINVAL;
             goto done;
         }
+        /* Streamed downloads run in forked children: they never share
+           the pool's sockets. */
+        bool keep = sink == NULL
+            && (strcmp(verb, "GET") == 0 || strcmp(verb, "HEAD") == 0);
         c->fd = -1;
         c->tls = NULL;
         c->position = 0;
         c->length = 0;
-        result = url->secure
-            ? opos_tls_connect(url->host, (uint16_t)url->port, &c->tls)
-            : connect_plain(url->host, (uint16_t)url->port, c);
-        if (result < 0) {
-            goto done;
+        bool pooled = keep && pool_take(url, c);
+    reconnect:
+        if (!pooled) {
+            result = url->secure
+                ? opos_tls_connect(url->host, (uint16_t)url->port, &c->tls)
+                : connect_plain(url->host, (uint16_t)url->port, c);
+            if (result < 0) {
+                goto done;
+            }
         }
         bool default_port = url->port == (url->secure ? 443u : 80u);
         char host_header[300];
@@ -517,10 +667,14 @@ static long http_request(const char *address, const char *post_type,
                      url->port);
         }
         char post_headers[200] = "";
-        if (post_type != NULL) {
+        if (send_body && post_type != NULL
+            && post_type[strcspn(post_type, "\r\n")] == '\0') {
             snprintf(post_headers, sizeof(post_headers),
                      "Content-Type: %s\r\nContent-Length: %lu\r\n",
                      post_type, (unsigned long)post_length);
+        } else if (send_body) {
+            snprintf(post_headers, sizeof(post_headers),
+                     "Content-Length: %lu\r\n", (unsigned long)post_length);
         }
         cookies[0] = '\0';
         if (cookie_get != NULL) {
@@ -534,29 +688,42 @@ static long http_request(const char *address, const char *post_type,
                          "Cookie: %s\r\n", value);
             }
         }
-        int length = snprintf(request, REQUEST_MAX,
+        int length = snprintf(request, REQUEST_MAX + extra_length,
                               "%s %s HTTP/1.1\r\nHost: %s\r\n"
                               "User-Agent: " USER_AGENT "\r\n"
-                              "Accept: text/html,*/*;q=0.8\r\n"
+                              "%s"
                               "Accept-Encoding: %s\r\n"
-                              "%s%s"
-                              "Connection: close\r\n\r\n",
-                              post_type != NULL ? "POST" : "GET", url->path,
-                              host_header,
+                              "%s%s%s"
+                              "Connection: %s\r\n\r\n",
+                              verb, url->path, host_header,
+                              has_header(extra_headers, "accept:")
+                                  ? "" : "Accept: text/html,*/*;q=0.8\r\n",
                               sink != NULL ? "identity" : "gzip",
-                              post_headers, cookies);
-        if (length <= 0 || length >= REQUEST_MAX
+                              post_headers, cookies,
+                              extra_headers != NULL ? extra_headers : "",
+                              keep ? "keep-alive" : "close");
+        if (length <= 0 || (size_t)length >= REQUEST_MAX + extra_length
             || raw_write(c, request, (size_t)length) != length
-            || (post_type != NULL && post_length > 0
+            || (send_body && post_length > 0
                 && raw_write(c, post_body, post_length)
                        != (long)post_length)) {
             connection_close(c);
+            if (pooled) {
+                pooled = false; /* the server closed it: a new one */
+                goto reconnect;
+            }
             result = -OPOS_EIO;
             goto done;
         }
         long got = read_line(c, line, HEADER_MAX);
         if (got < 0) {
             connection_close(c);
+            if (pooled) {
+                pooled = false;
+                c->position = 0;
+                c->length = 0;
+                goto reconnect;
+            }
             result = got;
             goto done;
         }
@@ -567,6 +734,9 @@ static long http_request(const char *address, const char *post_type,
             goto done;
         }
         long status = strtol(space + 1, NULL, 10);
+        if (strncmp(line, "HTTP/1.1", 8) != 0) {
+            keep = false; /* HTTP/1.0 closes unless told otherwise */
+        }
         bool chunked = false;
         bool gzip = false;
         bool deflate = false;
@@ -574,6 +744,7 @@ static long http_request(const char *address, const char *post_type,
         bool have_location = false;
         char next[OPOS_HTTP_URL_MAX];
         response->content_type[0] = '\0';
+        headers_used = 0;
         for (;;) {
             got = read_line(c, line, HEADER_MAX);
             if (got < 0) {
@@ -584,6 +755,11 @@ static long http_request(const char *address, const char *post_type,
             if (got == 0) {
                 break;
             }
+            if (headers_used + (size_t)got + 2 < HEADER_MAX) {
+                memcpy(headers + headers_used, line, (size_t)got);
+                headers_used += (size_t)got;
+                headers[headers_used++] = '\n';
+            }
             const char *value;
             if (header_is(line, "transfer-encoding", &value)) {
                 chunked = contains_folded(value, "chunked");
@@ -592,6 +768,10 @@ static long http_request(const char *address, const char *post_type,
             } else if (header_is(line, "content-encoding", &value)) {
                 gzip = contains_folded(value, "gzip");
                 deflate = contains_folded(value, "deflate");
+            } else if (header_is(line, "connection", &value)) {
+                if (contains_folded(value, "close")) {
+                    keep = false;
+                }
             } else if (header_is(line, "content-type", &value)) {
                 snprintf(response->content_type,
                          sizeof(response->content_type), "%s", value);
@@ -610,6 +790,12 @@ static long http_request(const char *address, const char *post_type,
             strcpy(location, next);
             if (status != 307 && status != 308) {
                 post_type = NULL;
+                post_body = NULL;
+                post_length = 0;
+                send_body = false;
+                if (strcmp(verb, "HEAD") != 0) {
+                    strcpy(verb, "GET");
+                }
             }
             continue;
         }
@@ -631,9 +817,19 @@ static long http_request(const char *address, const char *post_type,
             body.sink = sink;
             body.sink_context = sink_context;
         }
-        result = chunked ? read_chunked(c, &body)
+        bool no_body = strcmp(verb, "HEAD") == 0 || status == 204
+            || status == 304 || (status >= 100 && status < 200);
+        result = no_body ? 0
+               : chunked ? read_chunked(c, &body)
                          : read_body(c, content_length, &body);
-        connection_close(c);
+        /* Reusable only when the body had a known end and nothing more
+           arrived after it. */
+        if (keep && result >= 0 && (no_body || chunked || content_length >= 0)
+            && c->position == c->length) {
+            pool_put(url, c);
+        } else {
+            connection_close(c);
+        }
         if (result < 0) {
             goto done;
         }
@@ -662,6 +858,12 @@ static long http_request(const char *address, const char *post_type,
         response->body = body.data;
         response->length = body.length;
         body.data = NULL;
+        headers[headers_used] = '\0';
+        /* A copy of the right size (realloc does not shrink blocks). */
+        response->headers = malloc(headers_used + 1);
+        if (response->headers != NULL) {
+            memcpy(response->headers, headers, headers_used + 1);
+        }
         result = 0;
         goto done;
     }
@@ -672,12 +874,22 @@ done:
     free(request);
     free(cookies);
     free(url);
+    free(headers);
     return result;
+}
+
+long opos_http_request(const char *method, const char *url,
+                       const char *headers, const char *content_type,
+                       const void *body, size_t length, size_t max_body,
+                       struct opos_http_response *response) {
+    return http_request(method, url, headers, content_type, body, length,
+                        max_body, NULL, NULL, response);
 }
 
 long opos_http_get(const char *url, size_t max_body,
                    struct opos_http_response *response) {
-    return http_request(url, NULL, NULL, 0, max_body, NULL, NULL, response);
+    return http_request(NULL, url, NULL, NULL, NULL, 0, max_body, NULL, NULL,
+                        response);
 }
 
 long opos_http_download(const char *url, size_t max_body,
@@ -686,13 +898,15 @@ long opos_http_download(const char *url, size_t max_body,
     if (sink == NULL) {
         return -OPOS_EINVAL;
     }
-    return http_request(url, NULL, NULL, 0, max_body, sink, context,
+    return http_request(NULL, url, NULL, NULL, NULL, 0, max_body, sink,
+                        context,
                         response);
 }
 
 long opos_http_post(const char *url, const char *content_type,
                     const void *body, size_t length, size_t max_body,
                     struct opos_http_response *response) {
-    return http_request(url, content_type, body, length, max_body, NULL, NULL,
+    return http_request(NULL, url, NULL, content_type, body, length,
+                        max_body, NULL, NULL,
                         response);
 }

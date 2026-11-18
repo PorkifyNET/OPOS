@@ -46,6 +46,8 @@ struct tab {
     struct page page;
     bool have_page;
     int scroll;
+    int script_scroll;         /* scroll offset scripts were told about */
+    int script_width;          /* window width they were told about */
     bool follow_anchor;           /* keep the #fragment target in view */
     char url[OPOS_HTTP_URL_MAX];
     char title[128];              /* the page's <title>, or "" */
@@ -77,7 +79,7 @@ enum menu_action {
     MENU_OPEN_NEW_TAB, MENU_COPY_LINK, MENU_BOOKMARK_LINK, MENU_DOWNLOAD_LINK,
     MENU_BACK, MENU_FORWARD, MENU_RELOAD, MENU_BOOKMARK_PAGE, MENU_COPY,
     MENU_NEW_TAB, MENU_CLOSE_TAB, MENU_BOOKMARKS, MENU_HISTORY,
-    MENU_DOWNLOADS, MENU_COOKIES, MENU_COUNT
+    MENU_DOWNLOADS, MENU_COOKIES, MENU_JAVASCRIPT, MENU_COUNT
 };
 
 struct browser {
@@ -143,6 +145,13 @@ static void clamp_scroll(void) {
 static void set_status(const char *text) {
     snprintf(b.status, sizeof(b.status), "%s", text);
     b.dirty = true;
+}
+
+static void paint(void);
+
+void browser_status(const char *text) {
+    set_status(text);
+    paint();
 }
 
 static void set_address(const char *url) {
@@ -631,6 +640,8 @@ static void paint_page(void) {
             }
             break;
         }
+        case ITEM_BOX:
+            break;
         case ITEM_IMAGE:
             if (item->image != NULL && item->image->state == 1) {
                 image_blend(b.canvas.pixels, (int)b.canvas.stride,
@@ -822,6 +833,9 @@ static const char *menu_label(enum menu_action action) {
     case MENU_HISTORY: return "History";
     case MENU_DOWNLOADS: return "Downloads";
     case MENU_COOKIES: return "Cookies";
+    case MENU_JAVASCRIPT:
+        return scripting_enabled ? "Turn JavaScript off"
+                                 : "Turn JavaScript on";
     default: return "";
     }
 }
@@ -1119,13 +1133,18 @@ static void paint(void) {
 
 /* --------------------------------------------------------------- loading */
 
+static void sheets_update(struct page *page, const char *base, bool show);
+
 static void relayout(void) {
     if (!T->have_page) {
         return;
     }
     viewport_width_px = viewport_width();
     viewport_height_px = viewport_height();
+    /* Scripts may have added, changed or removed style sheets. */
+    sheets_update(&T->page, T->page.url, false);
     layout_page(&T->page, b.fonts, viewport_width() - 2 * MARGIN);
+    script_layout_done(&T->page);
     build_text();
     /* Images that arrive change the layout, not the text: offsets stay. */
     if (T->selection_anchor > T->text_length) {
@@ -1154,17 +1173,11 @@ static void append(char **out, size_t *used, size_t *capacity, const char *s,
     (*out)[*used] = '\0';
 }
 
-/* Style sheets of one page load: each address once, at most MAX_SHEETS
-   of them and MAX_CSS_BYTES in all (big sites link 20+ sheets). */
+/* Style sheets a page fetches: at most MAX_SHEETS of them and
+   MAX_CSS_BYTES in all (big sites link 20+ sheets). */
 #define MAX_SHEETS 32
 #define MAX_SHEET_BYTES (2u << 20)
 #define MAX_CSS_BYTES (6u << 20)
-
-struct sheet_loads {
-    int count;
-    size_t bytes;
-    char urls[MAX_SHEETS][OPOS_HTTP_URL_MAX];
-};
 
 static bool starts_with_ci(const char *text, const char *prefix);
 
@@ -1239,78 +1252,269 @@ static char *absolute_urls(const char *base, const char *text, size_t length,
     return out;
 }
 
-static __attribute__((noinline)) void fetch_sheet(const char *base,
-                                                      const char *href,
-                                                      struct css_sheet **chain,
-                                                      struct sheet_loads *loads) {
-    char url[OPOS_HTTP_URL_MAX];
-    if (!opos_url_resolve(base, href, url, sizeof(url))) {
-        return;
-    }
-    for (int i = 0; i < loads->count; i++) {
-        if (strcmp(loads->urls[i], url) == 0) {
-            return;
-        }
-    }
-    if (loads->count == MAX_SHEETS || loads->bytes >= MAX_CSS_BYTES) {
-        return;
-    }
-    snprintf(loads->urls[loads->count++], OPOS_HTTP_URL_MAX, "%s", url);
+static __attribute__((noinline)) struct css_sheet *fetch_sheet(
+    const char *url, int number, bool show, size_t *bytes) {
     char text[OPOS_HTTP_URL_MAX + 32];
-    snprintf(text, sizeof(text), "Style %d: %s", loads->count, url);
+    snprintf(text, sizeof(text), "Style %d: %s", number, url);
     set_status(text);
-    paint();
+    if (show) {
+        paint();
+    }
+    struct css_sheet *sheet = NULL;
     struct opos_http_response response;
     if (opos_http_get(url, MAX_SHEET_BYTES, &response) == 0) {
         if (response.status == 200) {
-            loads->bytes += response.length;
+            *bytes += response.length;
             size_t length;
-            char *text = absolute_urls(response.url,
-                                       (const char *)response.body,
-                                       response.length, &length);
-            if (text != NULL) {
-                *chain = css_append(*chain, css_parse(text, length));
-                free(text);
+            char *absolute = absolute_urls(response.url,
+                                           (const char *)response.body,
+                                           response.length, &length);
+            if (absolute != NULL) {
+                sheet = css_parse(absolute, length);
+                free(absolute);
             } else {
-                *chain = css_append(*chain,
-                                    css_parse((const char *)response.body,
-                                              response.length));
+                sheet = css_parse((const char *)response.body,
+                                  response.length);
             }
         }
         opos_http_free(&response);
     }
+    return sheet;
 }
 
-static void collect_sheets(struct opos_html_node *node, struct css_sheet **chain,
-                           const char *base, struct sheet_loads *loads) {
+/* Where a sheet of the page's chain came from: a <style> element (its
+   text), a linked sheet (its address) or the adopted sheets (node NULL,
+   not link). hash: of the text or the address. */
+struct page_sheet {
+    const struct opos_html_node *node;
+    bool link;
+    bool taken;                /* sheets_update: reused */
+    uint32_t hash;
+    struct css_sheet *sheet;   /* NULL: it failed to load */
+};
+
+struct sheet_walk {
+    struct page *page;
+    const char *base;
+    bool show;                 /* paint the status while fetching */
+    struct page_sheet *list;
+    size_t count, capacity;
+    bool changed;
+};
+
+static uint32_t hash_bytes(const char *text, size_t length) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++) {
+        hash = (hash ^ (uint8_t)text[i]) * 16777619u;
+    }
+    return hash;
+}
+
+static bool sheet_room(struct sheet_walk *w) {
+    if (w->count < w->capacity) {
+        return true;
+    }
+    size_t capacity = w->capacity == 0 ? 16 : w->capacity * 2;
+    struct page_sheet *grown = realloc(w->list, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        return false;
+    }
+    w->list = grown;
+    w->capacity = capacity;
+    return true;
+}
+
+/* Moves the page's old entry for this sheet to the new list; false when
+   there is none. */
+static bool sheet_reuse(struct sheet_walk *w, const struct opos_html_node *node,
+                        bool link, uint32_t hash) {
+    struct page *page = w->page;
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        struct page_sheet *old = &page->sheet_list[i];
+        if (!old->taken && old->hash == hash && old->link == link
+            && (link || old->node == node)) {
+            if (i != w->count) {
+                w->changed = true;
+            }
+            old->taken = true;
+            w->list[w->count] = *old;
+            w->list[w->count].node = node;
+            w->list[w->count].taken = false;
+            w->count++;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sheet_add_text(struct sheet_walk *w,
+                           const struct opos_html_node *node,
+                           const char *text, size_t length) {
+    uint32_t hash = hash_bytes(text, length);
+    if (!sheet_room(w) || sheet_reuse(w, node, false, hash)) {
+        return;
+    }
+    w->list[w->count++] = (struct page_sheet){node, false, false, hash,
+                                              css_parse(text, length)};
+    w->changed = true;
+}
+
+static void sheet_add_style(struct sheet_walk *w,
+                            const struct opos_html_node *node) {
+    size_t length;
+    const char *text = script_sheet_text(w->page, node, &length);
+    if (text != NULL) {
+        sheet_add_text(w, node, text, length);
+        return;
+    }
+    size_t total = 0, count = 0;
+    const struct opos_html_node *only = NULL;
+    for (const struct opos_html_node *t = node->first_child; t != NULL;
+         t = t->next_sibling) {
+        if (t->type == HTML_NODE_TEXT) {
+            total += t->text_length;
+            count++;
+            only = t;
+        }
+    }
+    if (count <= 1) {
+        sheet_add_text(w, node, only != NULL ? only->text : "",
+                       only != NULL ? only->text_length : 0);
+        return;
+    }
+    char *joined = malloc(total + 1);
+    if (joined == NULL) {
+        return;
+    }
+    size_t used = 0;
+    for (const struct opos_html_node *t = node->first_child; t != NULL;
+         t = t->next_sibling) {
+        if (t->type == HTML_NODE_TEXT) {
+            memcpy(joined + used, t->text, t->text_length);
+            used += t->text_length;
+        }
+    }
+    joined[used] = '\0';
+    sheet_add_text(w, node, joined, used);
+    free(joined);
+}
+
+static void sheet_add_link(struct sheet_walk *w,
+                           const struct opos_html_node *node,
+                           const char *href) {
+    char url[OPOS_HTTP_URL_MAX];
+    if (!opos_url_resolve(w->base, href, url, sizeof(url))) {
+        return;
+    }
+    uint32_t hash = hash_bytes(url, strlen(url));
+    for (size_t i = 0; i < w->count; i++) {
+        if (w->list[i].link && w->list[i].hash == hash) {
+            return; /* each address once */
+        }
+    }
+    if (!sheet_room(w) || sheet_reuse(w, node, true, hash)) {
+        return;
+    }
+    struct page *page = w->page;
+    struct css_sheet *sheet = NULL;
+    if (page->sheet_fetches < MAX_SHEETS
+        && page->sheet_bytes < MAX_CSS_BYTES) {
+        page->sheet_fetches++;
+        sheet = fetch_sheet(url, page->sheet_fetches, w->show,
+                            &page->sheet_bytes);
+    }
+    w->list[w->count++] = (struct page_sheet){node, true, false, hash, sheet};
+    w->changed = true;
+}
+
+static void sheets_walk(struct sheet_walk *w, struct opos_html_node *node) {
     for (; node != NULL; node = node->next_sibling) {
         if (node->type != HTML_NODE_ELEMENT) {
             continue;
         }
         if (node->tag == HTML_TAG_STYLE) {
             const char *media = opos_html_attribute(node, "media");
-            if (media != NULL && !css_media_matches(media)) {
-                continue;
+            if (media == NULL || css_media_matches(media)) {
+                sheet_add_style(w, node);
             }
-            for (struct opos_html_node *t = node->first_child; t != NULL;
-                 t = t->next_sibling) {
-                if (t->type == HTML_NODE_TEXT) {
-                    *chain = css_append(*chain, css_parse(t->text,
-                                                         t->text_length));
-                }
-            }
-        } else if (node->tag == HTML_TAG_LINK) {
+            continue;
+        }
+        if (node->tag == HTML_TAG_LINK) {
             const char *rel = opos_html_attribute(node, "rel");
             const char *href = opos_html_attribute(node, "href");
             const char *media = opos_html_attribute(node, "media");
             if (rel != NULL && href != NULL && strstr(rel, "stylesheet") != NULL
                 && strstr(rel, "alternate") == NULL
+                && opos_html_attribute(node, "disabled") == NULL
                 && (media == NULL || css_media_matches(media))) {
-                fetch_sheet(base, href, chain, loads);
+                sheet_add_link(w, node, href);
+            }
+            continue;
+        }
+        if (node->tag == HTML_TAG_TEMPLATE) {
+            continue;
+        }
+        sheets_walk(w, node->first_child);
+    }
+}
+
+/* Brings the page's sheets in line with its <style> and <link> elements,
+   which scripts add, change and remove: new ones are parsed or fetched,
+   unchanged ones kept, and the chain relinked when anything changed. */
+static void sheets_update(struct page *page, const char *base, bool show) {
+    if (page->doc == NULL) {
+        return;
+    }
+    struct sheet_walk w;
+    memset(&w, 0, sizeof(w));
+    w.page = page;
+    w.base = base;
+    w.show = show;
+    sheets_walk(&w, page->doc->root);
+    size_t length;
+    const char *adopted = script_sheet_text(page, NULL, &length);
+    if (adopted != NULL) {
+        sheet_add_text(&w, NULL, adopted, length);
+    }
+    bool removed = false;
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        removed |= !page->sheet_list[i].taken;
+    }
+    if (!w.changed && !removed) {
+        free(page->sheet_list);
+        page->sheet_list = w.list;
+        css_forget_matches(page->sheets);
+        return;
+    }
+    for (size_t i = 0; i < page->sheet_count; i++) {
+        struct page_sheet *old = &page->sheet_list[i];
+        if (!old->taken && old->sheet != NULL) {
+            css_unlink_free(old->sheet);
+        }
+    }
+    free(page->sheet_list);
+    page->sheet_list = w.list;
+    page->sheet_count = w.count;
+    struct css_sheet **chain = malloc((w.count + 1) * sizeof(*chain));
+    if (chain == NULL) {
+        /* Keep the sheets apart rather than half linked. */
+        for (size_t i = 0; i < w.count; i++) {
+            if (w.list[i].sheet != NULL) {
+                css_unlink_free(w.list[i].sheet);
             }
         }
-        collect_sheets(node->first_child, chain, base, loads);
+        page->sheet_count = 0;
+        page->sheets = NULL;
+        return;
     }
+    size_t used = 0;
+    for (size_t i = 0; i < w.count; i++) {
+        if (w.list[i].sheet != NULL) {
+            chain[used++] = w.list[i].sheet;
+        }
+    }
+    page->sheets = css_relink(chain, used);
+    free(chain);
 }
 
 /* The first enabled control with the autofocus attribute, or NULL. */
@@ -1532,19 +1736,24 @@ static void install_document(const char *html, size_t length,
     /* @media rules are decided while the sheets are parsed. */
     viewport_width_px = viewport_width();
     viewport_height_px = viewport_height();
-    static struct sheet_loads loads;
-    loads.count = 0;
-    loads.bytes = 0;
-    collect_sheets(doc->root, &T->page.sheets, url, &loads);
     snprintf(T->page.url, sizeof(T->page.url), "%s", url);
+    sheets_update(&T->page, url, true);
     T->have_page = true;
     T->scroll = 0;
+    T->script_scroll = 0;
     clear_selection();
     b.field_selecting = false;
     b.field_selection = NULL;
     T->dropdown = NULL;
     T->page.focus = find_autofocus(doc->body);
-    set_title(doc->title);
+    /* Web pages run their scripts before the first layout. */
+    if (scripting_enabled && (starts_with_ci(url, "http://")
+                              || starts_with_ci(url, "https://"))) {
+        script_page_start(&T->page);
+        script_take_dirty(&T->page);
+        script_take_title(&T->page);
+    }
+    set_title(T->page.doc->title);
     scroll_to_fragment(url);
 }
 
@@ -2199,22 +2408,26 @@ static enum load_result load_request(const char *url, const char *post,
 
 /* Loads url in the current tab; with record, it becomes the newest entry
    of the tab's back/forward list. */
+/* Makes T->url the newest entry of the tab's back/forward list. */
+static void history_record(void) {
+    if (T->history_position + 1 < T->history_count) {
+        T->history_count = T->history_position + 1;
+    }
+    if (T->history_count == HISTORY_MAX) {
+        memmove(T->history[0], T->history[1],
+                (HISTORY_MAX - 1) * sizeof(T->history[0]));
+        T->history_count--;
+    }
+    snprintf(T->history[T->history_count], sizeof(T->history[0]), "%s",
+             T->url);
+    T->history_position = T->history_count++;
+}
+
 static void navigate_request(const char *url, bool record, const char *post,
                              size_t post_length) {
     T->editing = false;
     if (load_request(url, post, post_length, false) == LOAD_SHOWN && record) {
-        if (T->history_position + 1 < T->history_count) {
-            T->history_count = T->history_position + 1;
-        }
-        if (T->history_count == HISTORY_MAX) {
-            memmove(T->history[0], T->history[1],
-                    (HISTORY_MAX - 1) * sizeof(T->history[0]));
-            T->history_count--;
-        }
-        /* Where redirects ended up. */
-        snprintf(T->history[T->history_count], sizeof(T->history[0]), "%s",
-                 T->url);
-        T->history_position = T->history_count++;
+        history_record(); /* where redirects ended up */
     }
     b.dirty = true;
 }
@@ -2248,6 +2461,237 @@ static void refresh_controls(void) {
     b.dirty = true;
 }
 
+/* ------------------------------------------------------------ scripts */
+
+static void go_history(int step);
+
+/* Applies what the shown page's scripts asked for: a new title, a
+   navigation, a new address, a changed document. */
+static void scripts_apply(void) {
+    if (canvas_take_painted()) {
+        b.dirty = true; /* a canvas changed: paint again */
+    }
+    if (!T->have_page || T->page.script == NULL) {
+        return;
+    }
+    if (script_take_title(&T->page)) {
+        set_title(T->page.doc->title);
+        b.dirty = true;
+    }
+    char url[OPOS_HTTP_URL_MAX];
+    bool replace;
+    if (script_take_navigation(&T->page, url, sizeof(url), &replace)) {
+        navigate(url, !replace);
+        return;
+    }
+    int step = script_take_history_step(&T->page);
+    if (step != 0) {
+        go_history(step);
+        return;
+    }
+    if (script_take_url(&T->page, url, sizeof(url), &replace)) {
+        /* history.pushState: a new address without loading it. Going
+           back to it later loads it. */
+        snprintf(T->url, sizeof(T->url), "%s", url);
+        if (!T->editing) {
+            set_address(url);
+        }
+        if (replace && T->history_position >= 0) {
+            snprintf(T->history[T->history_position],
+                     sizeof(T->history[0]), "%s", url);
+        } else {
+            history_record();
+        }
+        b.dirty = true;
+    }
+    if (script_take_dirty(&T->page)) {
+        refresh_controls();
+    }
+}
+
+/* Runs due timers in every tab; returns milliseconds until the next one
+   (-1: none). Tabs in the background run theirs at most once a second
+   and are laid out again when shown. */
+static long scripts_tick(void) {
+    static long long background_due;
+    long long now = uptime_ms();
+    bool background = now >= background_due;
+    if (background) {
+        background_due = now + 1000;
+    }
+    long next = -1;
+    for (int i = 0; i < b.tab_count; i++) {
+        struct tab *tab = b.tabs[i];
+        if (!tab->have_page || tab->page.script == NULL
+            || (tab != T && !background)) {
+            continue;
+        }
+        long wait = script_run_timers(&tab->page);
+        if (tab != T) {
+            script_take_dirty(&tab->page); /* tab_switch lays it out */
+            wait = wait < 0 ? -1 : 1000;
+        }
+        if (wait >= 0 && (next < 0 || wait < next)) {
+            next = wait;
+        }
+    }
+    scripts_apply();
+    /* The shown page hears when it scrolled or the window resized. */
+    if (T->have_page && T->page.script != NULL) {
+        if (T->script_width != b.width) {
+            bool first = T->script_width == 0;
+            T->script_width = b.width;
+            if (!first) {
+                script_window_event(&T->page, "resize");
+            }
+        }
+        if (T->script_scroll != T->scroll) {
+            T->script_scroll = T->scroll;
+            script_window_event(&T->page, "scroll");
+        }
+        scripts_apply();
+    }
+    return next;
+}
+
+/* --------------------------------------------- layout asked by scripts */
+
+struct opos_font *browser_font(int index) {
+    return index >= 0 && index < FONT_COUNT ? b.fonts[index] : NULL;
+}
+
+static struct tab *tab_of(const struct page *page) {
+    for (int i = 0; i < b.tab_count; i++) {
+        if (&b.tabs[i]->page == page) {
+            return b.tabs[i];
+        }
+    }
+    return NULL;
+}
+
+void browser_layout_now(struct page *page) {
+    struct tab *tab = tab_of(page);
+    if (tab == NULL || !tab->have_page) {
+        return;
+    }
+    struct tab *shown = T;
+    b.tab = tab;
+    int keep = T->scroll;
+    relayout();
+    T->scroll = keep;
+    clamp_scroll();
+    b.tab = shown;
+    b.dirty = true;
+}
+
+bool browser_element_rect(struct page *page, const struct opos_html_node *node,
+                          int rect[4]) {
+    struct tab *tab = tab_of(page);
+    bool fixed;
+    if (tab == NULL || !page_element_box(page, node, rect, &fixed)) {
+        return false;
+    }
+    rect[0] += MARGIN;
+    rect[1] += MARGIN - (fixed ? 0 : tab->scroll);
+    return true;
+}
+
+void browser_page_metrics(struct page *page, int *scroll_x, int *scroll_y,
+                          int *width, int *height) {
+    struct tab *tab = tab_of(page);
+    *scroll_x = 0;
+    *scroll_y = tab != NULL ? tab->scroll : 0;
+    *width = page->content_width + 2 * MARGIN;
+    *height = page->content_height + 2 * MARGIN;
+}
+
+void browser_scroll_to(struct page *page, int y) {
+    struct tab *tab = tab_of(page);
+    if (tab == NULL) {
+        return;
+    }
+    struct tab *shown = T;
+    b.tab = tab;
+    T->scroll = y;
+    T->follow_anchor = false;
+    clamp_scroll();
+    /* The page asked for it: no scroll event back for this one. */
+    T->script_scroll = T->scroll;
+    b.tab = shown;
+    b.dirty = true;
+}
+
+/* A click at a page element: true when a script cancelled it. (x, y) are
+   window coordinates. */
+static bool script_click(const struct opos_html_node *target, int x, int y) {
+    if (!T->have_page || T->page.script == NULL) {
+        return false;
+    }
+    if (target == NULL) {
+        target = T->page.doc->body;
+    }
+    return script_event(&T->page, target, "click", x - MARGIN,
+                        y - CHROME_HEIGHT, 0);
+}
+
+/* "input" and "change" after the user changed a control. */
+static void script_changed(const struct opos_html_node *node, bool input,
+                           bool change) {
+    if (T->page.script == NULL || node == NULL) {
+        return;
+    }
+    if (input) {
+        script_event(&T->page, node, "input", 0, 0, 0);
+    }
+    if (change) {
+        script_event(&T->page, node, "change", 0, 0, 0);
+    }
+}
+
+/* The DOM's KeyboardEvent key and keyCode for an OPOS key. */
+static int key_name(uint32_t key, char *out, size_t capacity) {
+    static const struct {
+        uint32_t key;
+        const char *name;
+        int code;
+    } named[] = {
+        {'\n', "Enter", 13}, {'\b', "Backspace", 8}, {'\t', "Tab", 9},
+        {OPOS_KEY_ESCAPE, "Escape", 27}, {OPOS_KEY_UP, "ArrowUp", 38},
+        {OPOS_KEY_DOWN, "ArrowDown", 40}, {OPOS_KEY_LEFT, "ArrowLeft", 37},
+        {OPOS_KEY_RIGHT, "ArrowRight", 39}, {OPOS_KEY_DELETE, "Delete", 46},
+        {OPOS_KEY_HOME, "Home", 36}, {OPOS_KEY_END, "End", 35},
+        {OPOS_KEY_PAGE_UP, "PageUp", 33},
+        {OPOS_KEY_PAGE_DOWN, "PageDown", 34},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        if (named[i].key == key) {
+            snprintf(out, capacity, "%s", named[i].name);
+            return named[i].code;
+        }
+    }
+    char utf8[5] = {0};
+    if (key < 0x80) {
+        utf8[0] = (char)key;
+    } else if (key < 0x800) {
+        utf8[0] = (char)(0xc0 | key >> 6);
+        utf8[1] = (char)(0x80 | (key & 0x3f));
+    } else if (key < 0x10000) {
+        utf8[0] = (char)(0xe0 | key >> 12);
+        utf8[1] = (char)(0x80 | ((key >> 6) & 0x3f));
+        utf8[2] = (char)(0x80 | (key & 0x3f));
+    } else {
+        utf8[0] = (char)(0xf0 | key >> 18);
+        utf8[1] = (char)(0x80 | ((key >> 12) & 0x3f));
+        utf8[2] = (char)(0x80 | ((key >> 6) & 0x3f));
+        utf8[3] = (char)(0x80 | (key & 0x3f));
+    }
+    snprintf(out, capacity, "%s", utf8);
+    if (key >= 'a' && key <= 'z') {
+        return (int)key - 32;
+    }
+    return key == ' ' ? 32 : key < 0x80 ? (int)key : 0;
+}
+
 static void set_focus(const struct opos_html_node *node) {
     if (T->have_page && T->page.focus != node) {
         T->page.focus = node;
@@ -2262,6 +2706,10 @@ static void submit_form(const struct opos_html_node *control,
     const struct opos_html_node *form = form_of(control);
     if (form == NULL) {
         return;
+    }
+    if (T->page.script != NULL
+        && script_event(&T->page, form, "submit", 0, 0, 0)) {
+        return; /* the page's script handles it */
     }
     size_t length = 0;
     char *data = form_encode(&T->page, form, submitter, &length);
@@ -2320,6 +2768,32 @@ static void click_control(const struct opos_html_node *node) {
     }
     struct form_field *field = form_field(&T->page, node);
     if (field == NULL) {
+        return;
+    }
+    if (field->kind == FIELD_CHECKBOX || field->kind == FIELD_RADIO) {
+        /* The box changes first; a cancelled click puts it back. */
+        bool was = field->checked;
+        if (field->kind == FIELD_CHECKBOX) {
+            field->checked = !field->checked;
+        } else {
+            form_check_radio(&T->page, node);
+        }
+        bool cancelled = script_click(node, b.press_x, b.press_y);
+        field = form_field(&T->page, node); /* a layout may move it */
+        if (field == NULL) {
+            return;
+        }
+        if (cancelled) {
+            field->checked = was;
+        } else {
+            script_changed(node, true, true);
+        }
+        T->page.focus = node;
+        refresh_controls();
+        return;
+    }
+    if (script_click(node, b.press_x, b.press_y)) {
+        refresh_controls();
         return;
     }
     switch (field->kind) {
@@ -2946,7 +3420,43 @@ static void open_main_menu(void) {
     menu_add(MENU_HISTORY);
     menu_add(MENU_DOWNLOADS);
     menu_add(MENU_COOKIES);
+    menu_add(MENU_JAVASCRIPT);
     menu_place(menu_button_x() + 28 - MENU_WIDTH, BUTTON_Y + 30);
+}
+
+/* JavaScript is on unless the file "javascript-off" is in the browser's
+   data folder. */
+static void javascript_setting_path(char *out, size_t capacity) {
+    snprintf(out, capacity, "%s/javascript-off", b.data_dir);
+}
+
+static void javascript_load_setting(void) {
+    char path[200];
+    javascript_setting_path(path, sizeof(path));
+    long fd = b.data_dir[0] != '\0' ? opos_open(path, OPOS_O_RDONLY) : -1;
+    scripting_enabled = fd < 0;
+    if (fd >= 0) {
+        opos_close((int)fd);
+    }
+}
+
+static void javascript_toggle(void) {
+    scripting_enabled = !scripting_enabled;
+    if (b.data_dir[0] != '\0') {
+        char path[200];
+        javascript_setting_path(path, sizeof(path));
+        if (scripting_enabled) {
+            opos_unlink(path);
+        } else {
+            long fd = opos_open(path, OPOS_O_WRONLY | OPOS_O_CREAT
+                                          | OPOS_O_TRUNC);
+            if (fd >= 0) {
+                opos_close((int)fd);
+            }
+        }
+    }
+    set_status(scripting_enabled ? "JavaScript is on" : "JavaScript is off");
+    reload();
 }
 
 static bool quit; /* the last tab was closed */
@@ -2977,6 +3487,7 @@ static void menu_run(enum menu_action action) {
     case MENU_HISTORY: navigate("about:history", true); break;
     case MENU_DOWNLOADS: navigate("about:downloads", true); break;
     case MENU_COOKIES: navigate("about:cookies", true); break;
+    case MENU_JAVASCRIPT: javascript_toggle(); break;
     default: break;
     }
 }
@@ -3099,6 +3610,8 @@ static void on_click(int x, int y) {
     const struct opos_html_node *control = page_control_at(
         &T->page, x - MARGIN, y - CHROME_HEIGHT - MARGIN + T->scroll,
         T->scroll);
+    b.press_x = x;
+    b.press_y = y;
     if (control != NULL) {
         struct form_field *field = form_field(&T->page, control);
         bool select_field = is_text_field(field)
@@ -3147,10 +3660,27 @@ static void on_release(void) {
     const struct display_item *item = page_item_at(
         &T->page, b.press_x - MARGIN,
         b.press_y - CHROME_HEIGHT - MARGIN + T->scroll, T->scroll);
+    const struct opos_html_node *link = item != NULL ? item->link : NULL;
     char url[OPOS_HTTP_URL_MAX];
-    if (link_target(item, url, sizeof(url))) {
-        const char *target = opos_html_attribute(item->link, "target");
-        if (opos_html_attribute(item->link, "download") != NULL
+    bool has_url = link_target(item, url, sizeof(url));
+    if (script_click(item != NULL ? item->element : NULL, b.press_x,
+                     b.press_y)) {
+        return; /* a script handled the click */
+    }
+    const char *href = link != NULL ? opos_html_attribute(link, "href")
+                                    : NULL;
+    while (href != NULL && (*href == ' ' || *href == '\n' || *href == '\t')) {
+        href++;
+    }
+    if (href != NULL && starts_with_ci(href, "javascript:")) {
+        if (!script_runs_javascript_url(&T->page, href)) {
+            set_status("This link needs JavaScript");
+        }
+        return;
+    }
+    if (has_url) {
+        const char *target = opos_html_attribute(link, "target");
+        if (opos_html_attribute(link, "download") != NULL
             && strncmp(url, "about:", 6) != 0) {
             download_url(url);
         } else if (target != NULL && strcmp(target, "_blank") == 0) {
@@ -3292,8 +3822,37 @@ static void on_key(uint32_t key, uint32_t modifiers) {
         b.dirty = true;
         return;
     }
+    if (T->have_page && T->page.script != NULL && !T->editing
+        && !T->finding && !ctrl) {
+        char name[16];
+        int code = key_name(key, name, sizeof(name));
+        int keys = shift ? 1 : 0;
+        bool cancelled = script_key(&T->page, T->page.focus, "keydown",
+                                    name, code, keys);
+        if (key >= ' ' || key == '\n') {
+            cancelled |= script_key(&T->page, T->page.focus, "keypress",
+                                    name, code, keys);
+        }
+        if (cancelled) {
+            script_key(&T->page, T->page.focus, "keyup", name, code, keys);
+            b.dirty = true;
+            return;
+        }
+    }
     if (T->have_page && T->page.focus != NULL && !T->editing && !T->finding
         && field_key(key, ctrl, (modifiers & OPOS_MOD_SHIFT) != 0)) {
+        bool edit = key >= ' ' || key == '\b' || key == OPOS_KEY_DELETE
+                 || (ctrl && (key == 'v' || key == 'V' || key == 'x'
+                              || key == 'X'));
+        if (edit && T->page.focus != NULL) {
+            script_changed(T->page.focus, true, false);
+        }
+        if (!ctrl && T->page.script != NULL) {
+            char name[16];
+            int code = key_name(key, name, sizeof(name));
+            script_key(&T->page, T->page.focus, "keyup", name, code,
+                       shift ? 1 : 0);
+        }
         return;
     }
     if (key == '\t' && T->have_page && !T->editing && !T->finding) {
@@ -3438,6 +3997,10 @@ static bool resize(int width, int height) {
     return true;
 }
 
+/* JavaScript (React and the like) recurses deeply: a 4 MiB stack instead
+   of the SDK's 128 KiB (crt0.S). */
+__attribute__((used)) const unsigned long opos_stack_size = 4ul << 20;
+
 int main(int argc, char **argv) {
     if (opos_window_create("BROWSER", 900, 640) < 0) {
         return 1;
@@ -3474,6 +4037,8 @@ int main(int argc, char **argv) {
     }
     library_open(b.data_dir);
     cookies_open(b.data_dir);
+    script_set_data_dir(b.data_dir);
+    javascript_load_setting();
 
     tab_open(argc > 1 ? argv[1] : NULL, true);
     if (T == NULL) {
@@ -3482,6 +4047,7 @@ int main(int argc, char **argv) {
 
     struct opos_event event;
     while (!quit) {
+        long timer_wait = scripts_tick();
         if (b.dirty) {
             paint();
         }
@@ -3497,8 +4063,13 @@ int main(int argc, char **argv) {
             if (load_next_image()) {
                 continue;
             }
-            /* While downloads run, wake up to show their progress. */
-            got = opos_window_event(&event, downloads_running() ? 250 : -1);
+            /* While downloads run, wake up to show their progress; wake
+               up for the next script timer too. */
+            long wait = downloads_running() ? 250 : -1;
+            if (timer_wait >= 0 && (wait < 0 || timer_wait < wait)) {
+                wait = timer_wait < 4 ? 4 : timer_wait;
+            }
+            got = opos_window_event(&event, wait);
         }
         if (got <= 0) {
             if (got < 0) {

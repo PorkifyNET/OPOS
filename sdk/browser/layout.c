@@ -374,7 +374,8 @@ static void add_text(struct ctx *c, const char *text, size_t length,
 /* ---------------------------------------------------------------- images */
 
 static bool is_replaced(const struct opos_html_node *node) {
-    return node->tag == HTML_TAG_IMG || node->tag == HTML_TAG_SVG;
+    return node->tag == HTML_TAG_IMG || node->tag == HTML_TAG_SVG
+        || node->tag == HTML_TAG_CANVAS;
 }
 
 static struct image_ref *image_new(struct ctx *c) {
@@ -431,8 +432,23 @@ static struct image_ref *image_for(struct ctx *c,
     for (size_t i = 0; i < page->image_count; i++) {
         if (page->images[i]->node == node) {
             page->images[i]->colour = style->colour;
+            if (node->tag == HTML_TAG_CANVAS) {
+                canvas_size(node, &page->images[i]->width,
+                            &page->images[i]->height);
+            }
             return page->images[i];
         }
+    }
+    if (node->tag == HTML_TAG_CANVAS) {
+        /* Drawn by scripts (canvas.c); transparent until then. */
+        struct image_ref *ref = image_new(c);
+        if (ref != NULL) {
+            ref->node = node;
+            ref->canvas = true;
+            ref->state = 1;
+            canvas_size(node, &ref->width, &ref->height);
+        }
+        return ref;
     }
     const char *source = NULL;
     if (node->tag != HTML_TAG_SVG) {
@@ -1163,6 +1179,7 @@ static void emit_line(struct ctx *c, size_t count, int used,
             text->underline = style->underline;
             text->strike = style->strike;
             text->link = style->link;
+            text->element = style->element;
             break;
         }
         case IT_IMAGE: {
@@ -1172,6 +1189,9 @@ static void emit_line(struct ctx *c, size_t count, int used,
             if (image != NULL) {
                 image->image = item->image;
                 image->link = style->link;
+                image->element = item->image != NULL
+                    && item->image->node != NULL ? item->image->node
+                                                 : style->element;
                 image->colour = 0x00d8d8d8;
             }
             break;
@@ -1778,6 +1798,12 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
        (collapsing with its first child's). */
     int frame_top = box_top + (collapse_top && c->pending_margin > 0
                                ? c->pending_margin : 0);
+    size_t box_index = (size_t)-1;
+    if (!c->measuring
+        && add_item(c, ITEM_BOX, box_x, frame_top, box_width, 0) != NULL) {
+        box_index = c->page->item_count - 1;
+        c->page->items[box_index].element = node;
+    }
     size_t fill_index = (size_t)-1;
     size_t outline_index = (size_t)-1;
     if (boxed && !c->measuring) {
@@ -1872,6 +1898,9 @@ static void layout_block(struct ctx *c, const struct opos_html_node *node,
             c->page->items[outline_index].height = c->y - box_top;
         }
     }
+    if (box_index != (size_t)-1) {
+        c->page->items[box_index].height = max_int(c->y - frame_top, 0);
+    }
     if (contains) {
         c->abs_frame = outer_frame;
         place_frame(c, &inner, box_x + style->border,
@@ -1920,7 +1949,7 @@ struct cell {
     int spec;            /* width attribute in pixels, or -percent */
     int height;
     size_t first_item, last_item;
-    size_t fill_index, outline_index;
+    size_t fill_index, outline_index, box_index;
     bool nowrap;
 };
 
@@ -2432,7 +2461,12 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
     c->pending_margin = 0;
     int table_top = c->y;
     size_t table_fill = (size_t)-1, table_outline = (size_t)-1;
+    size_t table_box = (size_t)-1;
     if (!c->measuring) {
+        if (add_item(c, ITEM_BOX, x0, table_top, total, 0) != NULL) {
+            table_box = c->page->item_count - 1;
+            c->page->items[table_box].element = node;
+        }
         if (st->has_background
             && add_item(c, ITEM_RECT, x0, table_top, total, 0) != NULL) {
             table_fill = c->page->item_count - 1;
@@ -2474,6 +2508,12 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
             int pad_b = style->padding[BOTTOM] + cell_border;
             cell->fill_index = (size_t)-1;
             cell->outline_index = (size_t)-1;
+            cell->box_index = (size_t)-1;
+            if (!c->measuring
+                && add_item(c, ITEM_BOX, cell_x, y, cell_width, 0) != NULL) {
+                cell->box_index = c->page->item_count - 1;
+                c->page->items[cell->box_index].element = cell->node;
+            }
             if (!c->measuring) {
                 bool has_bg = style->has_background || row->style.has_background;
                 if (has_bg && add_item(c, ITEM_RECT, cell_x, y, cell_width, 0)
@@ -2537,6 +2577,9 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
             int box_top = t.rows[cell->row].top;
             int box_height = t.rows[last_row].top + t.rows[last_row].height
                            - box_top;
+            if (cell->box_index != (size_t)-1) {
+                c->page->items[cell->box_index].height = box_height;
+            }
             if (cell->fill_index != (size_t)-1) {
                 c->page->items[cell->fill_index].height = box_height;
             }
@@ -2554,6 +2597,9 @@ static void layout_table(struct ctx *c, const struct opos_html_node *node,
                     c->page->items[k].y += shift;
                 }
             }
+        }
+        if (table_box != (size_t)-1) {
+            c->page->items[table_box].height = table_bottom - table_top;
         }
         if (table_fill != (size_t)-1) {
             c->page->items[table_fill].height = table_bottom - table_top;
@@ -3500,8 +3546,10 @@ void layout_page(struct page *page, struct opos_font *fonts[FONT_COUNT],
 }
 
 void page_destroy(struct page *page) {
+    script_page_end(page);
     form_fields_free(page);
     css_free(page->sheets);
+    free(page->sheet_list);
     style_sheets = NULL;
     free_arena(page);
     free(page->items);
@@ -3539,4 +3587,90 @@ const struct opos_html_node *page_control_at(const struct page *page, int x,
         }
     }
     return NULL;
+}
+
+static bool node_inside(const struct opos_html_node *node,
+                        const struct opos_html_node *ancestor) {
+    for (int depth = 0; node != NULL && depth < 512; depth++) {
+        if (node == ancestor) {
+            return true;
+        }
+        node = node->parent;
+    }
+    return false;
+}
+
+bool page_element_box(const struct page *page,
+                      const struct opos_html_node *node, int box[4],
+                      bool *fixed) {
+    for (size_t i = 0; i < page->item_count; i++) {
+        const struct display_item *item = &page->items[i];
+        if (item->kind == ITEM_BOX && item->element == node) {
+            box[0] = item->x;
+            box[1] = item->y;
+            box[2] = item->width;
+            box[3] = item->height;
+            *fixed = item->fixed;
+            return true;
+        }
+    }
+    /* Inline elements: the bounds of the text, images and controls in
+       them. */
+    bool found = false;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (size_t i = 0; i < page->item_count; i++) {
+        const struct display_item *item = &page->items[i];
+        const struct opos_html_node *owner = item->element != NULL
+                                           ? item->element : item->control;
+        if (owner == NULL || !node_inside(owner, node)) {
+            continue;
+        }
+        if (!found) {
+            x0 = item->x;
+            y0 = item->y;
+            x1 = item->x + item->width;
+            y1 = item->y + item->height;
+            *fixed = item->fixed;
+            found = true;
+            continue;
+        }
+        x0 = min_int(x0, item->x);
+        y0 = min_int(y0, item->y);
+        x1 = max_int(x1, item->x + item->width);
+        y1 = max_int(y1, item->y + item->height);
+    }
+    if (found) {
+        box[0] = x0;
+        box[1] = y0;
+        box[2] = x1 - x0;
+        box[3] = y1 - y0;
+    }
+    return found;
+}
+
+void page_element_style(struct page *page, const struct opos_html_node *node,
+                        struct style *style) {
+    const struct opos_html_node *path[256];
+    int count = 0;
+    for (const struct opos_html_node *n = node; n != NULL && count < 256;
+         n = n->parent) {
+        if (n->type == HTML_NODE_ELEMENT) {
+            path[count++] = n;
+        }
+    }
+    struct style parent;
+    memset(&parent, 0, sizeof(parent));
+    parent.display = DISPLAY_BLOCK;
+    parent.font_size = DEFAULT_FONT_SIZE;
+    parent.colour = DEFAULT_TEXT;
+    parent.border_colour = DEFAULT_TEXT;
+    const struct css_sheet *saved = style_sheets;
+    style_sheets = page->sheets;
+    for (int i = count - 1; i >= 0; i--) {
+        struct style computed;
+        style_compute(path[i], &parent, &computed);
+        parent = computed;
+    }
+    style_sheets = saved;
+    *style = parent;
 }

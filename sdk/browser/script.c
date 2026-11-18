@@ -2269,16 +2269,153 @@ static bool fetch_script(struct script_state *s, const char *url,
     return true;
 }
 
-static void evaluate(struct script_state *s, const char *code, size_t length,
-                     const char *name) {
+
+
+/* Compiled classic scripts kept for the browser's session by URL while
+   their Cache-Control max-age lasts: a reload or another page of the
+   same site skips both the download and the compile. */
+#define CODE_CACHE_ENTRIES 128
+#define CODE_CACHE_BYTES (32u << 20)
+
+static struct cached_code {
+    char *url;
+    uint8_t *code;
+    size_t size;
+    long long expires, used;
+} code_cache[CODE_CACHE_ENTRIES];
+static size_t code_cache_bytes;
+
+static void code_cache_drop(struct cached_code *c) {
+    code_cache_bytes -= c->size;
+    free(c->url);
+    free(c->code);
+    memset(c, 0, sizeof(*c));
+}
+
+static struct cached_code *code_cache_find(const char *url) {
+    long long now = uptime_ms();
+    for (int i = 0; i < CODE_CACHE_ENTRIES; i++) {
+        struct cached_code *c = &code_cache[i];
+        if (c->url != NULL && now >= c->expires) {
+            code_cache_drop(c);
+        }
+        if (c->url != NULL && strcmp(c->url, url) == 0) {
+            c->used = now;
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* How long a script response may be reused, in milliseconds (0: not). */
+static long long cache_lifetime(const struct opos_http_response *response) {
+    char value[256];
+    if (response->status != 200 || response->headers == NULL
+        || !find_header(response->headers, "cache-control", value,
+                        sizeof(value))) {
+        return 0;
+    }
+    for (char *p = value; *p != '\0'; p++) {
+        *p = (char)tolower((unsigned char)*p);
+    }
+    const char *age = strstr(value, "max-age=");
+    if (strstr(value, "no-store") != NULL || strstr(value, "no-cache") != NULL
+        || age == NULL) {
+        return 0;
+    }
+    long seconds = strtol(age + 8, NULL, 10);
+    return seconds > 0 ? (long long)seconds * 1000 : 0;
+}
+
+/* Keeps a copy of a compiled script (QuickJS's buffer belongs to the
+   page's runtime). */
+static void code_cache_add(JSContext *ctx, const char *url,
+                           JSValueConst function, long long lifetime) {
+    size_t size;
+    uint8_t *code = JS_WriteObject(ctx, &size, function,
+                                   JS_WRITE_OBJ_BYTECODE);
+    if (code == NULL) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return;
+    }
+    if (size <= CODE_CACHE_BYTES / 4 && code_cache_find(url) == NULL) {
+        struct cached_code *slot;
+        for (;;) {
+            struct cached_code *oldest = NULL;
+            slot = NULL;
+            for (int i = 0; i < CODE_CACHE_ENTRIES; i++) {
+                struct cached_code *c = &code_cache[i];
+                if (c->url == NULL) {
+                    slot = slot != NULL ? slot : c;
+                } else if (oldest == NULL || c->used < oldest->used) {
+                    oldest = c;
+                }
+            }
+            if (slot != NULL && code_cache_bytes + size <= CODE_CACHE_BYTES) {
+                break;
+            }
+            code_cache_drop(oldest); /* not NULL: the cache is not empty */
+        }
+        slot->url = strdup(url);
+        slot->code = malloc(size);
+        if (slot->url == NULL || slot->code == NULL) {
+            free(slot->url);
+            free(slot->code);
+            slot->url = NULL;
+            slot->code = NULL;
+        } else {
+            memcpy(slot->code, code, size);
+            slot->size = size;
+            code_cache_bytes += size;
+            slot->used = uptime_ms();
+            slot->expires = slot->used + lifetime;
+        }
+    }
+    js_free(ctx, code);
+}
+
+/* Runs a compiled script; reports JS_EXCEPTION and errors. */
+static void run_function(struct script_state *s, JSValue function) {
     JSContext *ctx = s->context;
-    begin_call(s);
-    JSValue result = JS_Eval(ctx, code, length, name, JS_EVAL_TYPE_GLOBAL);
+    JSValue result = JS_IsException(function)
+        ? function : JS_EvalFunction(ctx, function);
     if (JS_IsException(result)) {
         report_exception(ctx);
     }
     JS_FreeValue(ctx, result);
+}
+
+/* Compiles and runs a classic script; lifetime > 0 keeps its compiled
+   code under name (its URL) for that long. */
+static void evaluate(struct script_state *s, const char *code, size_t length,
+                     const char *name, long long lifetime) {
+    JSContext *ctx = s->context;
+    begin_call(s);
+    JSValue function = JS_Eval(ctx, code, length, name,
+                               JS_EVAL_TYPE_GLOBAL
+                               | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (lifetime > 0 && !JS_IsException(function)) {
+        code_cache_add(ctx, name, function, lifetime);
+    }
+    run_function(s, function);
     end_call(s);
+}
+
+/* Runs a script kept by code_cache_add; false if it could not be read. */
+static bool evaluate_cached(struct script_state *s,
+                            const struct cached_code *cached) {
+    JSContext *ctx = s->context;
+    begin_call(s);
+    JSValue function = JS_ReadObject(ctx, cached->code, cached->size,
+                                     JS_READ_OBJ_BYTECODE);
+    if (JS_IsException(function)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        end_call(s);
+        return false;
+    }
+    run_function(s, function);
+    end_call(s);
+    return true;
 }
 
 /* ------------------------------------------------------------- modules */
@@ -2486,16 +2623,20 @@ static void run_script(struct script_state *s,
     if (src != NULL) {
         char url[OPOS_HTTP_URL_MAX];
         struct opos_http_response response;
-        if (src[0] != '\0'
-            && opos_url_resolve(s->page->url, src, url, sizeof(url))
-            && fetch_script(s, url, &response)) {
+        bool resolved = src[0] != '\0'
+            && opos_url_resolve(s->page->url, src, url, sizeof(url));
+        struct cached_code *cached = resolved && kind == SCRIPT_CLASSIC
+            ? code_cache_find(url) : NULL;
+        if (cached != NULL && evaluate_cached(s, cached)) {
+            loaded = true;
+        } else if (resolved && fetch_script(s, url, &response)) {
             loaded = true;
             if (kind == SCRIPT_MODULE) {
                 run_module(s, (const char *)response.body, response.length,
                            url, url);
             } else {
                 evaluate(s, (const char *)response.body, response.length,
-                         url);
+                         url, cache_lifetime(&response));
             }
             opos_http_free(&response);
         }
@@ -2510,7 +2651,7 @@ static void run_script(struct script_state *s,
                          ++s->inline_modules);
                 run_module(s, b.data, b.length, name, s->page->url);
             } else {
-                evaluate(s, b.data, b.length, s->page->url);
+                evaluate(s, b.data, b.length, s->page->url, 0);
             }
         }
         free(b.data);
@@ -2854,7 +2995,7 @@ bool script_runs_javascript_url(struct page *page, const char *url) {
         code[used++] = c;
     }
     code[used] = '\0';
-    evaluate(s, code, used, "javascript:");
+    evaluate(s, code, used, "javascript:", 0);
     free(code);
     run_pending(s);
     return true;

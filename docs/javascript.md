@@ -242,8 +242,33 @@ timers and the network APIs.
      reset, same-site and cross-site images, broken images, Intl)
      passes; Chart.js 4.4 from a CDN draws a bar chart and a doughnut;
      the network (22), CSS (17) and module (15) tests still pass.
-6. **Speed**: keep compiled bytecode of large scripts for the session,
-   lay out only once per batch of changes, and measure heavy sites.
+6. **Speed** (done, branch `browser/javascript-speed`)
+   - Measured on BBC News in QEMU/KVM: setting up `dom.js` takes 10-20
+     ms, compiling all scripts about 230 ms, running them 10-20 ms, and
+     scripts cause no extra layouts while the page loads (changes are
+     already laid out once per timer round or event). Downloading the
+     scripts took 18-21 s: about 40 files, each over a new TCP and TLS
+     connection (650-1000 ms for a new one).
+   - Keep-alive (`sdk/lib/http.c`): GET and HEAD keep their connection
+     in a pool of 6 idle ones (30 s at most) for the next request to the
+     same server. A request on a pooled connection that the server has
+     closed is sent again on a new one. Responses that end only when the
+     connection closes, HTTP/1.0 answers and `Connection: close` are not
+     kept; streamed downloads (`opos_http_download`, run in forked
+     children) never use the pool. A request on a kept connection takes
+     50-70 ms. All programs that use the SDK's HTTP calls gain from it.
+   - Compiled code cache (`script.c`): classic scripts with a
+     `Cache-Control: max-age` (and no `no-store`/`no-cache`) are kept as
+     QuickJS bytecode (`JS_WriteObject`) by URL for the browser's
+     session, up to 32 MiB, until max-age ends. A reload or another page
+     that uses the same script reads the bytecode and neither downloads
+     nor compiles it.
+   - Result on BBC News: scripts done 18-21 s before, 5 s now on first
+     load and under 1 s on reload. The network (22), CSS (17), module
+     (15) and canvas (24) tests still pass.
+   - Not done: modules are not cached; `Expires` and `Vary` are not
+     read; requests still run one at a time (the kernel's `fork` copies
+     the whole process, so parallel downloads in children cost too much).
 
 ## Not planned
 

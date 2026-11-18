@@ -1,6 +1,10 @@
 /*
- * HTTP and HTTPS client for OPOS applications (HTTP/1.1, one request per
- * connection, no keep-alive).
+ * HTTP and HTTPS client for OPOS applications (HTTP/1.1). GET and HEAD
+ * requests keep their connection for the next request to the same server
+ * (up to 6 idle connections, 30 s each); other requests and
+ * opos_http_download use a connection of their own. A program that forks
+ * while connections are kept should only use opos_http_download in the
+ * child.
  *
  * opos_http_get downloads a whole page into memory. It follows redirects,
  * decodes chunked transfer coding and gzip/deflate content coding, and

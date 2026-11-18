@@ -204,9 +204,44 @@ timers and the network APIs.
      the step 3 CSS test still passes 17/17 and the network test 22/22;
      BBC News and GitHub load without script errors (GitHub's popover
      code needed `:not([attr])` and escaped selectors).
-5. **Canvas 2D**: `<canvas>` with `getContext('2d')` (paths, fills,
-   strokes, text, images, `toDataURL`), drawn into the page. It needs a
-   rasterizer of its own, so it moved out of step 4.
+5. **Canvas 2D** (done, branch `browser/javascript-canvas`)
+   - `<canvas>` is now shown (it was `display: none`) as a replaced
+     element like `<img>`, 300 x 150 unless its `width`/`height` say
+     otherwise. `sdk/browser/canvas.c` keeps one 0xAARRGGBB surface per
+     canvas; layout reads it through `canvas_pixels` and the browser
+     paints again whenever a canvas changed (`canvas_take_painted`).
+   - The rasteriser is the one `svg.c` already had, moved into
+     `vector.h` and shared: paths flattened to device pixels, exact-area
+     anti-aliasing, strokes with caps, joins and miter limits.
+   - `CanvasRenderingContext2D` (in `dom.js`, one native `N.cv`):
+     rectangles, paths (`arc`, `arcTo`, `ellipse`, `roundRect`, Bézier
+     curves), `fill`/`stroke` with nonzero and even-odd rules, `clip`,
+     `save`/`restore`, transforms (`DOMMatrix`, `getTransform`,
+     `setTransform`), `globalAlpha`, composite operations and blend
+     modes, line dashes, linear, radial and conic gradients, patterns,
+     `fillText`/`strokeText`/`measureText` with the browser's fonts,
+     `drawImage` from `<img>`, `<canvas>` and `ImageBitmap`,
+     `getImageData`/`putImageData`/`createImageData`,
+     `isPointInPath`/`isPointInStroke`, `Path2D` (also from SVG path
+     data), `toDataURL` and `toBlob` (PNG), and `createImageBitmap`.
+     Setting `width` or `height` clears the canvas and its state.
+   - Images: `new Image()` and `<img>` load for scripts with `onload`/
+     `onerror`, `complete` and `naturalWidth`. Images from other sites
+     taint the canvas: `getImageData` and `toDataURL` then throw
+     `SecurityError`.
+   - `Intl` (QuickJS has none): English formatting for `NumberFormat`
+     (decimal, currency, percent, compact), `DateTimeFormat`,
+     `Collator`, `PluralRules`, `RelativeTimeFormat`, `ListFormat`,
+     `Segmenter` and `Locale`, plus `toLocaleString`. Chart libraries
+     need it.
+   - Not yet: shadows and `filter` (kept, not drawn), WebGL,
+     `OffscreenCanvas`, other locales.
+   - Tested in QEMU: a test page with 24 checks (fills, strokes, arcs,
+     transforms, clip, alpha, compositing, gradients, text, drawImage,
+     toDataURL round trip, putImageData, Path2D, dashes, patterns, width
+     reset, same-site and cross-site images, broken images, Intl)
+     passes; Chart.js 4.4 from a CDN draws a bar chart and a doughnut;
+     the network (22), CSS (17) and module (15) tests still pass.
 6. **Speed**: keep compiled bytecode of large scripts for the session,
    lay out only once per batch of changes, and measure heavy sites.
 

@@ -2298,7 +2298,7 @@ void style_compute(const struct opos_html_node *element,
     case HTML_TAG_PARAM: case HTML_TAG_SOURCE: case HTML_TAG_TRACK:
     case HTML_TAG_NOFRAMES: case HTML_TAG_NOEMBED: case HTML_TAG_IFRAME:
     case HTML_TAG_OBJECT: case HTML_TAG_EMBED: case HTML_TAG_VIDEO:
-    case HTML_TAG_AUDIO: case HTML_TAG_CANVAS:
+    case HTML_TAG_AUDIO:
     case HTML_TAG_OPTION: case HTML_TAG_OPTGROUP: case HTML_TAG_COLGROUP:
     case HTML_TAG_COL: case HTML_TAG_DIALOG:
         style->display = DISPLAY_NONE;

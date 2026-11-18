@@ -181,8 +181,36 @@ const uint32_t *image_ref_scaled(struct image_ref *ref, int width,
         || (size_t)width * (size_t)height > 16u * 1024 * 1024) {
         return NULL;
     }
-    if (ref->scaled != NULL && ref->scaled_width == width
+    if (!ref->canvas && ref->scaled != NULL && ref->scaled_width == width
         && ref->scaled_height == height && ref->scaled_colour == ref->colour) {
+        return ref->scaled;
+    }
+    if (ref->canvas) {
+        int cw, ch;
+        unsigned version;
+        const uint32_t *pixels = canvas_pixels(ref->node, &cw, &ch, &version);
+        if (pixels == NULL) {
+            return NULL;
+        }
+        if (ref->scaled != NULL && ref->scaled_width == width
+            && ref->scaled_height == height && ref->canvas_version == version) {
+            return ref->scaled;
+        }
+        free(ref->scaled);
+        ref->scaled = malloc((size_t)width * height * 4);
+        if (ref->scaled == NULL) {
+            return NULL;
+        }
+        if (width == cw && height == ch) {
+            memcpy(ref->scaled, pixels, (size_t)width * height * 4);
+        } else {
+            image_resample(pixels, (uint32_t)cw, 0, 0, (uint32_t)cw,
+                           (uint32_t)ch, ref->scaled, (uint32_t)width,
+                           (uint32_t)width, (uint32_t)height);
+        }
+        ref->scaled_width = width;
+        ref->scaled_height = height;
+        ref->canvas_version = version;
         return ref->scaled;
     }
     free(ref->scaled);

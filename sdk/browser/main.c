@@ -2468,6 +2468,9 @@ static void go_history(int step);
 /* Applies what the shown page's scripts asked for: a new title, a
    navigation, a new address, a changed document. */
 static void scripts_apply(void) {
+    if (canvas_take_painted()) {
+        b.dirty = true; /* a canvas changed: paint again */
+    }
     if (!T->have_page || T->page.script == NULL) {
         return;
     }
@@ -2552,6 +2555,10 @@ static long scripts_tick(void) {
 }
 
 /* --------------------------------------------- layout asked by scripts */
+
+struct opos_font *browser_font(int index) {
+    return index >= 0 && index < FONT_COUNT ? b.fonts[index] : NULL;
+}
 
 static struct tab *tab_of(const struct page *page) {
     for (int i = 0; i < b.tab_count; i++) {

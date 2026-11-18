@@ -305,6 +305,8 @@ struct image_ref {
     uint32_t *scaled;          /* cached copy at scaled_width/height */
     int scaled_width, scaled_height;
     uint32_t scaled_colour;
+    bool canvas;               /* a <canvas>: pixels come from canvas.c */
+    unsigned canvas_version;   /* of the cached scaled copy */
 };
 
 /* image.c */
@@ -471,6 +473,21 @@ void script_layout_done(struct page *page);
 /* The page scrolled or the window changed size: fires "scroll" or
    "resize" at the window. */
 void script_window_event(struct page *page, const char *type);
+
+/* canvas.c: <canvas> surfaces. canvas_size is the size of the element's
+   attributes (300 x 150 by default); canvas_pixels gives a canvas's
+   0xAARRGGBB pixels and a version that changes with every drawing (NULL
+   before a script draws); canvas_take_painted says whether any canvas
+   changed since it was last asked; canvas_page_end frees a page's
+   canvases and script-loaded images. */
+void canvas_size(const struct opos_html_node *node, int *width, int *height);
+const uint32_t *canvas_pixels(const struct opos_html_node *node, int *width,
+                              int *height, unsigned *version);
+bool canvas_take_painted(void);
+void canvas_page_end(struct page *page);
+/* main.c: the browser's fonts (0 sans, 1 bold, 2 italic, 3 bold italic,
+   4 mono, 5 mono bold). */
+struct opos_font *browser_font(int index);
 
 /* library.c: bookmarks, history and downloads. data_dir "" keeps them
    only in memory. */

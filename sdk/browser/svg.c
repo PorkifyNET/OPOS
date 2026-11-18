@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "browser.h"
+#include "vector.h"
 
 #define SVG_MAX_DEPTH 24
 #define SVG_MAX_RULES 256
@@ -209,11 +210,6 @@ static bool word_equal(const char *text, size_t length, const char *word) {
 
 /* -------------------------------------------------------------- matrices */
 
-/* x' = a x + c y + e, y' = b x + d y + f */
-struct matrix {
-    double a, b, c, d, e, f;
-};
-
 static const struct matrix IDENTITY = {1, 0, 0, 1, 0, 0};
 
 /* The transform that applies n first, then m. */
@@ -314,16 +310,18 @@ static struct matrix parse_transform(const char *text) {
 
 /* ------------------------------------------------------------ rasteriser */
 
-struct raster {
-    int width, height;
-    float *cover;         /* (width + 2) * height signed area deltas */
-    float *pixels;        /* premultiplied RGBA, width * height * 4 */
-    int top, bottom;      /* rows that hold area deltas */
-};
-
 static void raster_line(struct raster *r, double x0, double y0, double x1,
                         double y1) {
-    if (y0 == y1 || y0 != y0 || y1 != y1) {
+    if (y0 == y1 || y0 != y0 || y1 != y1 || x0 != x0 || x1 != x1) {
+        return;
+    }
+    /* Infinite points (from scripts' huge numbers) would make NaN. */
+    const double far = 1e9;
+    x0 = x0 < -far ? -far : x0 > far ? far : x0;
+    x1 = x1 < -far ? -far : x1 > far ? far : x1;
+    y0 = y0 < -far ? -far : y0 > far ? far : y0;
+    y1 = y1 < -far ? -far : y1 > far ? far : y1;
+    if (y0 == y1) {
         return;
     }
     float direction = 1;
@@ -395,19 +393,6 @@ static void raster_line(struct raster *r, double x0, double y0, double x1,
 }
 
 /* ----------------------------------------------------------------- paths */
-
-/* Points in device pixels; a subpath starts at starts[i]. */
-struct path {
-    double *xy;
-    int count, capacity;
-    int *starts;
-    bool *closed;
-    int subpaths, sub_capacity;
-    bool failed;
-    /* Bounding box in user units, for objectBoundingBox gradients. */
-    double min_x, min_y, max_x, max_y;
-    bool have_box;
-};
 
 static void path_reset(struct path *path) {
     path->count = 0;
@@ -499,16 +484,6 @@ static void path_close(struct path *path) {
 static int subpath_end(const struct path *path, int index) {
     return index + 1 < path->subpaths ? path->starts[index + 1] : path->count;
 }
-
-/* Builds a path in user units, flattened through a matrix to device
-   pixels. */
-struct builder {
-    struct path *path;
-    struct matrix m;
-    double x, y;           /* current point (user units) */
-    double start_x, start_y;
-    bool open;             /* a subpath has been started */
-};
 
 static void build_move(struct builder *b, double x, double y) {
     double dx, dy;
@@ -2568,4 +2543,67 @@ bool image_ref_gradient(struct image_ref *ref, const char *css) {
     ref->height = GRADIENT_SIZE;
     ref->state = 1;
     return true;
+}
+
+/* ------------------------------------------- shared with canvas.c */
+
+double vec_sqrt(double x) { return svg_sqrt(x); }
+double vec_sin(double x) { return svg_sin(x); }
+double vec_cos(double x) { return svg_cos(x); }
+double vec_atan2(double y, double x) { return svg_atan2(y, x); }
+double vec_floor(double x) { return svg_floor(x); }
+
+struct matrix vec_multiply(struct matrix m, struct matrix n) {
+    return multiply(m, n);
+}
+
+bool vec_invert(struct matrix m, struct matrix *out) {
+    return invert(m, out);
+}
+
+void vec_apply(const struct matrix *m, double x, double y, double *ox,
+               double *oy) {
+    apply(m, x, y, ox, oy);
+}
+
+void vec_line(struct raster *r, double x0, double y0, double x1, double y1) {
+    raster_line(r, x0, y0, x1, y1);
+}
+
+void vec_path_reset(struct path *path) { path_reset(path); }
+void vec_path_free(struct path *path) { path_free(path); }
+
+int vec_subpath_end(const struct path *path, int index) {
+    return subpath_end(path, index);
+}
+
+void vec_move(struct builder *b, double x, double y) { build_move(b, x, y); }
+void vec_lineto(struct builder *b, double x, double y) {
+    build_line(b, x, y);
+}
+
+void vec_cubic(struct builder *b, double x1, double y1, double x2, double y2,
+               double x3, double y3) {
+    build_cubic(b, x1, y1, x2, y2, x3, y3);
+}
+
+void vec_quad(struct builder *b, double x1, double y1, double x2,
+              double y2) {
+    build_quad(b, x1, y1, x2, y2);
+}
+
+void vec_close(struct builder *b) { build_close(b); }
+
+void vec_point(struct builder *b, double device_x, double device_y) {
+    path_point(b->path, device_x, device_y);
+}
+
+void vec_stroke(struct raster *r, const struct path *path, int cap, int join,
+                double miter_limit, double half) {
+    struct state s;
+    memset(&s, 0, sizeof(s));
+    s.cap = cap;
+    s.join = join;
+    s.miter_limit = miter_limit;
+    stroke_path(r, path, &s, half);
 }

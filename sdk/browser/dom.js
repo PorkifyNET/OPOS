@@ -1076,7 +1076,8 @@ class HTMLElement extends Element {
     set content(v) {
         if (N.name(this) !== 'template') N.setAttr(this, 'content', String(v));
     }
-    /* <canvas>, <video>, <audio>: not drawn or played yet. */
+    /* <canvas> (its own getContext and toDataURL are below); <video>,
+       <audio>: not played yet. */
     getContext() { return null; }
     toDataURL() { return 'data:,'; }
     play() { return Promise.reject(new Error('NotSupportedError')); }
@@ -1228,6 +1229,1224 @@ function Audio(src) {
     return element;
 }
 Audio.prototype = G.HTMLAudioElement.prototype;
+
+
+/* --------------------------------------------------------------- Intl */
+
+/* QuickJS has no Intl: this one formats the English (en-US) way
+   whatever locale is asked for. */
+const CURRENCY_SIGNS = {USD: '$', EUR: '€', GBP: '£', JPY: '¥', CNY: 'CN¥',
+    INR: '₹', KRW: '₩', CAD: 'CA$', AUD: 'A$', CHF: 'CHF', RUB: 'RUB',
+    BRL: 'R$', MXN: 'MX$'};
+function intlLocale(locales) {
+    const first = Array.isArray(locales) ? locales[0] : locales;
+    return typeof first === 'string' && first !== '' ? first : 'en-US';
+}
+function groupDigits(text) {
+    return text.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+class NumberFormat {
+    constructor(locales, options = {}) {
+        const o = Object.assign({}, options);
+        const style = o.style || 'decimal';
+        const currency = style === 'currency'
+            ? String(o.currency || '').toUpperCase() : undefined;
+        if (style === 'currency' && !currency)
+            throw new TypeError('Currency code is required with currency style.');
+        const digits = currency === 'JPY' || currency === 'KRW' ? 0
+            : style === 'currency' ? 2 : 0;
+        let min = o.minimumFractionDigits, max = o.maximumFractionDigits;
+        if (min === undefined) min = Math.min(digits, max ?? digits);
+        if (max === undefined)
+            max = Math.max(min, style === 'currency' ? digits
+                                : style === 'percent' ? 0 : 3);
+        if (min > max) throw new RangeError('maximumFractionDigits is out of range');
+        define(this, '_o', {locale: intlLocale(locales), numberingSystem: 'latn',
+            style, currency, currencyDisplay: o.currencyDisplay || 'symbol',
+            unit: o.unit, minimumIntegerDigits: o.minimumIntegerDigits || 1,
+            minimumFractionDigits: min, maximumFractionDigits: max,
+            minimumSignificantDigits: o.minimumSignificantDigits,
+            maximumSignificantDigits: o.maximumSignificantDigits,
+            useGrouping: o.useGrouping === undefined ? 'auto' : o.useGrouping,
+            notation: o.notation || 'standard',
+            compactDisplay: o.compactDisplay || 'short',
+            signDisplay: o.signDisplay || 'auto'});
+    }
+    resolvedOptions() {
+        const r = {};
+        for (const [k, v] of Object.entries(this._o)) if (v !== undefined) r[k] = v;
+        return r;
+    }
+    format(value) { return this.formatToParts(value).map(p => p.value).join(''); }
+    formatToParts(value) {
+        const o = this._o;
+        let n = typeof value === 'bigint' ? Number(value) : Number(value);
+        const parts = [];
+        if (Number.isNaN(n)) return [{type: 'nan', value: 'NaN'}];
+        const negative = n < 0 || Object.is(n, -0);
+        n = Math.abs(n);
+        if (o.style === 'percent') n *= 100;
+        let suffix = '';
+        if (o.notation === 'compact' && n >= 1000) {
+            const units = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+            for (const [size, letter] of units) {
+                if (n >= size) { n /= size; suffix = letter; break; }
+            }
+        }
+        let text;
+        if (!Number.isFinite(n)) {
+            text = '∞';
+        } else if (o.maximumSignificantDigits !== undefined
+                   || (o.notation === 'compact' && o.maximumFractionDigits === 3
+                       && suffix !== '')) {
+            const digits = o.maximumSignificantDigits || 2;
+            text = String(Number(n.toPrecision(digits)));
+            if (text.includes('e')) text = n.toFixed(0);
+        } else {
+            text = n.toFixed(o.maximumFractionDigits);
+            if (text.includes('.')) {
+                let [whole, fraction] = text.split('.');
+                while (fraction.length > o.minimumFractionDigits
+                       && fraction.endsWith('0'))
+                    fraction = fraction.slice(0, -1);
+                text = fraction ? whole + '.' + fraction : whole;
+            }
+        }
+        let [whole, fraction] = text.split('.');
+        if (whole !== '∞')
+            whole = whole.padStart(o.minimumIntegerDigits, '0');
+        if (o.useGrouping !== false && whole !== '∞') whole = groupDigits(whole);
+        if (negative && (n !== 0 || o.signDisplay === 'negative')
+            && o.signDisplay !== 'never')
+            parts.push({type: 'minusSign', value: '-'});
+        else if (o.signDisplay === 'always' || (o.signDisplay === 'exceptZero'
+                                                  && n !== 0))
+            parts.push({type: 'plusSign', value: '+'});
+        if (o.style === 'currency') {
+            const sign = o.currencyDisplay === 'code' ? o.currency + ' '
+                : o.currencyDisplay === 'name' ? ''
+                : CURRENCY_SIGNS[o.currency] || o.currency + ' ';
+            if (sign) parts.push({type: 'currency', value: sign});
+        }
+        const groups = whole.split(',');
+        groups.forEach((g, i) => {
+            if (i > 0) parts.push({type: 'group', value: ','});
+            parts.push({type: whole === '∞' ? 'infinity' : 'integer', value: g});
+        });
+        if (fraction) {
+            parts.push({type: 'decimal', value: '.'});
+            parts.push({type: 'fraction', value: fraction});
+        }
+        if (suffix) parts.push({type: 'compact', value: suffix});
+        if (o.style === 'percent') parts.push({type: 'percentSign', value: '%'});
+        if (o.style === 'currency' && o.currencyDisplay === 'name')
+            parts.push({type: 'literal', value: ' '},
+                       {type: 'currency', value: o.currency});
+        if (o.style === 'unit' && o.unit)
+            parts.push({type: 'literal', value: ' '}, {type: 'unit', value: o.unit});
+        return parts;
+    }
+    formatRange(a, b) { return this.format(a) + '–' + this.format(b); }
+    static supportedLocalesOf(locales) {
+        return Array.isArray(locales) ? locales.slice() : locales ? [locales] : [];
+    }
+}
+
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+    'Friday', 'Saturday'];
+class DateTimeFormat {
+    constructor(locales, options = {}) {
+        const o = Object.assign({}, options);
+        const any = ['weekday', 'era', 'year', 'month', 'day', 'hour', 'minute',
+            'second', 'fractionalSecondDigits', 'timeStyle', 'dateStyle']
+            .some(k => o[k] !== undefined);
+        if (!any) { o.year = o.month = o.day = 'numeric'; }
+        if (o.dateStyle) {
+            const s = o.dateStyle;
+            o.year = 'numeric';
+            o.month = s === 'short' ? 'numeric' : s === 'medium' ? 'short' : 'long';
+            o.day = 'numeric';
+            if (s === 'full') o.weekday = 'long';
+        }
+        if (o.timeStyle) {
+            o.hour = 'numeric';
+            o.minute = '2-digit';
+            if (o.timeStyle !== 'short') o.second = '2-digit';
+        }
+        define(this, '_o', Object.assign(o, {locale: intlLocale(locales),
+            calendar: 'gregory', numberingSystem: 'latn',
+            timeZone: o.timeZone || 'UTC'}));
+    }
+    resolvedOptions() { return Object.assign({}, this._o); }
+    format(date) {
+        return this.formatToParts(date).map(p => p.value).join('');
+    }
+    formatToParts(date) {
+        const d = date === undefined ? new Date() : new Date(date);
+        if (Number.isNaN(d.getTime())) throw new RangeError('Invalid time value');
+        const o = this._o, parts = [];
+        const utc = o.timeZone === 'UTC';
+        const get = {year: utc ? d.getUTCFullYear() : d.getFullYear(),
+            month: utc ? d.getUTCMonth() : d.getMonth(),
+            day: utc ? d.getUTCDate() : d.getDate(),
+            weekday: utc ? d.getUTCDay() : d.getDay(),
+            hour: utc ? d.getUTCHours() : d.getHours(),
+            minute: utc ? d.getUTCMinutes() : d.getMinutes(),
+            second: utc ? d.getUTCSeconds() : d.getSeconds()};
+        const two = n => String(n).padStart(2, '0');
+        const lit = v => parts.push({type: 'literal', value: v});
+        const named = o.month === 'long' || o.month === 'short'
+                   || o.month === 'narrow';
+        if (o.weekday) {
+            const w = DAY_NAMES[get.weekday];
+            parts.push({type: 'weekday', value: o.weekday === 'long' ? w
+                        : o.weekday === 'short' ? w.slice(0, 3) : w[0]});
+            if (o.month || o.day || o.year) lit(', ');
+        }
+        const month = () => {
+            const m = MONTH_NAMES[get.month];
+            parts.push({type: 'month', value: o.month === 'long' ? m
+                : o.month === 'short' ? m.slice(0, 3) : o.month === 'narrow'
+                ? m[0] : o.month === '2-digit' ? two(get.month + 1)
+                : String(get.month + 1)});
+        };
+        const day = () => parts.push({type: 'day', value: o.day === '2-digit'
+            ? two(get.day) : String(get.day)});
+        const year = () => parts.push({type: 'year', value: o.year === '2-digit'
+            ? two(get.year % 100) : String(get.year)});
+        if (named) {
+            if (o.month) month();
+            if (o.day) { if (o.month) lit(' '); day(); }
+            if (o.year) { if (o.day) lit(', '); else if (o.month) lit(' '); year(); }
+        } else {
+            const pieces = [];
+            if (o.month) pieces.push(month);
+            if (o.day) pieces.push(day);
+            if (o.year) pieces.push(year);
+            pieces.forEach((f, i) => { if (i > 0) lit('/'); f(); });
+        }
+        if (o.hour || o.minute || o.second) {
+            if (parts.length) lit(', ');
+            const h12 = o.hour12 !== false && o.hourCycle !== 'h23'
+                     && o.hourCycle !== 'h24';
+            if (o.hour) {
+                let h = get.hour;
+                if (h12) h = h % 12 || 12;
+                parts.push({type: 'hour', value: o.hour === '2-digit' || !h12
+                    ? two(h) : String(h)});
+            }
+            if (o.minute) {
+                if (o.hour) lit(':');
+                parts.push({type: 'minute', value: two(get.minute)});
+            }
+            if (o.second) {
+                if (o.hour || o.minute) lit(':');
+                parts.push({type: 'second', value: two(get.second)});
+            }
+            if (o.hour && h12) {
+                lit(' ');
+                parts.push({type: 'dayPeriod', value: get.hour < 12 ? 'AM' : 'PM'});
+            }
+            if (o.timeZoneName) { lit(' '); parts.push({type: 'timeZoneName',
+                                                        value: 'UTC'}); }
+        }
+        return parts;
+    }
+    formatRange(a, b) { return this.format(a) + ' – ' + this.format(b); }
+    static supportedLocalesOf(locales) {
+        return NumberFormat.supportedLocalesOf(locales);
+    }
+}
+
+class Collator {
+    constructor(locales, options = {}) {
+        define(this, '_o', {locale: intlLocale(locales), usage: 'sort',
+            sensitivity: options.sensitivity || 'variant',
+            ignorePunctuation: false, collation: 'default',
+            numeric: !!options.numeric, caseFirst: 'false'});
+        this.compare = this.compare.bind(this);
+    }
+    compare(a, b) {
+        a = String(a); b = String(b);
+        const o = this._o;
+        if (o.sensitivity === 'base' || o.sensitivity === 'accent') {
+            a = a.toLowerCase(); b = b.toLowerCase();
+        }
+        if (o.numeric) {
+            const re = /(\d+)|(\D+)/g;
+            const x = a.match(re) || [], y = b.match(re) || [];
+            for (let i = 0; i < Math.min(x.length, y.length); i++) {
+                const p = x[i], q = y[i];
+                if (/^\d/.test(p) && /^\d/.test(q)) {
+                    if (Number(p) !== Number(q)) return Number(p) < Number(q) ? -1 : 1;
+                } else if (p !== q) {
+                    return p.localeCompare(q);
+                }
+            }
+            return x.length - y.length;
+        }
+        const al = a.toLowerCase(), bl = b.toLowerCase();
+        if (al !== bl) return al < bl ? -1 : 1;
+        return a === b ? 0 : a < b ? 1 : -1;
+    }
+    resolvedOptions() { return Object.assign({}, this._o); }
+}
+
+class PluralRules {
+    constructor(locales, options = {}) {
+        define(this, '_o', {locale: intlLocale(locales),
+                            type: options.type || 'cardinal'});
+    }
+    select(n) {
+        n = Number(n);
+        if (this._o.type === 'ordinal') {
+            const ten = n % 10, hundred = n % 100;
+            if (ten === 1 && hundred !== 11) return 'one';
+            if (ten === 2 && hundred !== 12) return 'two';
+            if (ten === 3 && hundred !== 13) return 'few';
+            return 'other';
+        }
+        return n === 1 ? 'one' : 'other';
+    }
+    resolvedOptions() {
+        return Object.assign({pluralCategories: this._o.type === 'ordinal'
+            ? ['few', 'one', 'two', 'other'] : ['one', 'other']}, this._o);
+    }
+}
+
+class RelativeTimeFormat {
+    constructor(locales, options = {}) {
+        define(this, '_o', {locale: intlLocale(locales),
+            style: options.style || 'long', numeric: options.numeric || 'always',
+            numberingSystem: 'latn'});
+    }
+    format(value, unit) {
+        value = Number(value);
+        unit = String(unit).replace(/s$/, '');
+        const units = ['second', 'minute', 'hour', 'day', 'week', 'month',
+                       'quarter', 'year'];
+        if (!units.includes(unit)) throw new RangeError('Invalid unit argument');
+        if (this._o.numeric === 'auto') {
+            if (value === 0) return unit === 'day' ? 'today'
+                : unit === 'second' ? 'now' : 'this ' + unit;
+            if (value === 1 && unit === 'day') return 'tomorrow';
+            if (value === -1 && unit === 'day') return 'yesterday';
+            if (Math.abs(value) === 1 && unit !== 'second'
+                && unit !== 'minute' && unit !== 'hour')
+                return (value > 0 ? 'next ' : 'last ') + unit;
+        }
+        const n = Math.abs(value);
+        const text = new NumberFormat().format(n) + ' ' + unit
+            + (n === 1 ? '' : 's');
+        return value < 0 || Object.is(value, -0) ? text + ' ago' : 'in ' + text;
+    }
+    formatToParts(value, unit) {
+        return [{type: 'literal', value: this.format(value, unit)}];
+    }
+    resolvedOptions() { return Object.assign({}, this._o); }
+}
+
+class ListFormat {
+    constructor(locales, options = {}) {
+        define(this, '_o', {locale: intlLocale(locales),
+            type: options.type || 'conjunction', style: options.style || 'long'});
+    }
+    format(list) {
+        const items = Array.from(list, String);
+        const word = this._o.type === 'disjunction' ? 'or'
+            : this._o.type === 'unit' ? '' : 'and';
+        if (items.length < 2) return items.join('');
+        if (items.length === 2)
+            return word ? items[0] + ' ' + word + ' ' + items[1]
+                        : items.join(', ');
+        return items.slice(0, -1).join(', ') + ',' + (word ? ' ' + word : '')
+            + ' ' + items[items.length - 1];
+    }
+}
+
+class Segmenter {
+    constructor(locales, options = {}) {
+        define(this, '_o', {locale: intlLocale(locales),
+                            granularity: options.granularity || 'grapheme'});
+    }
+    segment(text) {
+        text = String(text);
+        const granularity = this._o.granularity;
+        const pieces = granularity === 'word'
+            ? text.match(/\w+|\s+|[^\w\s]/gu) || []
+            : granularity === 'sentence'
+            ? text.match(/[^.!?]+[.!?]*\s*/g) || []
+            : Array.from(text);
+        let index = 0;
+        const list = pieces.map(segment => {
+            const item = {segment, index, input: text};
+            if (granularity === 'word') item.isWordLike = /\w/.test(segment);
+            index += segment.length;
+            return item;
+        });
+        list.containing = i => list.find(s => i >= s.index
+            && i < s.index + s.segment.length);
+        return list;
+    }
+}
+
+class Locale {
+    constructor(tag) {
+        const t = String(tag);
+        const [language, region] = t.split(/[-_]/);
+        Object.assign(this, {baseName: t, language, region, script: undefined,
+                             calendar: undefined, numberingSystem: undefined});
+    }
+    toString() { return this.baseName; }
+    maximize() { return this; }
+    minimize() { return this; }
+}
+
+const Intl = {NumberFormat, DateTimeFormat, Collator, PluralRules,
+    RelativeTimeFormat, ListFormat, Segmenter, Locale,
+    DisplayNames: class DisplayNames {
+        constructor(locales, options = {}) { this._type = options.type; }
+        of(code) { return String(code); }
+    },
+    getCanonicalLocales: locales => NumberFormat.supportedLocalesOf(locales),
+    supportedValuesOf: () => []};
+Number.prototype.toLocaleString = function (locales, options) {
+    return new NumberFormat(locales, options).format(Number(this));
+};
+Date.prototype.toLocaleDateString = function (locales, options = {}) {
+    return new DateTimeFormat(locales, Object.assign({}, options,
+        options.year || options.month || options.day || options.weekday
+            ? {} : {year: 'numeric', month: 'numeric', day: 'numeric'}))
+        .format(this);
+};
+Date.prototype.toLocaleTimeString = function (locales, options = {}) {
+    return new DateTimeFormat(locales, Object.assign({}, options,
+        options.hour || options.minute ? {} : {hour: 'numeric',
+            minute: '2-digit', second: '2-digit'})).format(this);
+};
+Date.prototype.toLocaleString = function (locales, options) {
+    return new DateTimeFormat(locales, options || {year: 'numeric',
+        month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit',
+        second: '2-digit'}).format(this);
+};
+/* ------------------------------------------------------------- canvas */
+
+/* N.cv(node, op, ...): the operations of canvas.c. */
+const CV = {SIZE: 0, RESET: 1, SAVE: 2, RESTORE: 3, TRANSFORM: 4,
+    SET_TRANSFORM: 5, GET_TRANSFORM: 6, BEGIN: 7, MOVE: 8, LINE: 9, QUAD: 10,
+    CUBIC: 11, ARC: 12, ARC_TO: 13, ELLIPSE: 14, RECT: 15, CLOSE: 16,
+    FILL: 17, STROKE: 18, CLIP: 19, FILL_RECT: 20, STROKE_RECT: 21,
+    CLEAR_RECT: 22, STYLE: 23, GRADIENT: 24, PATTERN: 25, LINE_WIDTH: 26,
+    CAP: 27, JOIN: 28, MITER: 29, ALPHA: 30, COMPOSITE: 31, FONT: 32,
+    ALIGN: 33, BASELINE: 34, DASH: 35, DASH_OFFSET: 36, SMOOTHING: 37,
+    FILL_TEXT: 38, STROKE_TEXT: 39, MEASURE: 40, DRAW_IMAGE: 41,
+    GET_IMAGE_DATA: 42, PUT_IMAGE_DATA: 43, TO_DATA_URL: 44, IN_PATH: 45,
+    IN_STROKE: 46, IMAGE_SIZE: 47, LOAD_IMAGE: 48};
+const CAPS = ['butt', 'round', 'square'];
+const JOINS = ['miter', 'round', 'bevel'];
+const ALIGNS = ['start', 'end', 'left', 'right', 'center'];
+const BASELINES = ['alphabetic', 'top', 'hanging', 'middle', 'ideographic',
+                   'bottom'];
+const COMPOSITES = ['source-over', 'source-in', 'source-out', 'source-atop',
+    'destination-over', 'destination-in', 'destination-out',
+    'destination-atop', 'lighter', 'copy', 'xor'];
+/* Blend modes are accepted and drawn as source-over. */
+const BLENDS = ['multiply', 'screen', 'overlay', 'darken', 'lighten',
+    'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'difference',
+    'exclusion', 'hue', 'saturation', 'color', 'luminosity'];
+
+function colourText(packed) {
+    const a = Math.floor(packed / 16777216), rgb = packed % 16777216;
+    if (a === 255) return '#' + rgb.toString(16).padStart(6, '0');
+    /* The shortest decimal that is the same 8-bit alpha (128 is 0.5). */
+    let alpha = a / 255;
+    for (const digits of [1, 2, 3]) {
+        const f = 10 ** digits, d = Math.round(a / 255 * f) / f;
+        if (Math.round(d * 255) === a) { alpha = d; break; }
+    }
+    return 'rgba(' + (rgb >> 16) + ', ' + ((rgb >> 8) & 255) + ', '
+        + (rgb & 255) + ', ' + String(alpha) + ')';
+}
+const finiteAll = (...v) => v.every(Number.isFinite);
+
+class CanvasGradient {
+    constructor() { illegal(); }
+    addColorStop(offset, colour) {
+        offset = Number(offset);
+        if (!(offset >= 0 && offset <= 1))
+            throw new DOMException('Offset out of range', 'IndexSizeError');
+        if (N.cv(this._canvas, CV.STYLE, 2, String(colour)) === null)
+            throw new DOMException('Not a colour', 'SyntaxError');
+        this._stops.push(offset, String(colour));
+    }
+}
+function makeGradient(canvas, kind, values) {
+    const g = Object.create(CanvasGradient.prototype);
+    define(g, '_canvas', canvas);
+    define(g, '_kind', kind);
+    define(g, '_values', values);
+    define(g, '_stops', []);
+    return g;
+}
+class CanvasPattern {
+    constructor() { illegal(); }
+    setTransform() {}
+}
+
+class ImageData {
+    constructor(a, b, c, settings) {
+        let data, width, height;
+        if (a instanceof Uint8ClampedArray) {
+            data = a;
+            width = b >>> 0;
+            if (width === 0 || data.length % 4 !== 0
+                || (data.length / 4) % width !== 0)
+                throw new DOMException('Bad ImageData size', 'IndexSizeError');
+            height = c === undefined ? data.length / 4 / width : c >>> 0;
+            if (height * width * 4 !== data.length)
+                throw new DOMException('Bad ImageData size', 'IndexSizeError');
+        } else {
+            width = a >>> 0;
+            height = b >>> 0;
+            if (width === 0 || height === 0)
+                throw new DOMException('Bad ImageData size', 'IndexSizeError');
+            data = new Uint8ClampedArray(width * height * 4);
+        }
+        define(this, 'data', data);
+        define(this, 'width', width);
+        define(this, 'height', height);
+        this.colorSpace = 'srgb';
+    }
+}
+
+class TextMetrics {
+    constructor() { illegal(); }
+}
+
+class DOMMatrixReadOnly {
+    constructor(init) {
+        let m = [1, 0, 0, 1, 0, 0];
+        if (Array.isArray(init) && init.length === 6) m = init.map(Number);
+        else if (Array.isArray(init) && init.length === 16)
+            m = [init[0], init[1], init[4], init[5], init[12], init[13]]
+                .map(Number);
+        else if (init && typeof init === 'object')
+            m = ['a', 'b', 'c', 'd', 'e', 'f'].map(k => Number(init[k] ?? (
+                k === 'a' || k === 'd' ? 1 : 0)));
+        [this.a, this.b, this.c, this.d, this.e, this.f] = m;
+    }
+    get m11() { return this.a; }
+    get m12() { return this.b; }
+    get m21() { return this.c; }
+    get m22() { return this.d; }
+    get m41() { return this.e; }
+    get m42() { return this.f; }
+    get is2D() { return true; }
+    get isIdentity() {
+        return this.a === 1 && this.b === 0 && this.c === 0 && this.d === 1
+            && this.e === 0 && this.f === 0;
+    }
+    multiply(o) {
+        const n = new DOMMatrix(o);
+        return new DOMMatrix([
+            this.a * n.a + this.c * n.b, this.b * n.a + this.d * n.b,
+            this.a * n.c + this.c * n.d, this.b * n.c + this.d * n.d,
+            this.a * n.e + this.c * n.f + this.e,
+            this.b * n.e + this.d * n.f + this.f]);
+    }
+    translate(x = 0, y = 0) { return this.multiply([1, 0, 0, 1, x, y]); }
+    scale(x = 1, y = x) { return this.multiply([x, 0, 0, y, 0, 0]); }
+    rotate(degrees = 0) {
+        const r = degrees * Math.PI / 180;
+        return this.multiply([Math.cos(r), Math.sin(r), -Math.sin(r),
+                              Math.cos(r), 0, 0]);
+    }
+    inverse() {
+        const det = this.a * this.d - this.b * this.c;
+        if (det === 0) return new DOMMatrix([NaN, NaN, NaN, NaN, NaN, NaN]);
+        return new DOMMatrix([this.d / det, -this.b / det, -this.c / det,
+            this.a / det, (this.c * this.f - this.d * this.e) / det,
+            (this.b * this.e - this.a * this.f) / det]);
+    }
+    transformPoint(p = {}) {
+        const x = p.x || 0, y = p.y || 0;
+        return {x: this.a * x + this.c * y + this.e,
+                y: this.b * x + this.d * y + this.f, z: 0, w: 1};
+    }
+    toString() {
+        return 'matrix(' + [this.a, this.b, this.c, this.d, this.e, this.f]
+            .join(', ') + ')';
+    }
+}
+class DOMMatrix extends DOMMatrixReadOnly {}
+
+/* Path2D: the operations, replayed into a context's path when used. */
+class Path2D {
+    constructor(init) {
+        define(this, '_ops', []);
+        if (init instanceof Path2D) this._ops.push(...init._ops);
+        else if (typeof init === 'string') svgPathOps(init, this._ops);
+    }
+    addPath(path) {
+        if (path instanceof Path2D) this._ops.push(...path._ops);
+    }
+}
+const PATH_METHODS = {moveTo: CV.MOVE, lineTo: CV.LINE,
+    quadraticCurveTo: CV.QUAD, bezierCurveTo: CV.CUBIC, arc: CV.ARC,
+    arcTo: CV.ARC_TO, ellipse: CV.ELLIPSE, rect: CV.RECT,
+    closePath: CV.CLOSE};
+for (const [name, op] of Object.entries(PATH_METHODS))
+    Path2D.prototype[name] = function (...args) {
+        const item = [op, ...args.map(Number)];
+        if (op === CV.ARC) item[6] = !!args[5];
+        if (op === CV.ELLIPSE) item[8] = !!args[7];
+        this._ops.push(item);
+    };
+Path2D.prototype.roundRect = function (...args) {
+    roundRectOps(this._ops, ...args);
+};
+
+/* SVG path data ("M 10 10 L 20 20 ...") as path operations. */
+function svgPathOps(d, ops) {
+    const tokens = String(d).match(
+        /[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g)
+        || [];
+    let i = 0, command = '', x = 0, y = 0, sx = 0, sy = 0;
+    let cx = 0, cy = 0, qx = 0, qy = 0, last = '';
+    const num = () => Number(tokens[i++]);
+    const more = () => i < tokens.length && !/[A-Za-z]/.test(tokens[i]);
+    while (i < tokens.length) {
+        if (/[A-Za-z]/.test(tokens[i])) command = tokens[i++];
+        else if (!command) return;
+        if (command.toUpperCase() !== 'Z' && !more()) return;
+        const rel = command === command.toLowerCase();
+        const ox = rel ? x : 0, oy = rel ? y : 0;
+        switch (command.toUpperCase()) {
+        case 'M':
+            x = ox + num(); y = oy + num(); sx = x; sy = y;
+            ops.push([CV.MOVE, x, y]);
+            command = rel ? 'l' : 'L';
+            break;
+        case 'L': x = ox + num(); y = oy + num(); ops.push([CV.LINE, x, y]);
+            break;
+        case 'H': x = ox + num(); ops.push([CV.LINE, x, y]); break;
+        case 'V': y = oy + num(); ops.push([CV.LINE, x, y]); break;
+        case 'C': {
+            const x1 = ox + num(), y1 = oy + num();
+            cx = ox + num(); cy = oy + num();
+            x = ox + num(); y = oy + num();
+            ops.push([CV.CUBIC, x1, y1, cx, cy, x, y]);
+            break;
+        }
+        case 'S': {
+            const x1 = /[CS]/i.test(last) ? 2 * x - cx : x;
+            const y1 = /[CS]/i.test(last) ? 2 * y - cy : y;
+            cx = ox + num(); cy = oy + num();
+            x = ox + num(); y = oy + num();
+            ops.push([CV.CUBIC, x1, y1, cx, cy, x, y]);
+            break;
+        }
+        case 'Q':
+            qx = ox + num(); qy = oy + num();
+            x = ox + num(); y = oy + num();
+            ops.push([CV.QUAD, qx, qy, x, y]);
+            break;
+        case 'T':
+            qx = /[QT]/i.test(last) ? 2 * x - qx : x;
+            qy = /[QT]/i.test(last) ? 2 * y - qy : y;
+            x = ox + num(); y = oy + num();
+            ops.push([CV.QUAD, qx, qy, x, y]);
+            break;
+        case 'A': {
+            let rx = Math.abs(num()), ry = Math.abs(num());
+            const phi = num() * Math.PI / 180, large = num() !== 0,
+                  sweep = num() !== 0;
+            const x2 = ox + num(), y2 = oy + num();
+            if (rx === 0 || ry === 0) { ops.push([CV.LINE, x2, y2]); }
+            else {
+                /* Endpoint to centre form (SVG implementation notes). */
+                const cp = Math.cos(phi), sp = Math.sin(phi);
+                const hx = (x - x2) / 2, hy = (y - y2) / 2;
+                const x1p = cp * hx + sp * hy, y1p = -sp * hx + cp * hy;
+                const lambda = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+                if (lambda > 1) { rx *= Math.sqrt(lambda); ry *= Math.sqrt(lambda); }
+                const num2 = rx * rx * ry * ry - rx * rx * y1p * y1p
+                           - ry * ry * x1p * x1p;
+                const den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+                let k = den > 0 && num2 > 0 ? Math.sqrt(num2 / den) : 0;
+                if (large === sweep) k = -k;
+                const cxp = k * rx * y1p / ry, cyp = -k * ry * x1p / rx;
+                const ccx = cp * cxp - sp * cyp + (x + x2) / 2;
+                const ccy = sp * cxp + cp * cyp + (y + y2) / 2;
+                const a0 = Math.atan2((y1p - cyp) / ry, (x1p - cxp) / rx);
+                const a1 = Math.atan2((-y1p - cyp) / ry, (-x1p - cxp) / rx);
+                ops.push([CV.ELLIPSE, ccx, ccy, rx, ry, phi, a0, a1, !sweep]);
+            }
+            x = x2; y = y2;
+            break;
+        }
+        case 'Z':
+            ops.push([CV.CLOSE]);
+            x = sx; y = sy;
+            last = command;
+            command = ''; /* numbers after Z end the data */
+            continue;
+        default:
+            return;
+        }
+        last = command;
+    }
+}
+
+function roundRectOps(ops, x, y, w, h, radii = 0) {
+    [x, y, w, h] = [x, y, w, h].map(Number);
+    if (!finiteAll(x, y, w, h)) return;
+    let list = Array.isArray(radii) ? radii : [radii];
+    if (list.length < 1 || list.length > 4)
+        throw new RangeError('roundRect: 1 to 4 radii');
+    list = list.map(r => typeof r === 'object' && r !== null
+        ? Number(r.x) || 0 : Number(r));
+    if (list.some(r => r < 0)) throw new RangeError('roundRect: negative radius');
+    const [tl, tr, br, bl] = list.length === 1 ? [list[0], list[0], list[0], list[0]]
+        : list.length === 2 ? [list[0], list[1], list[0], list[1]]
+        : list.length === 3 ? [list[0], list[1], list[2], list[1]] : list;
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+    const scale = Math.min(1, w / (tl + tr || 1), w / (bl + br || 1),
+                           h / (tl + bl || 1), h / (tr + br || 1));
+    const [a, b, c, d] = [tl, tr, br, bl].map(r => r * scale);
+    const P = Math.PI;
+    ops.push([CV.MOVE, x + a, y], [CV.LINE, x + w - b, y],
+             [CV.ARC, x + w - b, y + b, b, -P / 2, 0],
+             [CV.LINE, x + w, y + h - c], [CV.ARC, x + w - c, y + h - c, c, 0, P / 2],
+             [CV.LINE, x + d, y + h], [CV.ARC, x + d, y + h - d, d, P / 2, P],
+             [CV.LINE, x, y + a], [CV.ARC, x + a, y + a, a, P, 3 * P / 2],
+             [CV.CLOSE], [CV.MOVE, x, y]);
+}
+
+function canvasDefaults() {
+    return {fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1,
+        lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, globalAlpha: 1,
+        globalCompositeOperation: 'source-over', font: '10px sans-serif',
+        textAlign: 'start', textBaseline: 'alphabetic', direction: 'inherit',
+        lineDash: [], lineDashOffset: 0, imageSmoothingEnabled: true,
+        imageSmoothingQuality: 'low', shadowColor: 'rgba(0, 0, 0, 0)',
+        shadowBlur: 0, shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none',
+        letterSpacing: '0px', wordSpacing: '0px', fontKerning: 'auto',
+        fontStretch: 'normal', fontVariantCaps: 'normal',
+        textRendering: 'auto'};
+}
+
+class CanvasRenderingContext2D {
+    constructor() { illegal(); }
+    get canvas() { return this._canvas; }
+    _do(op, ...args) { return N.cv(this._canvas, op, ...args); }
+    /* The path also stays in JavaScript, to put it back after a Path2D
+       was drawn. */
+    _path(op, ...args) {
+        this._ops.push([op, ...args]);
+        return this._do(op, ...args);
+    }
+    _with(path, fn) {
+        if (!(path instanceof Path2D)) return fn();
+        this._do(CV.BEGIN);
+        for (const op of path._ops) this._do(...op);
+        try { return fn(); }
+        finally {
+            this._do(CV.BEGIN);
+            for (const op of this._ops) this._do(...op);
+        }
+    }
+    save() {
+        this._stack.push(Object.assign({}, this._state));
+        this._do(CV.SAVE);
+    }
+    restore() {
+        if (this._stack.length === 0) return;
+        this._state = this._stack.pop();
+        this._do(CV.RESTORE);
+    }
+    reset() {
+        this._do(CV.RESET);
+        this._state = canvasDefaults();
+        this._stack = [];
+        this._ops = [];
+    }
+    isContextLost() { return false; }
+    getContextAttributes() {
+        return {alpha: true, colorSpace: 'srgb', desynchronized: false,
+                willReadFrequently: false};
+    }
+    /* transforms */
+    transform(a, b, c, d, e, f) {
+        if (finiteAll(a, b, c, d, e, f)) this._do(CV.TRANSFORM, a, b, c, d, e, f);
+    }
+    setTransform(a, b, c, d, e, f) {
+        if (a === undefined) return this.resetTransform();
+        if (typeof a === 'object') {
+            const m = new DOMMatrix(a);
+            return this._do(CV.SET_TRANSFORM, m.a, m.b, m.c, m.d, m.e, m.f);
+        }
+        if (finiteAll(a, b, c, d, e, f))
+            this._do(CV.SET_TRANSFORM, a, b, c, d, e, f);
+    }
+    getTransform() { return new DOMMatrix(this._do(CV.GET_TRANSFORM)); }
+    resetTransform() { this._do(CV.SET_TRANSFORM, 1, 0, 0, 1, 0, 0); }
+    translate(x, y) { this.transform(1, 0, 0, 1, x, y); }
+    scale(x, y) { this.transform(x, 0, 0, y, 0, 0); }
+    rotate(angle) {
+        if (!Number.isFinite(angle)) return;
+        const c = Math.cos(angle), s = Math.sin(angle);
+        this.transform(c, s, -s, c, 0, 0);
+    }
+    /* paths */
+    beginPath() { this._ops = []; this._do(CV.BEGIN); }
+    moveTo(x, y) { this._path(CV.MOVE, +x, +y); }
+    lineTo(x, y) { this._path(CV.LINE, +x, +y); }
+    quadraticCurveTo(a, b, x, y) { this._path(CV.QUAD, +a, +b, +x, +y); }
+    bezierCurveTo(a, b, c, d, x, y) {
+        this._path(CV.CUBIC, +a, +b, +c, +d, +x, +y);
+    }
+    arc(x, y, r, a0, a1, ccw = false) {
+        this._path(CV.ARC, +x, +y, +r, +a0, +a1, !!ccw);
+    }
+    arcTo(a, b, c, d, r) { this._path(CV.ARC_TO, +a, +b, +c, +d, +r); }
+    ellipse(x, y, rx, ry, rotation, a0, a1, ccw = false) {
+        this._path(CV.ELLIPSE, +x, +y, +rx, +ry, +rotation, +a0, +a1, !!ccw);
+    }
+    rect(x, y, w, h) { this._path(CV.RECT, +x, +y, +w, +h); }
+    roundRect(...args) {
+        const ops = [];
+        roundRectOps(ops, ...args);
+        for (const op of ops) this._path(...op);
+    }
+    closePath() { this._path(CV.CLOSE); }
+    fill(a, b) {
+        const path = a instanceof Path2D ? a : null;
+        const rule = path ? b : a;
+        this._with(path, () => this._do(CV.FILL, rule === 'evenodd'));
+    }
+    stroke(path) { this._with(path, () => this._do(CV.STROKE)); }
+    clip(a, b) {
+        const path = a instanceof Path2D ? a : null;
+        const rule = path ? b : a;
+        this._with(path, () => this._do(CV.CLIP, rule === 'evenodd'));
+    }
+    isPointInPath(a, b, c, d) {
+        const path = a instanceof Path2D ? a : null;
+        const [x, y, rule] = path ? [b, c, d] : [a, b, c];
+        return this._with(path, () =>
+            this._do(CV.IN_PATH, +x, +y, rule === 'evenodd'));
+    }
+    isPointInStroke(a, b, c) {
+        const path = a instanceof Path2D ? a : null;
+        const [x, y] = path ? [b, c] : [a, b];
+        return this._with(path, () => this._do(CV.IN_STROKE, +x, +y));
+    }
+    fillRect(x, y, w, h) { this._do(CV.FILL_RECT, +x, +y, +w, +h); }
+    strokeRect(x, y, w, h) { this._do(CV.STROKE_RECT, +x, +y, +w, +h); }
+    clearRect(x, y, w, h) { this._do(CV.CLEAR_RECT, +x, +y, +w, +h); }
+    /* styles */
+    _paint(which, value) {
+        if (typeof value === 'string') {
+            const packed = this._do(CV.STYLE, which, value);
+            return packed === null ? null : colourText(packed);
+        }
+        if (value instanceof CanvasGradient) {
+            this._do(CV.GRADIENT, which, value._kind, ...value._values,
+                     value._stops);
+            return value;
+        }
+        if (value instanceof CanvasPattern) {
+            return this._do(CV.PATTERN, which, value._source,
+                            value._repetition) ? value : null;
+        }
+        return null;
+    }
+    get fillStyle() { return this._state.fillStyle; }
+    set fillStyle(v) {
+        const set = this._paint(0, v);
+        if (set !== null) this._state.fillStyle = set;
+    }
+    get strokeStyle() { return this._state.strokeStyle; }
+    set strokeStyle(v) {
+        const set = this._paint(1, v);
+        if (set !== null) this._state.strokeStyle = set;
+    }
+    createLinearGradient(x0, y0, x1, y1) {
+        if (!finiteAll(+x0, +y0, +x1, +y1)) throw new TypeError('not finite');
+        return makeGradient(this._canvas, 0, [+x0, +y0, 0, +x1, +y1, 0]);
+    }
+    createRadialGradient(x0, y0, r0, x1, y1, r1) {
+        if (!finiteAll(+x0, +y0, +r0, +x1, +y1, +r1))
+            throw new TypeError('not finite');
+        if (r0 < 0 || r1 < 0)
+            throw new DOMException('Negative radius', 'IndexSizeError');
+        return makeGradient(this._canvas, 1, [+x0, +y0, +r0, +x1, +y1, +r1]);
+    }
+    createConicGradient(angle, x, y) {
+        return makeGradient(this._canvas, 2, [+x, +y, +angle, 0, 0, 0]);
+    }
+    createPattern(image, repetition) {
+        const source = imageSource(image);
+        if (source === null) return null;
+        repetition = repetition === null || repetition === undefined
+            ? 'repeat' : String(repetition);
+        if (!['repeat', 'repeat-x', 'repeat-y', 'no-repeat', '']
+                .includes(repetition))
+            throw new DOMException('Bad repetition', 'SyntaxError');
+        const p = Object.create(CanvasPattern.prototype);
+        define(p, '_source', source);
+        define(p, '_repetition', repetition);
+        return p;
+    }
+    get lineWidth() { return this._state.lineWidth; }
+    set lineWidth(v) {
+        v = Number(v);
+        if (v > 0 && Number.isFinite(v)) {
+            this._state.lineWidth = v;
+            this._do(CV.LINE_WIDTH, v);
+        }
+    }
+    get lineCap() { return this._state.lineCap; }
+    set lineCap(v) {
+        const i = CAPS.indexOf(String(v));
+        if (i >= 0) { this._state.lineCap = CAPS[i]; this._do(CV.CAP, i); }
+    }
+    get lineJoin() { return this._state.lineJoin; }
+    set lineJoin(v) {
+        const i = JOINS.indexOf(String(v));
+        if (i >= 0) { this._state.lineJoin = JOINS[i]; this._do(CV.JOIN, i); }
+    }
+    get miterLimit() { return this._state.miterLimit; }
+    set miterLimit(v) {
+        v = Number(v);
+        if (v > 0 && Number.isFinite(v)) {
+            this._state.miterLimit = v;
+            this._do(CV.MITER, v);
+        }
+    }
+    get globalAlpha() { return this._state.globalAlpha; }
+    set globalAlpha(v) {
+        v = Number(v);
+        if (v >= 0 && v <= 1) {
+            this._state.globalAlpha = v;
+            this._do(CV.ALPHA, v);
+        }
+    }
+    get globalCompositeOperation() {
+        return this._state.globalCompositeOperation;
+    }
+    set globalCompositeOperation(v) {
+        v = String(v);
+        const i = COMPOSITES.indexOf(v);
+        if (i < 0 && !BLENDS.includes(v)) return;
+        this._state.globalCompositeOperation = v;
+        this._do(CV.COMPOSITE, i < 0 ? 0 : i);
+    }
+    get font() { return this._state.font; }
+    set font(v) {
+        v = String(v);
+        if (!/\d(px|pt|em|rem|%)?/.test(v)) return;
+        this._state.font = v;
+        this._do(CV.FONT, v);
+    }
+    get textAlign() { return this._state.textAlign; }
+    set textAlign(v) {
+        const i = ALIGNS.indexOf(String(v));
+        if (i >= 0) { this._state.textAlign = ALIGNS[i]; this._do(CV.ALIGN, i); }
+    }
+    get textBaseline() { return this._state.textBaseline; }
+    set textBaseline(v) {
+        const i = BASELINES.indexOf(String(v));
+        if (i >= 0) {
+            this._state.textBaseline = BASELINES[i];
+            this._do(CV.BASELINE, i);
+        }
+    }
+    setLineDash(list) {
+        list = Array.from(list, Number);
+        if (list.some(v => !(v >= 0) || !Number.isFinite(v))) return;
+        if (list.length % 2 === 1) list = list.concat(list);
+        this._state.lineDash = list;
+        this._do(CV.DASH, list);
+    }
+    getLineDash() { return this._state.lineDash.slice(); }
+    get lineDashOffset() { return this._state.lineDashOffset; }
+    set lineDashOffset(v) {
+        v = Number(v);
+        if (Number.isFinite(v)) {
+            this._state.lineDashOffset = v;
+            this._do(CV.DASH_OFFSET, v);
+        }
+    }
+    get imageSmoothingEnabled() { return this._state.imageSmoothingEnabled; }
+    set imageSmoothingEnabled(v) {
+        this._state.imageSmoothingEnabled = !!v;
+        this._do(CV.SMOOTHING, !!v);
+    }
+    /* text */
+    fillText(text, x, y, maxWidth) {
+        this._do(CV.FILL_TEXT, String(text), +x, +y,
+                 maxWidth === undefined ? undefined : +maxWidth);
+    }
+    strokeText(text, x, y, maxWidth) {
+        this._do(CV.STROKE_TEXT, String(text), +x, +y,
+                 maxWidth === undefined ? undefined : +maxWidth);
+    }
+    measureText(text) {
+        const [width, ascent, descent] = this._do(CV.MEASURE, String(text));
+        const m = Object.create(TextMetrics.prototype);
+        Object.assign(m, {width, actualBoundingBoxLeft: 0,
+            actualBoundingBoxRight: width, actualBoundingBoxAscent: ascent,
+            actualBoundingBoxDescent: descent, fontBoundingBoxAscent: ascent,
+            fontBoundingBoxDescent: descent, emHeightAscent: ascent,
+            emHeightDescent: descent, hangingBaseline: ascent * 0.8,
+            alphabeticBaseline: 0, ideographicBaseline: -descent});
+        return m;
+    }
+    /* images */
+    drawImage(image, ...a) {
+        const source = imageSource(image);
+        if (source === null) return;
+        const size = N.cv(source, CV.IMAGE_SIZE);
+        if (size === null) return;
+        let sx = 0, sy = 0, [sw, sh] = size, dx, dy, dw = sw, dh = sh;
+        if (a.length === 2) [dx, dy] = a;
+        else if (a.length === 4) [dx, dy, dw, dh] = a;
+        else if (a.length === 8) [sx, sy, sw, sh, dx, dy, dw, dh] = a;
+        else throw new TypeError('drawImage: wrong number of arguments');
+        [sx, sy, sw, sh, dx, dy, dw, dh] =
+            [sx, sy, sw, sh, dx, dy, dw, dh].map(Number);
+        if (!finiteAll(sx, sy, sw, sh, dx, dy, dw, dh)) return;
+        if (sw < 0) { sx += sw; sw = -sw; }
+        if (sh < 0) { sy += sh; sh = -sh; }
+        if (dw < 0) { dx += dw; dw = -dw; }
+        if (dh < 0) { dy += dh; dh = -dh; }
+        this._do(CV.DRAW_IMAGE, source, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+    createImageData(a, b) {
+        if (a instanceof ImageData) return new ImageData(a.width, a.height);
+        return new ImageData(Math.abs(a), Math.abs(b));
+    }
+    getImageData(x, y, w, h) {
+        [x, y, w, h] = [x, y, w, h].map(Number);
+        if (w === 0 || h === 0)
+            throw new DOMException('Zero size', 'IndexSizeError');
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        const buffer = this._do(CV.GET_IMAGE_DATA, x, y, w, h);
+        if (buffer === null)
+            throw new DOMException('The canvas has been tainted by '
+                                   + 'cross-origin data.', 'SecurityError');
+        return new ImageData(new Uint8ClampedArray(buffer), w, h);
+    }
+    putImageData(data, dx, dy, x = 0, y = 0, w = data.width, h = data.height) {
+        if (!(data instanceof ImageData)) throw new TypeError('not ImageData');
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        const bytes = data.data;
+        const buffer = bytes.byteOffset === 0
+            && bytes.byteLength === bytes.buffer.byteLength
+            ? bytes.buffer : bytes.slice().buffer;
+        this._do(CV.PUT_IMAGE_DATA, buffer, data.width, data.height,
+                 +dx, +dy, +x, +y, +w, +h);
+    }
+    /* shadows and filters are kept but not drawn */
+}
+for (const name of ['direction', 'imageSmoothingQuality', 'shadowColor',
+        'shadowBlur', 'shadowOffsetX', 'shadowOffsetY', 'filter',
+        'letterSpacing', 'wordSpacing', 'fontKerning', 'fontStretch',
+        'fontVariantCaps', 'textRendering'])
+    Object.defineProperty(CanvasRenderingContext2D.prototype, name, {
+        get() { return this._state[name]; },
+        set(v) { this._state[name] = typeof this._state[name] === 'number'
+            ? Number(v) : String(v); },
+        configurable: true});
+
+/* What drawImage and createPattern take: <img>, <canvas>, ImageBitmap
+   (made from those) or ImageData (through a canvas of its own). */
+function imageSource(image) {
+    if (image instanceof ImageBitmap) return image._source;
+    if (image instanceof HTMLElement) {
+        const name = N.name(image);
+        if (name === 'img' || name === 'canvas') return image;
+        if (name === 'video') return null;
+    }
+    if (image && image._canvasImage) return image._canvasImage;
+    throw new TypeError('Not an image');
+}
+
+class ImageBitmap {
+    constructor() { illegal(); }
+    close() {}
+}
+function createImageBitmap(image, ...rest) {
+    return new Promise((resolve, reject) => {
+        let source;
+        if (image instanceof ImageData) {
+            source = document.createElement('canvas');
+            source.width = image.width;
+            source.height = image.height;
+            source.getContext('2d').putImageData(image, 0, 0);
+        } else if (image instanceof Blob) {
+            source = new Image();
+            source.onload = () => done();
+            source.onerror = () => reject(new DOMException(
+                'The image could not be decoded', 'InvalidStateError'));
+            image.arrayBuffer().then(b => {
+                source.src = 'data:' + (image.type || 'image/png')
+                    + ';base64,' + G.btoa(Array.from(new Uint8Array(b),
+                        c => String.fromCharCode(c)).join(''));
+            });
+            return;
+        } else {
+            try { source = imageSource(image); } catch (e) { reject(e); return; }
+        }
+        done();
+        function done() {
+            const size = N.cv(source, CV.IMAGE_SIZE);
+            if (size === null) {
+                reject(new DOMException('The image is not loaded',
+                                        'InvalidStateError'));
+                return;
+            }
+            let bitmap = source;
+            if (rest.length >= 4) {
+                const [sx, sy, sw, sh] = rest;
+                bitmap = document.createElement('canvas');
+                bitmap.width = Math.abs(sw);
+                bitmap.height = Math.abs(sh);
+                bitmap.getContext('2d').drawImage(source, sx, sy, sw, sh, 0, 0,
+                                                  Math.abs(sw), Math.abs(sh));
+            }
+            const b = Object.create(ImageBitmap.prototype);
+            define(b, '_source', bitmap);
+            const [w, h] = N.cv(bitmap, CV.IMAGE_SIZE) || size;
+            define(b, 'width', w);
+            define(b, 'height', h);
+            resolve(b);
+        }
+    });
+}
+
+/* <canvas> */
+const canvasProto = G.HTMLCanvasElement.prototype;
+for (const [name, fallback] of [['width', 300], ['height', 150]])
+    Object.defineProperty(canvasProto, name, {
+        get() {
+            const v = /^\s*(\d+)/.exec(N.attr(this, name) || '');
+            return v ? Number(v[1]) : fallback;
+        },
+        set(v) {
+            v = Number(v);
+            N.setAttr(this, name, String(v >= 0 ? Math.floor(v) : fallback));
+            canvasReset(this);
+        },
+        configurable: true});
+function canvasReset(canvas) {
+    const context = canvasContexts.get(canvas);
+    if (context) context.reset();
+    else N.cv(canvas, CV.RESET);
+}
+const canvasContexts = new WeakMap();
+canvasProto.getContext = function (type) {
+    if (String(type) !== '2d') return null;
+    let context = canvasContexts.get(this);
+    if (!context) {
+        context = Object.create(CanvasRenderingContext2D.prototype);
+        define(context, '_canvas', this);
+        context._state = canvasDefaults();
+        context._stack = [];
+        context._ops = [];
+        canvasContexts.set(this, context);
+        N.cv(this, CV.SIZE);
+    }
+    return context;
+};
+canvasProto.toDataURL = function () {
+    const url = N.cv(this, CV.TO_DATA_URL);
+    if (url === null)
+        throw new DOMException('The canvas has been tainted by cross-origin '
+                               + 'data.', 'SecurityError');
+    return url;
+};
+canvasProto.toBlob = function (callback, type) {
+    const url = this.toDataURL(type);
+    addTimer(() => {
+        const comma = url.indexOf(',');
+        const text = G.atob(url.slice(comma + 1));
+        const bytes = new Uint8Array(text.length);
+        for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+        callback(url === 'data:,' ? null : new Blob([bytes],
+                                                    {type: 'image/png'}));
+    }, 0, [], false);
+};
+canvasProto.captureStream = function () {
+    throw new DOMException('Not supported', 'NotSupportedError');
+};
+canvasProto.transferControlToOffscreen = canvasProto.captureStream;
+
+/* <img>: a script that sets src on an image outside the page loads it
+   itself (between timers, like fetch), so load fires and the image can
+   be drawn; images in the page are loaded by the browser. */
+const imageLoads = new WeakMap();
+function imageSourceSet(image) {
+    if (N.connected(image)) return;
+    const src = N.attr(image, 'src') || '';
+    const load = {pending: true, size: null, waiters: []};
+    imageLoads.set(image, load);
+    let url = null;
+    try { if (src !== '') url = new URL(src, document.baseURI).href; }
+    catch (e) {}
+    netQueue.push(() => {
+        if (imageLoads.get(image) !== load) return;
+        let size = null;
+        if (url !== null) {
+            try { size = N.cv(image, CV.LOAD_IMAGE, url); } catch (e) {}
+        }
+        load.pending = false;
+        load.size = size;
+        for (const w of load.waiters.splice(0)) w(size !== null);
+        dispatch(image, new Event(size !== null ? 'load' : 'error'));
+    });
+}
+const setAttrNotingImages = N.setAttr;
+N.setAttr = (element, name, value) => {
+    const result = setAttrNotingImages(element, name, value);
+    if (String(name).toLowerCase() === 'src' && N.kind(element) === 1
+        && N.name(element) === 'img')
+        imageSourceSet(element);
+    return result;
+};
+const imageProto = G.HTMLImageElement.prototype;
+function imageSize(image) {
+    const load = imageLoads.get(image);
+    if (load) return load.size;
+    return N.cv(image, CV.IMAGE_SIZE);
+}
+Object.defineProperties(imageProto, {
+    complete: {get() {
+        const load = imageLoads.get(this);
+        return !load || !load.pending;
+    }, configurable: true},
+    naturalWidth: {get() { const s = imageSize(this); return s ? s[0] : 0; },
+                   configurable: true},
+    naturalHeight: {get() { const s = imageSize(this); return s ? s[1] : 0; },
+                    configurable: true},
+});
+imageProto.decode = function () {
+    const load = imageLoads.get(this);
+    if (!load || !load.pending)
+        return imageSize(this) || !load ? Promise.resolve()
+            : Promise.reject(new DOMException('The image could not be '
+                                              + 'decoded', 'EncodingError'));
+    return new Promise((resolve, reject) => load.waiters.push(ok => ok
+        ? resolve() : reject(new DOMException('The image could not be '
+                                              + 'decoded', 'EncodingError'))));
+};
 
 /* ------------------------------------------------------- the document */
 
@@ -3013,6 +4232,9 @@ const api = {
     PopStateEvent, HashChangeEvent, URL, URLSearchParams, DOMTokenList,
     Storage, AbortController, AbortSignal, MutationObserver, DOMException,
     MutationRecord, customElements, Image, Option, Audio,
+    CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData,
+    TextMetrics, DOMMatrix, DOMMatrixReadOnly, Path2D, ImageBitmap,
+    createImageBitmap, Intl,
     fetch, Request, Response, Headers, XMLHttpRequest, crypto, Crypto,
     XMLHttpRequestEventTarget, FormData, Blob, File, TextEncoder,
     TextDecoder, DOMRect, DOMRectReadOnly, StyleSheet, CSSStyleSheet,

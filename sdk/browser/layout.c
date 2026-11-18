@@ -374,7 +374,8 @@ static void add_text(struct ctx *c, const char *text, size_t length,
 /* ---------------------------------------------------------------- images */
 
 static bool is_replaced(const struct opos_html_node *node) {
-    return node->tag == HTML_TAG_IMG || node->tag == HTML_TAG_SVG;
+    return node->tag == HTML_TAG_IMG || node->tag == HTML_TAG_SVG
+        || node->tag == HTML_TAG_CANVAS;
 }
 
 static struct image_ref *image_new(struct ctx *c) {
@@ -431,8 +432,23 @@ static struct image_ref *image_for(struct ctx *c,
     for (size_t i = 0; i < page->image_count; i++) {
         if (page->images[i]->node == node) {
             page->images[i]->colour = style->colour;
+            if (node->tag == HTML_TAG_CANVAS) {
+                canvas_size(node, &page->images[i]->width,
+                            &page->images[i]->height);
+            }
             return page->images[i];
         }
+    }
+    if (node->tag == HTML_TAG_CANVAS) {
+        /* Drawn by scripts (canvas.c); transparent until then. */
+        struct image_ref *ref = image_new(c);
+        if (ref != NULL) {
+            ref->node = node;
+            ref->canvas = true;
+            ref->state = 1;
+            canvas_size(node, &ref->width, &ref->height);
+        }
+        return ref;
     }
     const char *source = NULL;
     if (node->tag != HTML_TAG_SVG) {

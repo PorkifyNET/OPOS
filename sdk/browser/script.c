@@ -26,6 +26,7 @@
 #include <opos_http.h>
 
 #include "browser.h"
+#include "canvas.h"
 #include "quickjs.h"
 
 #define SCRIPT_MAX_BYTES (4u << 20)   /* one external script */
@@ -303,6 +304,23 @@ static JSValue wrap(JSContext *ctx, const struct opos_html_node *node) {
 
 static struct opos_html_node *unwrap(JSValueConst value) {
     return JS_GetOpaque(value, node_class);
+}
+
+/* For canvas.c (canvas.h). */
+struct opos_html_node *script_unwrap(JSValueConst value) {
+    return JS_IsObject(value) ? unwrap(value) : NULL;
+}
+
+struct page *script_page(JSContext *ctx) {
+    struct script_state *s = state_of(ctx);
+    return s != NULL ? s->page : NULL;
+}
+
+void script_more_time(JSContext *ctx) {
+    struct script_state *s = state_of(ctx);
+    if (s != NULL && s->deadline != 0) {
+        s->deadline = uptime_ms() + SCRIPT_TIME_MS;
+    }
 }
 
 /* ------------------------------------------------------------- helpers */
@@ -1193,6 +1211,12 @@ static bool url_origin(const char *url, char *out, size_t capacity) {
     }
     snprintf(out, capacity, "%s://%s", secure ? "https" : "http", host);
     return true;
+}
+
+bool script_same_origin(const char *a, const char *b) {
+    char one[300], two[300];
+    return url_origin(a, one, sizeof(one)) && url_origin(b, two, sizeof(two))
+        && strcmp(one, two) == 0;
 }
 
 /* Header names a page may not set: the browser sets them itself. */
@@ -2600,6 +2624,7 @@ void script_page_start(struct page *page) {
         return;
     }
     JSValue native = JS_NewObject(ctx);
+    canvas_add_natives(ctx, native);
     JS_SetPropertyFunctionList(ctx, native, native_functions,
                                sizeof(native_functions)
                                / sizeof(native_functions[0]));
@@ -2665,6 +2690,7 @@ void script_page_end(struct page *page) {
         }
     }
     free(s->wrappers);
+    canvas_page_end(page);
     for (size_t i = 0; i < s->sheet_text_count; i++) {
         free(s->sheet_texts[i].text);
     }

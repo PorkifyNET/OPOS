@@ -1,10 +1,10 @@
-OPOS 0.6.6: programs can now ask "Save changes?" before they close, and the OPOS Store has a full set of office programs.
+OPOS 0.6.8: the Browser now runs JavaScript, so many more websites work.
 
-- Writer, the new OPOS word processor, is in the OPOS Store (Office). Write documents with headings, bold, italic, underline, colors, lists and alignment on real pages, and open and save Word documents (.docx) and text files.
-- Spreadsheet, the new OPOS spreadsheet, is in the OPOS Store (Office). Work with numbers, text, dates and about 90 functions such as SUM, IF and VLOOKUP, and open and save Excel workbooks (.xlsx) and CSV files.
-- Presentation, the new OPOS slide show program, is in the OPOS Store (Office). Make slides with titles, lists, text boxes, shapes and pictures, show them full screen, and open and save PowerPoint presentations (.pptx).
-- Calculator is in the OPOS Store (Accessories), with a standard and a scientific mode and a history of your calculations.
-- Closing a program with the close button or Super+Q now lets it ask whether to save your changes first, instead of closing at once. Writer, Spreadsheet, Presentation and Picasso use this, so unsaved work is no longer lost by accident. Picasso 1.1 in the OPOS Store is needed for Picasso; update it from the Store.
-- A program that does not respond still closes when you ask a second time.
+- The Browser runs the scripts on web pages. Menus, buttons, pop-ups and other parts of pages that are made with JavaScript now work, and pages that build themselves with scripts (such as BBC News and GitHub) now show their content.
+- Sites can load more data while you look at them, remember your settings and log-ins (cookies and saved site storage), and change the address without loading a new page.
+- Pages can draw with scripts (canvas), so charts, simple games and animated pictures on websites now show.
+- Pages with modern scripts (modules, custom elements, observers) and styles changed by scripts now work.
+- Sites you visit often open faster: the Browser keeps connections to a site open for the next request and keeps scripts it has already prepared.
+- WebAssembly, WebGL and plug-ins are not supported yet.
 
 Updating from 0.6.3 or older: VMware may hang at the restart at the end of the update. The update is already installed by then. Close VMware, end vmware-vmx.exe (taskkill /F /IM vmware-vmx.exe from an administrator command prompt; this stops every running VM) or restart Windows, then start the VM again.

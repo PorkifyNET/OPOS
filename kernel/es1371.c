@@ -300,13 +300,23 @@ bool es1371_initialize(void) {
    clear the DAC2 interrupt flag (see es1371_poll). With interrupts off
    nothing clears it, and VMware's device reset then waits for that thread
    forever: the VM and VMware hang. So DAC2 is stopped before a reset or
-   power-off. */
+   power-off. Turning DAC2 off alone was not enough (VMware still hung
+   at some restarts): a period already being played still ends by setting
+   the flag, and its thread then waits for it. So the flag is cleared
+   before DAC2 is turned off and for 50 ms (over two periods) after. */
 void es1371_stop(void) {
     if (!ready) {
         return;
     }
     ready = false;
+    out32(REG_SERIAL, SERIAL_P2_MODE(3) | SERIAL_P2_END_INC(2));
     out32(REG_CONTROL, 0);
+    for (uint32_t i = 0; i < 50000; i++) {
+        if ((in32(REG_STATUS) & STATUS_DAC2) != 0) {
+            out32(REG_SERIAL, SERIAL_P2_MODE(3) | SERIAL_P2_END_INC(2));
+        }
+        io_in8(0x80); /* about 1 us; interrupts are off here */
+    }
     out32(REG_SERIAL, 0);
 }
 
